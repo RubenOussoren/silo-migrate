@@ -1,0 +1,282 @@
+# frozen_string_literal: true
+
+require "rexml/document"
+require "rexml/xpath"
+require "pathname"
+require "set"
+require "zlib"
+require "time"
+
+module SiloMigrate
+  class TableStructure
+    attr_reader :name, :columns, :primary_keys, :indexes, :unique_keys
+
+    def initialize(name)
+      @name = name
+      @columns = []
+      @primary_keys = []
+      @indexes = {}
+      @unique_keys = {}
+    end
+
+    def add_column(attrs)
+      col = {
+        name: attrs["Field"].to_s,
+        type: attrs["Type"] || "text",
+        null: attrs["Null"] == "YES",
+        key: attrs["Key"].to_s,
+        default: attrs["Default"],
+        extra: attrs["Extra"].to_s
+      }
+      @columns << col
+      case col[:key]
+      when "PRI" then @primary_keys << col[:name]
+      when "UNI" then @unique_keys["uk_#{col[:name]}"] = [col[:name]]
+      when "MUL" then @indexes["idx_#{col[:name]}"] = [col[:name]]
+      end
+    end
+
+    def column_names
+      @columns.map { |col| col[:name] }
+    end
+
+    def to_create_table_sql
+      lines = @columns.map do |col|
+        definition = "  #{SQLXML.escape_identifier(col[:name])} #{col[:type]}"
+        definition += " NOT NULL" unless col[:null]
+        if col[:default] && col[:default] != "null"
+          default = col[:default]
+          definition += if default.start_with?("CURRENT_") || default == "NULL" || numeric_type?(col[:type])
+                          " DEFAULT #{default}"
+                        else
+                          " DEFAULT #{SQLXML.escape_sql_string(default)}"
+                        end
+        elsif col[:null] && col[:default] == "null"
+          definition += " DEFAULT NULL"
+        end
+        if col[:extra].downcase.include?("auto_increment")
+          definition += " AUTO_INCREMENT"
+        elsif col[:extra].downcase.include?("on update current_timestamp") || col[:extra].include?("DEFAULT_GENERATED")
+          definition += " ON UPDATE CURRENT_TIMESTAMP" unless definition.upcase.include?("ON UPDATE CURRENT_TIMESTAMP")
+        end
+        definition
+      end
+
+      lines << "  PRIMARY KEY (#{@primary_keys.map { |key| SQLXML.escape_identifier(key) }.join(', ')})" if @primary_keys.any?
+      @unique_keys.each { |name, cols| lines << "  UNIQUE KEY #{SQLXML.escape_identifier(name)} (#{cols.map { |col| SQLXML.escape_identifier(col) }.join(', ')})" }
+      @indexes.each { |name, cols| lines << "  KEY #{SQLXML.escape_identifier(name)} (#{cols.map { |col| SQLXML.escape_identifier(col) }.join(', ')})" }
+
+      "DROP TABLE IF EXISTS #{SQLXML.escape_identifier(@name)};\n" \
+        "CREATE TABLE #{SQLXML.escape_identifier(@name)} (\n" \
+        "#{lines.join(",\n")}\n" \
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n"
+    end
+
+    private
+
+    def numeric_type?(type)
+      type.match?(/\A(?:int|bigint|tinyint|smallint|mediumint|float|double|decimal|numeric)/i)
+    end
+  end
+
+  module SQLXML
+    module_function
+
+    def escape_sql_string(value)
+      return "NULL" if value.nil?
+
+      escaped = value.to_s
+                     .gsub("\\", "\\\\\\")
+                     .gsub("'", "\\\\'")
+                     .gsub("\n", "\\n")
+                     .gsub("\r", "\\r")
+                     .gsub("\t", "\\t")
+                     .gsub("\x00", "\\0")
+                     .gsub("\x1a", "\\Z")
+      "'#{escaped}'"
+    end
+
+    def escape_identifier(name)
+      "`#{name.to_s.gsub('`', '``')}`"
+    end
+  end
+
+  class XMLToSQLConverter
+    attr_reader :stats
+
+    UNESCAPED_AMP = /&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/
+
+    def initialize(batch_size: 1000, include_tables: nil, exclude_tables: nil, include_files: nil, exclude_files: nil, schema_only: false, verbose: true)
+      @batch_size = batch_size
+      @include_tables = include_tables&.to_set
+      @exclude_tables = Array(exclude_tables).to_set
+      @include_files = include_files&.to_set
+      @exclude_files = Array(exclude_files).to_set
+      @schema_only = schema_only
+      @verbose = verbose
+      reset_stats
+    end
+
+    def convert(source, output_path, file_pattern: "*.xml")
+      reset_stats
+      source = Pathname(source)
+      output_path = Pathname(output_path)
+      files = source.file? ? [source] : source.glob(file_pattern).to_a.concat(source.glob("#{file_pattern}.gz").to_a).sort
+      raise UsageError, "No XML files found in #{source}" if files.empty?
+
+      files_to_process, skipped = files.partition { |file| process_file?(file) }
+      @stats[:files_skipped] += skipped.length
+      raise UsageError, "No XML files to process after filtering. All #{files.length} files were excluded." if files_to_process.empty?
+
+      log "\n#{'=' * 60}\nXML TO SQL CONVERTER\n#{'=' * 60}"
+      log "\nSource: #{source}"
+      log "Output: #{output_path}"
+      log "Files found: #{files.length}"
+      log "Files to skip: #{skipped.length}" if skipped.any?
+      log "Files to process: #{files_to_process.length}"
+
+      open_output(output_path) do |out|
+        out.write("-- Generated by xml-to-sql converter\n")
+        out.write("-- Source: #{source}\n")
+        out.write("-- Generated at: #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        out.write("SET NAMES utf8mb4;\nSET sql_mode = '';\nSET FOREIGN_KEY_CHECKS = 0;\nSET UNIQUE_CHECKS = 0;\nSET AUTOCOMMIT = 0;\n\n")
+        files_to_process.each { |file| convert_file(file, out) }
+        out.write("\nCOMMIT;\nSET FOREIGN_KEY_CHECKS = 1;\nSET UNIQUE_CHECKS = 1;\nSET AUTOCOMMIT = 1;\n")
+      end
+
+      @stats[:bytes_written] = File.size(output_path)
+      log "\n#{'=' * 60}\nCONVERSION COMPLETE\n#{'=' * 60}"
+      log "\nFiles processed:  #{@stats[:files_processed]}"
+      log "Files skipped:    #{@stats[:files_skipped]}" if @stats[:files_skipped].positive?
+      log "Tables converted: #{@stats[:tables_processed]}"
+      log "Tables skipped:   #{@stats[:tables_skipped]}" if @stats[:tables_skipped].positive?
+      log "Rows converted:   #{@stats[:rows_processed]}"
+      log "Output size:      #{DumpTools.format_size(@stats[:bytes_written])}"
+      log "\nOutput written to: #{output_path}"
+      @stats
+    end
+
+    def convert_file(xml_path, output)
+      log "\nProcessing: #{File.basename(xml_path)}"
+      doc = REXML::Document.new(fixed_xml(xml_path))
+      structures = {}
+
+      REXML::XPath.each(doc, "//table_structure") do |node|
+        table = node.attributes["name"].to_s
+        unless process_table?(table)
+          @stats[:tables_skipped] += 1
+          next
+        end
+
+        structure = TableStructure.new(table)
+        node.elements.each("field") { |field| structure.add_column(field.attributes) }
+        structures[table] = structure
+        output.write("\n-- Table: #{table}\n")
+        output.write(structure.to_create_table_sql)
+        output.write("\n")
+        @stats[:tables_processed] += 1
+      end
+
+      unless @schema_only
+        REXML::XPath.each(doc, "//table_data") do |node|
+          table = node.attributes["name"].to_s
+          next unless process_table?(table)
+
+          rows = []
+          node.elements.each("row") do |row_node|
+            row = {}
+            row_node.elements.each("field") { |field| row[field.attributes["name"]] = field.text }
+            rows << row
+            @stats[:rows_processed] += 1
+            if rows.length >= @batch_size
+              write_rows_batch(output, table, structures[table], rows)
+              rows = []
+            end
+          end
+          write_rows_batch(output, table, structures[table], rows) if rows.any?
+        end
+      end
+
+      @stats[:files_processed] += 1
+    end
+
+    private
+
+    def reset_stats
+      @stats = { tables_processed: 0, rows_processed: 0, bytes_written: 0, files_processed: 0, files_skipped: 0, tables_skipped: 0 }
+    end
+
+    def fixed_xml(path)
+      text = if path.to_s.end_with?(".gz")
+               Zlib::GzipReader.open(path.to_s, &:read)
+             else
+               File.read(path, mode: "rb")
+             end
+      text = text.force_encoding("UTF-8").encode("UTF-8", invalid: :replace, undef: :replace)
+      text.split(/(<!\[CDATA\[.*?\]\]>)/m).map do |part|
+        part.start_with?("<![CDATA[") ? part : part.gsub(UNESCAPED_AMP, "&amp;")
+      end.join
+    end
+
+    def open_output(path)
+      if path.to_s.end_with?(".gz")
+        Zlib::GzipWriter.open(path.to_s) { |gz| yield gz }
+      else
+        File.open(path, "w:utf-8") { |file| yield file }
+      end
+    end
+
+    def process_table?(table)
+      return false if @include_tables && !@include_tables.include?(table)
+      return false if @exclude_tables.include?(table)
+
+      true
+    end
+
+    def process_file?(file)
+      file_name = file.basename.to_s
+      base = file_name.sub(/\.gz\z/, "").sub(/\.xml\z/, "")
+      return false if @include_files && !@include_files.include?(file_name) && !@include_files.include?(base)
+      return false if @exclude_files.include?(file_name) || @exclude_files.include?(base)
+
+      true
+    end
+
+    def write_rows_batch(out, table, structure, rows)
+      return if rows.empty?
+
+      columns = structure ? structure.column_names : rows.first.keys
+      col_defs = structure ? structure.columns.to_h { |col| [col[:name], col] } : {}
+      out.write("INSERT INTO #{SQLXML.escape_identifier(table)} (#{columns.map { |col| SQLXML.escape_identifier(col) }.join(', ')}) VALUES\n")
+      value_rows = rows.map do |row|
+        values = columns.map do |col|
+          definition = col_defs[col]
+          format_value(row[col], definition&.dig(:type) || "text", definition.nil? || definition[:null])
+        end
+        "  (#{values.join(', ')})"
+      end
+      out.write(value_rows.join(",\n"))
+      out.write(";\n")
+    end
+
+    def format_value(value, type, allows_null)
+      if value.nil? || value == "null"
+        return "NULL" if allows_null
+        return "0" if type.match?(/\A(?:int|bigint|tinyint|smallint|mediumint|float|double|decimal|numeric)/i)
+
+        return "''"
+      end
+
+      if type.match?(/\A(?:int|bigint|tinyint|smallint|mediumint|float|double|decimal|numeric)/i)
+        return allows_null ? "NULL" : "0" if value == ""
+        return value if value.to_s.match?(/\A-?\d+(?:\.\d+)?\z/)
+      end
+
+      SQLXML.escape_sql_string(value)
+    end
+
+    def log(message)
+      puts(message) if @verbose
+    end
+  end
+end

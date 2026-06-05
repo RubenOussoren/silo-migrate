@@ -1,0 +1,7 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+warn "xml-to-sql has been replaced by silo-migrate convert-xml; forwarding command."
+
+ARGV.unshift("convert-xml")
+load File.expand_path("silo-migrate", __dir__)

@@ -1,0 +1,13 @@
+.bundle/
+.ruby-version
+.env
+coverage/
+pkg/
+tmp/
+log/
+
+# Generated local migration workspaces and safe AI exports should not live in
+# the source repository.
+customers/
+safe-ai-workspaces/
+migrations/

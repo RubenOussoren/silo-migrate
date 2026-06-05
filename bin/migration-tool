@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+warn "migration-tool has been replaced by silo-migrate; forwarding command."
+
+load File.expand_path("silo-migrate", __dir__)
