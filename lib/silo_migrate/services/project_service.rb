@@ -198,13 +198,24 @@ module SiloMigrate
         raise UsageError, "Could not find an available localhost port starting at #{preferred}"
       end
 
-      def cleanup(customer, yes: false)
+      def cleanup(customer, yes: false, force: false)
         path = Project.project_path(customer, @env)
         raise UsageError, "Project not found: #{customer}" unless Dir.exist?(path)
         raise UsageError, "Cleanup deletes the project and volumes. Re-run with --yes to confirm." unless yes
 
         if File.exist?(File.join(path, "docker-compose.yml"))
-          @runtime.compose(customer, ["--profile", "all", "--profile", "initial-db", "--profile", "final-db", "--profile", "converter", "down", "--volumes", "--remove-orphans"], capture: true)
+          result = @runtime.compose(customer, ["--profile", "all", "--profile", "initial-db", "--profile", "final-db", "--profile", "converter", "down", "--volumes", "--remove-orphans"], capture: true)
+          unless result.success?
+            detail = (result.stderr.to_s.empty? ? result.stdout.to_s : result.stderr.to_s).strip
+            unless force
+              raise UsageError, <<~MSG.chomp
+                Could not stop containers/volumes for '#{customer}' (exit #{result.status || 'unknown'}): #{detail}
+                Project directory NOT deleted: #{path}
+                Fix Docker (or stop the containers manually) and retry, or re-run with --force to delete the directory anyway.
+              MSG
+            end
+            @output.puts "[WARN] Containers/volumes could not be stopped; deleting project directory anyway (--force)."
+          end
         end
         FileUtils.rm_rf(path)
         @output.puts "[OK] Project '#{customer}' has been deleted"
@@ -292,10 +303,9 @@ module SiloMigrate
         command = Array(command).reject(&:empty?)
         command = ["bundle", "exec", "ruby", "converter.rb"] if command.empty?
         @last_converter_command = command
-        result = @runtime.compose(customer, ["--profile", "converter", "exec", "-T", "converter", *command], capture: true, timeout: nil)
+        args = ["--profile", "converter", "exec", "-T", "converter", *command]
+        result = execute_converter_command(customer, args)
         @last_converter_result = result
-        @output.puts result.stdout unless result.stdout.empty?
-        @output.puts result.stderr unless result.stderr.empty?
         generate_converter_summary(customer, command: command, result: result) if redacted_logs
         raise UsageError, "Converter command failed with exit code #{result.status}" unless result.success?
 
@@ -366,16 +376,6 @@ module SiloMigrate
         destination
       end
 
-      def warn_on_gzip_corruption(path)
-        return unless DumpTools.gzip_file?(path)
-
-        verification = DumpTools.verify_gzip(path)
-        return if verification[:valid]
-
-        @output.puts "[WARN] gzip quick check failed: #{verification[:message]}"
-        @output.puts "[WARN] The dump may be truncated or corrupt; the import preflight will verify it fully."
-      end
-
       def generate_connection_readme(customer, phase, db_type, db_name, port, password)
         project_path = Project.project_path(customer, @env)
         path = File.join(project_path, "dumps", phase, "CONNECTION.md")
@@ -422,6 +422,45 @@ module SiloMigrate
       end
 
       private
+
+      # Streams converter output live and keeps only a bounded tail in memory;
+      # falls back to a full capture for runtimes without streaming support.
+      def execute_converter_command(customer, args)
+        unless @runtime.respond_to?(:compose_exec_stream)
+          result = @runtime.compose(customer, args, capture: true, timeout: nil)
+          @output.puts result.stdout unless result.stdout.empty?
+          @output.puts result.stderr unless result.stderr.empty?
+          return result
+        end
+
+        stdout_tail = BoundedBuffer.new
+        stderr_tail = BoundedBuffer.new
+        stream_result = @runtime.compose_exec_stream(customer, args, timeout: nil) do |stream, chunk|
+          @output.print(chunk)
+          (stream == :stderr ? stderr_tail : stdout_tail).write(chunk)
+        end
+        Runtime::CommandResult.new(
+          success?: stream_result.success?,
+          stdout: tail_with_truncation_marker(stdout_tail),
+          stderr: tail_with_truncation_marker(stderr_tail),
+          status: stream_result.status
+        )
+      end
+
+      def tail_with_truncation_marker(buffer)
+        text = buffer.tail_string
+        buffer.truncated? ? "[earlier output truncated]\n#{text}" : text
+      end
+
+      def warn_on_gzip_corruption(path)
+        return unless DumpTools.gzip_file?(path)
+
+        verification = DumpTools.verify_gzip(path)
+        return if verification[:valid]
+
+        @output.puts "[WARN] gzip quick check failed: #{verification[:message]}"
+        @output.puts "[WARN] The dump may be truncated or corrupt; the import preflight will verify it fully."
+      end
 
       def port_conflicts_for_config(config, profile, customer: nil)
         service_ports_for_profile(config, profile).select do |entry|

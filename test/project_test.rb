@@ -31,6 +31,24 @@ class ProjectTest < SiloMigrateTest
     end
   end
 
+  def test_cleanup_preserves_project_directory_when_compose_down_fails
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      path = project.project_path("acme")
+
+      runtime.compose_results << SiloMigrate::Runtime::CommandResult.new(success?: false, stdout: "", stderr: "Cannot connect to the Docker daemon", status: 1)
+      error = assert_raises(SiloMigrate::UsageError) { project.cleanup("acme", yes: true) }
+      assert_includes error.message, "NOT deleted"
+      assert Dir.exist?(path)
+
+      runtime.compose_results << SiloMigrate::Runtime::CommandResult.new(success?: false, stdout: "", stderr: "Cannot connect to the Docker daemon", status: 1)
+      project.cleanup("acme", yes: true, force: true)
+      refute Dir.exist?(path)
+    end
+  end
+
   def test_config_env_read_write_compatibility
     with_tmp_base do |_dir, env|
       SiloMigrate::Project.ensure_project_dirs("acme", env)

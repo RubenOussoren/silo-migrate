@@ -142,7 +142,13 @@ module SiloMigrate
 
         raise UsageError, "sqlite3 gem is required to read #{db_path}" unless defined?(SQLite3::Database)
 
-        db = SQLite3::Database.new(db_path)
+        wal_path = "#{db_path}-wal"
+        if File.exist?(wal_path) && (Time.now - File.mtime(wal_path)) < 10
+          summary["warnings"] = ["intermediate.db was written to in the last few seconds; the converter may still be running and this summary may be incomplete"]
+        end
+
+        db = SQLite3::Database.new(db_path, readonly: true)
+        db.busy_timeout = 2000
         db.results_as_hash = true
         rows = db.execute("SELECT created_at, type, message, exception, details FROM log_entries ORDER BY created_at")
         summary["log_entry_count"] = rows.length
@@ -151,7 +157,13 @@ module SiloMigrate
         summary["counts_by_type"] = summary["counts_by_type"].sort.to_h
         summary
       rescue StandardError => e
-        if defined?(SQLite3::SQLException) && e.is_a?(SQLite3::SQLException)
+        if defined?(SQLite3::BusyException) && e.is_a?(SQLite3::BusyException)
+          summary.merge(
+            "available" => false,
+            "read_error" => "intermediate.db is locked (the converter may still be writing); retry after the converter finishes",
+            "entries" => []
+          )
+        elsif defined?(SQLite3::SQLException) && e.is_a?(SQLite3::SQLException)
           summary.merge(
             "available" => false,
             "read_error" => redactor.redact(e.message),

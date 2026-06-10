@@ -45,6 +45,17 @@ module SiloMigrate
         @container_health_states.fetch(name, "healthy")
       end
 
+      # Mirrors Docker#compose_exec_stream by delegating to compose (so
+      # subclasses that stub compose keep working) and replaying its captured
+      # output as streamed chunks.
+      def compose_exec_stream(customer, args, timeout: nil, &block)
+        @operations << [:compose_exec_stream, customer, args, timeout]
+        result = compose(customer, args, capture: true, timeout: timeout)
+        block.call(:stdout, result.stdout) unless result.stdout.to_s.empty?
+        block.call(:stderr, result.stderr) unless result.stderr.to_s.empty?
+        CommandResult.new(success?: result.success?, stdout: "", stderr: "", status: result.status)
+      end
+
       def container_running?(name)
         @operations << [:container_running?, name]
         @running_containers.fetch(name, true)

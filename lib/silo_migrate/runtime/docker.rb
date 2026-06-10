@@ -22,6 +22,47 @@ module SiloMigrate
         run(cmd, chdir: project_path, capture: capture, timeout: timeout)
       end
 
+      # Streams a compose command's stdout/stderr to the block as chunks arrive
+      # instead of buffering everything in memory. Optional contract method
+      # (guard with respond_to?). The returned CommandResult carries only the
+      # exit status; output ownership stays with the caller's block.
+      def compose_exec_stream(customer, args, timeout: nil)
+        ensure_available!
+        project_path = Project.project_path(customer, @env)
+        cmd = normalize_command(["docker", "compose", "-f", File.join(project_path, "docker-compose.yml"), *args])
+        deadline = timeout ? Time.now + timeout : nil
+        status = nil
+
+        Open3.popen3(*cmd, chdir: project_path) do |stdin, out, err, wait_thr|
+          stdin.close
+          readers = { out => :stdout, err => :stderr }
+          until readers.empty?
+            wait = deadline ? [deadline - Time.now, 0.1].max : nil
+            ready, = IO.select(readers.keys, nil, nil, wait)
+            if deadline && Time.now >= deadline
+              terminate_single_process(wait_thr.pid)
+              yield :stderr, "\n#{timeout_message(cmd, timeout)}\n"
+              return CommandResult.new(success?: false, stdout: "", stderr: timeout_message(cmd, timeout), status: nil)
+            end
+            next unless ready
+
+            ready.each do |io|
+              chunk = io.read_nonblock(65_536, exception: false)
+              case chunk
+              when :wait_readable then next
+              when nil then readers.delete(io)
+              else yield readers[io], chunk
+              end
+            end
+          end
+          status = wait_thr.value
+        end
+
+        CommandResult.new(success?: status.success?, stdout: "", stderr: "", status: status.exitstatus)
+      rescue Errno::ENOENT => e
+        raise UsageError, "#{DOCKER_NOT_FOUND_ERROR}\nOriginal error: #{e.message}"
+      end
+
       def container_running?(name)
         result = run(["docker", "inspect", "-f", "{{.State.Running}}", name], capture: true, timeout: 10)
         result.success? && result.stdout.strip == "true"

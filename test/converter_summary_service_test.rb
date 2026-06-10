@@ -85,6 +85,29 @@ class ConverterSummaryServiceTest < SiloMigrateTest
     end
   end
 
+  def test_warns_when_intermediate_db_wal_is_fresh
+    with_tmp_base do |_dir, env|
+      project = SiloMigrate::Services::ProjectService.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: StringIO.new)
+      project.init("acme")
+      db_path = File.join(project.project_path("acme"), "output", "intermediate.db")
+      create_intermediate_db(db_path)
+      insert_log_entry(db_path, type: "info", message: "ok", exception: nil, details: nil)
+      write("#{db_path}-wal", "")
+
+      artifacts = SiloMigrate::Services::ConverterSummaryService.new(env: env).generate(
+        "acme",
+        command: ["ruby", "converter.rb"],
+        result: SiloMigrate::Runtime::CommandResult.new(success?: true, stdout: "", stderr: "", status: 0)
+      )
+
+      summary = JSON.parse(File.read(artifacts.fetch(:summary_path)))
+      warnings = summary.dig("sources", "intermediate_db", "warnings")
+      refute_nil warnings
+      assert_match(/may still be running/, warnings.first)
+      assert_equal 1, summary.dig("sources", "intermediate_db", "log_entry_count")
+    end
+  end
+
   private
 
   def create_intermediate_db(path)

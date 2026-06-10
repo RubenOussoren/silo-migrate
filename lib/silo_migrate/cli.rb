@@ -172,8 +172,11 @@ module SiloMigrate
     end
 
     def cleanup(argv)
-      options = { yes: false }
-      OptionParser.new { |opts| opts.on("-y", "--yes") { options[:yes] = true } }.parse!(argv)
+      options = { yes: false, force: false }
+      OptionParser.new do |opts|
+        opts.on("-y", "--yes") { options[:yes] = true }
+        opts.on("--force") { options[:force] = true }
+      end.parse!(argv)
       @project_service.cleanup(required_arg(argv, "CUSTOMER"), **options)
     end
 
