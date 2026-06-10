@@ -115,8 +115,10 @@ module SiloMigrate
         return if options[:skip_health_wait]
 
         state = container_health_state(container_name)
-        if state == "none"
-          @output.puts "[WARN] Container #{container_name} has no healthcheck; skipping health wait."
+        if state.nil? || state == "none"
+          # nil: runtime cannot report health states; waiting on a healthcheck
+          # that may not exist would just burn the timeout.
+          @output.puts "[WARN] Container #{container_name} has no healthcheck; skipping health wait." if state == "none"
           return
         end
         return if state == "healthy"
@@ -164,18 +166,7 @@ module SiloMigrate
       end
 
       def database_config(customer, phase, config)
-        if phase == "final"
-          db_type = config["FINAL_DB_TYPE"]
-          raise UsageError, "No final database configured for #{customer}.\nRun 'silo-migrate add-final-db #{customer}' first to configure it." unless db_type
-
-          [db_type, config["FINAL_DB_NAME"] || "#{customer}_final_db", config["FINAL_DB_PASSWORD"] || config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"]]
-        else
-          [config["INITIAL_DB_TYPE"], config["INITIAL_DB_NAME"] || config["DB_NAME"], config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"]]
-        end.tap do |db_type, db_name, password|
-          raise UsageError, "No #{phase} database configured" unless db_type
-          raise UsageError, "Database name not configured" unless db_name
-          raise UsageError, "Database password not configured in config.env." unless password
-        end
+        Project.database_config(customer, phase, config)
       end
 
       def resolve_dump_path(dumps_dir, file)
@@ -566,7 +557,12 @@ module SiloMigrate
           match && match[1].to_i
         end
 
+        # Only the mysql-family clients report dump line numbers as "at line N";
+        # postgres emits "at line N" inside PL/pgSQL CONTEXT messages where the
+        # number refers to a function body, not the dump.
         def error_line_number
+          return nil unless @db_type.nil? || %w[mysql mariadb].include?(@db_type)
+
           match = @output.match(LINE_NUMBER_PATTERN)
           match && match[1].to_i
         end

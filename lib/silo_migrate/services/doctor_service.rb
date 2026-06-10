@@ -25,7 +25,8 @@ module SiloMigrate
           docker_check,
           compose_check,
           git_check,
-          base_path_check
+          base_path_check,
+          disk_check
         ]
 
         checks.each { |check| print_check(check) }
@@ -113,6 +114,30 @@ module SiloMigrate
         end
       rescue UsageError
         { name: "Git", ok: false, detail: "not available", fix: "install git (required for setup-converter)" }
+      end
+
+      # Advisory only (optional): low disk warns but never fails doctor, since
+      # the real requirement depends on dump sizes.
+      def disk_check
+        target = Project.base_path_configured?(@env) ? Project.resolve_base_path(@env) : Dir.home
+        target = Dir.home unless Dir.exist?(target)
+        result = @runtime.run(["df", "-Pk", target], capture: true, timeout: 10)
+        free_kb = result.success? ? result.stdout.lines.drop(1).first.to_s.split[3].to_i : 0
+        if free_kb.zero?
+          { name: "Free disk", ok: true, detail: "could not determine free space at #{target}" }
+        elsif free_kb * 1024 < 10 * 1024 * 1024 * 1024
+          {
+            name: "Free disk",
+            ok: false,
+            optional: true,
+            detail: "#{DumpTools.format_size(free_kb * 1024)} free at #{target} - large imports may fail",
+            fix: "free up disk space before importing multi-GB dumps"
+          }
+        else
+          { name: "Free disk", ok: true, detail: "#{DumpTools.format_size(free_kb * 1024)} free at #{target}" }
+        end
+      rescue UsageError
+        { name: "Free disk", ok: true, detail: "could not determine free space" }
       end
 
       def base_path_check

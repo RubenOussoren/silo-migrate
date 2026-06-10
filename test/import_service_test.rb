@@ -64,6 +64,21 @@ class ImportServiceTest < SiloMigrateTest
     end
   end
 
+  class NoHealthStateRuntime < SiloMigrate::Runtime::Fake
+    undef_method :container_health_state
+  end
+
+  def test_import_skips_health_wait_when_runtime_cannot_report_health_state
+    with_tmp_base do |_dir, env|
+      runtime = NoHealthStateRuntime.new
+      import, = build_import(env, runtime)
+      import.import_dump("acme", "initial", { file: "dump.sql" })
+
+      refute(runtime.operations.any? { |op| op.first == :wait_for_container_healthy })
+      assert(runtime.operations.any? { |op| op.first == :run_with_stdin })
+    end
+  end
+
   def test_import_proceeds_with_warning_when_no_healthcheck
     with_tmp_base do |_dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
@@ -172,6 +187,17 @@ class ImportServiceTest < SiloMigrateTest
       db_type: "postgres", customer: "acme", phase: "initial"
     ).summary.join("\n")
     assert_includes summary, "Duplicate key"
+    assert_includes summary, "replace-dump acme initial"
+  end
+
+  def test_postgres_plpgsql_context_line_numbers_do_not_trigger_statement_scan
+    path = write(File.join(Dir.mktmpdir, "dump.sql"), "INSERT INTO users VALUES (1);\n")
+    summary = SiloMigrate::Services::ImportService::ImportFailureDiagnostic.new(
+      path: path,
+      output: "ERROR:  division by zero\nCONTEXT:  PL/pgSQL function check_value() at line 4 at assignment",
+      db_type: "postgres", customer: "acme", phase: "initial"
+    ).summary.join("\n")
+    refute_includes summary, "Reported SQL line"
     assert_includes summary, "replace-dump acme initial"
   end
 end

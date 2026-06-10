@@ -161,18 +161,7 @@ module SiloMigrate
       end
 
       def database_config(customer, phase, config)
-        if phase == "final"
-          db_type = config["FINAL_DB_TYPE"]
-          raise UsageError, "No final database configured for #{customer}.\nRun 'silo-migrate add-final-db #{customer}' first to configure it." unless db_type
-
-          [db_type, config["FINAL_DB_NAME"] || "#{customer}_final_db", config["FINAL_DB_PASSWORD"] || config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"]]
-        else
-          [config["INITIAL_DB_TYPE"], config["INITIAL_DB_NAME"] || config["DB_NAME"], config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"]]
-        end.tap do |db_type, db_name, password|
-          raise UsageError, "No #{phase} database configured" unless db_type
-          raise UsageError, "Database name not configured" unless db_name
-          raise UsageError, "Database password not configured in config.env." unless password
-        end
+        Project.database_config(customer, phase, config)
       end
     end
   end
