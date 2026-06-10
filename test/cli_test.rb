@@ -372,20 +372,53 @@ class CLITest < SiloMigrateTest
     end
   end
 
-  def test_ai_prepare_command_creates_safe_workspace
-    with_tmp_base do |dir, env|
-      env["SILO_MIGRATE_SAFE_AI_BASE_PATH"] = File.join(dir, "safe-ai")
+  def test_ai_prepare_writes_safe_artifacts_into_converter_clone
+    with_tmp_base do |_dir, env|
       out = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: out, error: StringIO.new)
       cli.run(["init", "acme"])
       project_path = SiloMigrate::Project.project_path("acme", env)
+      create_converter_platform(env, "acme", "fixture")
       write(File.join(project_path, "schema", "initial", "summary.json"), "{}\n")
 
       assert_equal 0, cli.run(["ai", "prepare", "acme"])
 
-      assert File.exist?(File.join(dir, "safe-ai", "acme", "AGENTS.md"))
-      assert File.exist?(File.join(dir, "safe-ai", "acme", "schema", "initial", "summary.json"))
-      assert_includes out.string, "Safe AI workspace prepared"
+      clone = File.join(project_path, "discourse-converters")
+      assert File.exist?(File.join(clone, "AGENTS.md"))
+      assert File.exist?(File.join(clone, "safe-artifacts", "schema", "initial", "summary.json"))
+      assert File.exist?(File.join(clone, "safe-artifacts", "manifest.json"))
+      assert_includes out.string, "Safe artifacts prepared"
+    end
+  end
+
+  def test_ai_prepare_without_converter_clone_fails_with_setup_hint
+    with_tmp_base do |_dir, env|
+      err = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: StringIO.new, error: err)
+      cli.run(["init", "acme"])
+
+      assert_equal 1, cli.run(["ai", "prepare", "acme"])
+      assert_includes err.string, "setup-converter"
+    end
+  end
+
+  def test_findings_generate_auto_refreshes_safe_artifacts
+    with_tmp_base do |_dir, env|
+      out = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: out, error: StringIO.new)
+      cli.run(["init", "acme"])
+      project_path = SiloMigrate::Project.project_path("acme", env)
+      create_converter_platform(env, "acme", "fixture")
+      write(File.join(project_path, "findings", "redacted-logs", "latest.summary.json"), JSON.pretty_generate(cli_redacted_summary))
+
+      assert_equal 0, cli.run(["ai", "prepare", "acme"])
+      safe = File.join(project_path, "discourse-converters", "safe-artifacts")
+      stale = write(File.join(safe, "findings", "finding-stale.yml"), "id: finding-stale\ndev_visibility: safe\n")
+
+      assert_equal 0, cli.run(["findings", "generate", "acme"])
+
+      refute File.exist?(stale), "auto-refresh should have rebuilt safe-artifacts"
+      assert(Dir[File.join(safe, "findings", "finding-*.yml")].any?, "fresh findings should be mirrored into safe-artifacts")
     end
   end
 

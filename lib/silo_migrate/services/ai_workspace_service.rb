@@ -3,13 +3,41 @@
 require "fileutils"
 require "find"
 require "json"
+require "time"
 require "yaml"
 
 module SiloMigrate
   module Services
+    # Prepares the Normal Dev AI surface: the engineer's (or AI's) working
+    # directory is the project's real discourse-converters git clone, and this
+    # service writes a locally git-ignored `safe-artifacts/` directory inside
+    # it (schema bundles, redacted logs, safe findings, synthetic fixtures)
+    # plus generated agent instruction files. Converter code is never copied
+    # and never touched — `refresh` only ever rebuilds `safe-artifacts/`.
     class AIWorkspaceService
-      ARTIFACT_VERSION = 1
-      DEFAULT_SAFE_DIR_NAME = "safe-ai-workspaces"
+      ARTIFACT_VERSION = 2
+      SAFE_ARTIFACTS_DIR = "safe-artifacts"
+      GENERATED_MARKER = "silo-migrate:generated"
+      EXCLUDE_BEGIN = "# >>> silo-migrate generated (do not commit) >>>"
+      EXCLUDE_END = "# <<< silo-migrate generated <<<"
+      EXCLUDED_PATHS = %w[
+        /safe-artifacts/
+        /AGENTS.md
+        /CLAUDE.md
+        /.claude/
+        /.silo/
+        /Dockerfile
+      ].freeze
+      FORBIDDEN_PARENT_PATHS = %w[
+        ../dumps/
+        ../output/
+        ../config.env
+        ../converter-settings/
+        ../trusted/
+        ../uploads/
+        ../shared/
+        ../docker-compose.yml
+      ].freeze
       SKIPPED_BASENAMES = %w[
         .bundle
         .env
@@ -28,56 +56,110 @@ module SiloMigrate
         @output = output
       end
 
-      def prepare(customer, output_dir: nil)
+      def prepare(customer)
         Project.load_config(customer, @env)
         project_path = File.expand_path(Project.project_path(customer, @env))
-        workspace_path = File.expand_path(output_dir || default_workspace_path(customer))
-        validate_workspace_path!(workspace_path, project_path)
+        clone_path = File.join(project_path, "discourse-converters")
+        unless Dir.exist?(clone_path)
+          raise UsageError, "Converter is not set up for #{customer}.\nRun 'silo-migrate setup-converter #{customer}' first."
+        end
 
-        FileUtils.rm_rf(workspace_path)
-        FileUtils.mkdir_p(workspace_path)
+        if Dir.exist?(File.join(clone_path, ".git"))
+          write_git_exclude_block(clone_path)
+        else
+          @output.puts "[WARN] discourse-converters is not a git clone; generated files cannot be locally git-ignored."
+        end
+
+        safe_artifacts = File.join(clone_path, SAFE_ARTIFACTS_DIR)
+        reset_safe_artifacts!(safe_artifacts, clone_path)
 
         copied = []
-        copied.concat(copy_dir(project_path, workspace_path, "discourse-converters", required: true))
-        copied.concat(copy_dir(project_path, workspace_path, "schema", required: true))
-        copied.concat(copy_dir(project_path, workspace_path, File.join("findings", "redacted-logs"), required: true))
-        copied.concat(copy_safe_findings(project_path, workspace_path))
-        copied.concat(copy_dir(project_path, workspace_path, "synthetic-fixtures", required: true))
-        copied.concat(write_agent_files(customer, workspace_path))
-        copied << write_normal_dev_silo_config(customer, workspace_path)
+        copied.concat(copy_dir(project_path, safe_artifacts, "schema", required: true))
+        copied.concat(copy_dir(project_path, safe_artifacts, File.join("findings", "redacted-logs"), required: true))
+        copied.concat(copy_safe_findings(project_path, safe_artifacts))
+        copied.concat(copy_dir(project_path, safe_artifacts, "synthetic-fixtures", required: true))
 
-        @output.puts "[OK] Safe AI workspace prepared: #{workspace_path}"
-        @output.puts "[OK] Files/directories written: #{copied.length}"
-        { workspace_path: workspace_path, copied: copied }
+        copied << write_file(File.join(safe_artifacts, ".gitignore"), "*\n")
+        copied << write_file(File.join(safe_artifacts, "manifest.json"), JSON.pretty_generate(manifest(customer)) + "\n")
+        copied << write_file(File.join(safe_artifacts, "allowed-commands.json"), JSON.pretty_generate(allowed_commands(customer)) + "\n")
+        copied.concat(write_instruction_files(customer, clone_path, safe_artifacts))
+
+        @output.puts "[OK] Safe artifacts prepared: #{safe_artifacts}"
+        @output.puts "[OK] Work from #{clone_path} (real git clone; commit/push converter changes normally)"
+        { safe_artifacts_path: safe_artifacts, clone_path: clone_path, copied: copied }
       end
 
       alias refresh prepare
 
+      # Refreshes safe-artifacts only when a previous `ai prepare` ran for this
+      # customer (manifest present). Never raises: artifact generation commands
+      # must not fail because the refresh did.
+      def refresh_if_prepared(customer)
+        clone_path = File.join(Project.project_path(customer, @env), "discourse-converters")
+        return false unless File.exist?(File.join(clone_path, SAFE_ARTIFACTS_DIR, "manifest.json"))
+
+        prepare(customer)
+        true
+      rescue StandardError => e
+        @output.puts "[WARN] Safe artifacts refresh skipped: #{e.message.lines.first.strip}"
+        false
+      end
+
       private
 
-      def default_workspace_path(customer)
-        base = @env["SILO_MIGRATE_SAFE_AI_BASE_PATH"]
-        base ||= File.join(File.dirname(Project.base_path(@env)), DEFAULT_SAFE_DIR_NAME)
-        File.join(base, customer)
-      end
-
-      def validate_workspace_path!(workspace_path, project_path)
-        raise UsageError, "Safe AI workspace path cannot be the raw customer project path." if workspace_path == project_path
-        if workspace_path.start_with?("#{project_path}/")
-          raise UsageError, "Safe AI workspace must be outside the raw customer project: #{workspace_path}"
+      # The only rm_rf in this service: hard-guarded so a mis-resolved path can
+      # never delete converter code.
+      def reset_safe_artifacts!(safe_artifacts, clone_path)
+        expected = File.join(File.expand_path(clone_path), SAFE_ARTIFACTS_DIR)
+        unless File.expand_path(safe_artifacts) == expected
+          raise UsageError, "Refusing to delete unexpected safe-artifacts path: #{safe_artifacts}"
         end
 
-        raise UsageError, "Refusing to prepare a safe AI workspace at filesystem root." if workspace_path == "/"
+        FileUtils.rm_rf(safe_artifacts)
+        FileUtils.mkdir_p(safe_artifacts)
       end
 
-      def copy_dir(project_path, workspace_path, relative, required:)
+      def write_git_exclude_block(clone_path)
+        exclude_path = File.join(clone_path, ".git", "info", "exclude")
+        existing = File.exist?(exclude_path) ? File.read(exclude_path) : ""
+        stripped = strip_managed_block(existing)
+        block = ([EXCLUDE_BEGIN] + EXCLUDED_PATHS + [EXCLUDE_END]).join("\n")
+        content = stripped.empty? ? "#{block}\n" : "#{stripped.chomp}\n#{block}\n"
+        Project.atomic_write(exclude_path, content)
+      end
+
+      # Removes every managed block (older runs or interrupted writes can leave
+      # more than one) so the rewrite always converges to a single block.
+      def strip_managed_block(content)
+        loop do
+          lines = content.lines
+          begin_index = lines.index { |line| line.chomp == EXCLUDE_BEGIN }
+          return content unless begin_index
+
+          end_index = lines[begin_index..].index { |line| line.chomp == EXCLUDE_END }
+          return content unless end_index
+
+          content = (lines[0...begin_index] + lines[(begin_index + end_index + 1)..]).join
+        end
+      end
+
+      def manifest(customer)
+        {
+          "artifact_version" => ARTIFACT_VERSION,
+          "kind" => "safe-artifacts",
+          "customer" => customer,
+          "generated_at" => Time.now.utc.iso8601
+        }
+      end
+
+      def copy_dir(project_path, safe_artifacts, relative, required:)
         source = File.join(project_path, relative)
         unless Dir.exist?(source)
           @output.puts "[WARN] No #{relative}/ artifacts found." if required
           return []
         end
 
-        destination = File.join(workspace_path, relative)
+        destination = File.join(safe_artifacts, relative)
         FileUtils.mkdir_p(File.dirname(destination))
         copy_tree(source, destination)
         [destination]
@@ -112,14 +194,14 @@ module SiloMigrate
         SKIPPED_BASENAMES.include?(basename) || SKIPPED_PATTERNS.any? { |pattern| basename.match?(pattern) }
       end
 
-      def copy_safe_findings(project_path, workspace_path)
+      def copy_safe_findings(project_path, safe_artifacts)
         findings_dir = File.join(project_path, "findings")
         unless Dir.exist?(findings_dir)
           @output.puts "[WARN] No findings/ artifacts found."
           return []
         end
 
-        destination_dir = File.join(workspace_path, "findings")
+        destination_dir = File.join(safe_artifacts, "findings")
         FileUtils.mkdir_p(destination_dir)
         copied = []
         skipped = []
@@ -149,19 +231,51 @@ module SiloMigrate
         raise UsageError, "Malformed finding #{File.basename(path)}: #{e.message}"
       end
 
-      def write_agent_files(customer, workspace_path)
+      def write_instruction_files(customer, clone_path, safe_artifacts)
         files = []
-        agents = agent_instructions(customer)
-        claude = claude_instructions(customer)
-        allowed = allowed_commands(customer)
-
-        files << write_file(File.join(workspace_path, "AGENTS.md"), agents)
-        files << write_file(File.join(workspace_path, "CLAUDE.md"), claude)
-        files << write_file(File.join(workspace_path, "allowed-commands.json"), JSON.pretty_generate(allowed) + "\n")
-        files
+        files << write_generated_root_file(clone_path, safe_artifacts, "AGENTS.md", agent_instructions(customer))
+        files << write_generated_root_file(clone_path, safe_artifacts, "CLAUDE.md", claude_instructions(customer))
+        files << write_claude_settings(clone_path)
+        files << write_normal_dev_silo_config(customer, clone_path)
+        files.compact
       end
 
-      def write_normal_dev_silo_config(customer, workspace_path)
+      # Root instruction files must never clobber files owned by the upstream
+      # converter repo (or hand-written by the user): only overwrite when the
+      # existing file carries our generated marker; otherwise fall back into
+      # safe-artifacts/ and warn.
+      def write_generated_root_file(clone_path, safe_artifacts, name, content)
+        path = File.join(clone_path, name)
+        if File.exist?(path) && !File.read(path).include?(GENERATED_MARKER)
+          @output.puts "[WARN] #{name} already exists in discourse-converters (likely tracked upstream); writing #{SAFE_ARTIFACTS_DIR}/#{name} instead."
+          @output.puts "       Point your agent at it and do not edit the upstream file."
+          return write_file(File.join(safe_artifacts, name), content)
+        end
+
+        write_file(path, content)
+      end
+
+      def write_claude_settings(clone_path)
+        path = File.join(clone_path, ".claude", "settings.json")
+        if File.exist?(path) && !File.read(path).include?("_generated_by")
+          @output.puts "[WARN] .claude/settings.json already exists and was not generated by silo-migrate; leaving it untouched."
+          return nil
+        end
+
+        write_file(path, JSON.pretty_generate(claude_settings) + "\n")
+      end
+
+      def claude_settings
+        {
+          "_generated_by" => "silo-migrate",
+          "permissions" => {
+            "deny" => FORBIDDEN_PARENT_PATHS.map { |p| "Read(#{p}#{p.end_with?('/') ? '**' : ''})" } +
+                      ["Read(../findings/**)", "Read(../schema/**)", "Edit(safe-artifacts/**)"]
+          }
+        }
+      end
+
+      def write_normal_dev_silo_config(customer, clone_path)
         config = {
           "artifact_version" => ARTIFACT_VERSION,
           "kind" => "normal-dev-ai",
@@ -169,24 +283,27 @@ module SiloMigrate
           "dev_visibility" => VisibilityPolicy::SAFE,
           "mounts" => [
             {
-              "source" => workspace_path,
-              "target" => "/workspace/#{customer}-safe-ai",
+              "source" => clone_path,
+              "target" => "/workspace/#{customer}-converters",
               "access" => "read_write",
-              "classification" => "safe"
+              "classification" => "converter_clone_with_safe_artifacts"
             }
           ],
           "denied_mounts" => [
-            "raw customer project",
+            "raw customer project root",
             "dumps/",
             "trusted/",
-            "output/intermediate.db"
+            "output/",
+            "converter-settings/",
+            "config.env"
           ],
           "agents" => {
             "codex" => { "mode" => "normal" },
             "claude" => { "mode" => "normal" }
           }
         }
-        write_file(File.join(workspace_path, ".silo", "normal-dev-ai.yml"), config.to_yaml)
+        content = "# #{GENERATED_MARKER} — regenerated by 'silo-migrate ai refresh #{customer}'\n#{config.to_yaml}"
+        write_file(File.join(clone_path, ".silo", "normal-dev-ai.yml"), content)
       end
 
       def write_file(path, content)
@@ -196,40 +313,65 @@ module SiloMigrate
 
       def agent_instructions(customer)
         <<~MARKDOWN
-          # Normal Dev AI Workspace
+          <!-- #{GENERATED_MARKER} — local instruction file for `#{customer}`. Locally git-ignored; never commit. Regenerated by `silo-migrate ai refresh #{customer}`. -->
 
-          This workspace is generated for converter development for `#{customer}`.
+          # Converter Development — #{customer}
 
-          Allowed paths:
-          - `discourse-converters/`
-          - `schema/`
-          - `findings/redacted-logs/`
-          - `findings/finding-*.yml` with `dev_visibility: safe`
-          - `synthetic-fixtures/`
+          You are working in the project's real `discourse-converters` git clone.
+          Edit converter code and tests here, run the test suite, and commit/push
+          to the converter repository normally.
 
-          Forbidden paths and data:
-          - Raw customer project directories.
-          - `dumps/`, `trusted/`, `output/intermediate.db`, database credentials, raw logs, and raw row values.
-          - Names, emails, IP addresses, private messages, post bodies, secrets, or customer-specific text.
-          - `restricted` or `trusted_only` findings unless a trusted reviewer writes a safe derivative.
+          ## Safe artifacts
 
-          Allowed command loop:
-          - Edit converter code and tests in `discourse-converters/`.
-          - Ask a human operator to run `silo-migrate run-converter #{customer} TYPE --redacted-logs`.
-          - Ask for `silo-migrate findings generate #{customer}` and `silo-migrate fixtures generate #{customer}` after redacted logs are available.
-          - Ask for `silo-migrate ai refresh #{customer}` before using newly generated safe artifacts.
+          `#{SAFE_ARTIFACTS_DIR}/` is generated, read-only context:
+          - `#{SAFE_ARTIFACTS_DIR}/schema/` — schema bundles (structure only, no rows)
+          - `#{SAFE_ARTIFACTS_DIR}/findings/redacted-logs/latest.log` and `latest.summary.json`
+          - `#{SAFE_ARTIFACTS_DIR}/findings/finding-*.yml` — findings with `dev_visibility: safe`
+          - `#{SAFE_ARTIFACTS_DIR}/synthetic-fixtures/` — shape-only fixtures, no real values
 
-          Escalate when schema, redacted logs, safe findings, and synthetic fixtures are not enough. Do not request direct raw-data access from this workspace.
+          Never edit files under `#{SAFE_ARTIFACTS_DIR}/`; it is deleted and rebuilt by
+          `silo-migrate ai refresh #{customer}`.
+
+          ## Development loop
+
+          1. Edit converter code and tests in this clone.
+          2. Ask the human operator to run:
+             `silo-migrate run-converter #{customer} TYPE --redacted-logs`
+             (it executes this exact working tree inside the converter container).
+          3. Safe artifacts refresh in place automatically after redacted-log,
+             findings, and fixture generation. Re-read
+             `#{SAFE_ARTIFACTS_DIR}/findings/redacted-logs/latest.summary.json` and iterate.
+          4. Commit and push converter changes with normal git commands.
+
+          ## Hard rules
+
+          - Never read outside this directory. Specifically forbidden:
+            #{FORBIDDEN_PARENT_PATHS.map { |p| "`#{p}`" }.join(', ')},
+            and any other raw customer project path.
+          - Never request database credentials, raw rows, raw logs, or
+            `output/intermediate.db` contents.
+          - Never commit or `git add -f` any of: `#{SAFE_ARTIFACTS_DIR}/`, `AGENTS.md`,
+            `CLAUDE.md`, `.claude/`, `.silo/`, or a generated `Dockerfile`. They are
+            locally ignored via `.git/info/exclude` and must stay out of the
+            upstream repository.
+          - `restricted` and `trusted_only` findings never appear here. If schema,
+            redacted logs, safe findings, and fixtures are insufficient, ask the
+            human operator to escalate through the trusted workflow
+            (`trusted inspect` → review → `trusted redact` → `ai refresh`).
         MARKDOWN
       end
 
       def claude_instructions(customer)
         <<~MARKDOWN
-          # Claude Normal Dev Instructions
+          <!-- #{GENERATED_MARKER} — see AGENTS.md. Locally git-ignored; never commit. -->
 
-          Work only from the safe workspace for `#{customer}`. Treat all raw customer data, credentials, dumps, trusted artifacts, and intermediate databases as forbidden.
+          # Claude Instructions — #{customer}
 
-          Use schema bundles, redacted logs, safe findings, and synthetic fixtures to update converter code. For converter verification, request controlled `silo-migrate` commands from the human operator and consume only refreshed safe artifacts.
+          Read `AGENTS.md` in this directory and follow it exactly. Summary: edit
+          converter code here and commit normally; treat `#{SAFE_ARTIFACTS_DIR}/` as
+          read-only generated context; never read any `../` path (raw customer
+          data, credentials, dumps, trusted artifacts); never commit the generated
+          files listed in AGENTS.md.
         MARKDOWN
       end
 
@@ -241,25 +383,26 @@ module SiloMigrate
             {
               "command" => "silo-migrate run-converter #{customer} TYPE --redacted-logs",
               "requires_human_operator" => true,
-              "reason" => "Runs converter through the controlled migration runtime and emits redacted artifacts."
+              "reason" => "Runs this working tree through the controlled migration runtime, emits redacted artifacts, and auto-refreshes safe-artifacts/."
             },
             {
               "command" => "silo-migrate findings generate #{customer}",
               "requires_human_operator" => true,
-              "reason" => "Generates durable findings from redacted summaries."
+              "reason" => "Generates durable findings from redacted summaries; auto-refreshes safe-artifacts/."
             },
             {
               "command" => "silo-migrate fixtures generate #{customer}",
               "requires_human_operator" => true,
-              "reason" => "Generates shape-only fixtures from safe findings."
+              "reason" => "Generates shape-only fixtures from safe findings; auto-refreshes safe-artifacts/."
             },
             {
               "command" => "silo-migrate ai refresh #{customer}",
               "requires_human_operator" => true,
-              "reason" => "Regenerates this safe workspace from allowlisted artifacts."
+              "reason" => "Rebuilds safe-artifacts/ from allowlisted artifacts (never touches converter code)."
             }
           ],
           "denied" => [
+            "reading ../ paths from the converter clone (raw customer project)",
             "direct access to raw customer project paths",
             "database shell access",
             "reading dumps/",

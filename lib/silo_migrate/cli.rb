@@ -143,13 +143,17 @@ module SiloMigrate
         Generates shape-only synthetic fixtures from safe findings.
       HELP
       "ai" => <<~HELP,
-        Usage: silo-migrate ai prepare CUSTOMER [-o DIR]
-               silo-migrate ai refresh CUSTOMER [-o DIR]
-        Creates/regenerates the safe Normal Dev AI workspace (schema bundles,
-        redacted logs, safe findings, synthetic fixtures - never raw data).
+        Usage: silo-migrate ai prepare CUSTOMER
+               silo-migrate ai refresh CUSTOMER
+        Writes/refreshes the locally git-ignored safe-artifacts/ directory inside
+        the project's discourse-converters clone (schema bundles, redacted logs,
+        safe findings, synthetic fixtures) plus agent instruction files.
+        Never raw data or credentials; never touches converter code - the Dev AI
+        works directly in the clone and commits/pushes normally. Redacted-log,
+        findings, and fixture generation auto-refresh safe-artifacts afterwards.
       HELP
       "trusted" => <<~HELP,
-        Usage: silo-migrate trusted inspect CUSTOMER [--phase PHASE] [--reason TEXT] -- COMMAND...
+        Usage: silo-migrate trusted inspect CUSTOMER [--phase PHASE] [--reason TEXT] [--as-finding] [--message TEXT] -- COMMAND...
                silo-migrate trusted review CUSTOMER FINDING [--decision safe|rejected] [--reviewer NAME] [--notes TEXT]
                silo-migrate trusted redact CUSTOMER FINDING [--reviewer NAME] [--notes TEXT]
                silo-migrate trusted session CUSTOMER [--provider bedrock] [--runtime silo] [--reason TEXT] [--session-id ID]
@@ -157,6 +161,10 @@ module SiloMigrate
         Example inspection:
           silo-migrate trusted inspect acme --phase initial --reason "check edge case" -- \\
             mysql -u root -e "SELECT COUNT(*) FROM users"
+
+        --as-finding also writes a trusted_only finding stub (no raw output embedded)
+        so the conclusion can later flow to the safe zone via:
+          silo-migrate trusted redact acme trusted/findings/finding-inspect-....yml --notes "safe summary"
       HELP
       "doctor" => <<~HELP
         Usage: silo-migrate doctor
@@ -266,8 +274,8 @@ module SiloMigrate
           schema bundle CUSTOMER       Export AI-safe schema metadata bundle
           findings generate CUSTOMER   Generate structured findings from a redacted summary
           fixtures generate CUSTOMER   Generate shape-only synthetic fixtures from findings
-          ai prepare CUSTOMER          Generate a safe Normal Dev AI workspace
-          ai refresh CUSTOMER          Regenerate the safe Normal Dev AI workspace
+          ai prepare CUSTOMER          Write safe-artifacts/ into the converter clone
+          ai refresh CUSTOMER          Refresh safe-artifacts/ (never touches converter code)
           trusted inspect CUSTOMER     Run audited trusted-only inspection command after --
           trusted review CUSTOMER FILE Approve/reject a restricted finding
           trusted redact CUSTOMER FILE Write a safe redacted derivative
@@ -593,11 +601,7 @@ module SiloMigrate
       subcommand = required_arg(argv, "SUBCOMMAND")
       raise UsageError, "Unknown ai command: #{subcommand}" unless %w[prepare refresh].include?(subcommand)
 
-      options = {}
-      OptionParser.new do |opts|
-        opts.on("-o", "--output DIR") { |value| options[:output_dir] = value }
-      end.parse!(argv)
-      @ai_workspace_service.prepare(required_arg(argv, "CUSTOMER"), **options)
+      @ai_workspace_service.prepare(required_arg(argv, "CUSTOMER"))
     end
 
     def trusted(argv)
@@ -614,17 +618,26 @@ module SiloMigrate
 
     def trusted_inspect(argv)
       customer = required_arg(argv, "CUSTOMER")
-      options = { phase: "initial" }
+      options = { phase: "initial", as_finding: false }
       parser = OptionParser.new do |opts|
         opts.on("--phase PHASE") { |value| options[:phase] = validate_phase(value) }
         opts.on("--reason TEXT") { |value| options[:reason] = value }
+        opts.on("--as-finding") { options[:as_finding] = true }
+        opts.on("--message TEXT") { |value| options[:message] = value }
       end
       separator_index = argv.index("--")
       raise UsageError, "Trusted inspection command must be passed after '--'." unless separator_index
 
       parser.parse!(argv[0...separator_index])
       command = argv[(separator_index + 1)..] || []
-      @trusted_service.inspect(customer, phase: options[:phase], reason: options[:reason], command: command)
+      @trusted_service.inspect(
+        customer,
+        phase: options[:phase],
+        reason: options[:reason],
+        command: command,
+        as_finding: options[:as_finding],
+        message: options[:message]
+      )
     end
 
     def trusted_review(argv)

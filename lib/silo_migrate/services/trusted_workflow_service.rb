@@ -17,7 +17,7 @@ module SiloMigrate
         @output = output
       end
 
-      def inspect(customer, phase: "initial", reason:, command:, timestamp: Time.now.utc)
+      def inspect(customer, phase: "initial", reason:, command:, as_finding: false, message: nil, timestamp: Time.now.utc)
         Project.load_config(customer, @env)
         raise UsageError, "Trusted inspection requires --reason." if reason.to_s.strip.empty?
 
@@ -44,6 +44,8 @@ module SiloMigrate
         }
         Project.atomic_write(inspection_path, JSON.pretty_generate(inspection) + "\n")
 
+        finding_path = write_inspection_finding(customer, project_path, inspection_path, phase, reason, message, stamp, timestamp) if as_finding
+
         audit_path = write_audit(
           customer,
           "trusted_inspect",
@@ -54,13 +56,15 @@ module SiloMigrate
           "success" => result.success?,
           "exit_status" => result.status,
           "artifact" => source_label(inspection_path, project_path),
+          "finding" => finding_path ? source_label(finding_path, project_path) : nil,
           "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY,
           "redaction_review" => "not_reviewed"
         )
 
         @output.puts "[OK] Trusted inspection artifact: #{inspection_path}"
+        @output.puts "[OK] Trusted finding stub: #{finding_path}" if finding_path
         @output.puts "[OK] Trusted audit: #{audit_path}"
-        { inspection_path: inspection_path, audit_path: audit_path, result: result }
+        { inspection_path: inspection_path, finding_path: finding_path, audit_path: audit_path, result: result }
       end
 
       def review(customer, finding_path, decision: "safe", reviewer: default_reviewer, notes: nil, timestamp: Time.now.utc)
@@ -110,6 +114,31 @@ module SiloMigrate
 
       private
 
+      # Writes a trusted_only finding stub that REFERENCES the inspection but
+      # embeds none of its raw content (the command itself can contain raw
+      # values, e.g. WHERE email='...'), so the later safe derivative cannot
+      # leak anything. The human edits/redacts via 'trusted redact'.
+      def write_inspection_finding(customer, project_path, inspection_path, phase, reason, message, stamp, timestamp)
+        path = File.join(project_path, "trusted", "findings", "finding-inspect-#{stamp}.yml")
+        finding = {
+          "artifact_version" => ARTIFACT_VERSION,
+          "id" => "finding-inspect-#{stamp}",
+          "generated_at" => timestamp.utc.iso8601,
+          "source" => source_label(inspection_path, project_path),
+          "failure" => "trusted_inspection",
+          "severity" => "warning",
+          "phase" => phase,
+          "message" => (message.to_s.strip.empty? ? reason : message),
+          "exception_class" => nil,
+          "observed_shape" => nil,
+          "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY,
+          "contains_raw_rows" => false,
+          "recommended_next_step" => "Review the referenced inspection in the trusted zone, then run 'silo-migrate trusted redact #{customer} #{source_label(path, project_path)}' and summarize the conclusion safely in --notes."
+        }
+        Project.atomic_write(path, finding.to_yaml)
+        path
+      end
+
       def review_finding(customer, finding_path, decision:, reviewer:, notes:, timestamp:, redact:)
         Project.load_config(customer, @env)
         raise UsageError, "Finding not found: #{finding_path}" unless File.exist?(finding_path)
@@ -148,6 +177,9 @@ module SiloMigrate
       def safe_derivative(finding, reviewer, notes, timestamp, redact:)
         source_id = finding.fetch("id")
         derived = finding.dup
+        # Raw payload keys never survive into a safe derivative, regardless of
+        # how the source finding was authored.
+        %w[command stdout stderr details].each { |key| derived.delete(key) }
         derived["id"] = "#{source_id}-#{redact ? 'redacted' : 'reviewed'}"
         derived["generated_at"] = timestamp.utc.iso8601
         derived["source_trusted_finding_id"] = source_id

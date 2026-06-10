@@ -72,7 +72,7 @@ Key wiring facts:
 | Databases | MariaDB 10.11, MySQL 8.0, PostgreSQL 15 containers with healthchecks, utf8mb4 defaults, and import-friendly InnoDB settings; optional separate **final** database |
 | Import | Streamed restore (constant memory, progress + ETA), waits for container health, MySQL-8-collation auto-fix on MariaDB, table exclusion, `--fast`/`--turbo` modes, per-error diagnostics with exact recovery commands |
 | Converter | Clones/builds `discourse-converters` in its own container; platform shortcut (`run-converter acme vbulletin`) with auto-generated in-network settings, or any custom command after `--` |
-| Artifacts | Schema bundles (`schema bundle`), redacted converter logs/summaries, structured findings, shape-only synthetic fixtures, safe Normal-Dev-AI workspaces (`ai prepare`) |
+| Artifacts | Schema bundles (`schema bundle`), redacted converter logs/summaries, structured findings, shape-only synthetic fixtures, `safe-artifacts/` in the converter clone (`ai prepare`, auto-refreshed by the generators) |
 | Data safety | Raw dumps, live DBs, `intermediate.db`, and generated credentials never reach AI workspaces or logs; restricted data goes through the audited `trusted ...` workflow |
 
 ## What the tool CANNOT do (by design)
@@ -197,25 +197,36 @@ flowchart TD
 
 ## Data-safety zones (what AI tooling may see)
 
+Converter **code** is not customer data — it lives in exactly one place, the
+project's `discourse-converters` git clone, where the Dev AI edits, commits,
+and pushes normally. Only **data artifacts** are zone-separated: `ai prepare`
+writes a locally git-ignored `safe-artifacts/` directory *inside* the clone,
+and redacted-log/findings/fixture generation refreshes it automatically.
+
 ```mermaid
 flowchart LR
     subgraph RAW["Migration runtime zone — raw customer data"]
         dumps["dumps/*"] ~~~ dbs["DB containers"] ~~~ idb["output/intermediate.db"] ~~~ creds["config.env · converter-settings/"]
     end
-    subgraph TRUSTED["Trusted Data zone — audited access"]
-        ti["trusted inspect / review / redact / session"]
+    subgraph TRUSTED["Trusted Data zone — audited, analysis-only"]
+        ti["trusted inspect --as-finding<br/>→ human review (Bedrock chat, manually)<br/>→ trusted redact"]
     end
-    subgraph SAFEZ["Normal Dev AI zone — safe by construction"]
-        sb["schema bundles"] ~~~ rl["redacted logs/summaries"] ~~~ sf["safe findings"] ~~~ fx["synthetic fixtures"]
+    subgraph CLONE["discourse-converters clone — the Dev AI works here"]
+        code["converter code (real .git,<br/>commit/push normally)"]
+        subgraph SAFEZ["safe-artifacts/ (generated, git-ignored)"]
+            sb["schema bundles"] ~~~ rl["redacted logs"] ~~~ sf["safe findings"] ~~~ fx["fixtures"]
+        end
     end
-    RAW -- "redaction + shape-only extraction" --> SAFEZ
+    RAW -- "redaction + shape-only extraction<br/>(auto-refresh)" --> SAFEZ
     RAW -- "explicit, logged, reviewed" --> TRUSTED
-    TRUSTED -- "trusted redact (approved derivatives)" --> SAFEZ
+    TRUSTED -- "safe derivatives land in findings/,<br/>mirrored on next refresh" --> SAFEZ
 ```
 
 Rule of thumb: anything under `dumps/`, `output/`, `trusted/`,
-`converter-settings/`, or inside a container is raw-zone and never leaves it.
-Everything `ai prepare` copies into a workspace has been redacted or generated.
+`converter-settings/`, `config.env`, or inside a container is raw-zone — the
+generated `AGENTS.md` and `.claude/settings.json` deny rules keep agents away
+from those `../` paths (a soft boundary on macOS; Silo mounts make it hard
+later). Everything under `safe-artifacts/` has been redacted or synthesized.
 
 ## Quick troubleshooting
 
@@ -227,4 +238,6 @@ Everything `ai prepare` copies into a workspace has been redacted or generated.
 | Converter can't reach the DB | Use the platform shortcut so settings are generated; if compose was regenerated, recreate the container: `start CUSTOMER --profile converter` |
 | Port already in use | Interactive mode offers a free port; or `init`/`add-final-db` with an explicit `--port` |
 | Huge dump is slow on a Mac | Expected (Docker Desktop fsync); the preflight warns. Prefer a Linux host for multi-GB imports |
-| Want a clean slate | `replace-dump CUSTOMER PHASE --yes` (one DB) or `cleanup CUSTOMER --yes` (everything) |
+| Want a clean slate | `replace-dump CUSTOMER PHASE --yes` (one DB) or `cleanup CUSTOMER --yes` (everything — **push converter work first**, the clone lives inside the project dir) |
+| `safe-artifacts/` shows in `git status` | Re-run `ai refresh CUSTOMER` (it rewrites the `.git/info/exclude` block) |
+| `git pull` conflicts with `AGENTS.md` | Upstream added its own — delete the generated file, pull, re-run `ai refresh` (it falls back to `safe-artifacts/AGENTS.md`) |

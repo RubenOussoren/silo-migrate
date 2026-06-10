@@ -129,9 +129,9 @@
   <text x="810" y="816" text-anchor="middle" class="ts">shape-only, no real values</text>
 
   <rect class="box safe" x="1000" y="755" width="260" height="90"/>
-  <text x="1130" y="783" text-anchor="middle" class="tb">Safe AI workspace</text>
-  <text x="1130" y="801" text-anchor="middle" class="ts">ai prepare / ai refresh</text>
-  <text x="1130" y="816" text-anchor="middle" class="ts">for converter-dev AI agents</text>
+  <text x="1130" y="783" text-anchor="middle" class="tb">safe-artifacts/</text>
+  <text x="1130" y="801" text-anchor="middle" class="ts">in the converter clone (git-ignored)</text>
+  <text x="1130" y="816" text-anchor="middle" class="ts">ai prepare / refresh · auto-refreshed</text>
 
   <path class="arrow" d="M 450 660 C 380 700, 300 720, 230 751"/>
   <text x="290" y="712" class="lbl">redaction</text>

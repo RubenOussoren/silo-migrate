@@ -12,8 +12,7 @@ class DockerIntegrationTest < SiloMigrateTest
     Dir.mktmpdir("silo-migrate-docker-", "/private/tmp") do |dir|
       env = {
         "SILO_MIGRATE_BASE_PATH" => File.join(dir, "customers"),
-        "SILO_MIGRATE_USER_CONFIG" => File.join(dir, "user-config.env"),
-        "SILO_MIGRATE_SAFE_AI_BASE_PATH" => File.join(dir, "safe-ai")
+        "SILO_MIGRATE_USER_CONFIG" => File.join(dir, "user-config.env")
       }
       runtime = SiloMigrate::Runtime::Docker.new(env: env)
       runtime.ensure_available!
@@ -48,6 +47,14 @@ class DockerIntegrationTest < SiloMigrateTest
         assert_operator summary.fetch("table_count"), :>=, 1
         assert_includes out.string, "fixture converter ran"
 
+        # Prepare safe-artifacts BEFORE the redacted run so the run also
+        # exercises the auto-refresh hook end to end.
+        assert_cli_success cli, err, out, ["ai", "prepare", customer]
+        clone = File.join(project_path, "discourse-converters")
+        safe_artifacts = File.join(clone, "safe-artifacts")
+        assert Dir.exist?(safe_artifacts), "expected safe-artifacts inside the converter clone"
+        assert_includes File.read(File.join(clone, ".git", "info", "exclude")), "/safe-artifacts/"
+
         # Phase 2 loop: platform run with generated in-network settings,
         # real intermediate.db, then the full redaction/findings pipeline.
         assert_cli_success cli, err, out, ["run-converter", customer, "fixture", "--redacted-logs"]
@@ -62,16 +69,27 @@ class DockerIntegrationTest < SiloMigrateTest
         assert_equal true, run_summary.dig("sources", "intermediate_db", "available")
         assert_operator run_summary.dig("sources", "intermediate_db", "log_entry_count"), :>=, 1
 
+        # Auto-refresh mirrored the redacted summary into safe-artifacts.
+        assert File.exist?(File.join(safe_artifacts, "findings", "redacted-logs", "latest.summary.json")),
+               "redacted run should auto-refresh safe-artifacts"
+
         assert_cli_success cli, err, out, ["converter", "summary", customer]
         assert_cli_success cli, err, out, ["findings", "generate", customer]
         assert_cli_success cli, err, out, ["fixtures", "generate", customer]
-        assert_cli_success cli, err, out, ["ai", "prepare", customer]
 
-        workspace = Dir[File.join(dir, "safe-ai", "*")].first
-        refute_nil workspace, "expected a safe AI workspace"
-        assert_redaction_holds(workspace, %w[alice e2e_secret_pw_123], label: "AI workspace")
+        assert(Dir[File.join(safe_artifacts, "findings", "finding-*.yml")].any?, "findings should be mirrored into safe-artifacts")
+        assert(Dir[File.join(safe_artifacts, "synthetic-fixtures", "*.yml")].any?, "fixtures should be mirrored into safe-artifacts")
+
+        # Redaction sweep: safe-artifacts and the generated root files must not
+        # contain raw values or credentials (the clone itself legitimately
+        # contains the fixture converter's dummy settings, so it is not swept).
+        assert_redaction_holds(safe_artifacts, %w[alice e2e_secret_pw_123], label: "safe-artifacts")
+        [File.join(clone, "AGENTS.md"), File.join(clone, "CLAUDE.md"), File.join(clone, ".claude", "settings.json"), File.join(clone, ".silo", "normal-dev-ai.yml")].each do |file|
+          assert File.exist?(file), "expected generated #{File.basename(file)}"
+          %w[alice e2e_secret_pw_123].each { |sentinel| refute_includes File.read(file), sentinel }
+        end
         assert_redaction_holds(File.join(project_path, "findings"), %w[alice e2e_secret_pw_123], label: "findings artifacts")
-        refute Dir.exist?(File.join(workspace, "converter-settings")), "generated settings must not reach the AI workspace"
+        refute Dir.exist?(File.join(safe_artifacts, "converter-settings")), "generated settings must not reach safe-artifacts"
       ensure
         cli.run(["stop", customer, "--profile", "all", "--remove"]) if File.exist?(SiloMigrate::Project.config_path(customer, env))
       end

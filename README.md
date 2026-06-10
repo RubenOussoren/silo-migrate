@@ -26,8 +26,9 @@ practical end-to-end overview (capabilities, limits, happy paths, diagrams).
 - Clones and runs `discourse-converters` in the converter container.
 - Captures converter runs as redacted logs, structured summaries, durable
   findings, and shape-only synthetic fixtures.
-- Generates safe Normal Dev AI workspaces with only allowlisted converter,
-  schema, redacted log, safe finding, fixture, and agent instruction artifacts.
+- Generates a locally git-ignored `safe-artifacts/` directory inside the
+  converter clone (schema bundles, redacted logs, safe findings, fixtures,
+  agent instructions) so AI agents develop converter code in its real git home.
 - Provides an initial trusted-data workflow for audited raw-data inspection,
   restricted finding review, safe redacted derivatives, and Linux/Silo Bedrock
   session setup.
@@ -275,52 +276,58 @@ a pre-launch snapshot through Silo, and records audit metadata under
 `trusted/audit/`. On macOS it fails with guidance to use the Docker/local safe
 workflow or run the trusted session command on a Linux/Silo host.
 
-### Safe AI Workspaces
+### Safe Artifacts (Normal Dev AI)
 
 ```bash
 bin/silo-migrate ai prepare acme
 bin/silo-migrate ai refresh acme
-bin/silo-migrate ai prepare acme --output /tmp/acme-safe-ai
 ```
 
-`ai prepare` creates a generated Normal Dev AI workspace under
-`SILO_MIGRATE_SAFE_AI_BASE_PATH`, or a sibling `safe-ai-workspaces/` directory
-outside the raw customer project. `ai refresh` is the same operation and
-regenerates the workspace after new schema bundles, redacted logs, findings, or
-fixtures are produced.
+Converter code is never copied: the Dev AI (or you) works directly in the
+project's `discourse-converters` git clone and commits/pushes normally.
+`ai prepare` writes a **locally git-ignored `safe-artifacts/` directory inside
+that clone** plus generated agent instruction files; `ai refresh` is the same
+operation. Redacted-log, findings, and fixture generation auto-refresh
+`safe-artifacts/` in place afterwards, so the loop needs no manual syncing.
 
-The safe workspace includes:
+Generated inside the clone:
 
-- `discourse-converters/`
-- `schema/`
-- `findings/redacted-logs/`
-- `findings/finding-*.yml` only when `dev_visibility: safe`
-- `synthetic-fixtures/`
-- `AGENTS.md`, `CLAUDE.md`, `allowed-commands.json`
-- `.silo/normal-dev-ai.yml`
+- `safe-artifacts/schema/` — schema bundles (structure only)
+- `safe-artifacts/findings/redacted-logs/` — redacted run logs + summaries
+- `safe-artifacts/findings/finding-*.yml` — only `dev_visibility: safe`
+- `safe-artifacts/synthetic-fixtures/` — shape-only fixtures
+- `safe-artifacts/allowed-commands.json`, `manifest.json`
+- `AGENTS.md`, `CLAUDE.md` (instructions), `.claude/settings.json` (deny rules),
+  `.silo/normal-dev-ai.yml` (future Silo mount config)
 
+All generated paths are added to `.git/info/exclude` (local-only, never
+committed) so `git status` stays clean. `ai refresh` only ever rebuilds
+`safe-artifacts/` — converter code, `.git`, and your edits are never touched.
 It excludes `config.env`, `dumps/`, `trusted/`, `output/intermediate.db`, raw
-logs, database credentials, restricted findings, and trusted-only findings.
+logs, database credentials, `converter-settings/`, restricted findings, and
+trusted-only findings.
 
 ## AI-Safe Converter Development Flow
 
 The intended converter-development loop keeps raw customer data inside the
 migration runtime while still giving engineers and general-purpose AI agents
-enough context to fix converter code.
+enough context to fix converter code — without ever copying the code out of
+its git clone.
 
 ```text
 1. Import source data in the Migration Runtime Zone.
 2. Generate an AI-safe schema bundle.
-3. Generate a safe AI workspace with `ai prepare`.
-4. Develop converter code from schema, converter source, and safe docs.
-5. Run the converter through silo-migrate.
-6. Capture redacted logs and a redacted structured summary.
-7. Convert the summary into durable findings.
-8. Convert safe finding shapes into synthetic fixtures.
-9. Reproduce and fix converter behavior using synthetic data.
-10. Rerun the converter through the controlled runtime.
-11. Refresh the safe AI workspace.
-12. Escalate to the Trusted Data AI Zone only when raw data inspection is unavoidable.
+3. Run `ai prepare` (writes safe-artifacts/ into the converter clone).
+4. Run the AI agent FROM the clone; it edits converter code in place.
+5. Run the converter through silo-migrate (`run-converter acme TYPE --redacted-logs`)
+   — it executes the exact edited working tree.
+6. Redacted logs/summary, findings, and fixtures are generated; each step
+   auto-refreshes safe-artifacts/ in place.
+7. The AI re-reads safe-artifacts/findings/redacted-logs/latest.summary.json and iterates.
+8. Commit and push converter changes with normal git.
+9. Escalate to the Trusted Data AI Zone only when raw data inspection is unavoidable:
+   trusted inspect --as-finding -> human review -> trusted redact -> next refresh
+   delivers the safe conclusion into safe-artifacts/.
 ```
 
 Allowed in the normal Dev AI Zone:
@@ -350,30 +357,42 @@ platform-level runs are too coarse.
 
 ### macOS AI-Assisted Quickstart
 
-macOS uses Docker for migration execution and a generated safe workspace for
-normal Codex or Claude development:
+macOS uses Docker for migration execution; the AI agent works directly in the
+project's converter clone:
 
 ```bash
 bin/silo-migrate start acme --profile initial-db --wait
-bin/silo-migrate run-converter acme vbulletin --redacted-logs
+bin/silo-migrate ai prepare acme
+cd /path/to/customers/acme/discourse-converters   # run Codex/Claude from here
+# ... agent edits converter code ...
+bin/silo-migrate run-converter acme vbulletin --redacted-logs   # tests the edited tree
 bin/silo-migrate findings generate acme
 bin/silo-migrate fixtures generate acme
-bin/silo-migrate ai prepare acme
+# safe-artifacts/ refreshed automatically by the three commands above
 ```
 
-Run Codex or Claude from the generated safe workspace, not from the raw customer
-project. After converter changes or new findings, rerun the controlled migration
-commands and `bin/silo-migrate ai refresh acme`.
+Run the agent **from the clone directory** (`discourse-converters/`), never from
+the raw project root. The generated `AGENTS.md`/`CLAUDE.md` forbid reading `../`
+paths and `.claude/settings.json` adds deny rules; this is a soft boundary on
+macOS — Silo provides the hard boundary later.
 
-Trusted Bedrock sessions with raw data require a Linux/Silo host. On macOS, use
-human-operated `trusted inspect`, `trusted review`, and `trusted redact` for
-narrow local checks.
+Trusted Bedrock sessions with raw data require a Linux/Silo host. On macOS, the
+trusted loop is human-operated and analysis-only:
+
+```bash
+bin/silo-migrate trusted inspect acme --reason "check malformed users" --as-finding -- \
+  mysql -u root -e "SELECT ... FROM users WHERE ..."
+# review trusted/inspections/... yourself (optionally via a Bedrock chat, manually)
+bin/silo-migrate trusted redact acme /path/to/trusted/findings/finding-inspect-....yml \
+  --notes "safe summary of the conclusion"
+bin/silo-migrate ai refresh acme   # safe derivative now visible in safe-artifacts/
+```
 
 ### Linux AI-Assisted Quickstart
 
 Linux follows the same Docker baseline as macOS. If Silo is available, the
 generated `.silo/normal-dev-ai.yml` snippet can be used for an isolated Normal
-Dev AI session that mounts only the safe workspace.
+Dev AI session that mounts only the converter clone.
 
 For approved raw-data inspection, use:
 
@@ -386,14 +405,17 @@ environment, take a pre-launch Silo snapshot, and write audit records. Safe
 handoff back to Normal Dev AI should happen through `trusted redact`, safe
 findings, synthetic fixtures, and `ai refresh`.
 
-### Safe Workspace Checklist
+### Safe Artifacts Checklist
 
-Before starting a normal AI agent from a generated workspace:
+Before starting a normal AI agent from the converter clone:
 
-- Confirm `AGENTS.md`, `CLAUDE.md`, and `allowed-commands.json` exist.
-- Confirm `dumps/`, `trusted/`, `config.env`, and `output/intermediate.db` are absent.
-- Confirm every copied `findings/finding-*.yml` has `dev_visibility: safe`.
-- Confirm `.silo/normal-dev-ai.yml` mounts only the safe workspace path.
+- Confirm `AGENTS.md`, `CLAUDE.md`, and `safe-artifacts/allowed-commands.json` exist.
+- Confirm `git status` in the clone shows no generated files (the
+  `.git/info/exclude` block covers them; re-run `ai refresh` if not).
+- Confirm every `safe-artifacts/findings/finding-*.yml` has `dev_visibility: safe`.
+- Confirm `.silo/normal-dev-ai.yml` mounts only the clone path.
+- Before `cleanup CUSTOMER`, push converter work — the clone (and any unpushed
+  commits) lives inside the project directory that cleanup deletes.
 
 ## Artifact Layout
 
@@ -578,10 +600,10 @@ The implemented and planned future architecture is:
   levels beyond `safe`, audit logs, and redaction review hooks. The initial
   slice is implemented through `trusted inspect`, `trusted review`, and
   `trusted redact`.
-- Phase 4: Agent Runtime and Data Boundary. Implement safe Normal Dev AI
-  workspaces, optional Linux/Silo agent sessions, Trusted Data AI Bedrock setup,
-  snapshots, audit records, and Silo config snippets before replacing the
-  Docker migration runtime.
+- Phase 4: Agent Runtime and Data Boundary. Implement the safe-artifacts model
+  (Dev AI in the converter clone), optional Linux/Silo agent sessions, Trusted
+  Data AI Bedrock setup, snapshots, audit records, and Silo config snippets
+  before replacing the Docker migration runtime.
 
 Important boundaries for future work:
 

@@ -17,8 +17,9 @@ module SiloMigrate
       DETAILS_REDACTED = "[REDACTED_DETAILS]"
       MAX_DETECTED_ERRORS = 50
 
-      def initialize(env: ENV)
+      def initialize(env: ENV, output: $stdout)
         @env = env
+        @output = output
       end
 
       def generate(customer, command:, result: nil, stdout: nil, stderr: nil, timestamp: Time.now.utc)
@@ -64,6 +65,8 @@ module SiloMigrate
         summary_path = File.join(artifact_dir, "#{base}.summary.json")
         Project.atomic_write(summary_path, summary_content)
         Project.atomic_write(File.join(artifact_dir, "latest.summary.json"), summary_content)
+
+        AIWorkspaceService.new(env: @env, output: @output).refresh_if_prepared(customer)
 
         { log_path: log_path, summary_path: summary_path }
       end

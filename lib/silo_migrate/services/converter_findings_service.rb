@@ -49,6 +49,8 @@ module SiloMigrate
         index_path = File.join(findings_dir, "latest-findings.json")
         Project.atomic_write(index_path, JSON.pretty_generate(index) + "\n")
 
+        AIWorkspaceService.new(env: @env, output: @output).refresh_if_prepared(customer)
+
         { findings: written, index_path: index_path }
       end
 

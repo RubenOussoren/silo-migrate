@@ -335,7 +335,7 @@ module SiloMigrate
       def generate_converter_summary(customer, command: [], result: nil)
         command = Array(command).reject(&:empty?)
         command = ["bundle", "exec", "ruby", "converter.rb"] if command.empty?
-        artifacts = ConverterSummaryService.new(env: @env).generate(customer, command: command, result: result)
+        artifacts = ConverterSummaryService.new(env: @env, output: @output).generate(customer, command: command, result: result)
         @output.puts "[OK] Redacted converter log: #{artifacts.fetch(:log_path)}"
         @output.puts "[OK] Redacted converter summary: #{artifacts.fetch(:summary_path)}"
         artifacts

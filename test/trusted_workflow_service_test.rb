@@ -151,6 +151,85 @@ class TrustedWorkflowServiceTest < SiloMigrateTest
     end
   end
 
+  def test_inspect_as_finding_writes_stub_without_raw_payload
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+
+      artifacts = SiloMigrate::Services::TrustedWorkflowService.new(runtime: runtime, env: env, output: StringIO.new).inspect(
+        "acme",
+        phase: "initial",
+        reason: "Verify malformed user rows",
+        message: "Some users rows have malformed encoding",
+        command: ["echo", "raw-value-sentinel SELECT * FROM users WHERE email='real@customer.test'"],
+        as_finding: true,
+        timestamp: Time.utc(2026, 6, 1, 13, 0, 0)
+      )
+
+      finding_path = artifacts.fetch(:finding_path)
+      assert_includes finding_path, File.join("trusted", "findings", "finding-inspect-20260601-130000.yml")
+      content = File.read(finding_path)
+      refute_includes content, "raw-value-sentinel"
+      refute_includes content, "real@customer.test"
+
+      finding = YAML.safe_load(content)
+      assert_equal "trusted_only", finding.fetch("dev_visibility")
+      assert_equal "trusted_inspection", finding.fetch("failure")
+      assert_equal "Some users rows have malformed encoding", finding.fetch("message")
+      assert_includes finding.fetch("source"), "trusted/inspections/inspection-20260601-130000.json"
+
+      audit = JSON.parse(File.read(artifacts.fetch(:audit_path)))
+      assert_includes audit.dig("details", "finding"), "finding-inspect-20260601-130000.yml"
+    end
+  end
+
+  def test_redacting_inspection_finding_yields_safe_derivative_without_payload_keys
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      project_path = project.project_path("acme")
+      service = SiloMigrate::Services::TrustedWorkflowService.new(runtime: runtime, env: env, output: StringIO.new)
+
+      inspect_artifacts = service.inspect(
+        "acme",
+        reason: "Check rows",
+        command: %w[echo raw-value-sentinel],
+        as_finding: true,
+        timestamp: Time.utc(2026, 6, 1, 13, 0, 0)
+      )
+      # Even if someone enriches a trusted finding with raw payload keys by
+      # hand, the safe derivative must drop them.
+      enriched = YAML.safe_load(File.read(inspect_artifacts.fetch(:finding_path)))
+      enriched["stdout"] = "raw-value-sentinel"
+      enriched["command"] = ["echo", "raw-value-sentinel"]
+      write(inspect_artifacts.fetch(:finding_path), enriched.to_yaml)
+
+      redacted = service.redact(
+        "acme",
+        inspect_artifacts.fetch(:finding_path),
+        reviewer: "human",
+        notes: "Encoding issue confirmed; converter must scrub utf8mb3 remnants",
+        timestamp: Time.utc(2026, 6, 1, 13, 10, 0)
+      )
+
+      derivative_path = redacted.fetch(:reviewed_path)
+      assert File.exist?(derivative_path)
+      content = File.read(derivative_path)
+      refute_includes content, "raw-value-sentinel"
+
+      derivative = YAML.safe_load(content, permitted_classes: [Time])
+      assert_equal "safe", derivative.fetch("dev_visibility")
+      assert_equal "[REDACTED]", derivative.fetch("message")
+      refute derivative.key?("stdout")
+      refute derivative.key?("command")
+
+      # The safe derivative lands in findings/ and is picked up by safe-artifacts.
+      assert_equal File.join(project_path, "findings"), File.dirname(derivative_path)
+    end
+  end
+
   private
 
   def restricted_finding

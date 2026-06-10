@@ -56,6 +56,8 @@ module SiloMigrate
           @output.puts "[WARN] Skipping #{File.basename(path)}: #{e.message}"
         end
 
+        AIWorkspaceService.new(env: @env, output: @output).refresh_if_prepared(customer)
+
         { fixtures: written }
       end
 
