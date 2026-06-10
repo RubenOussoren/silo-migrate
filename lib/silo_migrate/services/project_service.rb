@@ -361,8 +361,19 @@ module SiloMigrate
                       end
 
         @output.puts "[OK] Dump staged: #{destination}"
+        warn_on_gzip_corruption(destination)
         print_dump_source_type(destination) if %w[sql gzip].include?(DumpTools.detect_file_format(destination)[:format])
         destination
+      end
+
+      def warn_on_gzip_corruption(path)
+        return unless DumpTools.gzip_file?(path)
+
+        verification = DumpTools.verify_gzip(path)
+        return if verification[:valid]
+
+        @output.puts "[WARN] gzip quick check failed: #{verification[:message]}"
+        @output.puts "[WARN] The dump may be truncated or corrupt; the import preflight will verify it fully."
       end
 
       def generate_connection_readme(customer, phase, db_type, db_name, port, password)

@@ -32,4 +32,31 @@ class DumpToolsTest < SiloMigrateTest
       assert_includes File.read(extracted), "CREATE TABLE"
     end
   end
+
+  def test_verify_gzip_accepts_valid_files
+    Dir.mktmpdir do |dir|
+      gz = gzip_write(File.join(dir, "dump.sql.gz"), "INSERT INTO t VALUES (1);\n" * 1000)
+      assert SiloMigrate::DumpTools.verify_gzip(gz)[:valid]
+      assert SiloMigrate::DumpTools.verify_gzip(gz, full: true)[:valid]
+    end
+  end
+
+  def test_verify_gzip_detects_truncated_files_in_full_mode
+    Dir.mktmpdir do |dir|
+      gz = gzip_write(File.join(dir, "dump.sql.gz"), "INSERT INTO t VALUES (1);\n" * 5000)
+      File.truncate(gz, File.size(gz) / 2)
+      result = SiloMigrate::DumpTools.verify_gzip(gz, full: true)
+      refute result[:valid]
+      refute_empty result[:message]
+    end
+  end
+
+  def test_verify_gzip_rejects_non_gzip_content
+    Dir.mktmpdir do |dir|
+      fake = write(File.join(dir, "dump.sql.gz"), "not gzip at all")
+      result = SiloMigrate::DumpTools.verify_gzip(fake)
+      refute result[:valid]
+      assert_includes result[:message], "magic"
+    end
+  end
 end

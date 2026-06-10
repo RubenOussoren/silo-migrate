@@ -38,6 +38,25 @@ module SiloMigrate
       File.extname(path.to_s).downcase == ".gz"
     end
 
+    # Quick mode decompresses the first ~1 MB (catches header/stream corruption).
+    # Full mode streams to EOF so Zlib validates the trailing CRC32/length,
+    # which catches truncated transfers before a multi-GB import starts.
+    def verify_gzip(path, full: false)
+      magic = File.open(path, "rb") { |f| f.read(2) }
+      return { valid: false, message: "not a gzip file (bad magic bytes)" } unless magic == "\x1F\x8B".b
+
+      Zlib::GzipReader.open(path.to_s) do |gz|
+        if full
+          nil while gz.read(1024 * 1024)
+        else
+          gz.read(1024 * 1024)
+        end
+      end
+      { valid: true, message: full ? "gzip integrity verified" : "gzip header and first block OK" }
+    rescue Zlib::Error, EOFError => e
+      { valid: false, message: "#{e.class}: #{e.message}" }
+    end
+
     def open_text(path, &block)
       if gzip_file?(path)
         Zlib::GzipReader.open(path.to_s) do |gz|

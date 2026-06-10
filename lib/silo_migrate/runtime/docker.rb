@@ -27,6 +27,17 @@ module SiloMigrate
         result.success? && result.stdout.strip == "true"
       end
 
+      # Returns "healthy"/"unhealthy"/"starting" from the container's healthcheck,
+      # "none" when the container defines no healthcheck, or "missing" when the
+      # container cannot be inspected. Optional contract method (guard with respond_to?).
+      def container_health_state(name)
+        result = run(["docker", "inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", name], capture: true, timeout: 10)
+        return "missing" unless result.success?
+
+        state = result.stdout.strip
+        state.empty? ? "none" : state
+      end
+
       def wait_for_container_healthy(container_name, timeout:)
         deadline = Time.now + timeout
         while Time.now < deadline

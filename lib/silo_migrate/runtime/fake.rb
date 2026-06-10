@@ -7,13 +7,16 @@ module SiloMigrate
   module Runtime
     class Fake
       attr_reader :commands, :operations, :running_containers, :last_stdin, :healthy_containers, :last_run_options
-      attr_accessor :schema_metadata, :mysql_variables_result, :container_disk_free_result, :docker_desktop_result
+      attr_accessor :schema_metadata, :mysql_variables_result, :container_disk_free_result, :docker_desktop_result,
+                    :container_health_states, :compose_results
 
       def initialize
         @commands = []
         @operations = []
         @running_containers = {}
         @healthy_containers = {}
+        @container_health_states = {}
+        @compose_results = []
         @schema_metadata = default_schema_metadata
         @mysql_variables_result = {
           "innodb_flush_method" => "fsync",
@@ -31,7 +34,15 @@ module SiloMigrate
         @operations << [:compose, customer, args, capture, timeout]
         @commands << [:compose, customer, args, capture, timeout]
         mark_profile_running(customer, args) if args.include?("up")
+        queued = @compose_results.shift
+        return queued if queued
+
         CommandResult.new(success?: true, stdout: capture ? "NAME STATUS\n" : "", stderr: "", status: 0)
+      end
+
+      def container_health_state(name)
+        @operations << [:container_health_state, name]
+        @container_health_states.fetch(name, "healthy")
       end
 
       def container_running?(name)

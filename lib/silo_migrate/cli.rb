@@ -218,6 +218,8 @@ module SiloMigrate
         opts.on("--turbo") { options[:turbo] = true }
         opts.on("--fix-collations") { options[:fix_collations] = true }
         opts.on("--no-fix-collations") { options[:fix_collations] = false }
+        opts.on("--health-timeout SECONDS", Integer) { |value| options[:health_timeout] = value }
+        opts.on("--skip-health-wait") { options[:skip_health_wait] = true }
       end.parse!(argv)
       customer = required_arg(argv, "CUSTOMER")
       phase = validate_phase(required_arg(argv, "PHASE"))
@@ -241,6 +243,10 @@ module SiloMigrate
       path = required_existing_path(required_arg(argv, "DUMP_FILE"))
       @output.puts "\nAnalyzing: #{File.basename(path)}"
       @output.puts "File size: #{DumpTools.format_size(File.size(path))}"
+      if DumpTools.gzip_file?(path)
+        verification = DumpTools.verify_gzip(path)
+        @output.puts "[WARN] gzip quick check failed: #{verification[:message]}" unless verification[:valid]
+      end
       detection = SQLTools.detect_dump_type(path)
       @output.puts "Detected type:    #{detection[:detected]}" if detection[:detected]
       @output.puts "Recommended:      #{DATABASE_TYPES.dig(detection[:recommended], :display_name) || detection[:recommended]}" if detection[:recommended]

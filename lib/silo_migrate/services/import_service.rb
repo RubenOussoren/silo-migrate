@@ -32,6 +32,7 @@ module SiloMigrate
           raise UsageError, "File does not appear to be a valid SQL dump: #{File.basename(dump_path)}\n#{format[:message]}" unless format[:is_valid]
           raise UsageError, "Cannot import tar archive directly. Extract the SQL file first." if format[:format] == "tar"
 
+          verify_gzip_integrity!(dump_path, print_validation)
           detection = SQLTools.detect_dump_type(dump_path)
           SQLTools.dump_type_summary(detection).each { |line| @output.puts line } if print_validation
         end
@@ -40,6 +41,8 @@ module SiloMigrate
         fast = options[:fast] || options[:turbo]
         container_name = "#{customer}_#{phase}_#{db_type}"
         raise UsageError, "Container #{container_name} is not running. Start it first." unless @runtime.container_running?(container_name)
+
+        ensure_container_ready!(customer, phase, container_name, options)
 
         preflight = ImportPreflight.new(
           runtime: @runtime,
@@ -56,7 +59,7 @@ module SiloMigrate
         )
         preflight.run unless options[:skip_preflight]
 
-        needs_collation_fix = db_type == "mariadb" && options[:fix_collations] != false && SQLTools.detect_mysql8_collations(dump_path)[:has_incompatible_collations]
+        needs_collation_fix = collation_fix_needed?(db_type, dump_path, options)
         cmd = @runtime.exec_import_command(container_name, db_type, db_name, password, max_packet: max_packet, disable_keys: fast)
         start_time = Time.now
         @output.puts "Importing into #{container_name}..."
@@ -72,7 +75,7 @@ module SiloMigrate
         reporter.start if report_progress
         result = stream_dump_to_runtime(cmd, dump_path, needs_collation_fix, excluded_tables(options[:exclude_tables]), progress_callback)
         elapsed = Time.now - start_time
-        raise UsageError, failure_message(result, dump_path) unless result.success?
+        raise UsageError, failure_message(result, dump_path, customer: customer, phase: phase, db_type: db_type) unless result.success?
 
         reporter.finish(elapsed) if report_progress
         @output.puts "\n[OK] Dump imported successfully"
@@ -91,6 +94,74 @@ module SiloMigrate
       end
 
       private
+
+      def verify_gzip_integrity!(dump_path, print_validation)
+        return unless DumpTools.gzip_file?(dump_path)
+        return if @env["SILO_MIGRATE_SKIP_GZIP_VERIFY"] == "1"
+
+        @output.puts "Verifying gzip integrity (full read)..." if print_validation
+        verification = DumpTools.verify_gzip(dump_path, full: true)
+        unless verification[:valid]
+          raise UsageError, <<~MSG.chomp
+            gzip integrity check failed for #{File.basename(dump_path)}: #{verification[:message]}
+            The file is likely truncated or corrupt - re-transfer it and stage it again.
+            Bypass this check with --skip-validation or SILO_MIGRATE_SKIP_GZIP_VERIFY=1 if you are sure the file is intact.
+          MSG
+        end
+        @output.puts "[OK] gzip integrity verified" if print_validation
+      end
+
+      def ensure_container_ready!(customer, phase, container_name, options)
+        return if options[:skip_health_wait]
+
+        state = container_health_state(container_name)
+        if state == "none"
+          @output.puts "[WARN] Container #{container_name} has no healthcheck; skipping health wait."
+          return
+        end
+        return if state == "healthy"
+
+        timeout = options.fetch(:health_timeout, 60)
+        @output.puts "Waiting for #{container_name} to become healthy (up to #{timeout}s)..."
+        return if @runtime.wait_for_container_healthy(container_name, timeout: timeout)
+
+        unless @runtime.container_running?(container_name)
+          raise UsageError, "Container #{container_name} stopped while waiting for it to become healthy.\nStart it again: silo-migrate start #{customer} --profile #{phase}-db --wait"
+        end
+
+        raise UsageError, <<~MSG.chomp
+          Container #{container_name} is not healthy after #{timeout}s (state: #{container_health_state(container_name) || 'unknown'}).
+          The database is probably still initializing. Wait for it, then retry:
+            silo-migrate start #{customer} --profile #{phase}-db --wait
+            silo-migrate import-dump #{customer} #{phase}
+          Bypass this check with --skip-health-wait, or raise the limit with --health-timeout SECONDS.
+        MSG
+      end
+
+      def container_health_state(container_name)
+        return nil unless @runtime.respond_to?(:container_health_state)
+
+        @runtime.container_health_state(container_name)
+      rescue UsageError
+        nil
+      end
+
+      def collation_fix_needed?(db_type, dump_path, options)
+        case db_type
+        when "mariadb"
+          options[:fix_collations] != false && SQLTools.detect_mysql8_collations(dump_path)[:has_incompatible_collations]
+        when "mysql"
+          if options[:fix_collations] == true
+            @output.puts "[INFO] Applying MySQL 8 collation fix as requested (MySQL 8 normally supports utf8mb4_0900_* natively)."
+            true
+          else
+            false
+          end
+        else
+          @output.puts "[WARN] --fix-collations is a MySQL/MariaDB option; ignoring it for #{db_type}." if options[:fix_collations] == true
+          false
+        end
+      end
 
       def database_config(customer, phase, config)
         if phase == "final"
@@ -205,10 +276,16 @@ module SiloMigrate
         end
       end
 
-      def failure_message(result, dump_path)
+      def failure_message(result, dump_path, customer:, phase:, db_type:)
         output = result.stderr.empty? ? result.stdout : result.stderr
         lines = ["Import failed (exit code #{result.status}): #{output}"]
-        diagnostic = ImportFailureDiagnostic.new(dump_path, output).summary
+        diagnostic = ImportFailureDiagnostic.new(
+          path: dump_path,
+          output: output,
+          db_type: db_type,
+          customer: customer,
+          phase: phase
+        ).summary
         lines.concat(diagnostic) if diagnostic.any?
         lines.join("\n")
       end
@@ -393,14 +470,41 @@ module SiloMigrate
       end
 
       class ImportFailureDiagnostic
-        ERROR_LINE_PATTERN = /ERROR\s+1180\b.*?\bat line\s+(\d+)/i
+        ERROR_CODE_PATTERN = /ERROR\s+(\d{3,4})\b/i
+        LINE_NUMBER_PATTERN = /\bat line\s+(\d+)/i
 
-        def initialize(path, output)
+        MYSQL_ADVICE = {
+          1062 => "Duplicate entry: the database already contains data, likely from a previous partial import. Reset it before retrying (see recovery steps below).",
+          1054 => "Unknown column: the dump references columns the target schema lacks (often MySQL generated columns). Try: silo-migrate preprocess-dump DUMP_FILE",
+          1366 => "Invalid value for a column: usually a character set mismatch. Re-export the source with --default-character-set=utf8mb4."
+        }.freeze
+
+        POSTGRES_ADVICE = [
+          [/duplicate key value violates unique constraint/i, "Duplicate key: the database already contains data, likely from a previous partial import. Reset it before retrying (see recovery steps below)."],
+          [/invalid byte sequence for encoding/i, "Encoding error: the dump contains bytes that are invalid for the database encoding. Re-export the source with UTF-8 client encoding."],
+          [/column .* does not exist/i, "Unknown column: the dump does not match the target schema."],
+          [/relation .* already exists/i, "Objects already exist: the database is not empty, likely from a previous partial import. Reset it before retrying (see recovery steps below)."]
+        ].freeze
+
+        def initialize(path:, output:, db_type: nil, customer: nil, phase: nil)
           @path = path
           @output = output.to_s
+          @db_type = db_type
+          @customer = customer
+          @phase = phase
         end
 
         def summary
+          lines = []
+          lines.concat(statement_context_lines)
+          lines.concat(advice_lines)
+          lines.concat(recovery_lines)
+          lines
+        end
+
+        private
+
+        def statement_context_lines
           line_number = error_line_number
           return [] unless line_number
 
@@ -418,10 +522,52 @@ module SiloMigrate
           lines
         end
 
-        private
+        def advice_lines
+          advice = mysql_advice || postgres_advice
+          advice ? ["Advice: #{advice}"] : []
+        end
+
+        def mysql_advice
+          code = error_code
+          return nil unless code
+          return collation_advice if code == 1273
+
+          MYSQL_ADVICE[code]
+        end
+
+        def collation_advice
+          if @db_type == "mariadb"
+            "Unknown collation: the dump uses MySQL 8 collations MariaDB does not support. Retry without --no-fix-collations so they are mapped automatically, or recreate the project with a mysql initial DB to match the dump."
+          else
+            "Unknown collation: the dump uses collations this server does not support. Retry with --fix-collations, or recreate the project with the engine matching the dump (see silo-migrate analyze-dump)."
+          end
+        end
+
+        def postgres_advice
+          POSTGRES_ADVICE.each do |pattern, advice|
+            return advice if @output.match?(pattern)
+          end
+          nil
+        end
+
+        def recovery_lines
+          return [] unless @customer && @phase
+
+          [
+            "Recovery (reset the #{@phase} database and retry):",
+            "  silo-migrate replace-dump #{@customer} #{@phase} --yes",
+            "  silo-migrate start #{@customer} --profile #{@phase}-db --wait",
+            "  silo-migrate import-dump #{@customer} #{@phase} --file #{File.basename(@path)}"
+          ]
+        end
+
+        def error_code
+          match = @output.match(ERROR_CODE_PATTERN)
+          match && match[1].to_i
+        end
 
         def error_line_number
-          match = @output.match(ERROR_LINE_PATTERN)
+          match = @output.match(LINE_NUMBER_PATTERN)
           match && match[1].to_i
         end
       end
