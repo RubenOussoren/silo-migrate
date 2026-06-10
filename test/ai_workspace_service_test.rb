@@ -20,6 +20,7 @@ class AIWorkspaceServiceTest < SiloMigrateTest
       write(File.join(project_path, "synthetic-fixtures", "synthetic-finding-safe.yml"), "values: {}\n")
       write(File.join(project_path, "dumps", "initial", "dump.sql"), "raw row\n")
       write(File.join(project_path, "output", "intermediate.db"), "sqlite raw\n")
+      write(File.join(project_path, "converter-settings", "vbulletin.yml"), "database:\n  password: \"sentinel_pw_123\"\n")
 
       out = StringIO.new
       artifacts = SiloMigrate::Services::AIWorkspaceService.new(env: env, output: out).prepare("acme")
@@ -40,6 +41,9 @@ class AIWorkspaceServiceTest < SiloMigrateTest
       refute File.exist?(File.join(workspace, "trusted", "findings", "finding-trusted.yml"))
       refute File.exist?(File.join(workspace, "output", "intermediate.db"))
       refute File.exist?(File.join(workspace, "findings", "finding-restricted.yml"))
+      refute File.exist?(File.join(workspace, "converter-settings"))
+      workspace_files = Dir.glob(File.join(workspace, "**", "*"), File::FNM_DOTMATCH).select { |f| File.file?(f) }
+      refute(workspace_files.any? { |f| File.read(f).include?("sentinel_pw_123") }, "generated converter settings leaked into the AI workspace")
 
       agent_instructions = File.read(File.join(workspace, "AGENTS.md"))
       refute_includes agent_instructions, project_path

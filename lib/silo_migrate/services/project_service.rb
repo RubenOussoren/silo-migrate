@@ -314,6 +314,7 @@ module SiloMigrate
 
       def run_converter_platform(customer, platform, reset: true, settings: nil, redacted_logs: false)
         validate_converter_platform!(customer, platform)
+        settings = generate_default_converter_settings(customer, platform) if settings.to_s.empty?
         command = ["./convert", "--from", platform]
         command << "--reset" if reset
         command.concat(["--settings", settings]) if settings && !settings.empty?
@@ -402,6 +403,20 @@ module SiloMigrate
           ```
 
           Docker network host: #{container_name}:#{internal_port}
+
+          ## Inside the converter container
+
+          Containers on the shared `migration_network` (including the converter)
+          must use the container hostname, not 127.0.0.1:
+
+          | Property | Value |
+          |----------|-------|
+          | **Host (in-network)** | #{container_name} |
+          | **Port (in-network)** | #{internal_port} |
+
+          `silo-migrate run-converter CUSTOMER PLATFORM` generates a settings file
+          with these values automatically (mounted at /converter-settings inside
+          the converter container); pass `--settings PATH` to override it.
         TEXT
         Project.atomic_write(path, content)
       end
@@ -450,6 +465,31 @@ module SiloMigrate
       def tail_with_truncation_marker(buffer)
         text = buffer.tail_string
         buffer.truncated? ? "[earlier output truncated]\n#{text}" : text
+      end
+
+      # Generates in-network connection settings for the platform shortcut.
+      # Failures fall back to the platform defaults (matching old behavior)
+      # rather than blocking the run.
+      def generate_default_converter_settings(customer, platform)
+        result = ConverterSettingsService.new(env: @env, output: @output).generate(customer, platform)
+        ensure_converter_settings_mount(customer)
+        @output.puts "[OK] Generated converter settings: #{result.fetch(:host_path)}"
+        result.fetch(:container_path)
+      rescue UsageError => e
+        @output.puts "[WARN] Could not generate converter settings: #{e.message.lines.first.strip}"
+        @output.puts "       Running with the platform's default settings (likely localhost; pass --settings to override)."
+        nil
+      end
+
+      def ensure_converter_settings_mount(customer)
+        compose_path = File.join(Project.project_path(customer, @env), "docker-compose.yml")
+        return unless File.exist?(compose_path)
+        return if File.read(compose_path).include?("/converter-settings")
+
+        @compose.generate(customer, Project.load_config(customer, @env))
+        @output.puts "[WARN] docker-compose.yml was regenerated to mount converter-settings/."
+        @output.puts "       Recreate the converter container so the generated settings are visible:"
+        @output.puts "         silo-migrate start #{customer} --profile converter"
       end
 
       def warn_on_gzip_corruption(path)
@@ -651,18 +691,7 @@ module SiloMigrate
       end
 
       def database_config(customer, phase, config)
-        if phase == "final"
-          db_type = config["FINAL_DB_TYPE"]
-          raise UsageError, "No final database configured for #{customer}.\nRun 'silo-migrate add-final-db #{customer}' first to configure it." unless db_type
-
-          [db_type, config["FINAL_DB_NAME"] || "#{customer}_final_db", config["FINAL_DB_PASSWORD"] || config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"]]
-        else
-          [config["INITIAL_DB_TYPE"], config["INITIAL_DB_NAME"] || config["DB_NAME"], config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"]]
-        end.tap do |db_type, db_name, password|
-          raise UsageError, "No #{phase} database configured" unless db_type
-          raise UsageError, "Database name not configured" unless db_name
-          raise UsageError, "Database password not configured in config.env." unless password
-        end
+        Project.database_config(customer, phase, config)
       end
 
       def converter_dockerfile

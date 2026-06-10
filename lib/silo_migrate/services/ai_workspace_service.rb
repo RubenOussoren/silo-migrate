@@ -15,6 +15,7 @@ module SiloMigrate
         .env
         .git
         config.env
+        converter-settings
       ].freeze
       SKIPPED_PATTERNS = [
         /\Asettings.*\.ya?ml\z/,

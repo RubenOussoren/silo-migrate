@@ -459,6 +459,42 @@ class CLITest < SiloMigrateTest
     end
   end
 
+  def test_run_converter_platform_shortcut_generates_in_network_settings
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
+      cli.run(["init", "acme", "--db-type", "mariadb", "--password", "topsecret"])
+      create_converter_platform(env, "acme", "vbulletin")
+      settings_defaults = File.join(SiloMigrate::Project.project_path("acme", env), "discourse-converters", "converters", "vbulletin", "settings.yml")
+      write(settings_defaults, "database:\n  host: \"127.0.0.1\"\n  port: 3306\n  username: \"root\"\n  password: \"x\"\n  database: \"y\"\n")
+
+      assert_equal 0, cli.run(["run-converter", "acme", "vbulletin"])
+
+      exec_args = runtime.commands.last[2]
+      assert_includes exec_args, "--settings"
+      assert_includes exec_args, "/converter-settings/vbulletin.yml"
+      generated = File.join(SiloMigrate::Project.project_path("acme", env), "converter-settings", "vbulletin.yml")
+      assert File.exist?(generated)
+      assert_includes File.read(generated), "acme_initial_mariadb"
+    end
+  end
+
+  def test_run_converter_platform_shortcut_falls_back_when_settings_cannot_be_generated
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
+      cli.run(["init", "acme"])
+      create_converter_platform(env, "acme", "vbulletin")
+
+      assert_equal 0, cli.run(["run-converter", "acme", "vbulletin"])
+
+      assert_equal [:compose, "acme", ["--profile", "converter", "exec", "-T", "converter", "./convert", "--from", "vbulletin", "--reset"], true, nil], runtime.commands.last
+      assert_includes out.string, "Could not generate converter settings"
+    end
+  end
+
   def test_run_converter_platform_shortcut_accepts_settings_path
     with_tmp_base do |_dir, env|
       runtime = SiloMigrate::Runtime::Fake.new

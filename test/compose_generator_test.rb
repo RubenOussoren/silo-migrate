@@ -42,6 +42,7 @@ class ComposeGeneratorTest < SiloMigrateTest
       assert_equal "postgres:15", compose["services"]["final-db"]["image"]
       assert_equal ["final-db", "all"], compose["services"]["final-db"]["profiles"]
       assert_equal ["converter", "all"], compose["services"]["converter"]["profiles"]
+      assert_includes compose["services"]["converter"]["volumes"], "./converter-settings:/converter-settings:ro"
     end
   end
 end

@@ -53,7 +53,8 @@ module SiloMigrate
           "volumes" => [
             "./discourse-converters:/converters:rw",
             "./output:/converters/output:rw",
-            "./uploads:/uploads:rw"
+            "./uploads:/uploads:rw",
+            "./converter-settings:/converter-settings:ro"
           ],
           "networks" => ["migration_network"]
         }
