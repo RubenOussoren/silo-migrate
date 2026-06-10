@@ -20,7 +20,15 @@ The AI/Silo/trusted-data architecture in this document should shape interfaces a
 
 ## Current Rebuild Status
 
-As of 2026-06-03, the Ruby `silo-migrate/` rebuild has completed the main Phase 1 compatibility slice, the planned Phase 2 converter-aware slice, an initial Phase 3 trusted-data workflow slice, and the first Phase 4 agent-boundary slice. Phase 2 includes AI-safe schema bundles, redacted converter run summaries, durable structured findings, and shape-only synthetic fixtures. Phase 3 now includes explicit finding visibility, safe-only fixture generation, audited trusted inspection, restricted finding review, and trusted-only redaction. Phase 4 starts with safe Normal Dev AI workspace generation and Linux/Silo Trusted Data AI session setup. Future agents should resume from the existing Ruby implementation rather than starting a new port.
+As of 2026-06-10, the Ruby `silo-migrate/` rebuild has completed the main Phase 1 compatibility slice, the planned Phase 2 converter-aware slice, an initial Phase 3 trusted-data workflow slice, and the first Phase 4 agent-boundary slice. Phase 2 includes AI-safe schema bundles, redacted converter run summaries, durable structured findings, and shape-only synthetic fixtures. Phase 3 now includes explicit finding visibility, safe-only fixture generation, audited trusted inspection, restricted finding review, and trusted-only redaction. Phase 4 starts with safe Normal Dev AI workspace generation and Linux/Silo Trusted Data AI session setup. Future agents should resume from the existing Ruby implementation rather than starting a new port.
+
+A 2026-06-10 refinement pass hardened the restore path and onboarding:
+
+- Base path resolution: `SILO_MIGRATE_BASE_PATH` > user config (`~/.config/silo-migrate/config.env`, written by the interactive first-run prompt) > legacy `/migrations/customers` when writable; unconfigured machines get an actionable error, and non-TTY interactive use fails fast instead of hanging.
+- `import-dump` waits for container health before streaming (`--health-timeout`, `--skip-health-wait`), fully verifies gzip integrity in preflight, honors explicit `--fix-collations` on mysql targets (mariadb auto-fix unchanged), and prints per-error-code diagnostics plus replace-dump/start/import recovery steps on failure.
+- `cleanup` no longer deletes the project directory when compose down fails (`--force` overrides); converter output streams through a bounded 4 MB tail instead of an unbounded capture; `intermediate.db` is read read-only with busy/WAL handling.
+- `run-converter CUSTOMER TYPE` now generates `converter-settings/TYPE.yml` (platform defaults merged with the in-network container host, internal port, and credentials; chmod 0600; mounted read-only at `/converter-settings`; excluded from AI workspaces) and passes it via `--settings` by default. Explicit `--settings` and the `--` escape hatch are unchanged.
+- New `doctor` command (environment preflight) and `converter summary CUSTOMER` standalone command; per-command help via `help <command>` / `<command> --help`; the Docker-gated smoke test now runs a real fixture converter against the migration DB over the compose network, produces `intermediate.db`, and asserts redaction end-to-end (no raw values or passwords in findings or AI workspaces).
 
 Implemented:
 

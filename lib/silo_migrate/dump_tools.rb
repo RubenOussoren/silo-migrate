@@ -45,16 +45,22 @@ module SiloMigrate
       magic = File.open(path, "rb") { |f| f.read(2) }
       return { valid: false, message: "not a gzip file (bad magic bytes)" } unless magic == "\x1F\x8B".b
 
-      Zlib::GzipReader.open(path.to_s) do |gz|
-        if full
+      if full
+        Zlib::GzipReader.open(path.to_s) do |gz|
           nil while gz.read(1024 * 1024)
-        else
-          gz.read(1024 * 1024)
         end
+        { valid: true, message: "gzip integrity verified" }
+      else
+        # A raw Inflate probe avoids GzipReader's unfinished-zstream warning
+        # when we intentionally stop after the first compressed megabyte.
+        inflater = Zlib::Inflate.new(32 + Zlib::MAX_WBITS)
+        File.open(path, "rb") { |file| inflater.inflate(file.read(1024 * 1024)) }
+        { valid: true, message: "gzip header and first block OK" }
       end
-      { valid: true, message: full ? "gzip integrity verified" : "gzip header and first block OK" }
     rescue Zlib::Error, EOFError => e
       { valid: false, message: "#{e.class}: #{e.message}" }
+    ensure
+      inflater&.end if defined?(inflater)
     end
 
     def open_text(path, &block)
