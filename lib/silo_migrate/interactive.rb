@@ -27,6 +27,7 @@ module SiloMigrate
     def run(customer = nil)
       ensure_interactive_stdin!
       ensure_base_path_configured!
+      warn_if_runtime_unavailable
       selection = choose_or_create_customer(customer)
       return unless selection
 
@@ -87,6 +88,14 @@ module SiloMigrate
         @output.puts "     Saved to #{config_file} (override with SILO_MIGRATE_BASE_PATH)"
         break
       end
+    end
+
+    def warn_if_runtime_unavailable
+      return unless @project_service.respond_to?(:runtime_available?)
+      return if @project_service.runtime_available?
+
+      @output.puts "[WARN] Docker does not appear to be running - container actions (start, import, converter) will fail."
+      @output.puts "       Start Docker, or run 'silo-migrate doctor' for a full environment check."
     end
 
     def choose_or_create_customer(customer)

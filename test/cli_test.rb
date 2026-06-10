@@ -16,6 +16,45 @@ class CLITest < SiloMigrateTest
     assert_includes out.string, "trusted inspect"
     assert_includes out.string, "trusted session"
     assert_includes out.string, "--bundle-install also builds/starts"
+    assert_includes out.string, "doctor"
+    assert_includes out.string, "converter summary"
+    assert_includes out.string, "alias: go"
+    assert_includes out.string, "migration-tool = silo-migrate"
+  end
+
+  def test_per_command_help
+    out = StringIO.new
+    cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, output: out, error: StringIO.new)
+
+    assert_equal 0, cli.run(["help", "import-dump"])
+    assert_includes out.string, "--fix-collations"
+    assert_includes out.string, "--skip-health-wait"
+
+    assert_equal 0, cli.run(["run-converter", "--help"])
+    assert_includes out.string, "--settings PATH"
+    assert_includes out.string, "/converter-settings"
+
+    assert_equal 0, cli.run(["convert-xml", "--help"])
+    assert_includes out.string, "--batch-size"
+
+    assert_equal 0, cli.run(["trusted", "--help"])
+    assert_includes out.string, "mysql -u root -e"
+  end
+
+  def test_converter_summary_standalone_command
+    with_tmp_base do |_dir, env|
+      out = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: out, error: StringIO.new)
+      cli.run(["init", "acme"])
+
+      assert_equal 0, cli.run(["converter", "summary", "acme"])
+
+      artifact_dir = File.join(SiloMigrate::Project.project_path("acme", env), "findings", "redacted-logs")
+      assert File.exist?(File.join(artifact_dir, "latest.summary.json"))
+      summary = JSON.parse(File.read(File.join(artifact_dir, "latest.summary.json")))
+      assert_equal false, summary.dig("sources", "intermediate_db", "available")
+      assert_includes out.string, "Redacted converter summary:"
+    end
   end
 
   def test_cli_init_and_start_use_fake_runtime

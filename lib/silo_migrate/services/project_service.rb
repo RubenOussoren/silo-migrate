@@ -298,6 +298,17 @@ module SiloMigrate
         end
       end
 
+      # True when the runtime's backing daemon is reachable (always true for
+      # runtimes without an availability probe, e.g. the fake runtime).
+      def runtime_available?
+        return true unless @runtime.respond_to?(:ensure_available!)
+
+        @runtime.ensure_available!
+        true
+      rescue UsageError
+        false
+      end
+
       def run_converter(customer, command: [], redacted_logs: false)
         Project.load_config(customer, @env)
         command = Array(command).reject(&:empty?)

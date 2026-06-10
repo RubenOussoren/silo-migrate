@@ -9,8 +9,161 @@ module SiloMigrate
     COMMANDS = %w[
       interactive go init list status cleanup start stop regenerate import-dump replace-dump
       analyze-dump preprocess-dump convert-xml stage-dump setup-converter add-final-db
-      run-converter schema findings fixtures ai trusted help
+      run-converter converter schema findings fixtures ai trusted doctor help
     ].freeze
+
+    COMMAND_HELP = {
+      "interactive" => <<~HELP,
+        Usage: silo-migrate interactive [CUSTOMER]   (alias: go)
+
+        Guided workflow: create/select a project, stage and import dumps, set up
+        and run the converter, and generate schema bundles step by step.
+        Shortcut: 'silo-migrate' (no args) or 'silo-migrate CUSTOMER'.
+      HELP
+      "init" => <<~HELP,
+        Usage: silo-migrate init CUSTOMER [options]
+          --db-type TYPE        mariadb (default), mysql, or postgres
+          --initial-port PORT   host port for the initial DB
+          --db-name NAME        initial database name
+          --password PASSWORD   database password
+          --final-db-type TYPE  also configure a final database
+          --final-port PORT     host port for the final DB
+      HELP
+      "cleanup" => <<~HELP,
+        Usage: silo-migrate cleanup CUSTOMER --yes [--force]
+          -y, --yes   confirm deletion of the project directory and volumes
+          --force     delete the project directory even if containers/volumes
+                      could not be stopped (default: abort and keep the directory)
+      HELP
+      "start" => <<~HELP,
+        Usage: silo-migrate start CUSTOMER [options]
+          --profile PROFILE          all (default), initial-db, final-db, or converter
+          --build                    rebuild images before starting
+          --force                    ignore host port conflicts
+          --wait                     wait for database health after starting
+          --health-timeout SECONDS   health wait limit (default 60)
+      HELP
+      "stop" => <<~HELP,
+        Usage: silo-migrate stop CUSTOMER [--profile PROFILE] [--remove]
+          --remove   also remove containers (compose down)
+      HELP
+      "import-dump" => <<~HELP,
+        Usage: silo-migrate import-dump CUSTOMER PHASE [options]   (PHASE: initial|final)
+          -f, --file FILE            dump filename (required when multiple dumps staged)
+          -x, --exclude-tables T1,T2 skip INSERTs for these tables
+          --fast                     disable keys/checks during import
+          --turbo                    fast mode + 1G max packet (recommended >1GB dumps)
+          --max-packet VALUE         max_allowed_packet (default 512M)
+          --fix-collations           force MySQL 8 collation mapping (mariadb auto-detects)
+          --no-fix-collations        disable the mariadb collation auto-fix
+          --health-timeout SECONDS   wait limit for container health (default 60)
+          --skip-health-wait         do not wait for container health
+          --skip-validation          skip dump format and gzip integrity checks
+          --trust-dump               alias for --skip-validation
+      HELP
+      "replace-dump" => <<~HELP,
+        Usage: silo-migrate replace-dump CUSTOMER PHASE --yes
+        Stops the phase DB container and removes its volume (reset before re-import).
+      HELP
+      "analyze-dump" => <<~HELP,
+        Usage: silo-migrate analyze-dump DUMP_FILE [options]
+          --large-threshold MB   highlight tables above this size (default 100)
+          --full                 scan the whole dump instead of the first 200MB
+      HELP
+      "preprocess-dump" => <<~HELP,
+        Usage: silo-migrate preprocess-dump DUMP_FILE [options]
+          -o, --output FILE   output path (default: *_preprocessed.sql)
+          --dry-run           only report what would change
+          -f, --force         overwrite an existing output file
+      HELP
+      "convert-xml" => <<~HELP,
+        Usage: silo-migrate convert-xml SOURCE [options]   (alias: xml-to-sql)
+          -o, --output FILE          output SQL path (default: alongside source)
+          -c, --customer CUSTOMER    write into the customer's dumps directory
+          --phase PHASE              initial (default) or final (with --customer)
+          -t, --include-tables T1,T2 only convert these tables
+          -x, --exclude-tables T1,T2 skip these tables
+          -f, --include-files F1,F2  only convert these XML files
+          -X, --exclude-files F1,F2  skip these XML files
+          -b, --batch-size SIZE      rows per INSERT batch (default 1000)
+          --schema-only              emit CREATE TABLE statements only
+          --compress                 gzip the output
+      HELP
+      "stage-dump" => <<~HELP,
+        Usage: silo-migrate stage-dump CUSTOMER PHASE SOURCE [--sql-file FILE]
+        Copies a .sql/.sql.gz dump (or extracts one from a tar archive) into the
+        project's dumps/PHASE directory. --sql-file selects a file inside a tar.
+      HELP
+      "setup-converter" => <<~HELP,
+        Usage: silo-migrate setup-converter CUSTOMER [options]
+          --repo REPO          converter repository (default: discourse-converters via SSH)
+          --branch BRANCH      branch to clone (default: main)
+          --start              build and start the converter container
+          --bundle-install     also run bundle install inside the container
+          --allow-ssh-prompt   allow an interactive SSH passphrase prompt
+      HELP
+      "add-final-db" => <<~HELP,
+        Usage: silo-migrate add-final-db CUSTOMER [options]
+          --db-type TYPE   mariadb, mysql, or postgres (default: same as initial)
+          --port PORT      host port (default: initial port + 1)
+          --db-name NAME   database name
+          --password PW    database password
+      HELP
+      "run-converter" => <<~HELP,
+        Usage: silo-migrate run-converter CUSTOMER PLATFORM [options]
+               silo-migrate run-converter CUSTOMER [options] -- COMMAND...
+          --settings PATH      converter settings file (default: generated with the
+                               migration DB container host/credentials and mounted
+                               at /converter-settings inside the container)
+          --no-reset           omit --reset from the platform shortcut
+          --redacted-logs      write redacted log + summary artifacts afterwards
+          --redacted-summary   alias for --redacted-logs
+
+        Examples:
+          silo-migrate run-converter acme vbulletin
+          silo-migrate run-converter acme -- ./convert --from vbulletin --settings /converter-settings/vbulletin.yml
+      HELP
+      "converter" => <<~HELP,
+        Usage: silo-migrate converter summary CUSTOMER
+        Generates redacted converter log/summary artifacts from output/intermediate.db
+        without re-running the converter.
+      HELP
+      "schema" => <<~HELP,
+        Usage: silo-migrate schema export CUSTOMER [--phase PHASE] [-o DIR]
+               silo-migrate schema bundle CUSTOMER [--phase PHASE] [-o DIR]
+        export writes raw schema SQL; bundle writes the AI-safe metadata bundle
+        (schema.sql, tables/columns/indexes JSON, summary, migration notes).
+      HELP
+      "findings" => <<~HELP,
+        Usage: silo-migrate findings generate CUSTOMER [--from FILE]
+        Generates structured findings from the latest (or given) redacted summary.
+      HELP
+      "fixtures" => <<~HELP,
+        Usage: silo-migrate fixtures generate CUSTOMER [--from FILE_OR_DIR]
+        Generates shape-only synthetic fixtures from safe findings.
+      HELP
+      "ai" => <<~HELP,
+        Usage: silo-migrate ai prepare CUSTOMER [-o DIR]
+               silo-migrate ai refresh CUSTOMER [-o DIR]
+        Creates/regenerates the safe Normal Dev AI workspace (schema bundles,
+        redacted logs, safe findings, synthetic fixtures - never raw data).
+      HELP
+      "trusted" => <<~HELP,
+        Usage: silo-migrate trusted inspect CUSTOMER [--phase PHASE] [--reason TEXT] -- COMMAND...
+               silo-migrate trusted review CUSTOMER FINDING [--decision safe|rejected] [--reviewer NAME] [--notes TEXT]
+               silo-migrate trusted redact CUSTOMER FINDING [--reviewer NAME] [--notes TEXT]
+               silo-migrate trusted session CUSTOMER [--provider bedrock] [--runtime silo] [--reason TEXT] [--session-id ID]
+
+        Example inspection:
+          silo-migrate trusted inspect acme --phase initial --reason "check edge case" -- \\
+            mysql -u root -e "SELECT COUNT(*) FROM users"
+      HELP
+      "doctor" => <<~HELP
+        Usage: silo-migrate doctor
+        Checks Ruby/Bundler/gems, the Docker daemon, Compose v2, git, and the
+        configured base path; exits non-zero when a required check fails.
+      HELP
+    }.freeze
 
     def initialize(runtime: Runtime::Docker.new, env: ENV, output: $stdout, error: $stderr)
       @runtime = runtime
@@ -34,6 +187,8 @@ module SiloMigrate
       return run_interactive(argv.first) if argv.length == 1 && !COMMANDS.include?(argv.first)
 
       command = argv.shift
+      return command_help(command) if argv.first == "--help" || argv.first == "-h"
+
       case command
       when "interactive", "go" then run_interactive(argv.shift)
       when "init" then init(argv)
@@ -52,12 +207,14 @@ module SiloMigrate
       when "setup-converter" then setup_converter(argv)
       when "add-final-db" then add_final_db(argv)
       when "run-converter" then run_converter(argv)
+      when "converter" then converter(argv)
       when "schema" then schema(argv)
       when "findings" then findings(argv)
       when "fixtures" then fixtures(argv)
       when "ai" then ai(argv)
       when "trusted" then trusted(argv)
-      when "help", nil then help(0)
+      when "doctor" then return doctor
+      when "help", nil then return argv.empty? ? help(0) : command_help(argv.shift)
       else
         raise UsageError, "Unknown command: #{command}"
       end
@@ -81,13 +238,16 @@ module SiloMigrate
         Shortcuts:
           silo-migrate                 Start guided interactive mode
           silo-migrate <customer>      Start guided mode for a customer
+          silo-migrate help <command>  Show a command's flags and examples
+          (compat aliases: migration-tool = silo-migrate, xml-to-sql = convert-xml)
 
         Commands:
-          interactive [customer]       Guided workflow
+          interactive [customer]       Guided workflow (alias: go)
+          doctor                       Check Ruby, Docker, git, and base path setup
           init CUSTOMER                Initialize a migration project
           list                         List migration projects
           status CUSTOMER              Show project and container status
-          cleanup CUSTOMER             Remove a project
+          cleanup CUSTOMER             Remove a project (--force deletes even if Docker fails)
           start CUSTOMER               Start Docker Compose services (--wait checks DB health)
           stop CUSTOMER                Stop Docker Compose services
           regenerate CUSTOMER          Regenerate docker-compose.yml
@@ -101,6 +261,7 @@ module SiloMigrate
                                      Use --allow-ssh-prompt for passphrase-protected SSH keys
           add-final-db CUSTOMER        Add final database configuration
           run-converter CUSTOMER [TYPE] Run converter TYPE shortcut or container command after --
+          converter summary CUSTOMER   Generate redacted converter summary from existing output
           schema export CUSTOMER       Export source/final DB schema
           schema bundle CUSTOMER       Export AI-safe schema metadata bundle
           findings generate CUSTOMER   Generate structured findings from a redacted summary
@@ -111,8 +272,31 @@ module SiloMigrate
           trusted review CUSTOMER FILE Approve/reject a restricted finding
           trusted redact CUSTOMER FILE Write a safe redacted derivative
           trusted session CUSTOMER     Launch a Linux/Silo Bedrock trusted data AI session
+
+        Run 'silo-migrate help <command>' (or '<command> --help') for flags and examples.
       HELP
       code
+    end
+
+    def command_help(command)
+      entry = COMMAND_HELP[command]
+      if entry
+        @output.puts entry
+        0
+      else
+        help(0)
+      end
+    end
+
+    def doctor
+      Services::DoctorService.new(runtime: @runtime, env: @env, output: @output).run ? 0 : 1
+    end
+
+    def converter(argv)
+      subcommand = required_arg(argv, "SUBCOMMAND")
+      raise UsageError, "Unknown converter command: #{subcommand}. Did you mean 'converter summary'?" unless subcommand == "summary"
+
+      @project_service.generate_converter_summary(required_arg(argv, "CUSTOMER"))
     end
 
     def run_interactive(customer)

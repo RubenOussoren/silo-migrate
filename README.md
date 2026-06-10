@@ -12,8 +12,9 @@ architecture and phase history.
 
 ## What It Does
 
-- Creates migration projects under `SILO_MIGRATE_BASE_PATH`, defaulting to
-  `/migrations/customers`.
+- Creates migration projects under a configurable base path (see
+  [Installation](#installation); legacy `/migrations/customers` still works on
+  hosts where it exists).
 - Generates Docker Compose services for initial DB, final DB, and converter
   containers.
 - Stages SQL dumps, tar archives containing SQL, and converted mysqldump XML.
@@ -28,6 +29,42 @@ architecture and phase history.
 - Provides an initial trusted-data workflow for audited raw-data inspection,
   restricted finding review, safe redacted derivatives, and Linux/Silo Bedrock
   session setup.
+
+## Installation
+
+Requirements:
+
+- **Ruby >= 3.1** (e.g. via `rbenv`, `asdf`, or Homebrew) and Bundler
+- **Docker** with Compose v2 — Docker Desktop on macOS, Docker Engine + compose
+  plugin on Linux
+- **git** (used by `setup-converter` to clone `discourse-converters`)
+
+```bash
+cd silo-migrate
+bundle install
+bin/silo-migrate doctor     # verifies Ruby, gems, Docker, git, and the base path
+```
+
+### Where projects are stored
+
+Projects live under a base path, resolved in this order:
+
+1. `SILO_MIGRATE_BASE_PATH` environment variable
+2. `~/.config/silo-migrate/config.env` (written by the interactive first-run prompt)
+3. The legacy `/migrations/customers` — only if it already exists and is writable
+   (typical on dedicated Linux migration hosts)
+
+On a fresh machine just run `bin/silo-migrate`: guided mode asks where to store
+projects the first time and persists the answer.
+
+### macOS notes
+
+- Multi-GB imports through Docker Desktop are slower than on Linux and can fail
+  during InnoDB commit/fsync; the generated compose files use safe InnoDB
+  settings, and the import preflight warns (or blocks unsafe configurations) on
+  large MariaDB imports. Linux is the preferred host for very large dumps.
+- Non-interactive use (pipes, CI) fails fast with the equivalent standalone
+  commands instead of hanging on a prompt.
 
 ## Quickstart
 
