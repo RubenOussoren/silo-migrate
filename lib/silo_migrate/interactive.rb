@@ -12,7 +12,7 @@ module SiloMigrate
     BACK_LABEL = "Back"
     BACK_COMMANDS = %w[b back ..].freeze
 
-    def initialize(project_service:, import_service:, schema_service: nil, findings_service: nil, fixture_service: nil, prompt: nil, output: $stdout)
+    def initialize(project_service:, import_service:, schema_service: nil, findings_service: nil, fixture_service: nil, prompt: nil, output: $stdout, stdin: $stdin)
       @project_service = project_service
       @import_service = import_service
       @schema_service = schema_service
@@ -21,9 +21,12 @@ module SiloMigrate
       @external_prompt = !prompt.nil?
       @prompt = prompt || default_prompt
       @output = output
+      @stdin = stdin
     end
 
     def run(customer = nil)
+      ensure_interactive_stdin!
+      ensure_base_path_configured!
       selection = choose_or_create_customer(customer)
       return unless selection
 
@@ -42,6 +45,49 @@ module SiloMigrate
     end
 
     private
+
+    def ensure_interactive_stdin!
+      return if @external_prompt || (@stdin.respond_to?(:tty?) && @stdin.tty?)
+
+      raise UsageError, <<~MSG.strip
+        Interactive mode needs a terminal (stdin is not a TTY).
+        Use the standalone commands instead, e.g.:
+          silo-migrate init CUSTOMER --db-type mariadb
+          silo-migrate stage-dump CUSTOMER initial /path/to/dump.sql.gz
+          silo-migrate start CUSTOMER --profile initial-db --wait
+          silo-migrate import-dump CUSTOMER initial
+          silo-migrate schema bundle CUSTOMER
+          silo-migrate setup-converter CUSTOMER
+          silo-migrate run-converter CUSTOMER PLATFORM
+        Run 'silo-migrate help' for the full command list.
+      MSG
+    end
+
+    def ensure_base_path_configured!
+      return if Project.base_path_configured?(env_for_project)
+
+      @output.puts "\nNo migration base path is configured yet."
+      @output.puts "Projects will be stored under this directory."
+      default = File.join(Dir.home, "migrations", "customers")
+      loop do
+        answer = ask("Base path for migration projects (blank for #{default})").to_s.strip
+        chosen = answer.empty? ? default : File.expand_path(answer)
+        begin
+          FileUtils.mkdir_p(chosen)
+        rescue SystemCallError => e
+          @output.puts "[WARN] Cannot create #{chosen}: #{e.message}. Choose another location."
+          next
+        end
+        unless File.writable?(chosen)
+          @output.puts "[WARN] #{chosen} is not writable. Choose another location."
+          next
+        end
+        config_file = UserConfig.save({ "SILO_MIGRATE_BASE_PATH" => chosen }, env_for_project)
+        @output.puts "[OK] Projects will be stored in #{chosen}"
+        @output.puts "     Saved to #{config_file} (override with SILO_MIGRATE_BASE_PATH)"
+        break
+      end
+    end
 
     def choose_or_create_customer(customer)
       return [Project.validate_customer_name!(customer), false] if customer
@@ -746,7 +792,7 @@ module SiloMigrate
       return @prompt.ask(message) if @prompt&.respond_to?(:ask)
 
       @output.print "#{message}: "
-      $stdin.gets&.chomp.to_s
+      @stdin.gets&.chomp.to_s
     end
 
     def ask_path(message)
@@ -768,8 +814,16 @@ module SiloMigrate
 
       @output.puts message
       choices.keys.each_with_index { |label, idx| @output.puts "  #{idx + 1}. #{label}" }
-      index = ask("Choice").to_i - 1
-      choices.values.fetch(index)
+      loop do
+        index = begin
+          Integer(ask("Choice").to_s.strip, 10) - 1
+        rescue ArgumentError, TypeError
+          nil
+        end
+        return choices.values[index] if index&.between?(0, choices.length - 1)
+
+        @output.puts "Invalid selection. Enter a number between 1 and #{choices.length}."
+      end
     end
 
     def ask_optional_integer(message)

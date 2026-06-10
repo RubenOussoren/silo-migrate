@@ -3,6 +3,7 @@
 require_relative "silo_migrate/version"
 require_relative "silo_migrate/errors"
 require_relative "silo_migrate/constants"
+require_relative "silo_migrate/user_config"
 require_relative "silo_migrate/project"
 require_relative "silo_migrate/compose_generator"
 require_relative "silo_migrate/dump_tools"

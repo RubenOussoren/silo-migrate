@@ -14,7 +14,32 @@ module SiloMigrate
     end
 
     def base_path(env = ENV)
-      env["SILO_MIGRATE_BASE_PATH"] || DEFAULT_BASE_PATH
+      resolved = resolve_base_path(env)
+      return resolved if resolved
+
+      raise UsageError, <<~MSG.strip
+        No migration base path is configured (and the legacy default #{DEFAULT_BASE_PATH} is not writable).
+        Fix one of:
+          - run 'silo-migrate' (interactive mode) to choose a location on first run
+          - export SILO_MIGRATE_BASE_PATH=/path/to/customers
+          - add SILO_MIGRATE_BASE_PATH="/path/to/customers" to #{UserConfig.path(env)}
+      MSG
+    end
+
+    def resolve_base_path(env = ENV)
+      explicit = env["SILO_MIGRATE_BASE_PATH"]
+      return explicit if explicit && !explicit.empty?
+
+      configured = UserConfig.load(env)["SILO_MIGRATE_BASE_PATH"]
+      return configured if configured && !configured.empty?
+
+      return DEFAULT_BASE_PATH if Dir.exist?(DEFAULT_BASE_PATH) && File.writable?(DEFAULT_BASE_PATH)
+
+      nil
+    end
+
+    def base_path_configured?(env = ENV)
+      !resolve_base_path(env).nil?
     end
 
     def project_path(customer, env = ENV)
@@ -33,12 +58,14 @@ module SiloMigrate
     end
 
     def save_config(customer, config, env = ENV)
-      path = config_path(customer, env)
-      content = config.map do |key, value|
+      atomic_write(config_path(customer, env), env_file_content(config))
+    end
+
+    def env_file_content(config)
+      config.map do |key, value|
         escaped = value.to_s.gsub("\\", "\\\\\\").gsub('"', '\"')
         %(#{key}="#{escaped}"\n)
       end.join
-      atomic_write(path, content)
     end
 
     def read_env_file(path)

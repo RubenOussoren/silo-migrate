@@ -10,10 +10,16 @@ require "stringio"
 require "zlib"
 require "silo_migrate"
 
+# Keep tests away from the developer's real ~/.config/silo-migrate.
+ENV["SILO_MIGRATE_USER_CONFIG"] = File.join(Dir.mktmpdir("silo-migrate-test"), "user-config.env")
+
 class SiloMigrateTest < Minitest::Test
   def with_tmp_base
     Dir.mktmpdir do |dir|
-      env = { "SILO_MIGRATE_BASE_PATH" => File.join(dir, "customers") }
+      env = {
+        "SILO_MIGRATE_BASE_PATH" => File.join(dir, "customers"),
+        "SILO_MIGRATE_USER_CONFIG" => File.join(dir, "user-config.env")
+      }
       yield dir, env
     end
   end

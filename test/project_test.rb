@@ -9,9 +9,26 @@ class ProjectTest < SiloMigrateTest
     assert_raises(SiloMigrate::UsageError) { SiloMigrate::Project.validate_customer_name!("") }
   end
 
-  def test_base_path_uses_silo_migrate_env
-    assert_equal "/tmp/example", SiloMigrate::Project.base_path("SILO_MIGRATE_BASE_PATH" => "/tmp/example")
-    assert_equal SiloMigrate::DEFAULT_BASE_PATH, SiloMigrate::Project.base_path({})
+  def test_base_path_resolution_chain
+    with_tmp_base do |dir, env|
+      assert_equal env["SILO_MIGRATE_BASE_PATH"], SiloMigrate::Project.base_path(env)
+      assert SiloMigrate::Project.base_path_configured?(env)
+
+      config_only_env = { "SILO_MIGRATE_USER_CONFIG" => env["SILO_MIGRATE_USER_CONFIG"] }
+      SiloMigrate::UserConfig.save({ "SILO_MIGRATE_BASE_PATH" => "/tmp/from-user-config" }, config_only_env)
+      assert_equal "/tmp/from-user-config", SiloMigrate::Project.base_path(config_only_env)
+
+      env_var_wins = config_only_env.merge("SILO_MIGRATE_BASE_PATH" => "/tmp/from-env")
+      assert_equal "/tmp/from-env", SiloMigrate::Project.base_path(env_var_wins)
+
+      empty_env = { "SILO_MIGRATE_USER_CONFIG" => File.join(dir, "missing-user-config.env") }
+      unless Dir.exist?(SiloMigrate::DEFAULT_BASE_PATH) && File.writable?(SiloMigrate::DEFAULT_BASE_PATH)
+        refute SiloMigrate::Project.base_path_configured?(empty_env)
+        error = assert_raises(SiloMigrate::UsageError) { SiloMigrate::Project.base_path(empty_env) }
+        assert_includes error.message, "SILO_MIGRATE_BASE_PATH"
+        assert_includes error.message, "interactive"
+      end
+    end
   end
 
   def test_config_env_read_write_compatibility
