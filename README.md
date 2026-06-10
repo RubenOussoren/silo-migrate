@@ -8,7 +8,9 @@ final database containers, stages and imports dumps, sets up
 The tool is usable today with Docker on macOS and Linux. The future Silo/Incus
 runtime is intentionally behind the same runtime boundary, but is not the active
 execution backend yet. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full
-architecture and phase history.
+architecture and phase history, and
+[`docs/migration-engineer-guide.md`](docs/migration-engineer-guide.md) for a
+practical end-to-end overview (capabilities, limits, happy paths, diagrams).
 
 ## What It Does
 
