@@ -47,4 +47,22 @@ class RuntimeContractTest < SiloMigrateTest
       :run_with_stdin
     ], runtime.operations.map(&:first)
   end
+
+  def test_mysql_fast_import_command_does_not_force_whole_dump_transaction
+    command = SiloMigrate::Runtime::Docker.new.exec_import_command(
+      "acme_initial_mariadb",
+      "mariadb",
+      "forum",
+      "password",
+      max_packet: "512M",
+      disable_keys: true
+    )
+
+    init_command = command.find { |arg| arg.start_with?("--init-command=") }
+    assert_includes command, "--max-allowed-packet=512M"
+    assert_includes init_command, "FOREIGN_KEY_CHECKS=0"
+    assert_includes init_command, "UNIQUE_CHECKS=0"
+    assert_includes init_command, "max_allowed_packet=1000000000"
+    refute_includes init_command, "AUTOCOMMIT=0"
+  end
 end

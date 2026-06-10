@@ -92,6 +92,8 @@ module SiloMigrate
           "--character-set-server=utf8mb4",
           "--collation-server=utf8mb4_unicode_ci",
           "--innodb-flush-log-at-trx-commit=0",
+          "--innodb-flush-method=fsync",
+          "--innodb-use-native-aio=0",
           "--innodb-doublewrite=0",
           "--innodb-buffer-pool-size=1G",
           "--max-allowed-packet=1G",

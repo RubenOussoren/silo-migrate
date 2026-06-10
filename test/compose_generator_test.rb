@@ -18,6 +18,8 @@ class ComposeGeneratorTest < SiloMigrateTest
       assert_equal ["initial-db", "all"], service["profiles"]
       assert_equal ["127.0.0.1:3307:3306"], service["ports"]
       assert_equal "secret", service["environment"]["MYSQL_ROOT_PASSWORD"]
+      assert_includes service["command"], "--innodb-flush-method=fsync"
+      assert_includes service["command"], "--innodb-use-native-aio=0"
     end
   end
 

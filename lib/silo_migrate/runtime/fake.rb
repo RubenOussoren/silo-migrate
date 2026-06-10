@@ -7,7 +7,7 @@ module SiloMigrate
   module Runtime
     class Fake
       attr_reader :commands, :operations, :running_containers, :last_stdin, :healthy_containers, :last_run_options
-      attr_accessor :schema_metadata
+      attr_accessor :schema_metadata, :mysql_variables_result, :container_disk_free_result, :docker_desktop_result
 
       def initialize
         @commands = []
@@ -15,11 +15,22 @@ module SiloMigrate
         @running_containers = {}
         @healthy_containers = {}
         @schema_metadata = default_schema_metadata
+        @mysql_variables_result = {
+          "innodb_flush_method" => "fsync",
+          "innodb_use_native_aio" => "OFF",
+          "innodb_flush_log_at_trx_commit" => "0"
+        }
+        @container_disk_free_result = {
+          "/var/lib/mysql" => 100 * 1024 * 1024 * 1024,
+          "/tmp" => 100 * 1024 * 1024 * 1024
+        }
+        @docker_desktop_result = false
       end
 
       def compose(customer, args, capture: false, timeout: 300)
         @operations << [:compose, customer, args, capture, timeout]
         @commands << [:compose, customer, args, capture, timeout]
+        mark_profile_running(customer, args) if args.include?("up")
         CommandResult.new(success?: true, stdout: capture ? "NAME STATUS\n" : "", stderr: "", status: 0)
       end
 
@@ -60,6 +71,21 @@ module SiloMigrate
         }
       end
 
+      def mysql_variables(container_name, db_type, db_name, password, names)
+        @operations << [:mysql_variables, container_name, db_type, db_name, names]
+        @mysql_variables_result.slice(*names)
+      end
+
+      def container_disk_free(container_name, paths)
+        @operations << [:container_disk_free, container_name, paths]
+        @container_disk_free_result.slice(*paths)
+      end
+
+      def docker_desktop?
+        @operations << [:docker_desktop?]
+        @docker_desktop_result
+      end
+
       def run(cmd, chdir: nil, capture: false, timeout: nil, stdin_data: nil, separate_process_group: true)
         @operations << [:run, cmd, chdir, capture, timeout, stdin_data&.bytesize, separate_process_group]
         @last_run_options = {
@@ -98,6 +124,39 @@ module SiloMigrate
       end
 
       private
+
+      def mark_profile_running(customer, args)
+        profile = profile_from_args(args)
+        case profile
+        when "initial-db"
+          mark_matching_or_common("#{customer}_initial_", %w[mariadb mysql postgres])
+        when "final-db"
+          mark_matching_or_common("#{customer}_final_", %w[mariadb mysql postgres])
+        when "converter"
+          mark_container_started("#{customer}_converter")
+        when "all"
+          mark_matching_or_common("#{customer}_initial_", %w[mariadb mysql postgres])
+          mark_matching_or_common("#{customer}_final_", %w[mariadb mysql postgres])
+          mark_container_started("#{customer}_converter")
+        end
+      end
+
+      def profile_from_args(args)
+        index = args.rindex("--profile")
+        index ? args[index + 1] : nil
+      end
+
+      def mark_matching_or_common(prefix, suffixes)
+        matching = @running_containers.keys.select { |name| name.start_with?(prefix) }
+        matching.each { |name| mark_container_started(name) }
+        suffixes.each { |suffix| mark_container_started("#{prefix}#{suffix}") } if matching.empty?
+      end
+
+      def mark_container_started(name)
+        return if @healthy_containers[name] == false && @running_containers[name] == false
+
+        @running_containers[name] = true
+      end
 
       def default_schema_metadata
         {

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "open3"
+require "rbconfig"
 require "timeout"
 
 module SiloMigrate
@@ -45,7 +46,7 @@ module SiloMigrate
         if %w[mysql mariadb].include?(db_type)
           import_cmd << "--max-allowed-packet=#{max_packet}" if max_packet
           if disable_keys
-            import_cmd << '--init-command=SET GLOBAL net_buffer_length=1000000; SET GLOBAL max_allowed_packet=1000000000; SET SESSION sql_mode="", FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0, AUTOCOMMIT=0;'
+            import_cmd << '--init-command=SET GLOBAL net_buffer_length=1000000; SET GLOBAL max_allowed_packet=1000000000; SET SESSION sql_mode="", FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0;'
           end
           import_cmd << db_name
         else
@@ -72,6 +73,32 @@ module SiloMigrate
         else
           postgres_metadata_commands(docker_cmd, db_name)
         end
+      end
+
+      def mysql_variables(container_name, db_type, db_name, password, names)
+        db_config = DATABASE_TYPES.fetch(db_type)
+        docker_cmd = ["docker", "exec", "-e", "#{db_config[:password_env]}=#{password}", container_name]
+        sql = "SHOW VARIABLES WHERE Variable_name IN (#{names.map { |name| "'#{name}'" }.join(', ')})"
+        result = run(mysql_query_command(docker_cmd, db_name, sql), capture: true, timeout: 20)
+        raise UsageError, "Could not query MySQL variables: #{result.stderr}" unless result.success?
+
+        result.stdout.lines.each_with_object({}) do |line, variables|
+          name, value = line.chomp.split("\t", 2)
+          variables[name] = value if name && value
+        end
+      end
+
+      def container_disk_free(container_name, paths)
+        result = run(["docker", "exec", container_name, "df", "-Pk", *paths], capture: true, timeout: 20)
+        raise UsageError, "Could not query container disk free space: #{result.stderr}" unless result.success?
+
+        parse_df_free_bytes(result.stdout)
+      end
+
+      def docker_desktop?
+        return false unless RbConfig::CONFIG["host_os"].to_s.match?(/darwin/i)
+
+        true
       end
 
       def run(cmd, chdir: nil, capture: false, timeout: nil, stdin_data: nil, separate_process_group: true)
@@ -203,6 +230,17 @@ module SiloMigrate
 
       def compact_sql(sql)
         sql.lines.map(&:strip).reject(&:empty?).join(" ")
+      end
+
+      def parse_df_free_bytes(output)
+        output.lines.drop(1).each_with_object({}) do |line, free|
+          parts = line.split
+          next if parts.length < 6
+
+          available_kb = parts[3].to_i
+          path = parts[5]
+          free[path] = available_kb * 1024
+        end
       end
 
       def run_attached(cmd, process_options, timeout, separate_process_group)

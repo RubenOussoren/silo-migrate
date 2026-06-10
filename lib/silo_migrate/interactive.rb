@@ -1,6 +1,10 @@
 # frozen_string_literal: true
 
+require "json"
+require "fileutils"
 require "pathname"
+require "set"
+require "time"
 
 module SiloMigrate
   class Interactive
@@ -94,6 +98,7 @@ module SiloMigrate
       @output.puts "Initial DB: #{config['INITIAL_DB_TYPE'] || 'not set'} on port #{config['INITIAL_PORT'] || 'not set'}"
       @output.puts "Final DB: #{config['FINAL_DB_TYPE']} on port #{config['FINAL_PORT']}" if config["FINAL_DB_TYPE"]
       @output.puts "Dumps: #{initial_dumps.length} initial, #{final_dumps.length} final"
+      @output.puts "Imports: #{import_status(customer)}"
       @output.puts "Schema bundle: #{schema_bundle_status(customer)}"
       @output.puts "\nContainer status:"
       @output.puts @project_service.container_status(customer) if @project_service.respond_to?(:container_status)
@@ -102,27 +107,46 @@ module SiloMigrate
     def select_next_action(customer)
       config = Project.load_config(customer, env_for_project)
       actions = {}
-      actions["Add/import initial source dump"] = :initial_dump if dump_files(customer, "initial").empty?
-      actions["Start initial DB and import dump"] = :import_initial if dump_files(customer, "initial").any?
-      actions["Add final database"] = :add_final_db unless config["FINAL_DB_TYPE"]
-      actions["Add/import final dump"] = :final_dump if config["FINAL_DB_TYPE"] && dump_files(customer, "final").empty?
-      actions["Start final DB and import dump"] = :import_final if config["FINAL_DB_TYPE"] && dump_files(customer, "final").any?
-      actions["Generate initial schema bundle"] = :bundle_initial_schema if dump_files(customer, "initial").any?
-      actions["Generate final schema bundle"] = :bundle_final_schema if config["FINAL_DB_TYPE"] && dump_files(customer, "final").any?
-      actions["Set up converter"] = :setup_converter unless Dir.exist?(File.join(@project_service.project_path(customer), "discourse-converters"))
-      actions["Run converter command"] = :run_converter if Dir.exist?(File.join(@project_service.project_path(customer), "discourse-converters"))
+      next_action = recommended_action(customer, config)
+      actions[next_action.fetch(:label)] = next_action.fetch(:action) if next_action
+      add_action(actions, "Add/import initial source dump", :initial_dump)
+      add_action(actions, "Start initial DB and import dump", :import_initial) if dump_files(customer, "initial").any?
+      add_action(actions, "Generate initial schema bundle", :bundle_initial_schema) if phase_imported?(customer, "initial") || dump_files(customer, "initial").any?
+      add_action(actions, "Add final database", :add_final_db) unless config["FINAL_DB_TYPE"]
+      add_action(actions, "Add/import final dump", :final_dump) if config["FINAL_DB_TYPE"]
+      add_action(actions, "Start final DB and import dump", :import_final) if config["FINAL_DB_TYPE"] && dump_files(customer, "final").any?
+      add_action(actions, "Generate final schema bundle", :bundle_final_schema) if config["FINAL_DB_TYPE"] && (phase_imported?(customer, "final") || dump_files(customer, "final").any?)
+      add_action(actions, "Set up converter", :setup_converter) unless converter_setup?(customer)
+      add_action(actions, "Run converter command", :run_converter) if converter_setup?(customer)
       actions["View detailed status"] = :status
       actions["Advanced actions"] = :advanced
       actions["Quit"] = :quit
       select("Recommended next step", actions)
     end
 
+    def add_action(actions, label, action)
+      actions[label] ||= action
+    end
+
+    def recommended_action(customer, config)
+      return { label: "Add/import initial source dump", action: :initial_dump } if dump_files(customer, "initial").empty?
+      return { label: "Start initial DB and import dump", action: :import_initial } unless phase_imported?(customer, "initial")
+      return { label: "Generate initial schema bundle", action: :bundle_initial_schema } unless schema_bundle_present?(customer, "initial")
+      return { label: "Add final database", action: :add_final_db } unless config["FINAL_DB_TYPE"]
+      return { label: "Add/import final dump", action: :final_dump } if dump_files(customer, "final").empty?
+      return { label: "Start final DB and import dump", action: :import_final } unless phase_imported?(customer, "final")
+      return { label: "Generate final schema bundle", action: :bundle_final_schema } unless schema_bundle_present?(customer, "final")
+      return { label: "Set up converter", action: :setup_converter } unless converter_setup?(customer)
+
+      { label: "Run converter command", action: :run_converter }
+    end
+
     def run_action(customer, action)
       case action
       when :initial_dump then prompt_dump_flow(customer, "initial")
       when :final_dump then prompt_dump_flow(customer, "final")
-      when :import_initial then offer_start_and_import(customer, "initial", dump_files(customer, "initial").first)
-      when :import_final then offer_start_and_import(customer, "final", dump_files(customer, "final").first)
+      when :import_initial then offer_start_and_import(customer, "initial", select_dump_for_import(customer, "initial"))
+      when :import_final then offer_start_and_import(customer, "final", select_dump_for_import(customer, "final"))
       when :add_final_db
         return BACK if add_final_db(customer) == BACK
 
@@ -140,7 +164,7 @@ module SiloMigrate
     def prompt_dump_flow(customer, phase)
       existing = dump_files(customer, phase)
       if existing.any?
-        @output.puts "\nExisting #{phase} dump found: #{File.basename(existing.first)} (#{DumpTools.format_size(File.size(existing.first))})"
+        show_existing_dumps(phase, existing)
         choice = select(
           "What would you like to do?",
           {
@@ -151,7 +175,7 @@ module SiloMigrate
           allow_back: true
         )
         return BACK if choice == BACK
-        return offer_start_and_import(customer, phase, existing.first) if choice == :use_existing
+        return offer_start_and_import(customer, phase, select_dump_for_import(customer, phase)) if choice == :use_existing
         return if choice == :skip
       end
 
@@ -177,7 +201,9 @@ module SiloMigrate
       end
 
       dump_path = if format == :xml
-                    convert_xml_to_project(customer, phase, source)
+                    exclude_files = prompt_xml_file_exclusions(Pathname(source))
+                    batch_size = prompt_xml_batch_size
+                    convert_xml_to_project(customer, phase, source, exclude_files: exclude_files, batch_size: batch_size)
                   else
                     @project_service.stage_dump(customer, phase, source)
                   end
@@ -187,23 +213,22 @@ module SiloMigrate
     def offer_start_and_import(customer, phase, dump_path)
       return unless dump_path
 
-      return unless confirm?("Start #{phase}-db and import this dump now?", default: true)
+      show_import_target(phase, dump_path)
+      return unless confirm?("Start #{phase}-db and import #{File.basename(dump_path)} now?", default: true)
 
-      begin
-        @project_service.start(
-          customer,
-          profile: "#{phase}-db",
-          wait_for_health: true,
-          on_port_conflict: proc { |conflicts| confirm_port_conflicts(customer, conflicts) }
-        )
-      rescue UsageError => e
-        @output.puts "[WARN] #{e.message}"
-        return
-      end
+      return unless start_services_with_recovery(customer, "#{phase}-db", wait_for_health: true)
+
       options = prompt_import_options(dump_path)
       options[:file] = File.basename(dump_path)
       options[:quiet_validation] = true
-      @import_service.import_dump(customer, phase, options)
+      begin
+        @import_service.import_dump(customer, phase, options)
+      rescue UsageError => e
+        @output.puts "[WARN] #{e.message}"
+        @output.puts "[WARN] Import did not complete; reset DB data before retrying this dump."
+        return
+      end
+      write_import_marker(customer, phase, dump_path)
       generate_schema_bundle(customer, phase)
     end
 
@@ -285,11 +310,7 @@ module SiloMigrate
         profile = select_profile
         return BACK if profile == BACK
 
-        @project_service.start(
-          customer,
-          profile: profile,
-          on_port_conflict: proc { |conflicts| confirm_port_conflicts(customer, conflicts) }
-        )
+        start_services_with_recovery(customer, profile)
       when :stop
         profile = select_profile
         return BACK if profile == BACK
@@ -311,6 +332,9 @@ module SiloMigrate
         return BACK if phase == BACK
 
         @import_service.replace_dump(customer, phase, yes: confirm!("Reset #{phase} database data?"))
+        clear_import_marker(customer, phase)
+        dump = select_dump_for_import(customer, phase)
+        offer_start_and_import(customer, phase, dump) if dump
       when :cleanup
         @project_service.cleanup(customer, yes: confirm!("Delete project #{customer}?"))
       when :quit
@@ -325,8 +349,13 @@ module SiloMigrate
       source = ask_path("Path to XML file or directory")
       return BACK if source == BACK
 
-      output = convert_xml_to_project(customer, phase, source)
+      exclude_files = prompt_xml_file_exclusions(Pathname(source))
+      batch_size = prompt_xml_batch_size
+      output = convert_xml_to_project(customer, phase, source, exclude_files: exclude_files, batch_size: batch_size)
+      return unless output
+
       @output.puts "[OK] XML converted: #{output}"
+      offer_start_and_import(customer, phase, output)
     end
 
     def generate_schema_bundle(customer, phase)
@@ -394,13 +423,103 @@ module SiloMigrate
       @output.puts "[WARN] #{e.message}"
     end
 
-    def convert_xml_to_project(customer, phase, source)
+    def convert_xml_to_project(customer, phase, source, exclude_files: nil, batch_size: 1000)
       source_path = Pathname(source)
       base = source_path.file? ? source_path.basename.to_s.sub(/\.gz\z/, "").sub(/\.xml\z/, "") : "combined"
       output = Pathname(File.join(@project_service.project_path(customer), "dumps", phase, "#{base}.sql.gz"))
-      XMLToSQLConverter.new(verbose: false).convert(source_path, output)
+      if output.exist? && !confirm?("Replace existing converted dump #{output.basename}?", default: false)
+        @output.puts "[WARN] XML conversion skipped; existing dump left unchanged."
+        return nil
+      end
+
+      summary = xml_source_summary(source_path, exclude_files: exclude_files)
+      @output.puts "\nConverting XML dump..."
+      @output.puts "Source: #{source_path}"
+      @output.puts "Files found: #{summary[:files_found]}"
+      if summary[:files_skipped].positive?
+        @output.puts "Files to skip: #{summary[:files_skipped]}"
+        summary[:skipped].first(10).each { |file| @output.puts "  - #{file.basename}" }
+        @output.puts "  ... and #{summary[:skipped].length - 10} more" if summary[:skipped].length > 10
+      end
+      @output.puts "Input size: #{DumpTools.format_size(summary[:bytes])} across #{summary[:files]} file#{summary[:files] == 1 ? '' : 's'}"
+      @output.puts "Insert batch size: #{batch_size}"
+      @output.puts "Output: #{output}"
+      @output.puts "Large XML conversions can take a while; progress will update periodically."
+      progress = xml_conversion_progress_printer
+      XMLToSQLConverter.new(exclude_files: exclude_files, batch_size: batch_size, verbose: false).convert(source_path, output, progress_callback: progress)
       @output.puts "[OK] XML converted and staged: #{output}"
       output
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+      nil
+    end
+
+    def prompt_xml_batch_size
+      return 1000 unless confirm?("Use a custom XML insert batch size? (default 1000)", default: false)
+
+      value = ask("XML insert batch size").to_s.strip
+      return 1000 if value.empty?
+
+      batch_size = Integer(value, 10)
+      return batch_size if batch_size.positive?
+
+      @output.puts "[WARN] Invalid XML batch size; using 1000."
+      1000
+    rescue ArgumentError
+      @output.puts "[WARN] Invalid XML batch size; using 1000."
+      1000
+    end
+
+    def prompt_xml_file_exclusions(source_path)
+      files = xml_source_files(source_path)
+      return [] if files.empty?
+
+      @output.puts "\nXML files found:"
+      files.each { |file| @output.puts "  #{file.basename}: #{DumpTools.format_size(file.size)}" }
+      return [] unless confirm?("Exclude any XML files from conversion?", default: false)
+
+      answer = ask("XML files to exclude (comma-separated, names or base names)").to_s
+      answer.split(",").map(&:strip).reject(&:empty?)
+    end
+
+    def xml_source_summary(source_path, exclude_files: nil)
+      files = xml_source_files(source_path)
+      skipped, selected = files.partition { |file| xml_file_excluded?(file, exclude_files) }
+      { files_found: files.length, files: selected.length, files_skipped: skipped.length, skipped: skipped, bytes: selected.sum { |file| file.size rescue 0 } }
+    end
+
+    def xml_source_files(source_path)
+      source_path.file? ? [source_path] : source_path.glob("*.xml").to_a.concat(source_path.glob("*.xml.gz").to_a).sort
+    end
+
+    def xml_file_excluded?(file, exclude_files)
+      exclude_files = Array(exclude_files)
+      file_name = file.basename.to_s
+      base = file_name.sub(/\.gz\z/, "").sub(/\.xml\z/, "")
+      exclude_files.include?(file_name) || exclude_files.include?(base)
+    end
+
+    def xml_conversion_progress_printer
+      proc do |progress|
+        case progress[:event]
+        when :start
+          @output.puts "Files to process: #{progress[:file_count]} (#{DumpTools.format_size(progress[:total_input_bytes])})"
+        when :file_start
+          file = progress[:current_file]
+          @output.puts "Processing #{file[:index]}/#{file[:count]}: #{file[:name]} (#{DumpTools.format_size(file[:size])})"
+        when :bytes, :rows, :table
+          file = progress[:current_file]
+          next unless file
+
+          percent = file[:size].positive? ? format(" %.1f%%", (file[:bytes_read].to_f / file[:size]) * 100) : ""
+          @output.puts "  #{file[:name]}: #{DumpTools.format_size(file[:bytes_read])}/#{DumpTools.format_size(file[:size])}#{percent}, rows #{progress[:rows_processed]}, tables #{progress[:tables_processed]}, elapsed #{DumpTools.format_elapsed(progress[:elapsed])}"
+        when :file_complete
+          file = progress[:current_file]
+          @output.puts "Finished #{file[:name]}: rows #{progress[:rows_processed]}, tables #{progress[:tables_processed]}"
+        when :complete
+          @output.puts "Conversion output size: #{DumpTools.format_size(progress[:bytes_written])}"
+        end
+      end
     end
 
     def setup_converter(customer)
@@ -415,8 +534,8 @@ module SiloMigrate
             @output.puts retry_error.message
             return unless confirm?("Try an alternate converter repository URL?", default: false)
 
-      repo = ask("Alternate repository URL").to_s.strip
-      return if repo.empty?
+            repo = ask("Alternate repository URL").to_s.strip
+            return if repo.empty?
 
             @project_service.setup_converter(customer, repo: repo)
           end
@@ -438,12 +557,59 @@ module SiloMigrate
       end
     end
 
-    def confirm_port_conflicts(customer, conflicts)
+    def start_services_with_recovery(customer, profile, wait_for_health: false)
+      attempts = 0
+      loop do
+        recovery = nil
+        begin
+          @project_service.start(
+            customer,
+            profile: profile,
+            wait_for_health: wait_for_health,
+            on_port_conflict: proc do |conflicts|
+              recovery = resolve_port_conflicts(customer, conflicts)
+              recovery == :force
+            end
+          )
+          return true
+        rescue UsageError => e
+          if recovery == :retry && attempts.zero?
+            attempts += 1
+            next
+          end
+
+          @output.puts "[WARN] #{e.message}"
+          return false
+        end
+      end
+    end
+
+    def resolve_port_conflicts(customer, conflicts)
       @output.puts "\n[WARN] The following configured ports appear to be in use:"
       conflicts.each { |entry| @output.puts "  - Port #{entry[:port]} (#{entry[:service]})" }
-      @output.puts "To recover, stop the conflicting service or edit config.env and run:"
-      @output.puts "  silo-migrate regenerate #{customer}"
-      confirm?("Continue anyway?", default: false)
+      @output.puts "Docker cannot start these database services until the host ports are free or changed."
+      choice = select(
+        "Port conflict recovery",
+        {
+          "Use another available port" => :change_port,
+          "Cancel start/import" => :cancel,
+          "Force start anyway" => :force
+        }
+      )
+      return :force if choice == :force
+      return :cancel if choice == :cancel
+
+      used_ports = Project.load_config(customer, env_for_project).values_at("INITIAL_PORT", "FINAL_PORT").compact.map(&:to_i).to_set
+      conflicts.each do |entry|
+        phase = entry[:service].sub("-db", "")
+        used_ports.delete(entry[:port].to_i)
+        new_port = @project_service.available_port(entry[:port].to_i + 1, avoid: used_ports)
+        @project_service.update_phase_port(customer, phase, new_port)
+        used_ports << new_port
+        @output.puts "  #{entry[:service]} will use port #{new_port}."
+      end
+      @output.puts "Retrying start with updated ports..."
+      :retry
     end
 
     def dump_files(customer, phase)
@@ -451,11 +617,101 @@ module SiloMigrate
       (Dir[File.join(dir, "*.sql")] + Dir[File.join(dir, "*.sql.gz")]).select { |path| File.file?(path) }.sort
     end
 
+    def select_dump_for_import(customer, phase)
+      dumps = dump_files(customer, phase)
+      return nil if dumps.empty?
+      return dumps.first if dumps.one?
+
+      choices = dumps.to_h { |path| [dump_label(path), path] }
+      choice = select("Select #{phase} dump to import", choices, allow_back: true)
+      choice == BACK ? nil : choice
+    end
+
+    def show_existing_dumps(phase, dumps)
+      if dumps.one?
+        @output.puts "\nExisting #{phase} dump found: #{dump_label(dumps.first)}"
+        return
+      end
+
+      @output.puts "\nExisting #{phase} dumps found:"
+      dumps.each { |path| @output.puts "  - #{dump_label(path)}" }
+    end
+
+    def show_import_target(phase, dump_path)
+      @output.puts "\nImport target:"
+      @output.puts "  Phase: #{phase}"
+      @output.puts "  Dump: #{File.basename(dump_path)}"
+      @output.puts "  Path: #{dump_path}"
+      @output.puts "  Size: #{DumpTools.format_size(File.size(dump_path))}"
+    end
+
+    def dump_label(path)
+      "#{File.basename(path)} (#{DumpTools.format_size(File.size(path))})"
+    end
+
+    def import_status(customer)
+      imports = %w[initial final].map do |phase|
+        "#{phase} imported" if import_marker_valid?(customer, phase)
+      end.compact
+      imports.empty? ? "none" : imports.join(", ")
+    end
+
+    def phase_imported?(customer, phase)
+      import_marker_valid?(customer, phase)
+    end
+
+    def import_marker_valid?(customer, phase)
+      marker = read_import_marker(customer, phase)
+      return false unless marker
+
+      dump = File.join(@project_service.project_path(customer), "dumps", phase, marker.fetch("file", ""))
+      File.file?(dump) && File.size(dump) == marker.fetch("size", -1).to_i
+    rescue KeyError
+      false
+    end
+
+    def write_import_marker(customer, phase, dump_path)
+      config = Project.load_config(customer, env_for_project)
+      marker = {
+        file: File.basename(dump_path),
+        size: File.size(dump_path),
+        imported_at: Time.now.iso8601,
+        db_type: phase == "final" ? config["FINAL_DB_TYPE"] : config["INITIAL_DB_TYPE"],
+        port: phase == "final" ? config["FINAL_PORT"] : config["INITIAL_PORT"]
+      }
+      Project.atomic_write(import_marker_path(customer, phase), JSON.pretty_generate(marker) + "\n")
+    end
+
+    def clear_import_marker(customer, phase)
+      FileUtils.rm_f(import_marker_path(customer, phase))
+    end
+
+    def read_import_marker(customer, phase)
+      path = import_marker_path(customer, phase)
+      return nil unless File.exist?(path)
+
+      JSON.parse(File.read(path))
+    rescue JSON::ParserError
+      nil
+    end
+
+    def import_marker_path(customer, phase)
+      File.join(@project_service.project_path(customer), "dumps", phase, ".imported.json")
+    end
+
     def schema_bundle_status(customer)
       phases = %w[initial final].select do |phase|
-        File.exist?(File.join(@project_service.project_path(customer), "schema", phase, "summary.json"))
+        schema_bundle_present?(customer, phase)
       end
       phases.empty? ? "none" : phases.join(", ")
+    end
+
+    def schema_bundle_present?(customer, phase)
+      File.exist?(File.join(@project_service.project_path(customer), "schema", phase, "summary.json"))
+    end
+
+    def converter_setup?(customer)
+      Dir.exist?(File.join(@project_service.project_path(customer), "discourse-converters"))
     end
 
     def env_for_project

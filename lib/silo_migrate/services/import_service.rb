@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "set"
+require "rbconfig"
 require "zlib"
 
 module SiloMigrate
@@ -9,6 +10,8 @@ module SiloMigrate
       CHUNK_SIZE = 1024 * 1024
       PROGRESS_BYTE_INTERVAL = 4 * 1024 * 1024
       PROGRESS_TIME_INTERVAL = 0.5
+      LARGE_IMPORT_BYTES = 1024 * 1024 * 1024
+      XML_CONVERTED_MARKER = "-- XML dumps are generated in autocommit mode"
 
       def initialize(runtime: Runtime::Docker.new, env: ENV, output: $stdout)
         Runtime::Contract.assert_implemented!(runtime)
@@ -38,6 +41,21 @@ module SiloMigrate
         container_name = "#{customer}_#{phase}_#{db_type}"
         raise UsageError, "Container #{container_name} is not running. Start it first." unless @runtime.container_running?(container_name)
 
+        preflight = ImportPreflight.new(
+          runtime: @runtime,
+          env: @env,
+          output: @output,
+          customer: customer,
+          phase: phase,
+          db_type: db_type,
+          db_name: db_name,
+          password: password,
+          container_name: container_name,
+          dump_path: dump_path,
+          options: options
+        )
+        preflight.run unless options[:skip_preflight]
+
         needs_collation_fix = db_type == "mariadb" && options[:fix_collations] != false && SQLTools.detect_mysql8_collations(dump_path)[:has_incompatible_collations]
         cmd = @runtime.exec_import_command(container_name, db_type, db_name, password, max_packet: max_packet, disable_keys: fast)
         start_time = Time.now
@@ -54,7 +72,7 @@ module SiloMigrate
         reporter.start if report_progress
         result = stream_dump_to_runtime(cmd, dump_path, needs_collation_fix, excluded_tables(options[:exclude_tables]), progress_callback)
         elapsed = Time.now - start_time
-        raise UsageError, "Import failed (exit code #{result.status}): #{result.stderr.empty? ? result.stdout : result.stderr}" unless result.success?
+        raise UsageError, failure_message(result, dump_path) unless result.success?
 
         reporter.finish(elapsed) if report_progress
         @output.puts "\n[OK] Dump imported successfully"
@@ -184,6 +202,293 @@ module SiloMigrate
         proc do |stats|
           custom_callback.call(stats)
           reporter.tick(stats)
+        end
+      end
+
+      def failure_message(result, dump_path)
+        output = result.stderr.empty? ? result.stdout : result.stderr
+        lines = ["Import failed (exit code #{result.status}): #{output}"]
+        diagnostic = ImportFailureDiagnostic.new(dump_path, output).summary
+        lines.concat(diagnostic) if diagnostic.any?
+        lines.join("\n")
+      end
+
+      class ImportPreflight
+        MYSQL_VARIABLES = %w[
+          innodb_flush_method
+          innodb_use_native_aio
+          innodb_flush_log_at_trx_commit
+        ].freeze
+
+        def initialize(runtime:, env:, output:, customer:, phase:, db_type:, db_name:, password:, container_name:, dump_path:, options:)
+          @runtime = runtime
+          @env = env
+          @output = output
+          @customer = customer
+          @phase = phase
+          @db_type = db_type
+          @db_name = db_name
+          @password = password
+          @container_name = container_name
+          @dump_path = dump_path
+          @options = options
+        end
+
+        def run
+          return unless mysql_family?
+
+          metadata = {
+            host_os: host_os,
+            docker_desktop: docker_desktop?,
+            dump_size: File.size(@dump_path),
+            xml_converted: xml_converted_dump?
+          }
+          variables = mysql_variables
+          disk = container_disk_free
+          print_preflight(metadata, variables, disk)
+          return unless block_unsafe_macos_mariadb?(metadata, variables)
+
+          raise UsageError, unsafe_macos_message(variables)
+        end
+
+        private
+
+        def mysql_family?
+          %w[mysql mariadb].include?(@db_type)
+        end
+
+        def macos?
+          host_os.match?(/darwin/i)
+        end
+
+        def host_os
+          (@env["SILO_MIGRATE_HOST_OS"] || RbConfig::CONFIG["host_os"]).to_s
+        end
+
+        def docker_desktop?
+          return @runtime.docker_desktop? if @runtime.respond_to?(:docker_desktop?)
+
+          macos?
+        end
+
+        def large_import?(size)
+          size >= large_import_threshold
+        end
+
+        def large_import_threshold
+          Integer(@env.fetch("SILO_MIGRATE_LARGE_IMPORT_BYTES", LARGE_IMPORT_BYTES))
+        rescue ArgumentError
+          LARGE_IMPORT_BYTES
+        end
+
+        def xml_converted_dump?
+          DumpHeaderScanner.contains?(@dump_path, XML_CONVERTED_MARKER)
+        end
+
+        def mysql_variables
+          return {} unless @runtime.respond_to?(:mysql_variables)
+
+          @runtime.mysql_variables(@container_name, @db_type, @db_name, @password, MYSQL_VARIABLES)
+        rescue UsageError
+          {}
+        end
+
+        def container_disk_free
+          return {} unless @runtime.respond_to?(:container_disk_free)
+
+          @runtime.container_disk_free(@container_name, ["/var/lib/mysql", "/tmp"])
+        rescue UsageError
+          {}
+        end
+
+        def print_preflight(metadata, variables, disk)
+          @output.puts "Import preflight:"
+          @output.puts "  Host OS: #{metadata[:host_os]}"
+          @output.puts "  Docker Desktop: #{metadata[:docker_desktop] ? 'yes' : 'no'}"
+          @output.puts "  DB type: #{@db_type}"
+          @output.puts "  Dump size: #{DumpTools.format_size(metadata[:dump_size])}"
+          @output.puts "  XML-converted dump: #{metadata[:xml_converted] ? 'yes' : 'no'}"
+          if variables.any?
+            @output.puts "  InnoDB: innodb_flush_method=#{variables['innodb_flush_method'] || 'unknown'}, innodb_use_native_aio=#{variables['innodb_use_native_aio'] || 'unknown'}, innodb_flush_log_at_trx_commit=#{variables['innodb_flush_log_at_trx_commit'] || 'unknown'}"
+          end
+          disk.each do |path, bytes|
+            @output.puts "  Free space #{path}: #{DumpTools.format_size(bytes)}"
+          end
+          print_macos_warning(metadata) if macos_warning?(metadata)
+        end
+
+        def macos_warning?(metadata)
+          @db_type == "mariadb" &&
+            macos? &&
+            metadata[:docker_desktop] &&
+            large_import?(metadata[:dump_size])
+        end
+
+        def print_macos_warning(metadata)
+          qualifier = metadata[:xml_converted] ? " XML-converted" : ""
+          @output.puts "[WARN] Large#{qualifier} MariaDB imports on macOS Docker Desktop can fail during InnoDB commit/fsync."
+          @output.puts "[WARN] Linux is the preferred path for multi-GB imports if this failure repeats."
+        end
+
+        def block_unsafe_macos_mariadb?(metadata, variables)
+          return false unless macos_warning?(metadata)
+
+          unsafe_flush_method?(variables["innodb_flush_method"]) || unsafe_native_aio?(variables["innodb_use_native_aio"])
+        end
+
+        def unsafe_flush_method?(value)
+          !value.to_s.empty? && value.to_s.downcase != "fsync"
+        end
+
+        def unsafe_native_aio?(value)
+          normalized = value.to_s.downcase
+          !normalized.empty? && !%w[off 0 false no].include?(normalized)
+        end
+
+        def unsafe_macos_message(variables)
+          <<~MESSAGE.chomp
+            Unsafe MariaDB InnoDB settings for a large macOS Docker Desktop import.
+            Current values: innodb_flush_method=#{variables['innodb_flush_method'] || 'unknown'}, innodb_use_native_aio=#{variables['innodb_use_native_aio'] || 'unknown'}.
+
+            Regenerate compose with safer DB settings:
+              silo-migrate regenerate #{@customer}
+            Reset the #{@phase} DB container so the new settings apply:
+              silo-migrate replace-dump #{@customer} #{@phase} --yes
+            Start the DB again:
+              silo-migrate start #{@customer} --profile #{@phase}-db --wait
+            Retry the import:
+              silo-migrate import-dump #{@customer} #{@phase} --file #{File.basename(@dump_path)}
+          MESSAGE
+        end
+      end
+
+      class DumpHeaderScanner
+        HEADER_BYTES = 1024 * 1024
+
+        def self.contains?(path, needle)
+          new(path).contains?(needle)
+        end
+
+        def initialize(path)
+          @path = path
+        end
+
+        def contains?(needle)
+          content = +""
+          open_reader do |reader|
+            content = reader.read(HEADER_BYTES).to_s
+          end
+          content.include?(needle)
+        end
+
+        private
+
+        def open_reader(&block)
+          if DumpTools.gzip_file?(@path)
+            Zlib::GzipReader.open(@path.to_s, &block)
+          else
+            File.open(@path, "rb", &block)
+          end
+        end
+      end
+
+      class ImportFailureDiagnostic
+        ERROR_LINE_PATTERN = /ERROR\s+1180\b.*?\bat line\s+(\d+)/i
+
+        def initialize(path, output)
+          @path = path
+          @output = output.to_s
+        end
+
+        def summary
+          line_number = error_line_number
+          return [] unless line_number
+
+          statement = SQLStatementScanner.new(@path).statement_at(line_number)
+          lines = ["Import failure diagnostics:"]
+          lines << "  Reported SQL line: #{line_number}"
+          lines << "  Statement table: #{statement[:table] || 'unknown'}"
+          lines << "  Statement lines: #{statement[:start_line] || 'unknown'}-#{statement[:end_line] || 'unknown'}"
+          lines << "  Statement rows: #{statement[:row_count] || 0}"
+          lines << "  Statement size: #{DumpTools.format_size(statement[:bytes] || 0)}"
+          lines << "  Dump transaction markers: #{statement[:dump_transaction_markers] ? 'yes' : 'no'}"
+          if @output.match?(/during\s+COMMIT/i) && @output.match?(/Operation not permitted|EPERM/i) && !statement[:dump_transaction_markers]
+            lines << "  Recommendation: this dump is transaction-free; if MariaDB still reports OS EPERM during COMMIT, retry the same import on Linux."
+          end
+          lines
+        end
+
+        private
+
+        def error_line_number
+          match = @output.match(ERROR_LINE_PATTERN)
+          match && match[1].to_i
+        end
+      end
+
+      class SQLStatementScanner
+        TRANSACTION_MARKER = /\b(?:START\s+TRANSACTION|BEGIN|COMMIT)\b|SET\s+AUTOCOMMIT\s*=\s*0/i
+
+        def initialize(path)
+          @path = path
+        end
+
+        def statement_at(line_number)
+          current = nil
+          selected = nil
+          dump_transaction_markers = false
+
+          DumpTools.open_text(@path) do |file|
+            file.each_line.with_index(1) do |line, number|
+              dump_transaction_markers ||= line.match?(TRANSACTION_MARKER)
+              current ||= new_statement(number)
+              update_statement(current, line, number)
+
+              if selected.nil? && number >= line_number && statement_complete?(line)
+                selected = current
+              elsif selected.nil? && current[:start_line] <= line_number && number >= line_number
+                selected = current
+              end
+
+              current = nil if statement_complete?(line)
+            end
+          end
+
+          selected ||= current || new_statement(line_number)
+          selected.merge(dump_transaction_markers: dump_transaction_markers)
+        end
+
+        private
+
+        def new_statement(line_number)
+          { start_line: line_number, end_line: line_number, table: nil, row_count: 0, bytes: 0, insert: false }
+        end
+
+        def update_statement(statement, line, line_number)
+          statement[:end_line] = line_number
+          statement[:bytes] += line.bytesize
+          statement[:table] ||= TableNameDetector.table_name(line)
+          statement[:insert] ||= line.match?(/\A\s*INSERT\s+(?:IGNORE\s+)?INTO\b/i)
+          statement[:row_count] += count_insert_rows(line) if statement[:insert]
+        end
+
+        def count_insert_rows(line)
+          if line.match?(/\A\s*INSERT\b/i)
+            values_index = line =~ /\bVALUES\b/i
+            return 0 unless values_index
+
+            return count_value_tuple_starts(line[(values_index + 6)..])
+          end
+
+          count_value_tuple_starts(line)
+        end
+
+        def count_value_tuple_starts(text)
+          text.scan(/(?:\A|,)\s*\(/).length
+        end
+
+        def statement_complete?(line)
+          line.match?(/;\s*\z/)
         end
       end
 

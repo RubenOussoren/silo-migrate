@@ -129,6 +129,7 @@ bin/silo-migrate replace-dump acme initial --yes
 bin/silo-migrate analyze-dump /path/to/dump.sql.gz
 bin/silo-migrate preprocess-dump /path/to/dump.sql.gz -o /path/to/fixed.sql.gz
 bin/silo-migrate convert-xml /path/to/xml_dumps -c acme --phase initial --compress
+bin/silo-migrate convert-xml /path/to/xml_dumps -c acme --phase initial --batch-size 250
 ```
 
 Useful import options:
@@ -143,6 +144,18 @@ bin/silo-migrate import-dump acme initial --no-fix-collations
 
 `import-dump` streams dump content into the database container. Table exclusion
 filters matching table DDL/DML while streaming.
+
+XML conversion writes import-friendly SQL without wrapping the dump in a single
+large transaction. The default XML insert batch size is `1000`; lowering
+`--batch-size` can help isolate a failing statement, but it may not fix Docker
+Desktop storage or InnoDB fsync errors.
+
+For multi-GB MariaDB imports on macOS Docker Desktop, `import-dump` runs a
+preflight that reports host/runtime details, key InnoDB variables, and container
+free space. If unsafe InnoDB settings are active, regenerate compose, reset the
+DB container, restart it, and retry the import. If a transaction-free
+XML-converted dump still fails with `ERROR 1180 ... during COMMIT` and OS
+`EPERM`, retry the same dump on Linux.
 
 ### Schema and AI-Safe Artifacts
 

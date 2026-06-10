@@ -76,6 +76,86 @@ class CLITest < SiloMigrateTest
     end
   end
 
+  def test_import_preflight_queries_mysql_variables_and_disk_on_default_runtime
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      service = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new).init("acme", db_type: "mariadb")
+      dump = File.join(SiloMigrate::Project.project_path("acme", env), "dumps", "initial", "dump.sql")
+      write(dump, "-- MySQL dump\nCREATE TABLE users (id int);\n")
+
+      service.import_dump("acme", "initial", file: "dump.sql", progress_callback: proc { |_stats| })
+
+      assert runtime.operations.any? { |operation| operation.first == :mysql_variables }
+      assert runtime.operations.any? { |operation| operation.first == :container_disk_free }
+      assert_includes out.string, "Import preflight:"
+      assert_includes out.string, "innodb_flush_method=fsync"
+    end
+  end
+
+  def test_macos_docker_desktop_large_mariadb_preflight_blocks_unsafe_innodb_settings
+    with_tmp_base do |_dir, env|
+      env["SILO_MIGRATE_HOST_OS"] = "darwin"
+      env["SILO_MIGRATE_LARGE_IMPORT_BYTES"] = "1"
+      runtime = SiloMigrate::Runtime::Fake.new
+      runtime.docker_desktop_result = true
+      runtime.mysql_variables_result = {
+        "innodb_flush_method" => "O_DIRECT",
+        "innodb_use_native_aio" => "ON",
+        "innodb_flush_log_at_trx_commit" => "0"
+      }
+      out = StringIO.new
+      service = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new).init("acme", db_type: "mariadb")
+      dump = File.join(SiloMigrate::Project.project_path("acme", env), "dumps", "initial", "dump.sql")
+      write(dump, "-- XML dumps are generated in autocommit mode\nCREATE TABLE users (id int);\n")
+
+      error = assert_raises(SiloMigrate::UsageError) do
+        service.import_dump("acme", "initial", file: "dump.sql", progress_callback: proc { |_stats| })
+      end
+
+      assert_includes out.string, "Large XML-converted MariaDB imports on macOS Docker Desktop"
+      assert_includes error.message, "Unsafe MariaDB InnoDB settings"
+      assert_includes error.message, "silo-migrate regenerate acme"
+      assert_includes error.message, "silo-migrate replace-dump acme initial --yes"
+      assert_includes error.message, "silo-migrate start acme --profile initial-db --wait"
+      assert_includes error.message, "silo-migrate import-dump acme initial --file dump.sql"
+      refute runtime.operations.any? { |operation| operation.first == :run_with_stdin }
+    end
+  end
+
+  def test_import_failure_1180_reports_statement_diagnostics_without_row_values
+    with_tmp_base do |_dir, env|
+      runtime = FailingImportRuntime.new("ERROR 1180 (HY000) at line 3: Got error 1 \"Operation not permitted\" during COMMIT\n")
+      out = StringIO.new
+      service = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new).init("acme", db_type: "mariadb")
+      dump = File.join(SiloMigrate::Project.project_path("acme", env), "dumps", "initial", "dump.sql")
+      write(dump, <<~SQL)
+        -- XML dumps are generated in autocommit mode
+        CREATE TABLE `users` (`id` int, `name` varchar(255));
+        INSERT INTO `users` (`id`, `name`) VALUES
+          (1, 'synthetic-secret-one'),
+          (2, 'synthetic-secret-two');
+      SQL
+
+      error = assert_raises(SiloMigrate::UsageError) do
+        service.import_dump("acme", "initial", file: "dump.sql", progress_callback: proc { |_stats| })
+      end
+
+      assert_includes error.message, "Import failure diagnostics:"
+      assert_includes error.message, "Reported SQL line: 3"
+      assert_includes error.message, "Statement table: users"
+      assert_includes error.message, "Statement lines: 3-5"
+      assert_includes error.message, "Statement rows: 2"
+      assert_includes error.message, "Dump transaction markers: no"
+      assert_includes error.message, "retry the same import on Linux"
+      refute_includes error.message, "synthetic-secret-one"
+      refute_includes error.message, "synthetic-secret-two"
+    end
+  end
+
   def test_import_uses_chunked_path_for_gzip_dump_without_transforms
     with_tmp_base do |_dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
@@ -662,7 +742,104 @@ class CLITest < SiloMigrateTest
       assert_includes runtime.last_stdin, "CREATE TABLE users"
       assert_equal 1, out.string.scan("Detected source format: sql").length
       refute_includes out.string, "Detected dump format: sql"
+      assert_includes out.string, "Import target:"
+      assert_includes out.string, "Dump: dump.sql"
+      assert_includes out.string, "Path: #{staged}"
       assert File.exist?(File.join(project.project_path("acme"), "schema", "initial", "summary.json"))
+      marker = File.join(project.project_path("acme"), "dumps", "initial", ".imported.json")
+      assert File.exist?(marker)
+    end
+  end
+
+  def test_guided_import_requires_selection_when_multiple_dumps_are_staged
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme", db_type: "mariadb")
+      first = write(File.join(project.project_path("acme"), "dumps", "initial", "first.sql"), "-- MySQL dump\nCREATE TABLE first_table (id int);\n")
+      second = write(File.join(project.project_path("acme"), "dumps", "initial", "second.sql"), "-- MySQL dump\nCREATE TABLE second_table (id int);\n")
+      selected_label = "#{File.basename(second)} (#{SiloMigrate::DumpTools.format_size(File.size(second))})"
+      prompt = FakePrompt.new(["Start initial DB and import dump", selected_label, "y", "n", "n", "n"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      assert_includes prompt.selected, "Select initial dump to import"
+      assert_includes out.string, "Dump: second.sql"
+      assert_includes out.string, "Path: #{second}"
+      refute_includes out.string, "Path: #{first}\n"
+      assert_includes runtime.last_stdin, "CREATE TABLE second_table"
+    end
+  end
+
+  def test_guided_import_port_conflict_cancel_does_not_start_docker
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme", db_type: "mariadb", initial_port: 3310)
+      runtime.running_containers["acme_initial_mariadb"] = false
+      write(File.join(project.project_path("acme"), "dumps", "initial", "dump.sql"), "-- MySQL dump\nCREATE TABLE users (id int);\n")
+      prompt = FakePrompt.new(["Start initial DB and import dump", "y", "Cancel start/import"])
+
+      project.stub(:port_listening?, ->(_port) { true }) do
+        SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+      end
+
+      refute runtime.commands.any? { |command| command[0] == :compose && command[2].include?("up") }
+      refute File.exist?(File.join(project.project_path("acme"), "dumps", "initial", ".imported.json"))
+      assert_includes out.string, "Docker cannot start these database services"
+      assert_includes out.string, "Start cancelled because configured port is in use"
+    end
+  end
+
+  def test_guided_import_port_conflict_can_change_port_and_retry
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme", db_type: "mariadb", initial_port: 3310)
+      runtime.running_containers["acme_initial_mariadb"] = false
+      write(File.join(project.project_path("acme"), "dumps", "initial", "dump.sql"), "-- MySQL dump\nCREATE TABLE users (id int);\n")
+      prompt = FakePrompt.new(["Start initial DB and import dump", "y", "Use another available port", "n", "n"])
+
+      project.stub(:port_listening?, ->(port) { port.to_i == 3310 }) do
+        project.stub(:available_port, ->(_preferred, avoid: []) { 3311 }) do
+          SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+        end
+      end
+
+      config = SiloMigrate::Project.load_config("acme", env)
+      assert_equal "3311", config["INITIAL_PORT"]
+      assert runtime.commands.any? { |command| command[0] == :compose && command[2].include?("up") }
+      assert File.exist?(File.join(project.project_path("acme"), "dumps", "initial", ".imported.json"))
+      assert_includes out.string, "Retrying start with updated ports"
+      assert_includes out.string, "Dump imported successfully"
+    end
+  end
+
+  def test_guided_import_failure_skips_marker_and_schema_bundle
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = FailingImportService.new
+      schema = SiloMigrate::Services::SchemaService.new(runtime: runtime, env: env, output: out)
+      project.init("acme", db_type: "mariadb")
+      dump = write(File.join(project.project_path("acme"), "dumps", "initial", "dump.sql"), "-- MySQL dump\nCREATE TABLE users (id int);\n")
+      prompt = FakePrompt.new(["Start initial DB and import dump", "y", "n", "n"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, schema_service: schema, prompt: prompt, output: out).run("acme")
+
+      refute File.exist?(File.join(project.project_path("acme"), "dumps", "initial", ".imported.json"))
+      refute File.exist?(File.join(project.project_path("acme"), "schema", "initial", "summary.json"))
+      assert_includes out.string, "Dump: dump.sql"
+      assert_includes out.string, "Path: #{dump}"
+      assert_includes out.string, "[WARN] synthetic import failure"
+      assert_includes out.string, "[WARN] Import did not complete; reset DB data before retrying this dump."
     end
   end
 
@@ -712,6 +889,132 @@ class CLITest < SiloMigrateTest
       SiloMigrate::Interactive.new(project_service: project, import_service: import, schema_service: schema, prompt: prompt, output: out).run("acme")
 
       assert File.exist?(File.join(project.project_path("acme"), "schema", "initial", "summary.json"))
+    end
+  end
+
+  def test_guided_advanced_convert_xml_shows_progress_and_stages_dump
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_dir = File.join(dir, "xml")
+      write(File.join(xml_dir, "users.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump>
+          <database name="forum">
+            <table_structure name="users"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+            <table_data name="users"><row><field name="id">1</field></row></table_data>
+          </database>
+        </mysqldump>
+      XML
+      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      staged = File.join(project.project_path("acme"), "dumps", "initial", "combined.sql.gz")
+      assert File.exist?(staged)
+      assert_includes out.string, "Converting XML dump..."
+      assert_includes out.string, "XML files found:"
+      assert_includes out.string, "Files to process: 1"
+      assert_includes out.string, "Processing 1/1: users.xml"
+      assert_includes out.string, "Conversion output size:"
+      assert_includes out.string, "[OK] XML converted and staged"
+      assert_includes out.string, "[OK] XML converted:"
+    end
+  end
+
+  def test_guided_advanced_convert_xml_can_exclude_files_by_base_name
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_dir = File.join(dir, "xml")
+      write(File.join(xml_dir, "users.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump>
+          <database name="forum">
+            <table_structure name="users"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+            <table_data name="users"><row><field name="id">1</field></row></table_data>
+          </database>
+        </mysqldump>
+      XML
+      write(File.join(xml_dir, "email_tracking2.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump>
+          <database name="forum">
+            <table_structure name="email_tracking"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+            <table_data name="email_tracking"><row><field name="id">1</field></row></table_data>
+          </database>
+        </mysqldump>
+      XML
+      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir, "y", "email_tracking2"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      staged = File.join(project.project_path("acme"), "dumps", "initial", "combined.sql.gz")
+      sql = Zlib::GzipReader.open(staged, &:read)
+      assert_includes sql, "CREATE TABLE `users`"
+      refute_includes sql, "email_tracking"
+      assert_includes out.string, "Files found: 2"
+      assert_includes out.string, "Files to skip: 1"
+      assert_includes out.string, "- email_tracking2.xml"
+      assert_includes out.string, "Files to process: 1"
+      assert_includes prompt.asked, "Exclude any XML files from conversion? [y/N]"
+      assert_includes prompt.asked, "XML files to exclude (comma-separated, names or base names)"
+    end
+  end
+
+  def test_guided_advanced_convert_xml_warns_when_all_files_are_excluded
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_dir = File.join(dir, "xml")
+      write(File.join(xml_dir, "users.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump><database name="forum"></database></mysqldump>
+      XML
+      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir, "y", "users"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      staged = File.join(project.project_path("acme"), "dumps", "initial", "combined.sql.gz")
+      refute File.exist?(staged)
+      assert_includes out.string, "Files found: 1"
+      assert_includes out.string, "Files to skip: 1"
+      assert_includes out.string, "No XML files to process after filtering"
+      refute_includes out.string, "[OK] XML converted:"
+    end
+  end
+
+  def test_guided_advanced_convert_xml_can_keep_existing_output
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_dir = File.join(dir, "xml")
+      write(File.join(xml_dir, "users.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump><database name="forum"></database></mysqldump>
+      XML
+      staged = File.join(project.project_path("acme"), "dumps", "initial", "combined.sql.gz")
+      gzip_write(staged, "existing")
+      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir, "n"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      assert_equal "existing", Zlib::GzipReader.open(staged, &:read)
+      assert_includes prompt.asked, "Replace existing converted dump combined.sql.gz? [y/N]"
+      assert_includes out.string, "existing dump left unchanged"
+      refute_includes out.string, "Converting XML dump..."
     end
   end
 
@@ -1062,6 +1365,28 @@ class CLITest < SiloMigrateTest
   class FailingSchemaService
     def bundle(*)
       raise SiloMigrate::UsageError, "synthetic schema bundle failure"
+    end
+  end
+
+  class FailingImportService
+    def import_dump(*)
+      raise SiloMigrate::UsageError, "synthetic import failure"
+    end
+  end
+
+  class FailingImportRuntime < SiloMigrate::Runtime::Fake
+    def initialize(stderr)
+      super()
+      @stderr = stderr
+    end
+
+    def run_with_stdin(cmd, chdir: nil)
+      @operations << [:run_with_stdin, cmd, chdir]
+      sink = StringIO.new
+      yield sink
+      @last_stdin = sink.string
+      @commands << [:run_stream, cmd, chdir, @last_stdin.bytesize]
+      SiloMigrate::Runtime::CommandResult.new(success?: false, stdout: "", stderr: @stderr, status: 1)
     end
   end
 

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "fileutils"
+require "set"
 require "socket"
 
 module SiloMigrate
@@ -150,6 +151,51 @@ module SiloMigrate
         config = Project.load_config(customer, @env)
         @compose.generate(customer, config)
         @output.puts "[OK] Regenerated docker-compose.yml for #{customer}"
+      end
+
+      def update_phase_port(customer, phase, port)
+        config = Project.load_config(customer, @env)
+        port = Integer(port)
+        raise UsageError, "Port must be between 1 and 65535" unless port.between?(1, 65_535)
+
+        case phase
+        when "initial"
+          if config["FINAL_PORT"].to_s == port.to_s
+            raise UsageError, "Initial and final database ports cannot be the same (#{port})"
+          end
+          config["INITIAL_PORT"] = port.to_s
+          db_type = config["INITIAL_DB_TYPE"] || "mariadb"
+          db_name = config["INITIAL_DB_NAME"] || config["DB_NAME"] || "#{customer}_initial_db"
+          password = config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"] || DEFAULT_PASSWORD
+        when "final"
+          raise UsageError, "No final database configured for #{customer}" unless config["FINAL_DB_TYPE"]
+          if config["INITIAL_PORT"].to_s == port.to_s
+            raise UsageError, "Initial and final database ports cannot be the same (#{port})"
+          end
+          config["FINAL_PORT"] = port.to_s
+          db_type = config["FINAL_DB_TYPE"]
+          db_name = config["FINAL_DB_NAME"] || "#{customer}_final_db"
+          password = config["FINAL_DB_PASSWORD"] || config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"] || DEFAULT_PASSWORD
+        else
+          raise UsageError, "Unknown phase: #{phase}"
+        end
+
+        Project.save_config(customer, config, @env)
+        @compose.generate(customer, config)
+        generate_connection_readme(customer, phase, db_type, db_name, port, password)
+        @output.puts "[OK] Updated #{phase} database port to #{port} and regenerated docker-compose.yml"
+        port
+      end
+
+      def available_port(preferred, avoid: [])
+        port = Integer(preferred)
+        avoid = avoid.map(&:to_i).to_set
+        while port <= 65_535
+          return port if !avoid.include?(port) && port_available?(port)
+
+          port += 1
+        end
+        raise UsageError, "Could not find an available localhost port starting at #{preferred}"
       end
 
       def cleanup(customer, yes: false)
@@ -378,6 +424,14 @@ module SiloMigrate
       def port_listening?(port)
         socket = Socket.tcp("127.0.0.1", port, connect_timeout: 1)
         socket.close
+        true
+      rescue SystemCallError, IOError
+        false
+      end
+
+      def port_available?(port)
+        server = TCPServer.new("127.0.0.1", port)
+        server.close
         true
       rescue SystemCallError, IOError
         false

@@ -121,6 +121,33 @@ class ProjectTest < SiloMigrateTest
     end
   end
 
+  def test_update_phase_port_persists_config_and_regenerates_compose
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      service = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      service.init("acme", db_type: "mariadb", initial_port: 3310)
+
+      service.update_phase_port("acme", "initial", 3312)
+
+      config = SiloMigrate::Project.load_config("acme", env)
+      compose = File.read(File.join(service.project_path("acme"), "docker-compose.yml"))
+      assert_equal "3312", config["INITIAL_PORT"]
+      assert_includes compose, "127.0.0.1:3312:3306"
+      assert_includes out.string, "Updated initial database port to 3312"
+    end
+  end
+
+  def test_available_port_skips_listening_and_avoided_ports
+    with_tmp_base do |_dir, env|
+      service = SiloMigrate::Services::ProjectService.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: StringIO.new)
+
+      service.stub(:port_available?, ->(port) { port == 3313 }) do
+        assert_equal 3313, service.available_port(3310, avoid: [3312])
+      end
+    end
+  end
+
   def test_start_waits_for_database_health_when_requested
     with_tmp_base do |_dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
