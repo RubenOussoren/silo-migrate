@@ -45,6 +45,40 @@ class XMLToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_empty_values_in_nullable_unique_columns_become_null
+    xml = <<~UNIQUE_XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="accounts">
+            <field Field="id" Type="int" Null="NO" Key="PRI" Extra="auto_increment" />
+            <field Field="uuid" Type="char(36)" Null="YES" Key="UNI" />
+            <field Field="code" Type="varchar(10)" Null="NO" Key="UNI" />
+            <field Field="bio" Type="varchar(255)" Null="YES" />
+          </table_structure>
+          <table_data name="accounts">
+            <row><field name="id">1</field><field name="uuid"></field><field name="code"></field><field name="bio"></field></row>
+            <row><field name="id">2</field><field name="uuid"></field><field name="code">x1</field><field name="bio">hi</field></row>
+          </table_data>
+        </database>
+      </mysqldump>
+    UNIQUE_XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      output = File.join(dir, "dump.sql")
+      SiloMigrate::XMLToSQLConverter.new(verbose: false).convert(Pathname(input), Pathname(output))
+
+      sql = File.read(output)
+      assert_includes sql, "UNIQUE KEY `uk_uuid` (`uuid`)"
+      # Nullable unique column: empty values must become NULL so the unique
+      # index accepts repeated "absent" values. Non-unique nullable columns
+      # (bio) and NOT NULL unique columns (code) keep the '' behavior.
+      assert_includes sql, "(1, NULL, '', '')"
+      assert_includes sql, "(2, NULL, 'x1', 'hi')"
+    end
+  end
+
   def test_rejects_non_positive_batch_size
     error = assert_raises(SiloMigrate::UsageError) do
       SiloMigrate::XMLToSQLConverter.new(batch_size: 0, verbose: false)

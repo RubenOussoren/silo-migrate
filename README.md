@@ -19,7 +19,8 @@ practical end-to-end overview (capabilities, limits, happy paths, diagrams).
   hosts where it exists).
 - Generates Docker Compose services for initial DB, final DB, and converter
   containers.
-- Stages SQL dumps, tar archives containing SQL, and converted mysqldump XML.
+- Stages SQL dumps, tar archives containing SQL, converted mysqldump XML, and
+  converted JSON exports (generic relational shredding, e.g. Khoros API data).
 - Imports dumps into MariaDB, MySQL, or PostgreSQL while streaming data instead
   of loading full dumps into memory.
 - Exports source/final schema and AI-safe schema bundles.
@@ -115,7 +116,8 @@ Typical flow:
 
 1. Select or create a project.
 2. Configure the initial database.
-3. Stage a SQL/tar dump, or convert mysqldump XML into a staged SQL dump.
+3. Stage a SQL/tar dump, or convert mysqldump XML or JSON export files into a
+   staged SQL dump.
 4. Analyze the dump, suggest import options, and optionally exclude tables.
 5. Start the database, wait for health, and import with progress.
 6. Generate the initial schema bundle.
@@ -131,7 +133,8 @@ Submenus include `Back` where returning to the project menu is useful. Path
 prompts accept `back`, `b`, or `..`, and support tab completion in a normal
 terminal.
 
-Advanced actions expose direct service control, XML conversion, schema bundle
+Advanced actions expose direct service control, XML conversion, JSON
+conversion, schema bundle
 generation, converter execution, redacted summary generation, findings
 generation, fixture generation, regeneration, reset, cleanup, and status.
 
@@ -170,6 +173,9 @@ bin/silo-migrate analyze-dump /path/to/dump.sql.gz
 bin/silo-migrate preprocess-dump /path/to/dump.sql.gz -o /path/to/fixed.sql.gz
 bin/silo-migrate convert-xml /path/to/xml_dumps -c acme --phase initial --compress
 bin/silo-migrate convert-xml /path/to/xml_dumps -c acme --phase initial --batch-size 250
+bin/silo-migrate convert-json /path/to/json_exports -c acme --phase initial
+bin/silo-migrate convert-json /path/to/json_exports -c acme --schema-dir /path/to/schemas
+bin/silo-migrate convert-json /path/to/json_exports -c acme --recover-truncated
 ```
 
 Useful import options:
@@ -189,6 +195,26 @@ XML conversion writes import-friendly SQL without wrapping the dump in a single
 large transaction. The default XML insert batch size is `1000`; lowering
 `--batch-size` can help isolate a failing statement, but it may not fix Docker
 Desktop storage or InnoDB fsync errors.
+
+JSON conversion (`convert-json`) turns arbitrary JSON export files into the
+same import-friendly SQL via convention-based relational shredding: nested
+objects flatten into prefixed columns (`avatar.url` -> `avatar_url`), arrays
+become child tables keyed by `_sid`/`_parent_sid`/`_parent_id`/`_ordinal`, and
+GraphQL `edges/node` wrappers unwrap automatically. Files are streamed (never
+loaded whole), so GB-scale exports are fine. Column types are inferred from the
+data, or taken exactly from Draft-07 `*.schema.json` files via `--schema-dir`,
+which also carries `x-pii` annotations into column comments and a queryable
+`_json_meta` manifest table. See `silo-migrate help convert-json` for all
+flags (records path, table overrides, depth limits, raw JSON columns).
+Malformed or truncated JSON files produce a clear error naming the file and
+position (truncated exports are called out explicitly). `--recover-truncated`
+(or the guided-mode recovery prompt) keeps the complete records from a
+truncated file — the partial tail record is discarded and the recovered vs
+expected counts are reported as warnings — or exclude the file with
+`-X`/`--exclude-files`. Re-exporting the broken file remains the real fix.
+Maintainer-level design (module map, shredding conventions, type lattice,
+extension points) lives in the workspace `ARCHITECTURE.md` under
+"JSON-to-SQL Conversion Design".
 
 For multi-GB MariaDB imports on macOS Docker Desktop, `import-dump` runs a
 preflight that reports host/runtime details, key InnoDB variables, and container

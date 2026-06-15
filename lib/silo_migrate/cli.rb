@@ -8,7 +8,7 @@ module SiloMigrate
   class CLI
     COMMANDS = %w[
       interactive go init list status cleanup start stop regenerate import-dump replace-dump
-      analyze-dump preprocess-dump convert-xml stage-dump setup-converter add-final-db
+      analyze-dump preprocess-dump convert-xml convert-json stage-dump setup-converter add-final-db
       run-converter converter schema findings fixtures ai trusted doctor help
     ].freeze
 
@@ -88,6 +88,38 @@ module SiloMigrate
           -b, --batch-size SIZE      rows per INSERT batch (default 1000)
           --schema-only              emit CREATE TABLE statements only
           --compress                 gzip the output
+      HELP
+      "convert-json" => <<~HELP,
+        Usage: silo-migrate convert-json SOURCE [options]
+          -o, --output FILE          output SQL path (default: alongside source)
+          -c, --customer CUSTOMER    write into the customer's dumps directory
+          --phase PHASE              initial (default) or final (with --customer)
+          -t, --include-tables T1,T2 only convert these tables (a root table
+                                     includes its child tables automatically)
+          -x, --exclude-tables T1,T2 skip these tables (a root table excludes
+                                     its child tables automatically)
+          -f, --include-files F1,F2  only convert these JSON files
+          -X, --exclude-files F1,F2  skip these JSON files
+          -b, --batch-size SIZE      rows per INSERT batch (default 1000)
+          --schema-only              emit CREATE TABLE statements only
+          --compress                 gzip the output
+          --schema-dir DIR           use FILE.schema.json (Draft-07) files from DIR
+                                     to drive column types, NULLability, and x-pii
+                                     annotations instead of inferring them
+          --records-path KEY         top-level key holding the records array
+                                     (default: data, with auto-detection fallback)
+          --table NAME               root table name override (single-file input)
+          --max-depth N              flatten depth before storing raw JSON (default 5)
+          --json-columns P1,P2       dotted record paths kept as raw JSON columns
+          --no-graphql-unwrap        keep edges/node wrappers as literal structure
+          --raw-dates                keep ISO-8601 strings as text, not DATETIME
+          --no-meta-table            do not emit the _json_meta PII manifest table
+          --recover-truncated        keep the complete records from truncated files
+                                     (the partial tail record is discarded; recovered
+                                     counts are reported as warnings)
+
+        Nested objects flatten into prefixed columns (avatar.url -> avatar_url);
+        arrays become child tables with _sid/_parent_sid/_parent_id/_ordinal keys.
       HELP
       "stage-dump" => <<~HELP,
         Usage: silo-migrate stage-dump CUSTOMER PHASE SOURCE [--sql-file FILE]
@@ -211,6 +243,7 @@ module SiloMigrate
       when "analyze-dump" then analyze_dump(argv)
       when "preprocess-dump" then preprocess_dump(argv)
       when "convert-xml" then convert_xml(argv)
+      when "convert-json" then convert_json(argv)
       when "stage-dump" then stage_dump(argv)
       when "setup-converter" then setup_converter(argv)
       when "add-final-db" then add_final_db(argv)
@@ -264,6 +297,7 @@ module SiloMigrate
           analyze-dump DUMP_FILE       Analyze SQL dump tables and source type
           preprocess-dump DUMP_FILE    Fix generated-column INSERT values
           convert-xml SOURCE           Convert mysqldump XML to SQL
+          convert-json SOURCE          Convert JSON exports to SQL (generic shredding)
           stage-dump CUSTOMER PHASE SRC Copy/extract a dump into a project
           setup-converter CUSTOMER     Clone/setup discourse-converters (--bundle-install also builds/starts)
                                      Use --allow-ssh-prompt for passphrase-protected SSH keys
@@ -494,7 +528,7 @@ module SiloMigrate
         opts.on("--compress") { options[:compress] = true }
       end.parse!(argv)
       source = Pathname(required_existing_path(required_arg(argv, "SOURCE")))
-      output = convert_xml_output_path(source, options)
+      output = converted_output_path(source, options, input_ext: ".xml")
       XMLToSQLConverter.new(
         batch_size: options[:batch_size],
         include_tables: options[:include_tables],
@@ -502,6 +536,52 @@ module SiloMigrate
         include_files: options[:include_files],
         exclude_files: options[:exclude_files],
         schema_only: options[:schema_only],
+        verbose: true
+      ).convert(source, output)
+      @output.puts "\nTo import this dump, run:\n  silo-migrate import-dump #{options[:customer]} #{options[:phase]}" if options[:customer]
+    end
+
+    def convert_json(argv)
+      options = { phase: "initial", batch_size: 1000, schema_only: false, compress: false, max_depth: JSONToSQLConverter::DEFAULT_MAX_DEPTH, graphql_unwrap: true, raw_dates: false, meta_table: true }
+      OptionParser.new do |opts|
+        opts.on("-o", "--output FILE") { |value| options[:output] = value }
+        opts.on("-c", "--customer CUSTOMER") { |value| options[:customer] = value }
+        opts.on("--phase PHASE") { |value| options[:phase] = validate_phase(value) }
+        opts.on("-t", "--include-tables TABLES") { |value| options[:include_tables] = csv(value) }
+        opts.on("-x", "--exclude-tables TABLES") { |value| options[:exclude_tables] = csv(value) }
+        opts.on("-f", "--include-files FILES") { |value| options[:include_files] = csv(value) }
+        opts.on("-X", "--exclude-files FILES") { |value| options[:exclude_files] = csv(value) }
+        opts.on("-b", "--batch-size SIZE", Integer) { |value| options[:batch_size] = value }
+        opts.on("--schema-only") { options[:schema_only] = true }
+        opts.on("--compress") { options[:compress] = true }
+        opts.on("--schema-dir DIR") { |value| options[:schema_dir] = value }
+        opts.on("--records-path KEY") { |value| options[:records_path] = value }
+        opts.on("--table NAME") { |value| options[:table_name] = value }
+        opts.on("--max-depth N", Integer) { |value| options[:max_depth] = value }
+        opts.on("--json-columns PATHS") { |value| options[:json_columns] = csv(value) }
+        opts.on("--no-graphql-unwrap") { options[:graphql_unwrap] = false }
+        opts.on("--raw-dates") { options[:raw_dates] = true }
+        opts.on("--no-meta-table") { options[:meta_table] = false }
+        opts.on("--recover-truncated") { options[:recover_truncated] = true }
+      end.parse!(argv)
+      source = Pathname(required_existing_path(required_arg(argv, "SOURCE")))
+      output = converted_output_path(source, options, input_ext: ".json")
+      JSONToSQLConverter.new(
+        batch_size: options[:batch_size],
+        include_tables: options[:include_tables],
+        exclude_tables: options[:exclude_tables],
+        include_files: options[:include_files],
+        exclude_files: options[:exclude_files],
+        schema_only: options[:schema_only],
+        schema_dir: options[:schema_dir],
+        records_path: options[:records_path],
+        table_name: options[:table_name],
+        max_depth: options[:max_depth],
+        json_columns: options[:json_columns],
+        graphql_unwrap: options[:graphql_unwrap],
+        raw_dates: options[:raw_dates],
+        meta_table: options[:meta_table],
+        recover_truncated: options.fetch(:recover_truncated, false),
         verbose: true
       ).convert(source, output)
       @output.puts "\nTo import this dump, run:\n  silo-migrate import-dump #{options[:customer]} #{options[:phase]}" if options[:customer]
@@ -717,19 +797,19 @@ module SiloMigrate
       "#{path}_preprocessed"
     end
 
-    def convert_xml_output_path(source, options)
+    def converted_output_path(source, options, input_ext:)
       if options[:customer]
         dumps_dir = File.join(Project.project_path(options[:customer], @env), "dumps", options[:phase])
         raise UsageError, "Customer dumps directory not found: #{dumps_dir}\nRun 'silo-migrate init #{options[:customer]}' first to set up the project." unless Dir.exist?(dumps_dir)
 
-        base = source.file? ? source.basename.to_s.sub(/\.gz\z/, "").sub(/\.xml\z/, "") : "combined"
+        base = source.file? ? source.basename.to_s.sub(/\.gz\z/, "").sub(/#{Regexp.escape(input_ext)}\z/, "") : "combined"
         return Pathname(File.join(dumps_dir, "#{base}.sql#{options[:compress] ? '.gz' : ''}"))
       end
 
       path = if options[:output]
                Pathname(options[:output])
              elsif source.file?
-               source.dirname.join("#{source.basename.to_s.sub(/\.gz\z/, '').sub(/\.xml\z/, '')}.sql")
+               source.dirname.join("#{source.basename.to_s.sub(/\.gz\z/, '').sub(/#{Regexp.escape(input_ext)}\z/, '')}.sql")
              else
                source.join("combined.sql")
              end

@@ -507,8 +507,12 @@ module SiloMigrate
           lines << "  Statement rows: #{statement[:row_count] || 0}"
           lines << "  Statement size: #{DumpTools.format_size(statement[:bytes] || 0)}"
           lines << "  Dump transaction markers: #{statement[:dump_transaction_markers] ? 'yes' : 'no'}"
-          if @output.match?(/during\s+COMMIT/i) && @output.match?(/Operation not permitted|EPERM/i) && !statement[:dump_transaction_markers]
-            lines << "  Recommendation: this dump is transaction-free; if MariaDB still reports OS EPERM during COMMIT, retry the same import on Linux."
+          if @output.match?(/during\s+COMMIT/i) && @output.match?(/Operation not permitted|EPERM/i)
+            table = statement[:table] || "the failing table"
+            lines << "  Recommendation: when a dump sets UNIQUE_CHECKS=0 and FOREIGN_KEY_CHECKS=0, MariaDB bulk-loads the first INSERT into each empty table and reports duplicate values in a UNIQUE column only at COMMIT, as this misleading OS error. Check #{table} for duplicate (especially repeated empty-string) values in UNIQUE-keyed columns."
+            unless statement[:dump_transaction_markers]
+              lines << "  If no duplicates exist: this dump is transaction-free, so a genuine OS EPERM during COMMIT points at the host filesystem - retry the same import on Linux."
+            end
           end
           lines
         end
@@ -569,7 +573,9 @@ module SiloMigrate
       end
 
       class SQLStatementScanner
-        TRANSACTION_MARKER = /\b(?:START\s+TRANSACTION|BEGIN|COMMIT)\b|SET\s+AUTOCOMMIT\s*=\s*0/i
+        # Anchored to line start: dump data rows can contain these words inside
+        # string values (forum posts), which must not count as markers.
+        TRANSACTION_MARKER = /\A\s*(?:START\s+TRANSACTION|BEGIN|COMMIT)\b|\A\s*SET\s+AUTOCOMMIT\s*=\s*0/i
 
         def initialize(path)
           @path = path

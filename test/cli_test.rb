@@ -9,6 +9,7 @@ class CLITest < SiloMigrateTest
     assert_equal 0, code
     assert_includes out.string, "Usage: silo-migrate"
     assert_includes out.string, "convert-xml"
+    assert_includes out.string, "convert-json"
     assert_includes out.string, "schema bundle"
     assert_includes out.string, "findings generate"
     assert_includes out.string, "fixtures generate"
@@ -37,8 +38,33 @@ class CLITest < SiloMigrateTest
     assert_equal 0, cli.run(["convert-xml", "--help"])
     assert_includes out.string, "--batch-size"
 
+    assert_equal 0, cli.run(["convert-json", "--help"])
+    assert_includes out.string, "--schema-dir"
+    assert_includes out.string, "--records-path"
+    assert_includes out.string, "--no-graphql-unwrap"
+
     assert_equal 0, cli.run(["trusted", "--help"])
     assert_includes out.string, "mysql -u root -e"
+  end
+
+  def test_convert_json_command_writes_sql_output
+    with_tmp_base do |dir, env|
+      out = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: out, error: StringIO.new)
+      input = write(File.join(dir, "users.json"), '{"object_name": "users", "data": [{"id": "user:1"}]}')
+
+      capture_io do
+        assert_equal 0, cli.run(["convert-json", input])
+
+        cli.run(["init", "acme"])
+        assert_equal 0, cli.run(["convert-json", input, "-c", "acme"])
+      end
+
+      assert_includes File.read(File.join(dir, "users.sql")), "CREATE TABLE `users`"
+      customer_sql = File.join(SiloMigrate::Project.project_path("acme", env), "dumps", "initial", "users.sql")
+      assert File.exist?(customer_sql)
+      assert_includes out.string, "import-dump acme initial"
+    end
   end
 
   def test_converter_summary_standalone_command

@@ -7,6 +7,7 @@ require "fileutils"
 require "set"
 require "zlib"
 require "time"
+require_relative "sql_text"
 
 module SiloMigrate
   class TableStructure
@@ -80,27 +81,7 @@ module SiloMigrate
     end
   end
 
-  module SQLXML
-    module_function
-
-    def escape_sql_string(value)
-      return "NULL" if value.nil?
-
-      escaped = value.to_s
-                     .gsub("\\", "\\\\\\")
-                     .gsub("'", "\\\\'")
-                     .gsub("\n", "\\n")
-                     .gsub("\r", "\\r")
-                     .gsub("\t", "\\t")
-                     .gsub("\x00", "\\0")
-                     .gsub("\x1a", "\\Z")
-      "'#{escaped}'"
-    end
-
-    def escape_identifier(name)
-      "`#{name.to_s.gsub('`', '``')}`"
-    end
-  end
+  SQLXML = SqlText
 
   class XMLToSQLConverter
     attr_reader :stats
@@ -189,6 +170,7 @@ module SiloMigrate
       current_columns = []
       current_column_types = {}
       current_column_nulls = {}
+      current_column_uniques = {}
 
       parse_xml_file(xml_path) do |event_type, table, data|
         case event_type
@@ -199,7 +181,7 @@ module SiloMigrate
           end
 
           if current_rows.any?
-            write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls)
+            write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls, column_uniques: current_column_uniques)
             current_rows = []
           end
           structures[table] = data
@@ -213,7 +195,7 @@ module SiloMigrate
           next if @schema_only
 
           if current_table != table
-            write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls) if current_rows.any?
+            write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls, column_uniques: current_column_uniques) if current_rows.any?
             current_table = table
             current_rows = []
 
@@ -221,10 +203,12 @@ module SiloMigrate
               current_columns = structures[table].column_names
               current_column_types = structures[table].columns.to_h { |col| [col[:name], col[:type]] }
               current_column_nulls = structures[table].columns.to_h { |col| [col[:name], col[:null]] }
+              current_column_uniques = structures[table].columns.to_h { |col| [col[:name], col[:key] == "UNI"] }
             else
               current_columns = data.keys
               current_column_types = {}
               current_column_nulls = {}
+              current_column_uniques = {}
             end
           end
 
@@ -232,13 +216,13 @@ module SiloMigrate
           @stats[:rows_processed] += 1
           report_progress(:rows)
           if current_rows.length >= @batch_size
-            write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls)
+            write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls, column_uniques: current_column_uniques)
             current_rows = []
           end
         end
       end
 
-      write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls) if current_rows.any?
+      write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls, column_uniques: current_column_uniques) if current_rows.any?
       @stats[:files_processed] += 1
       report_progress(:file_complete, force: true)
       @current_file_progress = nil
@@ -475,20 +459,22 @@ module SiloMigrate
       true
     end
 
-    def write_rows_batch(out, table, structure, rows, columns: nil, column_types: nil, column_nulls: nil)
+    def write_rows_batch(out, table, structure, rows, columns: nil, column_types: nil, column_nulls: nil, column_uniques: nil)
       return if rows.empty?
 
       columns ||= structure ? structure.column_names : rows.first.keys
       col_defs = structure ? structure.columns.to_h { |col| [col[:name], col] } : {}
       column_types ||= {}
       column_nulls ||= {}
+      column_uniques ||= {}
       out.write("INSERT INTO #{SQLXML.escape_identifier(table)} (#{columns.map { |col| SQLXML.escape_identifier(col) }.join(', ')}) VALUES\n")
       value_rows = rows.map do |row|
         values = columns.map do |col|
           definition = col_defs[col]
           type = definition&.dig(:type) || column_types[col] || "text"
           allows_null = definition ? definition[:null] : column_nulls.fetch(col, true)
-          format_value(row[col], type, allows_null)
+          unique = definition ? definition[:key] == "UNI" : column_uniques.fetch(col, false)
+          format_value(row[col], type, allows_null, unique: unique)
         end
         "  (#{values.join(', ')})"
       end
@@ -496,7 +482,7 @@ module SiloMigrate
       out.write(";\n")
     end
 
-    def format_value(value, type, allows_null)
+    def format_value(value, type, allows_null, unique: false)
       if value.nil? || value == "null"
         return "NULL" if allows_null
         return "0" if type.match?(/\A(?:int|bigint|tinyint|smallint|mediumint|float|double|decimal|numeric)/i)
@@ -508,6 +494,12 @@ module SiloMigrate
         return allows_null ? "NULL" : "0" if value == ""
         return value if value.to_s.match?(/\A-?\d+(?:\.\d+)?\z/)
       end
+
+      # Empty values in nullable UNIQUE-keyed columns must be NULL: repeated ''
+      # values violate the unique index, and under UNIQUE_CHECKS=0 MariaDB's
+      # bulk-insert path reports that only at COMMIT as a misleading
+      # "Got error 1 'Operation not permitted'" failure.
+      return "NULL" if unique && allows_null && value == ""
 
       SQLXML.escape_sql_string(value)
     end

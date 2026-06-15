@@ -240,6 +240,7 @@ module SiloMigrate
           "SQL dump file (.sql or .sql.gz)" => :sql,
           "Tar archive containing SQL" => :tar,
           "XML dump files (mysqldump --xml)" => :xml,
+          "JSON export files (Khoros/community API)" => :json,
           "Skip for now" => :skip
         },
         allow_back: true
@@ -255,10 +256,16 @@ module SiloMigrate
         return
       end
 
-      dump_path = if format == :xml
+      dump_path = case format
+                  when :xml
                     exclude_files = prompt_xml_file_exclusions(Pathname(source))
                     batch_size = prompt_xml_batch_size
                     convert_xml_to_project(customer, phase, source, exclude_files: exclude_files, batch_size: batch_size)
+                  when :json
+                    exclude_files = prompt_json_file_exclusions(Pathname(source))
+                    schema_dir = prompt_json_schema_dir(Pathname(source))
+                    batch_size = prompt_json_batch_size
+                    convert_json_to_project(customer, phase, source, exclude_files: exclude_files, batch_size: batch_size, schema_dir: schema_dir)
                   else
                     @project_service.stage_dump(customer, phase, source)
                   end
@@ -345,6 +352,7 @@ module SiloMigrate
           "Start services" => :start,
           "Stop services" => :stop,
           "Convert XML dump" => :convert_xml,
+          "Convert JSON dump" => :convert_json,
           "Generate schema bundle" => :schema_bundle,
           "Run converter command" => :run_converter,
           "Generate redacted summary from latest converter logs" => :converter_summary,
@@ -372,6 +380,7 @@ module SiloMigrate
 
         @project_service.stop(customer, profile: profile, remove: confirm?("Remove stopped containers?", default: false))
       when :convert_xml then convert_xml(customer)
+      when :convert_json then convert_json(customer)
       when :schema_bundle
         phase = select_phase
         return BACK if phase == BACK
@@ -410,6 +419,23 @@ module SiloMigrate
       return unless output
 
       @output.puts "[OK] XML converted: #{output}"
+      offer_start_and_import(customer, phase, output)
+    end
+
+    def convert_json(customer)
+      phase = select_phase
+      return BACK if phase == BACK
+
+      source = ask_path("Path to JSON file or directory")
+      return BACK if source == BACK
+
+      exclude_files = prompt_json_file_exclusions(Pathname(source))
+      schema_dir = prompt_json_schema_dir(Pathname(source))
+      batch_size = prompt_json_batch_size
+      output = convert_json_to_project(customer, phase, source, exclude_files: exclude_files, batch_size: batch_size, schema_dir: schema_dir)
+      return unless output
+
+      @output.puts "[OK] JSON converted: #{output}"
       offer_start_and_import(customer, phase, output)
     end
 
@@ -480,15 +506,70 @@ module SiloMigrate
 
     def convert_xml_to_project(customer, phase, source, exclude_files: nil, batch_size: 1000)
       source_path = Pathname(source)
-      base = source_path.file? ? source_path.basename.to_s.sub(/\.gz\z/, "").sub(/\.xml\z/, "") : "combined"
-      output = Pathname(File.join(@project_service.project_path(customer), "dumps", phase, "#{base}.sql.gz"))
-      if output.exist? && !confirm?("Replace existing converted dump #{output.basename}?", default: false)
+      output = converted_dump_output(customer, phase, source_path, ".xml")
+      unless output
         @output.puts "[WARN] XML conversion skipped; existing dump left unchanged."
         return nil
       end
 
-      summary = xml_source_summary(source_path, exclude_files: exclude_files)
-      @output.puts "\nConverting XML dump..."
+      show_conversion_summary("XML", source_path, ".xml", output, exclude_files: exclude_files, batch_size: batch_size)
+      XMLToSQLConverter.new(exclude_files: exclude_files, batch_size: batch_size, verbose: false)
+                       .convert(source_path, output, progress_callback: conversion_progress_printer)
+      @output.puts "[OK] XML converted and staged: #{output}"
+      output
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+      nil
+    end
+
+    def convert_json_to_project(customer, phase, source, exclude_files: nil, batch_size: 1000, schema_dir: nil, recover_truncated: false)
+      source_path = Pathname(source)
+      output = converted_dump_output(customer, phase, source_path, ".json")
+      unless output
+        @output.puts "[WARN] JSON conversion skipped; existing dump left unchanged."
+        return nil
+      end
+
+      show_conversion_summary("JSON", source_path, ".json", output, exclude_files: exclude_files, batch_size: batch_size)
+      @output.puts "Column types: #{schema_dir ? "from JSON Schemas in #{schema_dir}" : 'inferred from the data (two passes per file)'}"
+      JSONToSQLConverter.new(exclude_files: exclude_files, batch_size: batch_size, schema_dir: schema_dir&.to_s,
+                             recover_truncated: recover_truncated, verbose: false)
+                        .convert(source_path, output, progress_callback: conversion_progress_printer)
+      @output.puts "[OK] JSON converted and staged: #{output}"
+      output
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+      bad_file = e.message[/\AMalformed JSON in (\S+) /, 1]
+      if bad_file
+        if !recover_truncated && e.message.include?("appears to be truncated") &&
+           confirm?("Recover the complete records before the truncation point and continue? (the rest of #{bad_file} stays lost until re-exported)", default: true)
+          return convert_json_to_project(customer, phase, source, exclude_files: exclude_files,
+                                         batch_size: batch_size, schema_dir: schema_dir, recover_truncated: true)
+        end
+        if confirm?("Skip #{bad_file} and retry the conversion without it?", default: false)
+          return convert_json_to_project(customer, phase, source,
+                                         exclude_files: Array(exclude_files) + [bad_file],
+                                         batch_size: batch_size, schema_dir: schema_dir,
+                                         recover_truncated: recover_truncated)
+        end
+      end
+
+      nil
+    end
+
+    # Returns the staged dump path for a conversion, or nil when the user
+    # declines to replace an existing dump.
+    def converted_dump_output(customer, phase, source_path, ext)
+      base = source_path.file? ? source_path.basename.to_s.sub(/\.gz\z/, "").sub(/#{Regexp.escape(ext)}\z/, "") : "combined"
+      output = Pathname(File.join(@project_service.project_path(customer), "dumps", phase, "#{base}.sql.gz"))
+      return nil if output.exist? && !confirm?("Replace existing converted dump #{output.basename}?", default: false)
+
+      output
+    end
+
+    def show_conversion_summary(label, source_path, ext, output, exclude_files:, batch_size:)
+      summary = source_summary(source_path, ext, exclude_files: exclude_files)
+      @output.puts "\nConverting #{label} dump..."
       @output.puts "Source: #{source_path}"
       @output.puts "Files found: #{summary[:files_found]}"
       if summary[:files_skipped].positive?
@@ -499,62 +580,93 @@ module SiloMigrate
       @output.puts "Input size: #{DumpTools.format_size(summary[:bytes])} across #{summary[:files]} file#{summary[:files] == 1 ? '' : 's'}"
       @output.puts "Insert batch size: #{batch_size}"
       @output.puts "Output: #{output}"
-      @output.puts "Large XML conversions can take a while; progress will update periodically."
-      progress = xml_conversion_progress_printer
-      XMLToSQLConverter.new(exclude_files: exclude_files, batch_size: batch_size, verbose: false).convert(source_path, output, progress_callback: progress)
-      @output.puts "[OK] XML converted and staged: #{output}"
-      output
-    rescue UsageError => e
-      @output.puts "[WARN] #{e.message}"
-      nil
+      @output.puts "Large #{label} conversions can take a while; progress will update periodically."
     end
 
     def prompt_xml_batch_size
-      return 1000 unless confirm?("Use a custom XML insert batch size? (default 1000)", default: false)
+      prompt_batch_size("XML")
+    end
 
-      value = ask("XML insert batch size").to_s.strip
+    def prompt_json_batch_size
+      prompt_batch_size("JSON")
+    end
+
+    def prompt_batch_size(label)
+      return 1000 unless confirm?("Use a custom #{label} insert batch size? (default 1000)", default: false)
+
+      value = ask("#{label} insert batch size").to_s.strip
       return 1000 if value.empty?
 
       batch_size = Integer(value, 10)
       return batch_size if batch_size.positive?
 
-      @output.puts "[WARN] Invalid XML batch size; using 1000."
+      @output.puts "[WARN] Invalid #{label} batch size; using 1000."
       1000
     rescue ArgumentError
-      @output.puts "[WARN] Invalid XML batch size; using 1000."
+      @output.puts "[WARN] Invalid #{label} batch size; using 1000."
       1000
     end
 
     def prompt_xml_file_exclusions(source_path)
-      files = xml_source_files(source_path)
+      prompt_file_exclusions(source_path, ".xml", "XML")
+    end
+
+    def prompt_json_file_exclusions(source_path)
+      prompt_file_exclusions(source_path, ".json", "JSON")
+    end
+
+    def prompt_file_exclusions(source_path, ext, label)
+      files = source_files(source_path, ext)
       return [] if files.empty?
 
-      @output.puts "\nXML files found:"
+      @output.puts "\n#{label} files found:"
       files.each { |file| @output.puts "  #{file.basename}: #{DumpTools.format_size(file.size)}" }
-      return [] unless confirm?("Exclude any XML files from conversion?", default: false)
+      return [] unless confirm?("Exclude any #{label} files from conversion?", default: false)
 
-      answer = ask("XML files to exclude (comma-separated, names or base names)").to_s
+      answer = ask("#{label} files to exclude (comma-separated, names or base names)").to_s
       answer.split(",").map(&:strip).reject(&:empty?)
     end
 
-    def xml_source_summary(source_path, exclude_files: nil)
-      files = xml_source_files(source_path)
-      skipped, selected = files.partition { |file| xml_file_excluded?(file, exclude_files) }
+    # Offers a detected schema directory (source/schema or its sibling) when
+    # it holds *.schema.json files; otherwise asks for an optional path.
+    # Returns nil to infer column types from the data instead.
+    def prompt_json_schema_dir(source_path)
+      base_dir = source_path.file? ? source_path.dirname : source_path
+      detected = [base_dir.join("schema"), base_dir.parent.join("schema")].find do |dir|
+        dir.directory? && dir.glob("*.schema.json").any?
+      end
+      if detected
+        return detected if confirm?("Use JSON Schemas from #{detected} for exact column types and PII tracking?", default: true)
+
+        return nil
+      end
+
+      answer = ask("Directory with *.schema.json files (blank to infer types from the data)").to_s.strip
+      return nil if answer.empty?
+      return Pathname(answer) if Dir.exist?(answer)
+
+      @output.puts "[WARN] Schema directory not found: #{answer}; inferring types from the data."
+      nil
+    end
+
+    def source_summary(source_path, ext, exclude_files: nil)
+      files = source_files(source_path, ext)
+      skipped, selected = files.partition { |file| source_file_excluded?(file, ext, exclude_files) }
       { files_found: files.length, files: selected.length, files_skipped: skipped.length, skipped: skipped, bytes: selected.sum { |file| file.size rescue 0 } }
     end
 
-    def xml_source_files(source_path)
-      source_path.file? ? [source_path] : source_path.glob("*.xml").to_a.concat(source_path.glob("*.xml.gz").to_a).sort
+    def source_files(source_path, ext)
+      source_path.file? ? [source_path] : source_path.glob("*#{ext}").to_a.concat(source_path.glob("*#{ext}.gz").to_a).sort
     end
 
-    def xml_file_excluded?(file, exclude_files)
+    def source_file_excluded?(file, ext, exclude_files)
       exclude_files = Array(exclude_files)
       file_name = file.basename.to_s
-      base = file_name.sub(/\.gz\z/, "").sub(/\.xml\z/, "")
+      base = file_name.sub(/\.gz\z/, "").sub(/#{Regexp.escape(ext)}\z/, "")
       exclude_files.include?(file_name) || exclude_files.include?(base)
     end
 
-    def xml_conversion_progress_printer
+    def conversion_progress_printer
       proc do |progress|
         case progress[:event]
         when :start
@@ -573,6 +685,8 @@ module SiloMigrate
           @output.puts "Finished #{file[:name]}: rows #{progress[:rows_processed]}, tables #{progress[:tables_processed]}"
         when :complete
           @output.puts "Conversion output size: #{DumpTools.format_size(progress[:bytes_written])}"
+        when :warning
+          @output.puts "[WARN] #{progress[:message]}"
         end
       end
     end

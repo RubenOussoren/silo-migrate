@@ -164,6 +164,42 @@ class ImportServiceTest < SiloMigrateTest
     assert_includes summary, "Reported SQL line: 1"
   end
 
+  def test_failure_diagnostics_for_eperm_during_commit_explains_bulk_insert_duplicates
+    dump = <<~SQL
+      INSERT INTO `users` (`id`, `bio`) VALUES
+        (1, 'please COMMIT to the BEGIN of this plan'),
+        (2, '');
+    SQL
+    summary = SiloMigrate::Services::ImportService::ImportFailureDiagnostic.new(
+      path: write(File.join(Dir.mktmpdir, "dump.sql"), dump),
+      output: %(ERROR 1180 (HY000) at line 1: Got error 1 "Operation not permitted" during COMMIT),
+      db_type: "mariadb", customer: "acme", phase: "initial"
+    ).summary.join("\n")
+
+    # Words like COMMIT inside string data must not count as transaction markers.
+    assert_includes summary, "Dump transaction markers: no"
+    assert_includes summary, "UNIQUE-keyed columns"
+    assert_includes summary, "Check users for duplicate"
+    assert_includes summary, "retry the same import on Linux"
+  end
+
+  def test_failure_diagnostics_detects_real_transaction_markers
+    dump = <<~SQL
+      START TRANSACTION;
+      INSERT INTO `users` (`id`) VALUES (1);
+      COMMIT;
+    SQL
+    summary = SiloMigrate::Services::ImportService::ImportFailureDiagnostic.new(
+      path: write(File.join(Dir.mktmpdir, "dump.sql"), dump),
+      output: %(ERROR 1180 (HY000) at line 2: Got error 1 "Operation not permitted" during COMMIT),
+      db_type: "mariadb", customer: "acme", phase: "initial"
+    ).summary.join("\n")
+
+    assert_includes summary, "Dump transaction markers: yes"
+    assert_includes summary, "UNIQUE-keyed columns"
+    refute_includes summary, "retry the same import on Linux"
+  end
+
   def test_failure_diagnostics_for_unknown_collation_depends_on_engine
     path = write(File.join(Dir.mktmpdir, "dump.sql"), "CREATE TABLE t (id int);\n")
     mariadb = SiloMigrate::Services::ImportService::ImportFailureDiagnostic.new(

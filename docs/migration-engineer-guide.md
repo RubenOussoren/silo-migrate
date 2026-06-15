@@ -29,7 +29,7 @@ dump at any time.
 flowchart LR
     subgraph HOST["Your machine (macOS or Linux)"]
         ENG([Migration Engineer]) --> CLI["silo-migrate CLI<br/>(interactive or commands)"]
-        DUMP["Customer dump<br/>.sql / .sql.gz / tar / mysqldump XML"]
+        DUMP["Customer dump<br/>.sql / .sql.gz / tar / mysqldump XML / JSON export"]
         CLI <--> PROJ["Project directory<br/>&lt;base&gt;/customers/&lt;customer&gt;/<br/>config.env · docker-compose.yml<br/>dumps/ · output/ · findings/ · schema/"]
     end
 
@@ -39,7 +39,7 @@ flowchart LR
         CONV["converter container<br/>&lt;customer&gt;_converter<br/>(discourse-converters)"]
     end
 
-    DUMP -- "stage-dump / convert-xml" --> PROJ
+    DUMP -- "stage-dump / convert-xml / convert-json" --> PROJ
     PROJ -- "import-dump<br/>(streamed via docker exec)" --> IDB
     CLI -- "run-converter TYPE<br/>+ generated --settings" --> CONV
     CONV -- "reads source data<br/>(container DNS, e.g. acme_initial_mariadb:3306)" --> IDB
@@ -68,7 +68,7 @@ Key wiring facts:
 |------|--------------|
 | Environment | `doctor` preflight (Ruby, gems, Docker daemon, Compose v2, git, base path, free disk); first-run prompt picks and persists where projects live |
 | Projects | `init` / `list` / `status` / `regenerate` / `cleanup`; per-customer `config.env` compatible with the legacy Python toolkit layout |
-| Dumps | Stage `.sql`, `.sql.gz`, tar archives containing SQL, and mysqldump **XML → SQL** conversion (`convert-xml`, streaming, batched INSERTs); `analyze-dump` (tables, sizes, source engine); `preprocess-dump` (MySQL generated-column fixes); gzip integrity verification before import |
+| Dumps | Stage `.sql`, `.sql.gz`, tar archives containing SQL; mysqldump **XML → SQL** conversion (`convert-xml`, streaming, batched INSERTs); generic **JSON → SQL** conversion (`convert-json`, streaming relational shredding, optional `--schema-dir` JSON Schemas for exact types + PII tracking, `--recover-truncated` for cut-off files); `analyze-dump` (tables, sizes, source engine); `preprocess-dump` (MySQL generated-column fixes); gzip integrity verification before import |
 | Databases | MariaDB 10.11, MySQL 8.0, PostgreSQL 15 containers with healthchecks, utf8mb4 defaults, and import-friendly InnoDB settings; optional separate **final** database |
 | Import | Streamed restore (constant memory, progress + ETA), waits for container health, MySQL-8-collation auto-fix on MariaDB, table exclusion, `--fast`/`--turbo` modes, per-error diagnostics with exact recovery commands |
 | Converter | Clones/builds `discourse-converters` in its own container; platform shortcut (`run-converter acme vbulletin`) with auto-generated in-network settings, or any custom command after `--` |
@@ -108,8 +108,11 @@ so the happy path is mostly "press enter on the recommendation":
    persisted to `~/.config/silo-migrate/config.env`. Warned early if Docker is down.
 2. **Select or create the project** — pick from existing projects or name a new
    one; choose the initial DB type (mariadb/mysql/postgres) and port.
-3. **Add the initial dump** — choose SQL dump, tar archive, or XML dumps (XML is
-   converted to `.sql.gz` on the spot, with file-exclusion and batch-size prompts).
+3. **Add the initial dump** — choose SQL dump, tar archive, XML dumps, or JSON
+   export files (XML/JSON are converted to `.sql.gz` on the spot, with
+   file-exclusion and batch-size prompts; JSON also auto-detects a `schema/`
+   directory of `*.schema.json` files for exact column types and PII tracking,
+   and offers record-level recovery when a file is truncated).
    Path input has tab completion; `back`/`b`/`..` returns to the menu.
 4. **Start initial DB and import** — confirms the target, starts the container,
    waits for health, offers large-table exclusions and turbo mode (recommended
@@ -122,8 +125,8 @@ so the happy path is mostly "press enter on the recommendation":
    the chain: redacted summary → findings → synthetic fixtures, each defaulting
    to yes.
 8. **Advanced actions** menu covers everything else: status, start/stop by
-   profile, convert XML, schema bundle, converter summary, replace dump,
-   regenerate compose, cleanup.
+   profile, convert XML, convert JSON, schema bundle, converter summary,
+   replace dump, regenerate compose, cleanup.
 
 ## Happy path — CLI command mode
 
@@ -140,6 +143,8 @@ bin/silo-migrate init acme --db-type mariadb
 bin/silo-migrate stage-dump acme initial /path/to/forum-dump.sql.gz
 #    ...or convert mysqldump XML straight into the project:
 bin/silo-migrate convert-xml /path/to/xml-dir -c acme --compress
+#    ...or convert JSON export files (schemas optional; see help convert-json):
+bin/silo-migrate convert-json /path/to/json-dir -c acme --schema-dir /path/to/schemas
 
 # 3. start the source DB and restore the dump into it
 bin/silo-migrate start acme --profile initial-db --wait
@@ -183,6 +188,7 @@ flowchart TD
     B --> C{dump format?}
     C -- ".sql / .sql.gz / tar" --> D[stage-dump]
     C -- "mysqldump XML" --> E[convert-xml] --> D
+    C -- "JSON export" --> E2[convert-json] --> D
     D --> F["start --profile initial-db --wait"]
     F --> G[import-dump]
     G -- "fails" --> R["diagnostics + recovery:<br/>replace-dump → start --wait → import-dump"] --> G
@@ -235,6 +241,8 @@ later). Everything under `safe-artifacts/` has been redacted or synthesized.
 | Anything feels broken | `bin/silo-migrate doctor` |
 | Import failed mid-way | Read the diagnostics block — it names the error and prints the exact `replace-dump` / `start --wait` / `import-dump` recovery commands |
 | "gzip integrity check failed" | The dump is truncated — re-transfer it (don't bypass unless you're certain) |
+| "Malformed JSON in FILE … appears to be truncated" | The JSON export was cut off. Re-export it for the full data; meanwhile `--recover-truncated` (or the guided-mode prompt) keeps the complete records and reports recovered counts, or skip the file with `-X FILE` |
+| JSON tables/columns look unexpected | Conventions: nested objects flatten (`avatar.url` → `avatar_url`); arrays become `<table>_<path>` child tables joined via `_parent_id` (natural key) or `_parent_sid`; deep/mixed shapes land in `*_json` TEXT columns. See "JSON-to-SQL Conversion Design" in the workspace ARCHITECTURE.md |
 | Converter can't reach the DB | Use the platform shortcut so settings are generated; if compose was regenerated, recreate the container: `start CUSTOMER --profile converter` |
 | Port already in use | Interactive mode offers a free port; or `init`/`add-final-db` with an explicit `--port` |
 | Huge dump is slow on a Mac | Expected (Docker Desktop fsync); the preflight warns. Prefer a Linux host for multi-GB imports |
