@@ -81,6 +81,9 @@ script/install --yes --install-dir /migrations/silo-migrate --bin-dir /usr/local
 
 # normal user, non-interactive, without Docker package installation
 script/install --yes --skip-docker
+
+# migration host with curated Oh My Zsh add-ons
+script/install --yes --shell-preset migration
 ```
 
 Docker packages default to Docker's official repositories on Linux. Use distro
@@ -110,9 +113,20 @@ Installer flags:
 ```bash
 script/install --dry-run                 # print planned commands
 script/install --with-oh-my-zsh          # explicitly opt into Oh My Zsh
+script/install --shell-preset migration  # Oh My Zsh + safe server add-ons
+script/install --zsh-theme powerlevel10k # optional; requires a compatible local terminal font
+script/install --zsh-plugins git,zsh-autosuggestions,zsh-syntax-highlighting
 script/install --repo git@github.com:RubenOussoren/silo-migrate.git
 script/install --branch main
 ```
+
+The `migration` shell preset installs Oh My Zsh plus a server-safe plugin set:
+`git`, `zsh-autosuggestions`, and `zsh-syntax-highlighting`. It configures
+autosuggestions to use completion instead of shell history, keeps syntax
+highlighting last in the plugin list, and adds history settings intended to keep
+one-off AWS credential exports out of history. Prefer AWS profiles or IAM
+Identity Center/SSO for persistent access, and prefix any sensitive one-off
+export command with a leading space.
 
 Upgrade after fixes are pushed:
 

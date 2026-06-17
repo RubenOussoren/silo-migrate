@@ -127,21 +127,31 @@ class InstallServiceTest < SiloMigrateTest
       source_root = File.join(dir, "source")
       bin_dir = File.join(dir, "bin")
       project_data = File.join(dir, "customers", "acme", "dumps")
+      custom_dir = File.join(dir, ".oh-my-zsh", "custom")
       profile = File.join(dir, ".zshrc")
       FileUtils.mkdir_p(File.join(source_root, ".git"))
       FileUtils.mkdir_p(File.join(source_root, "script"))
       FileUtils.mkdir_p(File.join(source_root, "bin"))
       FileUtils.mkdir_p(bin_dir)
       FileUtils.mkdir_p(project_data)
+      FileUtils.mkdir_p(File.join(custom_dir, "plugins", "zsh-autosuggestions"))
+      FileUtils.mkdir_p(File.join(custom_dir, "plugins", "zsh-syntax-highlighting"))
+      FileUtils.mkdir_p(File.join(custom_dir, "themes", "powerlevel10k"))
       FileUtils.touch(File.join(source_root, "script", "install"))
       FileUtils.touch(File.join(source_root, "bin", "silo-migrate"))
       FileUtils.touch(File.join(source_root, "silo-migrate.gemspec"))
+      FileUtils.touch(File.join(custom_dir, "plugins", "zsh-autosuggestions", ".silo-migrate-installed"))
+      FileUtils.touch(File.join(custom_dir, "plugins", "zsh-syntax-highlighting", ".silo-migrate-installed"))
+      FileUtils.touch(File.join(custom_dir, "themes", "powerlevel10k", ".silo-migrate-installed"))
       File.write(File.join(project_data, "dump.sql"), "-- project data\n")
       File.write(profile, <<~ZSH)
         export PATH="/before:$PATH"
         # >>> silo-migrate PATH >>>
         export PATH="#{bin_dir}:$PATH"
         # <<< silo-migrate PATH <<<
+        # >>> silo-migrate zsh preset >>>
+        plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
+        # <<< silo-migrate zsh preset <<<
         export PATH="/after:$PATH"
       ZSH
 
@@ -156,7 +166,7 @@ class InstallServiceTest < SiloMigrateTest
       File.write(File.join(bin_dir, "custom-tool"), "#!/usr/bin/env bash\n")
 
       stdout, stderr, status = Open3.capture3(
-        { "HOME" => dir, "SHELL" => "/bin/zsh" },
+        { "HOME" => dir, "SHELL" => "/bin/zsh", "ZSH_CUSTOM" => custom_dir },
         File.expand_path("../script/install", __dir__),
         "--uninstall",
         "--install-dir", source_root,
@@ -171,9 +181,64 @@ class InstallServiceTest < SiloMigrateTest
       refute_path_exists File.join(bin_dir, "xml-to-sql")
       assert_path_exists File.join(bin_dir, "custom-tool")
       assert_path_exists File.join(project_data, "dump.sql")
+      refute_path_exists File.join(custom_dir, "plugins", "zsh-autosuggestions")
+      refute_path_exists File.join(custom_dir, "plugins", "zsh-syntax-highlighting")
+      refute_path_exists File.join(custom_dir, "themes", "powerlevel10k")
       refute_includes File.read(profile), "# >>> silo-migrate PATH >>>"
+      refute_includes File.read(profile), "# >>> silo-migrate zsh preset >>>"
       assert_includes File.read(profile), "/before"
       assert_includes File.read(profile), "/after"
+    end
+  end
+
+  def test_install_script_shell_preset_dry_run_outputs_secure_zsh_config
+    Dir.mktmpdir do |dir|
+      stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/zsh", "ZSH" => File.join(dir, ".oh-my-zsh"), "ZSH_CUSTOM" => File.join(dir, ".oh-my-zsh", "custom") },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--shell-preset", "migration",
+        "--skip-docker"
+      )
+
+      assert status.success?, stderr
+      assert_includes stdout, "https://github.com/zsh-users/zsh-autosuggestions.git"
+      assert_includes stdout, "https://github.com/zsh-users/zsh-syntax-highlighting.git"
+      assert_includes stdout, "plugins=(git zsh-autosuggestions zsh-syntax-highlighting)"
+      assert_includes stdout, "ZSH_AUTOSUGGEST_STRATEGY=(completion)"
+      assert_includes stdout, "ZSH_AUTOSUGGEST_HISTORY_IGNORE"
+      assert_includes stdout, "HIST_IGNORE_SPACE HIST_NO_STORE HIST_REDUCE_BLANKS"
+    end
+  end
+
+  def test_install_script_shell_preset_can_request_powerlevel10k
+    Dir.mktmpdir do |dir|
+      stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/zsh", "ZSH" => File.join(dir, ".oh-my-zsh"), "ZSH_CUSTOM" => File.join(dir, ".oh-my-zsh", "custom") },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--shell-preset", "migration",
+        "--zsh-theme", "powerlevel10k",
+        "--skip-docker"
+      )
+
+      assert status.success?, stderr
+      assert_includes stdout, "https://github.com/romkatv/powerlevel10k.git"
+      assert_includes stdout, 'ZSH_THEME="powerlevel10k/powerlevel10k"'
+    end
+  end
+
+  def test_install_script_rejects_unsupported_zsh_plugins
+    Dir.mktmpdir do |dir|
+      _stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/zsh", "ZSH" => File.join(dir, ".oh-my-zsh"), "ZSH_CUSTOM" => File.join(dir, ".oh-my-zsh", "custom") },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--zsh-plugins", "git,unknown-plugin"
+      )
+
+      refute status.success?
+      assert_includes stderr, "unsupported plugin: unknown-plugin"
     end
   end
 end
