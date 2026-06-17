@@ -13,7 +13,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "tty-prompt", ">= 0.23", "< 1.0"
-  spec.add_dependency "sqlite3", ">= 1.3", "< 3.0"
+  spec.add_dependency "sqlite3", ">= 2.8", "< 2.9"
   spec.add_dependency "oj", ">= 3.16", "< 4.0"
   spec.add_dependency "rexml", ">= 3.3", "< 4.0"
 
