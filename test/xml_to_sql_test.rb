@@ -476,6 +476,88 @@ class XMLToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_table_discovery_finds_tables_after_large_table_data_block
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="early" />
+          <table_data name="early">
+            <row><field name="body">#{"x" * 4096}</field></row>
+          </table_data>
+          <table_structure name="late" />
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new(chunk_size: 64).discover(Pathname(input))
+
+      assert_equal %w[early late], result.tables
+      assert_equal false, result.truncated
+    end
+  end
+
+  def test_table_discovery_sorted_tables_use_total_size_descending
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          #{discovery_structure_xml("small", rows: 100, data_length: 10, index_length: 5)}
+          #{discovery_structure_xml("big", rows: 10, data_length: 100, index_length: 10)}
+          #{discovery_structure_xml("middle", rows: 1_000, data_length: 40, index_length: 10)}
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new.discover(Pathname(input))
+
+      assert_equal %w[big middle small], result.sorted_tables
+    end
+  end
+
+  def test_table_discovery_sorted_tables_use_rows_as_secondary_sort
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          #{discovery_structure_xml("same_size_low_rows", rows: 5, data_length: 100, index_length: 10)}
+          #{discovery_structure_xml("same_size_high_rows", rows: 50, data_length: 90, index_length: 20)}
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new.discover(Pathname(input))
+
+      assert_equal %w[same_size_high_rows same_size_low_rows], result.sorted_tables
+    end
+  end
+
+  def test_table_discovery_sorted_tables_place_unsized_tables_after_sized_tables
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="z_unsized" />
+          #{discovery_structure_xml("sized", rows: 1, data_length: 1, index_length: 0)}
+          <table_structure name="a_unsized" />
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new.discover(Pathname(input))
+
+      assert_equal %w[sized a_unsized z_unsized], result.sorted_tables
+    end
+  end
+
   def test_rejects_non_positive_batch_size
     error = assert_raises(SiloMigrate::UsageError) do
       SiloMigrate::XMLToSQLConverter.new(batch_size: 0, verbose: false)
@@ -568,6 +650,41 @@ class XMLToSQLTest < SiloMigrateTest
       assert_includes warning[:message], input
       assert_includes warning[:message], "bin/silo-migrate convert-xml"
       assert_equal [warning[:message]], stats[:warnings]
+    end
+  end
+
+  def test_excluding_first_large_table_does_not_warn_as_zero_progress
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="email_tracking2">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+          </table_structure>
+          <table_data name="email_tracking2">
+            <row><field name="id">1</field></row>
+            <!-- #{"x" * 2048} -->
+          </table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      output = File.join(dir, "dump.sql")
+      snapshots = []
+
+      stats = SiloMigrate::XMLToSQLConverter.new(exclude_tables: ["email_tracking2"], verbose: false, zero_progress_warning_bytes: 128).convert(
+        Pathname(input),
+        Pathname(output),
+        progress_callback: proc { |snapshot| snapshots << snapshot },
+        progress_interval: 0
+      )
+
+      assert_equal 1, stats[:tables_observed]
+      assert_equal 0, stats[:tables_processed]
+      assert_empty stats[:warnings]
+      refute snapshots.any? { |snapshot| snapshot[:event] == :warning }
     end
   end
 
@@ -679,6 +796,15 @@ class XMLToSQLTest < SiloMigrateTest
   end
 
   private
+
+  def discovery_structure_xml(name, rows:, data_length:, index_length:)
+    <<~XML
+      <table_structure name="#{name}">
+        <field Field="id" Type="int" Null="NO" Key="PRI" />
+        <options Name="#{name}" Rows="#{rows}" Data_length="#{data_length}" Index_length="#{index_length}" />
+      </table_structure>
+    XML
+  end
 
   def messages_xml(body:, raw_body:)
     <<~XML

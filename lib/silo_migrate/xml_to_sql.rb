@@ -197,6 +197,7 @@ module SiloMigrate
       parse_xml_file(xml_path) do |event_type, table, data|
         case event_type
         when :structure
+          @stats[:tables_observed] += 1
           unless process_table?(table)
             @stats[:tables_skipped] += 1
             next
@@ -213,6 +214,7 @@ module SiloMigrate
           @stats[:tables_processed] += 1
           report_progress(:table, current_table: table, force: @stats[:tables_processed] == 1)
         when :row
+          @stats[:rows_observed] += 1
           next unless process_table?(table)
           next if @schema_only
 
@@ -545,9 +547,11 @@ module SiloMigrate
         while (chunk = input.read(XML_CHUNK_SIZE))
           track_input_bytes(chunk.bytesize)
           sanitizer.feed(chunk) { |fixed| yield fixed }
+          warn_if_no_tables_after_bytes
         end
       end
       sanitizer.finish { |fixed| yield fixed }
+      warn_if_no_tables_after_bytes
     end
 
     def track_input_bytes(bytes)
@@ -555,7 +559,6 @@ module SiloMigrate
 
       @current_file_progress[:bytes_read] += bytes
       @stats[:bytes_read] += bytes
-      warn_if_no_tables_after_bytes
       report_progress(:bytes)
     end
 
@@ -563,7 +566,7 @@ module SiloMigrate
       return if @zero_progress_warning_emitted
       return unless @zero_progress_warning_bytes && @zero_progress_warning_bytes.positive?
       return unless @stats[:bytes_read] >= @zero_progress_warning_bytes
-      return unless @stats[:tables_processed].zero? && @stats[:rows_processed].zero?
+      return unless @stats[:tables_observed].zero? && @stats[:rows_observed].zero?
 
       @zero_progress_warning_emitted = true
       emit_warning(
@@ -661,7 +664,19 @@ module SiloMigrate
     end
 
     def reset_stats
-      @stats = { tables_processed: 0, rows_processed: 0, bytes_read: 0, bytes_written: 0, files_processed: 0, files_skipped: 0, tables_skipped: 0, invalid_xml_chars_removed: 0, warnings: [] }
+      @stats = {
+        tables_processed: 0,
+        rows_processed: 0,
+        tables_observed: 0,
+        rows_observed: 0,
+        bytes_read: 0,
+        bytes_written: 0,
+        files_processed: 0,
+        files_skipped: 0,
+        tables_skipped: 0,
+        invalid_xml_chars_removed: 0,
+        warnings: []
+      }
     end
 
     def open_output(path, gzip: nil)
@@ -777,7 +792,15 @@ module SiloMigrate
       end
     end
 
-    Result = Struct.new(:tables, :files, :files_found, :files_skipped, :skipped, :table_metadata, :bytes_scanned, :truncated, keyword_init: true)
+    Result = Struct.new(:tables, :files, :files_found, :files_skipped, :skipped, :table_metadata, :bytes_scanned, :truncated, keyword_init: true) do
+      def sorted_tables
+        sized, unsized = tables.partition { |table| XMLTableDiscovery.size_metadata?(table_metadata[table]) }
+        sized.sort_by do |table|
+          metadata = table_metadata[table] || {}
+          [-XMLTableDiscovery.total_size(metadata), -metadata[:rows].to_i, table]
+        end + unsized.sort
+      end
+    end
 
     CDATA_START = "<![CDATA[".b
     CDATA_END = "]]>".b
@@ -785,6 +808,7 @@ module SiloMigrate
     COMMENT_END = "-->".b
     PROCESSING_START = "<?".b
     PROCESSING_END = "?>".b
+    TABLE_DATA_END_START = "</table_data".b
     INTERESTING_TAG = /<\s*(?:table_structure|table_data|options)\b/n
     TAG_NAME = /\A<\s*([A-Za-z_:][\w:.-]*)/n
     ATTR = /\b([A-Za-z_:][\w:.-]*)\s*=\s*(['"])(.*?)\2/mn
@@ -797,7 +821,7 @@ module SiloMigrate
       @max_bytes = max_bytes
     end
 
-    def discover(source, file_pattern: "*.xml")
+    def discover(source, file_pattern: "*.xml", progress_callback: nil, progress_interval: XMLToSQLConverter::DEFAULT_PROGRESS_INTERVAL)
       source = Pathname(source)
       files = source.file? ? [source] : source.glob(file_pattern).to_a.concat(source.glob("#{file_pattern}.gz").to_a).sort
       raise UsageError, "No XML files found in #{source}" if files.empty?
@@ -805,11 +829,20 @@ module SiloMigrate
       selected, skipped = files.partition { |file| process_file?(file) }
       raise UsageError, "No XML files to scan after filtering. All #{files.length} files were excluded." if selected.empty?
 
-      file_results = selected.map do |file|
-        tables, metadata, bytes_scanned, truncated = discover_file(file)
+      progress = DiscoveryProgress.new(
+        callback: progress_callback,
+        interval: progress_interval,
+        total_input_bytes: selected.sum { |file| file.size rescue 0 }
+      )
+      progress.report(:start, force: true, file_count: selected.length)
+
+      file_results = selected.each_with_index.map do |file, index|
+        progress.start_file(file, index: index + 1, count: selected.length)
+        tables, metadata, bytes_scanned, truncated = discover_file(file, progress: progress)
+        progress.finish_file(force: true)
         FileResult.new(path: file, tables: tables.sort, table_metadata: metadata, bytes_scanned: bytes_scanned, truncated: truncated)
       end
-      Result.new(
+      result = Result.new(
         tables: file_results.flat_map(&:tables).uniq.sort,
         files: file_results,
         files_found: files.length,
@@ -819,11 +852,69 @@ module SiloMigrate
         bytes_scanned: file_results.sum(&:bytes_scanned),
         truncated: file_results.any?(&:truncated)
       )
+      progress.report(:complete, force: true, tables: result.tables.length)
+      result
+    end
+
+    def self.total_size(metadata)
+      return 0 unless metadata
+
+      metadata.values_at(:data_length, :index_length).compact.sum
+    end
+
+    def self.size_metadata?(metadata)
+      metadata && (metadata.key?(:data_length) || metadata.key?(:index_length))
     end
 
     private
 
-    def discover_file(path)
+    class DiscoveryProgress
+      def initialize(callback:, interval:, total_input_bytes:)
+        @callback = callback
+        @interval = interval
+        @total_input_bytes = total_input_bytes
+        @started_at = Time.now
+        @last_progress_at = nil
+        @bytes_scanned = 0
+        @current_file = nil
+      end
+
+      def start_file(file, index:, count:)
+        @current_file = { path: file.to_s, name: file.basename.to_s, index: index, count: count, size: (file.size rescue 0), bytes_scanned: 0 }
+        report(:file_start, force: true)
+      end
+
+      def advance(bytes, tables:)
+        @bytes_scanned += bytes
+        @current_file[:bytes_scanned] += bytes if @current_file
+        report(:bytes, tables: tables)
+      end
+
+      def finish_file(force:)
+        report(:file_complete, force: force)
+        @current_file = nil
+      end
+
+      def report(event, force: false, **extra)
+        return unless @callback
+
+        now = Time.now
+        return if !force && @last_progress_at && now - @last_progress_at < @interval
+
+        @last_progress_at = now
+        @callback.call(
+          {
+            event: event,
+            elapsed: now - @started_at,
+            bytes_scanned: @bytes_scanned,
+            total_input_bytes: @total_input_bytes,
+            current_file: @current_file&.dup
+          }.merge(extra)
+        )
+      end
+    end
+
+    def discover_file(path, progress:)
       tables = Set.new
       metadata = {}
       bytes_scanned = 0
@@ -841,14 +932,18 @@ module SiloMigrate
         while (chunk = input.read(@chunk_size))
           if @max_bytes && bytes_scanned + chunk.bytesize > @max_bytes
             remaining = @max_bytes - bytes_scanned
-            scanner.feed(chunk.byteslice(0, remaining)) if remaining.positive?
-            bytes_scanned += remaining if remaining.positive?
+            if remaining.positive?
+              scanner.feed(chunk.byteslice(0, remaining))
+              bytes_scanned += remaining
+              progress.advance(remaining, tables: tables.length)
+            end
             truncated = true
             break
           end
 
           scanner.feed(chunk)
           bytes_scanned += chunk.bytesize
+          progress.advance(chunk.bytesize, tables: tables.length)
         end
       end
       scanner.finish
@@ -881,6 +976,7 @@ module SiloMigrate
         @chunk_size = chunk_size
         @buffer = +"".b
         @skip_until = nil
+        @skip_table_data_body = false
         @current_structure_table = nil
       end
 
@@ -897,6 +993,12 @@ module SiloMigrate
 
       def scan(final:)
         loop do
+          if @skip_table_data_body
+            break unless drain_table_data_body(final: final)
+
+            next
+          end
+
           if @skip_until
             break unless drain_skip(final: final)
 
@@ -973,11 +1075,31 @@ module SiloMigrate
         when "table_data"
           table = decoded_attribute(attrs["name"])
           @event_handler.call(:table, table, nil) unless table.empty?
+          @skip_table_data_body = true unless tag.end_with?("/>".b)
         when "options"
           table = decoded_attribute(attrs["Name"] || attrs["name"]) || @current_structure_table
           table = @current_structure_table if table.to_s.empty?
           metadata = options_metadata(attrs)
           @event_handler.call(:metadata, table, metadata) if table && !table.empty? && metadata.any?
+        end
+      end
+
+      def drain_table_data_body(final:)
+        index = @buffer.index(TABLE_DATA_END_START)
+        if index
+          tag_end = start_tag_end(index)
+          unless tag_end
+            trim_buffer(final: final)
+            return false
+          end
+
+          @buffer.slice!(0, tag_end + 1)
+          @skip_table_data_body = false
+          true
+        else
+          keep = final ? 0 : [SCAN_TAIL_BYTES, TABLE_DATA_END_START.bytesize - 1].max
+          @buffer = keep.positive? ? buffer_tail(keep) : +"".b
+          false
         end
       end
 

@@ -1175,9 +1175,8 @@ class CLITest < SiloMigrateTest
       assert File.exist?(staged)
       assert_includes out.string, "Converting XML dump..."
       assert_includes out.string, "XML files found:"
-      assert_includes out.string, "Large table candidates:"
+      assert_includes out.string, "Largest tables discovered (showing 1 of 1, sorted by total size):"
       assert_includes out.string, "- users (rows 1234567, data 150.0 MB, index 512.0 KB, total 150.5 MB)"
-      assert_includes out.string, "Tip: type \"exclude\" next to skip large or nonessential tables."
       assert_includes out.string, "Files to process: 1"
       assert_includes out.string, "Processing 1/1: users.xml"
       assert_includes out.string, "First table detected: users"
@@ -1185,7 +1184,7 @@ class CLITest < SiloMigrateTest
       assert_includes out.string, "Conversion output size:"
       assert_includes out.string, "[OK] XML converted and staged"
       assert_includes out.string, "[OK] XML converted:"
-      assert_includes prompt.asked, "XML table filter: all, include, or exclude (blank for all; discovered: users)"
+      assert_includes prompt.asked, "XML table filter: all, include, or exclude (blank for all; largest: users)"
     end
   end
 
@@ -1229,11 +1228,43 @@ class CLITest < SiloMigrateTest
       assert_includes out.string, "Files found: 1"
       assert_includes out.string, "Input size:"
       assert_includes out.string, "across 1 file"
-      assert_includes out.string, "Tables discovered:"
+      assert_includes out.string, "Largest tables discovered (showing 1 of 1, sorted by total size):"
       assert_includes out.string, "- users (rows 12, data 1.0 MB, index 512.0 KB, total 1.5 MB)"
       assert_includes out.string, "Processing 1/1: intel_20260609.xml"
       assert_includes out.string, "Dump: intel_20260609.sql.gz"
       refute_includes prompt.asked, "Exclude any XML files from conversion? [y/N]"
+    end
+  end
+
+  def test_guided_xml_discovery_shows_no_more_than_50_tables_sorted_by_size
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      structures = (1..55).map do |index|
+        <<~XML
+          <table_structure name="table_#{format('%03d', index)}">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+            <options Name="table_#{format('%03d', index)}" Rows="#{index}" Data_length="#{index * 1024}" Index_length="0" />
+          </table_structure>
+        XML
+      end.join
+      xml_file = write(File.join(dir, "many.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump><database name="forum">#{structures}</database></mysqldump>
+      XML
+      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_file, "", "", "n", "Quit"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      assert_includes out.string, "Largest tables discovered (showing 50 of 55, sorted by total size):"
+      table_lines = out.string.lines.drop_while { |line| !line.include?("Largest tables discovered") }.drop(1).take_while { |line| !line.include?("Discovery by file:") }
+      table_lines = table_lines.select { |line| line.start_with?("  - ") }
+      assert_equal 50, table_lines.length
+      assert_includes table_lines.first, "table_055"
+      refute table_lines.any? { |line| line.include?("table_001") }
     end
   end
 
@@ -1306,6 +1337,7 @@ class CLITest < SiloMigrateTest
       assert_includes out.string, "Files found: 2"
       assert_includes out.string, "Files to skip: 1"
       assert_includes out.string, "- email_tracking2.xml"
+      assert_includes out.string, "Files skipped before table discovery: 1"
       assert_includes out.string, "Files to process: 1"
       assert_includes prompt.asked, "Exclude any XML files from conversion? [y/N]"
       assert_includes prompt.asked, "XML files to exclude (comma-separated, names or base names)"

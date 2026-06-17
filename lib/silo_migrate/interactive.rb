@@ -11,9 +11,7 @@ module SiloMigrate
     BACK = :__back
     BACK_LABEL = "Back"
     BACK_COMMANDS = %w[b back ..].freeze
-    GUIDED_XML_DISCOVERY_BYTES = 64 * 1024 * 1024
-    LARGE_XML_TABLE_BYTES = 100 * 1024 * 1024
-    LARGE_XML_TABLE_ROWS = 1_000_000
+    GUIDED_XML_DISCOVERY_DISPLAY_LIMIT = 50
 
     def initialize(project_service:, import_service:, schema_service: nil, findings_service: nil, fixture_service: nil, prompt: nil, output: $stdout, stdin: $stdin)
       @project_service = project_service
@@ -760,37 +758,41 @@ module SiloMigrate
 
     def discover_xml_tables(source_path, exclude_files: nil)
       @output.puts "\nScanning XML tables (discovery only; conversion will run after filter selection)..."
-      discovery = XMLTableDiscovery.new(exclude_files: exclude_files, max_bytes: GUIDED_XML_DISCOVERY_BYTES).discover(source_path)
+      discovery = XMLTableDiscovery.new(exclude_files: exclude_files).discover(
+        source_path,
+        progress_callback: discovery_progress_printer
+      )
       if discovery.files_skipped.positive?
         @output.puts "Files skipped before table discovery: #{discovery.files_skipped}"
         discovery.skipped.first(10).each { |file| @output.puts "  - #{file.basename}" }
         @output.puts "  ... and #{discovery.skipped.length - 10} more" if discovery.skipped.length > 10
       end
-      if discovery.truncated
-        @output.puts "Fast discovery scanned the first #{DumpTools.format_size(discovery.bytes_scanned)}. " \
-                     "More tables may exist later in the dump, but early large tables are shown now so you can filter before conversion."
-      end
-      @output.puts "Tables discovered:"
-      if discovery.tables.empty?
-        @output.puts "  (none found)"
-      else
-        discovery.tables.each do |table|
-          @output.puts "  - #{table}#{xml_table_metadata_text(discovery.table_metadata[table])}"
-        end
-      end
-      show_large_xml_table_candidates(discovery)
+      show_discovered_xml_tables(discovery)
       @output.puts "Discovery by file:"
       discovery.files.each do |file|
         @output.puts "  #{file.path.basename}: #{file.count} table#{file.count == 1 ? '' : 's'}"
-        file.tables.each do |table|
-          metadata = file.table_metadata[table]
-          @output.puts "    - #{table}#{xml_table_metadata_text(metadata)}" if metadata && metadata.any?
-        end
       end
       discovery
     rescue UsageError => e
       @output.puts "[WARN] #{e.message}"
       nil
+    end
+
+    def show_discovered_xml_tables(discovery)
+      sorted = sorted_xml_tables(discovery)
+      shown = sorted.first(GUIDED_XML_DISCOVERY_DISPLAY_LIMIT)
+      @output.puts "Largest tables discovered (showing #{shown.length} of #{sorted.length}, sorted by total size):"
+      if discovery.tables.empty?
+        @output.puts "  (none found)"
+      else
+        shown.each do |table|
+          @output.puts "  - #{table}#{xml_table_metadata_text(discovery.table_metadata[table])}"
+        end
+      end
+      hidden_without_size = (sorted - shown).count { |table| !xml_table_has_size_metadata?(discovery.table_metadata[table]) }
+      if hidden_without_size.positive?
+        @output.puts "  Note: #{hidden_without_size} hidden table#{hidden_without_size == 1 ? '' : 's'} do not have size metadata."
+      end
     end
 
     def csv_answer(value)
@@ -809,40 +811,39 @@ module SiloMigrate
       " (#{parts.join(', ')})"
     end
 
-    def show_large_xml_table_candidates(discovery)
-      candidates = large_xml_table_candidates(discovery)
-      return if candidates.empty?
-
-      @output.puts "Large table candidates:"
-      candidates.first(10).each do |table, metadata|
-        @output.puts "  - #{table}#{xml_table_metadata_text(metadata)}"
-      end
-      @output.puts "Tip: type \"exclude\" next to skip large or nonessential tables."
+    def xml_table_has_size_metadata?(metadata)
+      XMLTableDiscovery.size_metadata?(metadata)
     end
 
-    def large_xml_table_candidates(discovery)
-      discovery.tables.filter_map do |table|
-        metadata = discovery.table_metadata[table]
-        next unless metadata
-
-        total = xml_table_total_bytes(metadata)
-        rows = metadata[:rows].to_i
-        next unless total >= LARGE_XML_TABLE_BYTES || rows >= LARGE_XML_TABLE_ROWS
-
-        [table, metadata]
-      end.sort_by { |_table, metadata| [-xml_table_total_bytes(metadata), -metadata[:rows].to_i] }
-    end
-
-    def xml_table_total_bytes(metadata)
-      metadata.values_at(:data_length, :index_length).compact.sum
+    def sorted_xml_tables(discovery)
+      discovery.respond_to?(:sorted_tables) ? discovery.sorted_tables : discovery.tables
     end
 
     def xml_table_filter_hint(discovery)
       return "" unless discovery && discovery.tables.any?
 
-      examples = large_xml_table_candidates(discovery).map(&:first)
-      examples = discovery.tables.first(5) if examples.empty?
-      "; discovered: #{examples.first(5).join(', ')}"
+      examples = sorted_xml_tables(discovery).first(5)
+      "; largest: #{examples.join(', ')}"
+    end
+
+    def discovery_progress_printer
+      proc do |progress|
+        case progress[:event]
+        when :bytes
+          total = progress[:total_input_bytes].to_i
+          scanned = progress[:bytes_scanned].to_i
+          percent = total.positive? ? format(" %.1f%%", (scanned.to_f / total) * 100) : ""
+          @output.puts "Discovery: #{DumpTools.format_size(scanned)}/#{DumpTools.format_size(total)}#{percent}, #{discovery_rate_text(progress)}, tables #{progress[:tables].to_i}"
+        end
+      end
+    end
+
+    def discovery_rate_text(progress)
+      elapsed = progress[:elapsed].to_f
+      return "rate n/a" unless elapsed.positive?
+
+      mb_per_second = progress[:bytes_scanned].to_i / 1024.0 / 1024.0 / elapsed
+      format("%.1f MB/s", mb_per_second)
     end
 
     def table_filter_description(include_tables:, exclude_tables:)
