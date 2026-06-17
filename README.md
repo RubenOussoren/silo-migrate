@@ -128,6 +128,14 @@ one-off AWS credential exports out of history. Prefer AWS profiles or IAM
 Identity Center/SSO for persistent access, and prefix any sensitive one-off
 export command with a leading space.
 
+If an earlier run left `/root/.oh-my-zsh` partially installed, move it aside
+before retrying:
+
+```bash
+mv /root/.oh-my-zsh /root/.oh-my-zsh.broken-$(date +%Y%m%d%H%M%S)
+script/install --yes --shell-preset migration --zsh-theme powerlevel10k
+```
+
 Upgrade after fixes are pushed:
 
 ```bash

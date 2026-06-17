@@ -208,6 +208,116 @@ class InstallServiceTest < SiloMigrateTest
       assert_includes stdout, "ZSH_AUTOSUGGEST_STRATEGY=(completion)"
       assert_includes stdout, "ZSH_AUTOSUGGEST_HISTORY_IGNORE"
       assert_includes stdout, "HIST_IGNORE_SPACE HIST_NO_STORE HIST_REDUCE_BLANKS"
+      assert_includes stdout, 'export ZSH="${ZSH:-$HOME/.oh-my-zsh}"'
+      assert_includes stdout, 'source "$ZSH/oh-my-zsh.sh"'
+      refute_includes stdout, "source \"#{dir}/.oh-my-zsh/oh-my-zsh.sh\""
+    end
+  end
+
+  def test_install_script_shell_preset_recovers_incomplete_oh_my_zsh
+    Dir.mktmpdir do |dir|
+      zsh_dir = File.join(dir, ".oh-my-zsh")
+      FileUtils.mkdir_p(zsh_dir)
+
+      stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/zsh", "ZSH" => zsh_dir, "ZSH_CUSTOM" => File.join(zsh_dir, "custom") },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--shell-preset", "migration",
+        "--zsh-theme", "powerlevel10k",
+        "--skip-docker"
+      )
+
+      assert status.success?, stderr
+      assert_includes stderr, "looks incomplete"
+      assert_includes stdout, "Moving incomplete Oh My Zsh directory"
+      assert_match(/\+ mv .*\.oh-my-zsh .*\.oh-my-zsh\.broken-\d{14}/, stdout)
+      assert_includes stdout, "raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
+      assert_includes stdout, 'ZSH_THEME="powerlevel10k/powerlevel10k"'
+    end
+  end
+
+  def test_install_script_with_oh_my_zsh_rejects_incomplete_oh_my_zsh
+    Dir.mktmpdir do |dir|
+      zsh_dir = File.join(dir, ".oh-my-zsh")
+      FileUtils.mkdir_p(zsh_dir)
+
+      _stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/zsh", "ZSH" => zsh_dir, "ZSH_CUSTOM" => File.join(zsh_dir, "custom") },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--install-deps",
+        "--with-oh-my-zsh",
+        "--skip-docker"
+      )
+
+      refute status.success?
+      assert_includes stderr, "Refusing to overwrite incomplete Oh My Zsh directory"
+      assert_includes stderr, "mv #{zsh_dir}"
+    end
+  end
+
+  def test_install_script_skips_complete_oh_my_zsh_install
+    Dir.mktmpdir do |dir|
+      zsh_dir = File.join(dir, ".oh-my-zsh")
+      FileUtils.mkdir_p(zsh_dir)
+      FileUtils.touch(File.join(zsh_dir, "oh-my-zsh.sh"))
+
+      stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/zsh", "ZSH" => zsh_dir, "ZSH_CUSTOM" => File.join(zsh_dir, "custom") },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--shell-preset", "migration",
+        "--skip-docker"
+      )
+
+      assert status.success?, stderr
+      refute_includes stderr, "looks incomplete"
+      refute_includes stdout, "raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
+      assert_includes stdout, "https://github.com/zsh-users/zsh-autosuggestions.git"
+    end
+  end
+
+  def test_install_script_replaces_marker_owned_incomplete_zsh_addon
+    Dir.mktmpdir do |dir|
+      zsh_dir = File.join(dir, ".oh-my-zsh")
+      addon_dir = File.join(zsh_dir, "custom", "plugins", "zsh-autosuggestions")
+      FileUtils.mkdir_p(addon_dir)
+      FileUtils.touch(File.join(zsh_dir, "oh-my-zsh.sh"))
+      FileUtils.touch(File.join(addon_dir, ".silo-migrate-installed"))
+
+      stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/zsh", "ZSH" => zsh_dir, "ZSH_CUSTOM" => File.join(zsh_dir, "custom") },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--shell-preset", "migration",
+        "--skip-docker"
+      )
+
+      assert status.success?, stderr
+      assert_includes stdout, "Replacing incomplete installer-managed zsh add-on at #{addon_dir}"
+      assert_match(/\+ rm -rf .*zsh-autosuggestions/, stdout)
+      assert_includes stdout, "git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions.git"
+    end
+  end
+
+  def test_install_script_rejects_unmanaged_incomplete_zsh_addon
+    Dir.mktmpdir do |dir|
+      zsh_dir = File.join(dir, ".oh-my-zsh")
+      addon_dir = File.join(zsh_dir, "custom", "plugins", "zsh-autosuggestions")
+      FileUtils.mkdir_p(addon_dir)
+      FileUtils.touch(File.join(zsh_dir, "oh-my-zsh.sh"))
+
+      _stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/zsh", "ZSH" => zsh_dir, "ZSH_CUSTOM" => File.join(zsh_dir, "custom") },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--shell-preset", "migration",
+        "--skip-docker"
+      )
+
+      refute status.success?
+      assert_includes stderr, "#{addon_dir} exists but is not a Git checkout"
     end
   end
 

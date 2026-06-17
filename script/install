@@ -325,6 +325,20 @@ zsh_custom_dir() {
   printf '%s\n' "${ZSH_CUSTOM:-$(oh_my_zsh_dir)/custom}"
 }
 
+oh_my_zsh_entrypoint() {
+  printf '%s\n' "$(oh_my_zsh_dir)/oh-my-zsh.sh"
+}
+
+oh_my_zsh_installed() {
+  [ -f "$(oh_my_zsh_entrypoint)" ]
+}
+
+manual_oh_my_zsh_cleanup_hint() {
+  local zsh_dir="$1"
+  printf 'Move it away manually, then rerun. Example: mv %q %q\n' \
+    "$zsh_dir" "${zsh_dir}.broken-\$(date +%Y%m%d%H%M%S)"
+}
+
 zsh_plugin_enabled() {
   local wanted="$1"
   case " $zsh_plugins " in
@@ -559,7 +573,31 @@ install_bundler() {
 
 install_oh_my_zsh() {
   [ "$install_deps" -eq 1 ] || return
-  [ -d "${HOME:?HOME is required}/.oh-my-zsh" ] && return
+
+  local zsh_dir entrypoint backup timestamp
+  zsh_dir="$(oh_my_zsh_dir)"
+  entrypoint="$(oh_my_zsh_entrypoint)"
+
+  oh_my_zsh_installed && return
+
+  if [ -d "$zsh_dir" ]; then
+    warn "Oh My Zsh directory exists at $zsh_dir, but $entrypoint is missing; it looks incomplete."
+    if [ "$shell_preset" = "migration" ]; then
+      timestamp="$(date +%Y%m%d%H%M%S)"
+      backup="${zsh_dir}.broken-${timestamp}"
+      while [ "$dry_run" -eq 0 ] && [ -e "$backup" ]; do
+        timestamp="$(date +%Y%m%d%H%M%S)-$$"
+        backup="${zsh_dir}.broken-${timestamp}"
+      done
+      log "Moving incomplete Oh My Zsh directory to $backup before reinstalling."
+      run_cmd mv "$zsh_dir" "$backup"
+    elif [ "$with_oh_my_zsh" -eq 1 ]; then
+      fail "Refusing to overwrite incomplete Oh My Zsh directory at $zsh_dir. $(manual_oh_my_zsh_cleanup_hint "$zsh_dir")"
+    else
+      warn "Skipping Oh My Zsh install. $(manual_oh_my_zsh_cleanup_hint "$zsh_dir")"
+      return
+    fi
+  fi
 
   if [ "$with_oh_my_zsh" -ne 1 ] && [ "$yes_mode" -eq 1 ]; then
     log "Skipping Oh My Zsh; pass --with-oh-my-zsh to install it non-interactively."
@@ -720,6 +758,15 @@ install_or_update_zsh_addon() {
     return
   fi
 
+  if [ -e "$target" ]; then
+    if [ ! -f "$marker" ]; then
+      fail "$target exists but is not a Git checkout. Move it away manually or remove it before rerunning."
+    fi
+
+    log "Replacing incomplete installer-managed zsh add-on at $target..."
+    run_cmd rm -rf "$target"
+  fi
+
   log "Installing zsh add-on $url into $target..."
   run_cmd mkdir -p "$(dirname "$target")"
   run_cmd git clone --depth 1 "$url" "$target"
@@ -773,23 +820,22 @@ configure_zsh_preset() {
   fi
 
   plugin_array="${zsh_plugins:-git}"
-  body=$(cat <<ZSH
-export ZSH="\${ZSH:-\$HOME/.oh-my-zsh}"
-ZSH_THEME="$theme_value"
-plugins=($plugin_array)
-
-# Keep credential exports out of history/autosuggestions. Prefix sensitive
-# one-off commands with a leading space for HIST_IGNORE_SPACE.
-setopt HIST_IGNORE_SPACE HIST_NO_STORE HIST_REDUCE_BLANKS
-HISTFILE="\${HISTFILE:-\$HOME/.zsh_history}"
-HISTSIZE="\${HISTSIZE:-50000}"
-SAVEHIST="\${SAVEHIST:-50000}"
-ZSH_AUTOSUGGEST_STRATEGY=(completion)
-ZSH_AUTOSUGGEST_HISTORY_IGNORE="(export AWS_*|AWS_ACCESS_KEY_ID=*|AWS_SECRET_ACCESS_KEY=*|AWS_SESSION_TOKEN=*|aws configure export-credentials*)"
-
-source "\$ZSH/oh-my-zsh.sh"
-ZSH
-)
+  body="$(
+    printf '%s\n' 'export ZSH="${ZSH:-$HOME/.oh-my-zsh}"'
+    printf 'ZSH_THEME="%s"\n' "$theme_value"
+    printf 'plugins=(%s)\n' "$plugin_array"
+    printf '\n'
+    printf '%s\n' '# Keep credential exports out of history/autosuggestions. Prefix sensitive'
+    printf '%s\n' '# one-off commands with a leading space for HIST_IGNORE_SPACE.'
+    printf '%s\n' 'setopt HIST_IGNORE_SPACE HIST_NO_STORE HIST_REDUCE_BLANKS'
+    printf '%s\n' 'HISTFILE="${HISTFILE:-$HOME/.zsh_history}"'
+    printf '%s\n' 'HISTSIZE="${HISTSIZE:-50000}"'
+    printf '%s\n' 'SAVEHIST="${SAVEHIST:-50000}"'
+    printf '%s\n' 'ZSH_AUTOSUGGEST_STRATEGY=(completion)'
+    printf '%s\n' 'ZSH_AUTOSUGGEST_HISTORY_IGNORE="(export AWS_*|AWS_ACCESS_KEY_ID=*|AWS_SECRET_ACCESS_KEY=*|AWS_SESSION_TOKEN=*|aws configure export-credentials*)"'
+    printf '\n'
+    printf '%s\n' 'source "$ZSH/oh-my-zsh.sh"'
+  )"
 
   if [ "$dry_run" -eq 1 ]; then
     log "[dry-run] update zsh preset block in $profile"
