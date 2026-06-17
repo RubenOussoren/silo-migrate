@@ -258,9 +258,11 @@ module SiloMigrate
 
       dump_path = case format
                   when :xml
-                    exclude_files = prompt_xml_file_exclusions(Pathname(source))
+                    source_path = Pathname(source)
+                    exclude_files = prompt_xml_file_exclusions(source_path)
+                    discover_xml_tables(source_path, exclude_files: exclude_files)
                     table_filters = prompt_xml_table_filters
-                    batch_size = prompt_xml_batch_size(Pathname(source))
+                    batch_size = prompt_xml_batch_size(source_path)
                     compressed = prompt_converted_output_compression("XML")
                     convert_xml_to_project(
                       customer,
@@ -424,9 +426,11 @@ module SiloMigrate
       source = ask_path("Path to XML file or directory")
       return BACK if source == BACK
 
-      exclude_files = prompt_xml_file_exclusions(Pathname(source))
+      source_path = Pathname(source)
+      exclude_files = prompt_xml_file_exclusions(source_path)
+      discover_xml_tables(source_path, exclude_files: exclude_files)
       table_filters = prompt_xml_table_filters
-      batch_size = prompt_xml_batch_size(Pathname(source))
+      batch_size = prompt_xml_batch_size(source_path)
       compressed = prompt_converted_output_compression("XML")
       output = convert_xml_to_project(
         customer,
@@ -677,6 +681,8 @@ module SiloMigrate
     end
 
     def prompt_xml_file_exclusions(source_path)
+      return [] if source_path.file?
+
       prompt_file_exclusions(source_path, ".xml", "XML")
     end
 
@@ -737,6 +743,30 @@ module SiloMigrate
 
     def large_conversion_source?(source_path, ext)
       source_files(source_path, ext).sum { |file| file.size rescue 0 } >= 1024 * 1024 * 1024
+    end
+
+    def discover_xml_tables(source_path, exclude_files: nil)
+      @output.puts "\nScanning XML tables (discovery only; conversion will run after filter selection)..."
+      discovery = XMLTableDiscovery.new(exclude_files: exclude_files).discover(source_path)
+      if discovery.files_skipped.positive?
+        @output.puts "Files skipped before table discovery: #{discovery.files_skipped}"
+        discovery.skipped.first(10).each { |file| @output.puts "  - #{file.basename}" }
+        @output.puts "  ... and #{discovery.skipped.length - 10} more" if discovery.skipped.length > 10
+      end
+      @output.puts "Tables discovered:"
+      if discovery.tables.empty?
+        @output.puts "  (none found)"
+      else
+        discovery.tables.each { |table| @output.puts "  - #{table}" }
+      end
+      @output.puts "Discovery by file:"
+      discovery.files.each do |file|
+        @output.puts "  #{file.path.basename}: #{file.count} table#{file.count == 1 ? '' : 's'}"
+      end
+      discovery
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+      nil
     end
 
     def csv_answer(value)

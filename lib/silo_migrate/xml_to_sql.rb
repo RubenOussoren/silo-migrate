@@ -512,4 +512,116 @@ module SiloMigrate
       puts(message) if @verbose
     end
   end
+
+  class XMLTableDiscovery
+    FileResult = Struct.new(:path, :tables, keyword_init: true) do
+      def count
+        tables.length
+      end
+    end
+
+    Result = Struct.new(:tables, :files, :files_found, :files_skipped, :skipped, keyword_init: true)
+
+    def initialize(include_files: nil, exclude_files: nil)
+      @include_files = include_files&.to_set
+      @exclude_files = Array(exclude_files).to_set
+    end
+
+    def discover(source, file_pattern: "*.xml")
+      source = Pathname(source)
+      files = source.file? ? [source] : source.glob(file_pattern).to_a.concat(source.glob("#{file_pattern}.gz").to_a).sort
+      raise UsageError, "No XML files found in #{source}" if files.empty?
+
+      selected, skipped = files.partition { |file| process_file?(file) }
+      raise UsageError, "No XML files to scan after filtering. All #{files.length} files were excluded." if selected.empty?
+
+      file_results = selected.map do |file|
+        FileResult.new(path: file, tables: discover_file(file).sort)
+      end
+      Result.new(
+        tables: file_results.flat_map(&:tables).uniq.sort,
+        files: file_results,
+        files_found: files.length,
+        files_skipped: skipped.length,
+        skipped: skipped
+      )
+    end
+
+    private
+
+    class DiscoveryListener
+      include REXML::StreamListener
+
+      def initialize(&table_handler)
+        @table_handler = table_handler
+      end
+
+      def tag_start(name, attrs)
+        return unless name == "table_structure" || name == "table_data"
+
+        table = attrs["name"].to_s
+        @table_handler.call(table) unless table.empty?
+      end
+    end
+
+    def discover_file(path)
+      tables = Set.new
+      parse_xml_file(path) { |table| tables << table }
+      tables.to_a
+    end
+
+    def parse_xml_file(xml_path, &block)
+      reader, writer = IO.pipe
+      writer_error = nil
+      parser_error = nil
+      writer_thread = Thread.new do
+        begin
+          stream_fixed_xml(xml_path) { |chunk| writer.write(chunk) }
+        rescue Errno::EPIPE, IOError
+          raise unless parser_error
+        rescue StandardError => e
+          writer_error = e
+        ensure
+          writer.close unless writer.closed?
+        end
+      end
+
+      REXML::Parsers::StreamParser.new(reader, DiscoveryListener.new(&block)).parse
+    rescue StandardError => e
+      parser_error = e
+      raise
+    ensure
+      reader.close unless reader.closed?
+      writer.close unless writer.closed?
+      writer_thread&.join
+      raise writer_error if writer_error && !parser_error
+    end
+
+    def stream_fixed_xml(path)
+      sanitizer = XMLToSQLConverter::XMLStreamSanitizer.new
+      open_input(path) do |input|
+        while (chunk = input.read(XMLToSQLConverter::XML_CHUNK_SIZE))
+          sanitizer.feed(chunk) { |fixed| yield fixed }
+        end
+      end
+      sanitizer.finish { |fixed| yield fixed }
+    end
+
+    def open_input(path)
+      if path.to_s.end_with?(".gz")
+        Zlib::GzipReader.open(path.to_s) { |gz| yield gz }
+      else
+        File.open(path, "rb") { |file| yield file }
+      end
+    end
+
+    def process_file?(file)
+      file_name = file.basename.to_s
+      base = file_name.sub(/\.gz\z/, "").sub(/\.xml\z/, "")
+      return false if @include_files && !@include_files.include?(file_name) && !@include_files.include?(base)
+      return false if @exclude_files.include?(file_name) || @exclude_files.include?(base)
+
+      true
+    end
+  end
 end

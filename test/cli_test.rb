@@ -1157,7 +1157,6 @@ class CLITest < SiloMigrateTest
         "",
         "",
         "",
-        "",
         "n",
         "Quit"
       ])
@@ -1172,8 +1171,11 @@ class CLITest < SiloMigrateTest
       assert_includes out.string, "Files found: 1"
       assert_includes out.string, "Input size:"
       assert_includes out.string, "across 1 file"
+      assert_includes out.string, "Tables discovered:"
+      assert_includes out.string, "- users"
       assert_includes out.string, "Processing 1/1: intel_20260609.xml"
       assert_includes out.string, "Dump: intel_20260609.sql.gz"
+      refute_includes prompt.asked, "Exclude any XML files from conversion? [y/N]"
     end
   end
 
@@ -1283,9 +1285,11 @@ class CLITest < SiloMigrateTest
         "Convert XML dump",
         "initial",
         xml_file,
-        "",
         "exclude",
-        "logs"
+        "logs",
+        "",
+        "",
+        "n"
       ])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
@@ -1313,9 +1317,11 @@ class CLITest < SiloMigrateTest
         "Convert XML dump",
         "initial",
         xml_file,
-        "",
         "include",
-        "users"
+        "users",
+        "",
+        "",
+        "n"
       ])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")

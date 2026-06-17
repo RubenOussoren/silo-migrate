@@ -126,6 +126,60 @@ class XMLToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_discovers_tables_from_single_xml_file
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="users">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+          </table_structure>
+          <table_data name="logs"><row><field name="id">1</field></row></table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new.discover(Pathname(input))
+
+      assert_equal %w[logs users], result.tables
+      assert_equal 1, result.files.length
+      assert_equal 2, result.files.first.count
+    end
+  end
+
+  def test_discovers_tables_from_gzip_xml
+    Dir.mktmpdir do |dir|
+      input = gzip_write(File.join(dir, "dump.xml.gz"), XML)
+      result = SiloMigrate::XMLTableDiscovery.new.discover(Pathname(input))
+
+      assert_equal %w[logs users], result.tables
+      assert_equal 1, result.files.length
+      assert_equal "dump.xml.gz", result.files.first.path.basename.to_s
+    end
+  end
+
+  def test_table_discovery_applies_file_exclusions
+    Dir.mktmpdir do |dir|
+      write(File.join(dir, "users.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump><database name="forum"><table_structure name="users" /></database></mysqldump>
+      XML
+      write(File.join(dir, "logs.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump><database name="forum"><table_structure name="logs" /></database></mysqldump>
+      XML
+
+      result = SiloMigrate::XMLTableDiscovery.new(exclude_files: ["logs"]).discover(Pathname(dir))
+
+      assert_equal ["users"], result.tables
+      assert_equal 2, result.files_found
+      assert_equal 1, result.files_skipped
+      assert_equal ["users.xml"], result.files.map { |file| file.path.basename.to_s }
+    end
+  end
+
   def test_rejects_non_positive_batch_size
     error = assert_raises(SiloMigrate::UsageError) do
       SiloMigrate::XMLToSQLConverter.new(batch_size: 0, verbose: false)
