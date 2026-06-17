@@ -995,7 +995,9 @@ module SiloMigrate
     ensure
       if defined?(Readline)
         Readline.completion_proc = previous_completion_proc
-        Readline.completer_word_break_characters = previous_completer_word_break_characters
+        if previous_completer_word_break_characters
+          Readline.completer_word_break_characters = previous_completer_word_break_characters
+        end
       end
     end
 

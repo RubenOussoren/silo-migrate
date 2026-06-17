@@ -1134,6 +1134,47 @@ class CLITest < SiloMigrateTest
     end
   end
 
+  def test_guided_initial_dump_flow_converts_single_xml_file
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_file = write(File.join(dir, "intel_20260609.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump>
+          <database name="forum">
+            <table_structure name="users"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+            <table_data name="users"><row><field name="id">1</field></row></table_data>
+          </database>
+        </mysqldump>
+      XML
+      prompt = FakePrompt.new([
+        "Add/import initial source dump",
+        "XML dump files (mysqldump --xml)",
+        xml_file,
+        "",
+        "",
+        "n",
+        "Quit"
+      ])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      staged = File.join(project.project_path("acme"), "dumps", "initial", "intel_20260609.sql.gz")
+      assert File.exist?(staged)
+      refute File.exist?(File.join(project.project_path("acme"), "dumps", "initial", "combined.sql.gz"))
+      sql = Zlib::GzipReader.open(staged, &:read)
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes out.string, "Files found: 1"
+      assert_includes out.string, "Input size:"
+      assert_includes out.string, "across 1 file"
+      assert_includes out.string, "Processing 1/1: intel_20260609.xml"
+      assert_includes out.string, "Dump: intel_20260609.sql.gz"
+    end
+  end
+
   def test_guided_advanced_convert_xml_can_exclude_files_by_base_name
     with_tmp_base do |dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
@@ -1415,6 +1456,23 @@ class CLITest < SiloMigrateTest
         completions = interactive.send(:complete_path, "source")
         assert_includes completions, "source.sql"
         assert_includes completions, "source_dir/"
+      end
+    end
+  end
+
+  def test_readline_path_prompt_does_not_restore_nil_word_break_characters
+    require "readline"
+
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: StringIO.new)
+      interactive = SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: FakePrompt.new([]), output: StringIO.new)
+
+      Readline.stub(:completer_word_break_characters, nil) do
+        Readline.stub(:readline, "source.xml") do
+          assert_equal "source.xml", interactive.send(:ask_path_with_readline, "Path to source data")
+        end
       end
     end
   end
