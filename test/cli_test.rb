@@ -39,6 +39,8 @@ class CLITest < SiloMigrateTest
 
     assert_equal 0, cli.run(["convert-xml", "--help"])
     assert_includes out.string, "--batch-size"
+    assert_includes out.string, "--no-scrub-invalid-xml-chars"
+    assert_includes out.string, "--invalid-xml-report"
 
     assert_equal 0, cli.run(["convert-json", "--help"])
     assert_includes out.string, "--schema-dir"
@@ -139,6 +141,50 @@ class CLITest < SiloMigrateTest
       customer_sql = File.join(SiloMigrate::Project.project_path("acme", env), "dumps", "initial", "users.sql")
       assert File.exist?(customer_sql)
       assert_includes out.string, "import-dump acme initial"
+    end
+  end
+
+  def test_convert_xml_command_scrubs_invalid_controls_and_honors_custom_report_path
+    with_tmp_base do |dir, env|
+      out = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: out, error: StringIO.new)
+      input = write(File.join(dir, "messages.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump>
+          <database name="forum">
+            <table_structure name="messages"><field Field="body" Type="text" Null="YES" /></table_structure>
+            <table_data name="messages"><row><field name="body"><![CDATA[before\x1Bafter]]></field></row></table_data>
+          </database>
+        </mysqldump>
+      XML
+      report = File.join(dir, "audit.summary.json")
+
+      capture_io do
+        assert_equal 0, cli.run(["convert-xml", input, "--invalid-xml-report", report])
+      end
+
+      assert_includes File.read(File.join(dir, "messages.sql")), "'beforeafter'"
+      assert_equal 1, JSON.parse(File.read(report)).fetch("total_scrubbed")
+      assert File.exist?(File.join(dir, "audit.events.jsonl"))
+    end
+  end
+
+  def test_convert_xml_command_can_disable_invalid_control_scrubbing
+    with_tmp_base do |dir, env|
+      err = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: StringIO.new, error: err)
+      input = write(File.join(dir, "messages.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump><database name="forum"><table_data name="messages"><row><field name="body">bad\x1Bbody</field></row></table_data></database></mysqldump>
+      XML
+
+      capture_io do
+        assert_equal 1, cli.run(["convert-xml", input, "--no-scrub-invalid-xml-chars"])
+      end
+
+      assert_includes err.string, "Invalid XML control character U+001B"
+      assert_includes err.string, "--no-scrub-invalid-xml-chars"
+      refute File.exist?(File.join(dir, "messages.sql"))
     end
   end
 
@@ -1176,6 +1222,38 @@ class CLITest < SiloMigrateTest
       assert_includes out.string, "Processing 1/1: intel_20260609.xml"
       assert_includes out.string, "Dump: intel_20260609.sql.gz"
       refute_includes prompt.asked, "Exclude any XML files from conversion? [y/N]"
+    end
+  end
+
+  def test_guided_convert_xml_writes_project_invalid_control_report
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_file = write(File.join(dir, "forum.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump>
+          <database name="forum">
+            <table_structure name="messages"><field Field="body" Type="text" Null="YES" /></table_structure>
+            <table_data name="messages"><row><field name="body"><![CDATA[before\x1Bafter]]></field></row></table_data>
+          </database>
+        </mysqldump>
+      XML
+      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_file, "", "", "n", "n"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      dump_dir = File.join(project.project_path("acme"), "dumps", "initial")
+      reports = Dir[File.join(dump_dir, "xml-invalid-chars-*.summary.json")]
+      assert_equal 1, reports.length
+      summary = JSON.parse(File.read(reports.first))
+      assert_equal 1, summary.fetch("total_scrubbed")
+      assert_equal true, summary.fetch("success")
+      assert File.exist?(reports.first.sub(/\.summary\.json\z/, ".events.jsonl"))
+      assert_includes out.string, "Removed 1 XML-forbidden control character."
+      assert_includes out.string, "Invalid XML audit: #{reports.first}"
     end
   end
 

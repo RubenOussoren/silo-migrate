@@ -12,6 +12,7 @@ require "fileutils"
 require "set"
 require "zlib"
 require "time"
+require "json"
 require_relative "sql_text"
 
 module SiloMigrate
@@ -96,7 +97,8 @@ module SiloMigrate
     XML_SANITIZER_TAIL = 128
     DEFAULT_PROGRESS_INTERVAL = 5
 
-    def initialize(batch_size: 1000, include_tables: nil, exclude_tables: nil, include_files: nil, exclude_files: nil, schema_only: false, verbose: true)
+    def initialize(batch_size: 1000, include_tables: nil, exclude_tables: nil, include_files: nil, exclude_files: nil, schema_only: false, verbose: true,
+                   scrub_invalid_xml_chars: true, invalid_xml_report_path: nil)
       raise UsageError, "XML batch size must be greater than 0" unless batch_size.to_i.positive?
 
       @batch_size = batch_size
@@ -106,6 +108,8 @@ module SiloMigrate
       @exclude_files = Array(exclude_files).to_set
       @schema_only = schema_only
       @verbose = verbose
+      @scrub_invalid_xml_chars = scrub_invalid_xml_chars
+      @invalid_xml_report_path = invalid_xml_report_path
       reset_stats
     end
 
@@ -117,8 +121,11 @@ module SiloMigrate
       @current_file_progress = nil
       @conversion_started_at = Time.now
       @total_input_bytes = 0
+      @invalid_xml_report = nil
+      @invalid_xml_report_finalized = false
       source = Pathname(source)
       output_path = Pathname(output_path)
+      prepare_invalid_xml_report(source, output_path)
       files = source.file? ? [source] : source.glob(file_pattern).to_a.concat(source.glob("#{file_pattern}.gz").to_a).sort
       raise UsageError, "No XML files found in #{source}" if files.empty?
 
@@ -150,19 +157,26 @@ module SiloMigrate
 
       @stats[:bytes_written] = File.size(output_path)
       report_progress(:complete, bytes_written: @stats[:bytes_written], force: true)
+      finalize_invalid_xml_report(success: true)
       log "\n#{'=' * 60}\nCONVERSION COMPLETE\n#{'=' * 60}"
       log "\nFiles processed:  #{@stats[:files_processed]}"
       log "Files skipped:    #{@stats[:files_skipped]}" if @stats[:files_skipped].positive?
       log "Tables converted: #{@stats[:tables_processed]}"
       log "Tables skipped:   #{@stats[:tables_skipped]}" if @stats[:tables_skipped].positive?
       log "Rows converted:   #{@stats[:rows_processed]}"
+      if @stats[:invalid_xml_chars_removed].positive?
+        log "Invalid XML chars removed: #{@stats[:invalid_xml_chars_removed]}"
+        log "Invalid XML audit: #{@invalid_xml_report.summary_path}"
+      end
       log "Output size:      #{DumpTools.format_size(@stats[:bytes_written])}"
       log "\nOutput written to: #{output_path}"
       @stats
     ensure
+      finalize_invalid_xml_report(success: false)
       FileUtils.rm_f(write_path) if atomic && write_path && output_path && write_path != output_path && File.exist?(write_path)
       @progress_callback = nil
       @current_file_progress = nil
+      @invalid_xml_report = nil
     end
 
     def convert_file(xml_path, output, index: 1, count: 1)
@@ -324,13 +338,17 @@ module SiloMigrate
       CDATA_START = "<![CDATA["
       CDATA_END = "]]>"
 
-      def initialize
+      def initialize(path:, scrub_invalid_xml_chars:, invalid_xml_handler:)
         @buffer = +""
         @in_cdata = false
+        @path = path
+        @scrub_invalid_xml_chars = scrub_invalid_xml_chars
+        @invalid_xml_handler = invalid_xml_handler
+        @input_byte_offset = 0
       end
 
       def feed(chunk, &block)
-        @buffer << chunk.to_s.force_encoding("UTF-8").encode("UTF-8", invalid: :replace, undef: :replace)
+        @buffer << clean_chunk(chunk)
         drain(final: false, &block)
       end
 
@@ -380,6 +398,107 @@ module SiloMigrate
       def fix_text(text)
         text.gsub(UNESCAPED_AMP, "&amp;")
       end
+
+      def clean_chunk(chunk)
+        raw = chunk.to_s.b
+        cleaned = scrub_invalid_controls(raw)
+        cleaned.force_encoding("UTF-8").encode("UTF-8", invalid: :replace, undef: :replace)
+      end
+
+      def scrub_invalid_controls(raw)
+        result = nil
+        keep_from = 0
+        raw.bytes.each_with_index do |byte, index|
+          next unless invalid_xml_control_byte?(byte)
+
+          offset = @input_byte_offset + index
+          unless @scrub_invalid_xml_chars
+            raise UsageError,
+                  "Invalid XML control character #{format_codepoint(byte)} in #{@path} at input byte offset #{offset}. " \
+                  "XML 1.0 forbids this character; remove --no-scrub-invalid-xml-chars to scrub it and write an audit report."
+          end
+
+          result ||= +"".b
+          result << raw.byteslice(keep_from, index - keep_from) if index > keep_from
+          @invalid_xml_handler&.call(file: @path, offset: offset, codepoint: byte)
+          keep_from = index + 1
+        end
+        @input_byte_offset += raw.bytesize
+        return raw unless result
+
+        result << raw.byteslice(keep_from, raw.bytesize - keep_from) if keep_from < raw.bytesize
+        result
+      end
+
+      def invalid_xml_control_byte?(byte)
+        byte <= 0x08 || byte == 0x0B || byte == 0x0C || (byte >= 0x0E && byte <= 0x1F)
+      end
+
+      def format_codepoint(codepoint)
+        format("U+%04X", codepoint)
+      end
+    end
+
+    class InvalidXMLCharReport
+      attr_reader :summary_path, :events_path, :total
+
+      def initialize(source_path:, output_path:, summary_path:, events_path:, started_at:)
+        @source_path = source_path.to_s
+        @output_path = output_path.to_s
+        @summary_path = Pathname(summary_path)
+        @events_path = Pathname(events_path)
+        @started_at = started_at
+        @total = 0
+        @per_file = Hash.new(0)
+        @per_codepoint = Hash.new(0)
+        @events = nil
+      end
+
+      def record(file:, offset:, codepoint:)
+        open_events
+        hex = format("U+%04X", codepoint)
+        event = {
+          source_file: file.to_s,
+          input_byte_offset: offset,
+          codepoint: hex,
+          decimal: codepoint,
+          hex: hex,
+          action: "removed"
+        }
+        @events.write("#{JSON.generate(event)}\n")
+        @total += 1
+        @per_file[file.to_s] += 1
+        @per_codepoint[hex] += 1
+      end
+
+      def finish(success:)
+        return if @total.zero?
+
+        @events&.close
+        @events = nil
+        FileUtils.mkdir_p(@summary_path.dirname)
+        summary = {
+          source_path: @source_path,
+          output_path: @output_path,
+          started_at: @started_at.utc.iso8601,
+          completed_at: Time.now.utc.iso8601,
+          success: success,
+          total_scrubbed: @total,
+          per_file_totals: @per_file,
+          per_codepoint_totals: @per_codepoint,
+          events_path: @events_path.to_s
+        }
+        File.write(@summary_path, JSON.pretty_generate(summary), mode: "w:utf-8")
+      end
+
+      private
+
+      def open_events
+        return if @events
+
+        FileUtils.mkdir_p(@events_path.dirname)
+        @events = File.open(@events_path, "w:utf-8")
+      end
     end
 
     def parse_xml_file(xml_path, &block)
@@ -426,7 +545,11 @@ module SiloMigrate
     end
 
     def stream_fixed_xml(path)
-      sanitizer = XMLStreamSanitizer.new
+      sanitizer = XMLStreamSanitizer.new(
+        path: path.to_s,
+        scrub_invalid_xml_chars: @scrub_invalid_xml_chars,
+        invalid_xml_handler: method(:record_invalid_xml_char)
+      )
       open_input(path) do |input|
         while (chunk = input.read(XML_CHUNK_SIZE))
           track_input_bytes(chunk.bytesize)
@@ -442,6 +565,44 @@ module SiloMigrate
       @current_file_progress[:bytes_read] += bytes
       @stats[:bytes_read] += bytes
       report_progress(:bytes)
+    end
+
+    def record_invalid_xml_char(file:, offset:, codepoint:)
+      @stats[:invalid_xml_chars_removed] += 1
+      @invalid_xml_report&.record(file: file, offset: offset, codepoint: codepoint)
+    end
+
+    def prepare_invalid_xml_report(source, output_path)
+      return unless @scrub_invalid_xml_chars
+
+      summary_path, events_path = invalid_xml_report_paths(output_path)
+      @invalid_xml_report = InvalidXMLCharReport.new(
+        source_path: source,
+        output_path: output_path,
+        summary_path: summary_path,
+        events_path: events_path,
+        started_at: @conversion_started_at
+      )
+    end
+
+    def finalize_invalid_xml_report(success:)
+      return unless @invalid_xml_report
+      return if @invalid_xml_report_finalized
+
+      @invalid_xml_report.finish(success: success)
+      @invalid_xml_report_finalized = true
+    end
+
+    def invalid_xml_report_paths(output_path)
+      summary_path = Pathname(@invalid_xml_report_path || "#{output_path}.invalid-xml-chars.json")
+      events_path = if summary_path.to_s.end_with?(".summary.json")
+                      Pathname(summary_path.to_s.sub(/\.summary\.json\z/, ".events.jsonl"))
+                    elsif summary_path.to_s.end_with?(".json")
+                      Pathname(summary_path.to_s.sub(/\.json\z/, ".events.jsonl"))
+                    else
+                      Pathname("#{summary_path}.events.jsonl")
+                    end
+      [summary_path, events_path]
     end
 
     def report_progress(event, extra = {})
@@ -482,7 +643,7 @@ module SiloMigrate
     end
 
     def reset_stats
-      @stats = { tables_processed: 0, rows_processed: 0, bytes_read: 0, bytes_written: 0, files_processed: 0, files_skipped: 0, tables_skipped: 0 }
+      @stats = { tables_processed: 0, rows_processed: 0, bytes_read: 0, bytes_written: 0, files_processed: 0, files_skipped: 0, tables_skipped: 0, invalid_xml_chars_removed: 0 }
     end
 
     def open_output(path, gzip: nil)

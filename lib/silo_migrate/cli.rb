@@ -88,6 +88,10 @@ module SiloMigrate
           -b, --batch-size SIZE      rows per INSERT batch (default 1000)
           --schema-only              emit CREATE TABLE statements only
           --compress                 gzip the output
+          --no-scrub-invalid-xml-chars
+                                     fail on XML-forbidden control characters
+                                     instead of removing them
+          --invalid-xml-report FILE   audit summary path for removed controls
       HELP
       "convert-json" => <<~HELP,
         Usage: silo-migrate convert-json SOURCE [options]
@@ -541,7 +545,7 @@ module SiloMigrate
     end
 
     def convert_xml(argv)
-      options = { phase: "initial", batch_size: 1000, schema_only: false, compress: false }
+      options = { phase: "initial", batch_size: 1000, schema_only: false, compress: false, scrub_invalid_xml_chars: true }
       OptionParser.new do |opts|
         opts.on("-o", "--output FILE") { |value| options[:output] = value }
         opts.on("-c", "--customer CUSTOMER") { |value| options[:customer] = value }
@@ -553,6 +557,8 @@ module SiloMigrate
         opts.on("-b", "--batch-size SIZE", Integer) { |value| options[:batch_size] = value }
         opts.on("--schema-only") { options[:schema_only] = true }
         opts.on("--compress") { options[:compress] = true }
+        opts.on("--no-scrub-invalid-xml-chars") { options[:scrub_invalid_xml_chars] = false }
+        opts.on("--invalid-xml-report FILE") { |value| options[:invalid_xml_report_path] = value }
       end.parse!(argv)
       source = Pathname(required_existing_path(required_arg(argv, "SOURCE")))
       output = converted_output_path(source, options, input_ext: ".xml")
@@ -563,6 +569,8 @@ module SiloMigrate
         include_files: options[:include_files],
         exclude_files: options[:exclude_files],
         schema_only: options[:schema_only],
+        scrub_invalid_xml_chars: options[:scrub_invalid_xml_chars],
+        invalid_xml_report_path: options[:invalid_xml_report_path] || default_invalid_xml_report_path(output, project_style: !!options[:customer]),
         verbose: true
       ).convert(source, output)
       @output.puts "\nTo import this dump, run:\n  silo-migrate import-dump #{options[:customer]} #{options[:phase]}" if options[:customer]
@@ -841,6 +849,12 @@ module SiloMigrate
                source.join("combined.sql")
              end
       options[:compress] && path.extname != ".gz" ? Pathname("#{path}.gz") : path
+    end
+
+    def default_invalid_xml_report_path(output, project_style:)
+      return nil unless project_style
+
+      output.dirname.join("xml-invalid-chars-#{Time.now.strftime('%Y%m%d-%H%M%S')}.summary.json")
     end
   end
 end

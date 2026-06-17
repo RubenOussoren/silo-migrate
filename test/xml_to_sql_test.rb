@@ -79,6 +79,177 @@ class XMLToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_preserves_post_body_xhtml_from_cdata_as_sql_value
+    unicode = "\u{1F600}"
+    body = <<~HTML.chomp
+      <article class="message" data-post-id="42">
+        <p>Don't normalize <strong>this</strong> XHTML & don't sanitize scripts.</p>
+        <pre data-path="C:\\tmp\\post.rb">puts 'hello'
+      puts "tab:\tand unicode: cafe emoji: #{unicode}"</pre>
+        <script type="application/json">{"raw":"<keep>&value"}</script>
+      </article>
+    HTML
+    raw_body = "[b]raw[/b]\n<not-html attr='still text'> & \\ backslash"
+    xml = messages_xml(body: "<![CDATA[#{body}]]>", raw_body: "<![CDATA[#{raw_body}]]>")
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.xml"), xml)
+      output = File.join(dir, "messages.sql")
+      SiloMigrate::XMLToSQLConverter.new(verbose: false).convert(Pathname(input), Pathname(output))
+
+      sql = File.read(output)
+      assert_includes sql, SiloMigrate::SQLXML.escape_sql_string(body)
+      assert_includes sql, SiloMigrate::SQLXML.escape_sql_string(raw_body)
+      assert_includes sql, "<script type=\"application/json\">"
+      assert_includes sql, "<keep>&value"
+      assert_includes sql, "tab:\\tand unicode: cafe emoji: #{unicode}"
+    end
+  end
+
+  def test_preserves_escaped_post_body_xhtml_as_same_character_value
+    body = "<p title=\"A & B\">Tom & Jerry's <em>escaped</em> XHTML</p>"
+    raw_body = "<blockquote data-x=\"1\">raw & exact</blockquote>"
+    xml = messages_xml(body: xml_escape(body), raw_body: xml_escape(raw_body))
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.xml"), xml)
+      output = File.join(dir, "messages.sql")
+      SiloMigrate::XMLToSQLConverter.new(verbose: false).convert(Pathname(input), Pathname(output))
+
+      sql = File.read(output)
+      assert_includes sql, SiloMigrate::SQLXML.escape_sql_string(body)
+      assert_includes sql, SiloMigrate::SQLXML.escape_sql_string(raw_body)
+      refute_includes sql, "&lt;em&gt;"
+      refute_includes sql, "&amp;amp;"
+    end
+  end
+
+  def test_xml_entity_repair_does_not_rewrite_post_body_value
+    body = "community links: /a?x=1&y=2 and escaped &amp; entity"
+    xml = messages_xml(body: body, raw_body: "")
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.xml"), xml)
+      output = File.join(dir, "messages.sql")
+      SiloMigrate::XMLToSQLConverter.new(verbose: false).convert(Pathname(input), Pathname(output))
+
+      sql = File.read(output)
+      assert_includes sql, SiloMigrate::SQLXML.escape_sql_string("community links: /a?x=1&y=2 and escaped & entity")
+    end
+  end
+
+  def test_scrubs_invalid_xml_controls_inside_text_and_cdata_with_audit_report
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="messages">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+            <field Field="subject" Type="text" Null="YES" />
+            <field Field="body" Type="text" Null="YES" />
+          </table_structure>
+          <table_data name="messages">
+            <row>
+              <field name="id">1</field>
+              <field name="subject">bad\x1Bsubject</field>
+              <field name="body"><![CDATA[before\x0C<strong>keep</strong>after]]></field>
+            </row>
+          </table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.xml"), xml)
+      output = File.join(dir, "messages.sql")
+      stats = SiloMigrate::XMLToSQLConverter.new(verbose: false).convert(Pathname(input), Pathname(output))
+
+      sql = File.read(output)
+      assert_equal 2, stats[:invalid_xml_chars_removed]
+      assert_includes sql, "'badsubject', 'before<strong>keep</strong>after'"
+
+      summary_path = "#{output}.invalid-xml-chars.json"
+      events_path = "#{output}.invalid-xml-chars.events.jsonl"
+      assert File.exist?(summary_path)
+      assert File.exist?(events_path)
+
+      summary = JSON.parse(File.read(summary_path))
+      assert_equal true, summary.fetch("success")
+      assert_equal 2, summary.fetch("total_scrubbed")
+      assert_equal 2, summary.fetch("per_file_totals").fetch(input)
+      assert_equal 1, summary.fetch("per_codepoint_totals").fetch("U+001B")
+      assert_equal 1, summary.fetch("per_codepoint_totals").fetch("U+000C")
+
+      events = File.readlines(events_path).map { |line| JSON.parse(line) }
+      assert_equal [xml.b.index("\x1B"), xml.b.index("\x0C")], events.map { |event| event.fetch("input_byte_offset") }
+      assert_equal %w[U+001B U+000C], events.map { |event| event.fetch("codepoint") }
+      assert_equal ["removed", "removed"], events.map { |event| event.fetch("action") }
+      report_text = File.read(summary_path) + File.read(events_path)
+      refute_includes report_text, "badsubject"
+      refute_includes report_text, "<strong>keep</strong>"
+      refute_includes report_text, "before"
+      refute_includes report_text, "after"
+    end
+  end
+
+  def test_no_scrub_invalid_xml_controls_fails_with_actionable_error
+    xml = messages_xml(body: "<![CDATA[before\x1Bafter]]>", raw_body: "")
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.xml"), xml)
+      output = File.join(dir, "messages.sql")
+
+      error = assert_raises(SiloMigrate::UsageError) do
+        SiloMigrate::XMLToSQLConverter.new(verbose: false, scrub_invalid_xml_chars: false).convert(Pathname(input), Pathname(output))
+      end
+
+      assert_includes error.message, "Invalid XML control character U+001B"
+      assert_includes error.message, "input byte offset #{xml.b.index("\x1B")}"
+      assert_includes error.message, "--no-scrub-invalid-xml-chars"
+      refute File.exist?(output)
+    end
+  end
+
+  def test_valid_xml_controls_are_preserved_and_do_not_create_report
+    body = "tab:\tline\ncr:&#13;"
+    xml = messages_xml(body: body, raw_body: "")
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.xml"), xml)
+      output = File.join(dir, "messages.sql")
+      stats = SiloMigrate::XMLToSQLConverter.new(verbose: false).convert(Pathname(input), Pathname(output))
+
+      assert_equal 0, stats[:invalid_xml_chars_removed]
+      assert_includes File.read(output), "'tab:\\tline\\ncr:\\r'"
+      refute File.exist?("#{output}.invalid-xml-chars.json")
+      refute File.exist?("#{output}.invalid-xml-chars.events.jsonl")
+    end
+  end
+
+  def test_invalid_xml_report_is_marked_failed_when_conversion_fails_later
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_data name="messages">
+            <row><field name="body">bad\x1Bbody</field></row>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "bad.xml"), xml)
+      output = File.join(dir, "bad.sql")
+
+      assert_raises(REXML::ParseException) do
+        SiloMigrate::XMLToSQLConverter.new(verbose: false).convert(Pathname(input), Pathname(output))
+      end
+
+      summary = JSON.parse(File.read("#{output}.invalid-xml-chars.json"))
+      assert_equal false, summary.fetch("success")
+      assert_equal 1, summary.fetch("total_scrubbed")
+      assert File.exist?("#{output}.invalid-xml-chars.events.jsonl")
+    end
+  end
+
   def test_include_tables_filters_structures_and_rows
     Dir.mktmpdir do |dir|
       input = write(File.join(dir, "dump.xml"), XML)
@@ -412,5 +583,39 @@ class XMLToSQLTest < SiloMigrateTest
       assert_equal "existing output\n", File.read(output)
       refute File.exist?("#{output}.tmp")
     end
+  end
+
+  private
+
+  def messages_xml(body:, raw_body:)
+    <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="messages">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+            <field Field="subject" Type="varchar(255)" Null="YES" />
+            <field Field="body" Type="text" Null="YES" />
+            <field Field="raw_body" Type="text" Null="YES" />
+          </table_structure>
+          <table_data name="messages">
+            <row>
+              <field name="id">1</field>
+              <field name="subject">Synthetic post</field>
+              <field name="body">#{body}</field>
+              <field name="raw_body">#{raw_body}</field>
+            </row>
+          </table_data>
+        </database>
+      </mysqldump>
+    XML
+  end
+
+  def xml_escape(value)
+    value.gsub("&", "&amp;")
+         .gsub("<", "&lt;")
+         .gsub(">", "&gt;")
+         .gsub('"', "&quot;")
+         .gsub("'", "&apos;")
   end
 end

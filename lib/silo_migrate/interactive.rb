@@ -550,9 +550,15 @@ module SiloMigrate
         exclude_tables: exclude_tables,
         output_compressed: output_compressed
       )
-      XMLToSQLConverter.new(exclude_files: exclude_files, batch_size: batch_size, include_tables: include_tables,
-                            exclude_tables: exclude_tables, verbose: false)
-                       .convert(source_path, output, progress_callback: conversion_progress_printer)
+      invalid_xml_report = project_invalid_xml_report_path(customer, phase)
+      stats = XMLToSQLConverter.new(exclude_files: exclude_files, batch_size: batch_size, include_tables: include_tables,
+                                    exclude_tables: exclude_tables, verbose: false,
+                                    invalid_xml_report_path: invalid_xml_report)
+                             .convert(source_path, output, progress_callback: conversion_progress_printer)
+      if stats[:invalid_xml_chars_removed].positive?
+        @output.puts "[WARN] Removed #{stats[:invalid_xml_chars_removed]} XML-forbidden control character#{stats[:invalid_xml_chars_removed] == 1 ? '' : 's'}."
+        @output.puts "[WARN] Invalid XML audit: #{invalid_xml_report}"
+      end
       @output.puts "[OK] XML converted and staged: #{output}"
       output
     rescue UsageError => e
@@ -603,6 +609,10 @@ module SiloMigrate
       return nil if output.exist? && !confirm?("Replace existing converted dump #{output.basename}?", default: false)
 
       output
+    end
+
+    def project_invalid_xml_report_path(customer, phase)
+      Pathname(File.join(@project_service.project_path(customer), "dumps", phase, "xml-invalid-chars-#{Time.now.strftime('%Y%m%d-%H%M%S')}.summary.json"))
     end
 
     def show_conversion_summary(label, source_path, ext, output, exclude_files:, batch_size:, include_tables: nil,
