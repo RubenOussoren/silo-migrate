@@ -111,6 +111,7 @@ module SiloMigrate
       @last_progress_at = nil
       @current_file_progress = nil
       @conversion_started_at = Time.now
+      @total_input_bytes = 0
       source = Pathname(source)
       output_path = Pathname(output_path)
       files = source.file? ? [source] : source.glob(file_pattern).to_a.concat(source.glob("#{file_pattern}.gz").to_a).sort
@@ -126,8 +127,8 @@ module SiloMigrate
       log "Files found: #{files.length}"
       log "Files to skip: #{skipped.length}" if skipped.any?
       log "Files to process: #{files_to_process.length}"
-      total_input_bytes = files_to_process.sum { |file| file.size rescue 0 }
-      report_progress(:start, file_count: files_to_process.length, total_input_bytes: total_input_bytes, output_path: output_path.to_s, force: true)
+      @total_input_bytes = files_to_process.sum { |file| file.size rescue 0 }
+      report_progress(:start, file_count: files_to_process.length, total_input_bytes: @total_input_bytes, output_path: output_path.to_s, force: true)
 
       write_path = atomic ? temporary_output_path(output_path) : output_path
       FileUtils.rm_f(write_path) if atomic
@@ -392,6 +393,7 @@ module SiloMigrate
       return unless @current_file_progress
 
       @current_file_progress[:bytes_read] += bytes
+      @stats[:bytes_read] += bytes
       report_progress(:bytes)
     end
 
@@ -414,6 +416,8 @@ module SiloMigrate
         files_processed: @stats[:files_processed],
         tables_processed: @stats[:tables_processed],
         rows_processed: @stats[:rows_processed],
+        bytes_read: @stats[:bytes_read],
+        total_input_bytes: @total_input_bytes,
         current_file: @current_file_progress&.dup
       }.merge(extra)
     end
@@ -431,7 +435,7 @@ module SiloMigrate
     end
 
     def reset_stats
-      @stats = { tables_processed: 0, rows_processed: 0, bytes_written: 0, files_processed: 0, files_skipped: 0, tables_skipped: 0 }
+      @stats = { tables_processed: 0, rows_processed: 0, bytes_read: 0, bytes_written: 0, files_processed: 0, files_skipped: 0, tables_skipped: 0 }
     end
 
     def open_output(path, gzip: nil)

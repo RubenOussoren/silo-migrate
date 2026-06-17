@@ -1156,6 +1156,8 @@ class CLITest < SiloMigrateTest
         xml_file,
         "",
         "",
+        "",
+        "",
         "n",
         "Quit"
       ])
@@ -1257,7 +1259,7 @@ class CLITest < SiloMigrateTest
       XML
       staged = File.join(project.project_path("acme"), "dumps", "initial", "combined.sql.gz")
       gzip_write(staged, "existing")
-      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir, "n"])
+      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir, "n", "", "n", "", "n"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1265,6 +1267,128 @@ class CLITest < SiloMigrateTest
       assert_includes prompt.asked, "Replace existing converted dump combined.sql.gz? [y/N]"
       assert_includes out.string, "existing dump left unchanged"
       refute_includes out.string, "Converting XML dump..."
+    end
+  end
+
+  def test_guided_advanced_convert_xml_can_exclude_tables_during_conversion
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_file = write(File.join(dir, "forum.xml"), xml_with_users_and_logs)
+      prompt = FakePrompt.new([
+        "Advanced actions",
+        "Convert XML dump",
+        "initial",
+        xml_file,
+        "",
+        "exclude",
+        "logs"
+      ])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      staged = File.join(project.project_path("acme"), "dumps", "initial", "forum.sql.gz")
+      sql = Zlib::GzipReader.open(staged, &:read)
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "INSERT INTO `users`"
+      refute_includes sql, "CREATE TABLE `logs`"
+      refute_includes sql, "INSERT INTO `logs`"
+      assert_includes out.string, "Table filter: exclude logs"
+    end
+  end
+
+  def test_guided_advanced_convert_xml_can_include_only_selected_tables
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_file = write(File.join(dir, "forum.xml"), xml_with_users_and_logs)
+      prompt = FakePrompt.new([
+        "Advanced actions",
+        "Convert XML dump",
+        "initial",
+        xml_file,
+        "",
+        "include",
+        "users"
+      ])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      staged = File.join(project.project_path("acme"), "dumps", "initial", "forum.sql.gz")
+      sql = Zlib::GzipReader.open(staged, &:read)
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "INSERT INTO `users`"
+      refute_includes sql, "CREATE TABLE `logs`"
+      refute_includes sql, "INSERT INTO `logs`"
+      assert_includes out.string, "Table filter: include only users"
+    end
+  end
+
+  def test_guided_advanced_convert_xml_blank_table_filter_converts_all_tables
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_file = write(File.join(dir, "forum.xml"), xml_with_users_and_logs)
+      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_file, "", ""])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      staged = File.join(project.project_path("acme"), "dumps", "initial", "forum.sql.gz")
+      sql = Zlib::GzipReader.open(staged, &:read)
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "CREATE TABLE `logs`"
+      assert_includes out.string, "Table filter: all tables"
+    end
+  end
+
+  def test_guided_advanced_convert_xml_can_write_plain_sql_output
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_file = write(File.join(dir, "forum.xml"), xml_with_users_and_logs)
+      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_file, "", "", "n", "n"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      staged = File.join(project.project_path("acme"), "dumps", "initial", "forum.sql")
+      assert File.exist?(staged)
+      refute File.exist?("#{staged}.gz")
+      assert_includes File.read(staged), "CREATE TABLE `users`"
+      assert_includes out.string, "Output compression: plain SQL (.sql)"
+    end
+  end
+
+  def test_guided_large_xml_source_defaults_to_larger_insert_batches
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_file = File.join(dir, "large.xml")
+      write(xml_file, xml_with_users_and_logs)
+      File.open(xml_file, "ab") { |file| file.truncate(1024 * 1024 * 1024) }
+      interactive = SiloMigrate::Interactive.new(
+        project_service: project,
+        import_service: import,
+        prompt: FakePrompt.new([""]),
+        output: out
+      )
+
+      assert_equal 5000, interactive.send(:prompt_xml_batch_size, Pathname(xml_file))
+      assert_includes out.string, "Large XML source detected; using 5000 rows per INSERT batch"
     end
   end
 
@@ -1571,6 +1695,28 @@ class CLITest < SiloMigrateTest
         "redacted" => true
       }
     }
+  end
+
+  def xml_with_users_and_logs
+    <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="users">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+          </table_structure>
+          <table_data name="users">
+            <row><field name="id">1</field></row>
+          </table_data>
+          <table_structure name="logs">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+          </table_structure>
+          <table_data name="logs">
+            <row><field name="id">1</field></row>
+          </table_data>
+        </database>
+      </mysqldump>
+    XML
   end
 
   def create_converter_platform(env, customer, platform)

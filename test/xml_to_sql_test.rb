@@ -79,6 +79,53 @@ class XMLToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_include_tables_filters_structures_and_rows
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), XML)
+      output = File.join(dir, "dump.sql")
+      stats = SiloMigrate::XMLToSQLConverter.new(include_tables: ["users"], verbose: false).convert(Pathname(input), Pathname(output))
+
+      sql = File.read(output)
+      assert_equal 1, stats[:tables_processed]
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "INSERT INTO `users`"
+      refute_includes sql, "CREATE TABLE `logs`"
+      refute_includes sql, "INSERT INTO `logs`"
+    end
+  end
+
+  def test_exclude_tables_filters_structures_and_rows
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), XML)
+      output = File.join(dir, "dump.sql")
+      stats = SiloMigrate::XMLToSQLConverter.new(exclude_tables: ["logs"], verbose: false).convert(Pathname(input), Pathname(output))
+
+      sql = File.read(output)
+      assert_equal 1, stats[:tables_processed]
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "INSERT INTO `users`"
+      refute_includes sql, "CREATE TABLE `logs`"
+      refute_includes sql, "INSERT INTO `logs`"
+    end
+  end
+
+  def test_include_and_exclude_table_filters_apply_conservatively
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), XML)
+      output = File.join(dir, "dump.sql")
+      stats = SiloMigrate::XMLToSQLConverter.new(include_tables: %w[users logs], exclude_tables: ["logs"], verbose: false).convert(Pathname(input), Pathname(output))
+
+      sql = File.read(output)
+      assert_equal 1, stats[:tables_processed]
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "CREATE TABLE `users`"
+      refute_includes sql, "CREATE TABLE `logs`"
+      refute_includes sql, "INSERT INTO `logs`"
+    end
+  end
+
   def test_rejects_non_positive_batch_size
     error = assert_raises(SiloMigrate::UsageError) do
       SiloMigrate::XMLToSQLConverter.new(batch_size: 0, verbose: false)

@@ -259,8 +259,19 @@ module SiloMigrate
       dump_path = case format
                   when :xml
                     exclude_files = prompt_xml_file_exclusions(Pathname(source))
-                    batch_size = prompt_xml_batch_size
-                    convert_xml_to_project(customer, phase, source, exclude_files: exclude_files, batch_size: batch_size)
+                    table_filters = prompt_xml_table_filters
+                    batch_size = prompt_xml_batch_size(Pathname(source))
+                    compressed = prompt_converted_output_compression("XML")
+                    convert_xml_to_project(
+                      customer,
+                      phase,
+                      source,
+                      exclude_files: exclude_files,
+                      batch_size: batch_size,
+                      include_tables: table_filters[:include_tables],
+                      exclude_tables: table_filters[:exclude_tables],
+                      output_compressed: compressed
+                    )
                   when :json
                     exclude_files = prompt_json_file_exclusions(Pathname(source))
                     schema_dir = prompt_json_schema_dir(Pathname(source))
@@ -414,8 +425,19 @@ module SiloMigrate
       return BACK if source == BACK
 
       exclude_files = prompt_xml_file_exclusions(Pathname(source))
-      batch_size = prompt_xml_batch_size
-      output = convert_xml_to_project(customer, phase, source, exclude_files: exclude_files, batch_size: batch_size)
+      table_filters = prompt_xml_table_filters
+      batch_size = prompt_xml_batch_size(Pathname(source))
+      compressed = prompt_converted_output_compression("XML")
+      output = convert_xml_to_project(
+        customer,
+        phase,
+        source,
+        exclude_files: exclude_files,
+        batch_size: batch_size,
+        include_tables: table_filters[:include_tables],
+        exclude_tables: table_filters[:exclude_tables],
+        output_compressed: compressed
+      )
       return unless output
 
       @output.puts "[OK] XML converted: #{output}"
@@ -504,16 +526,28 @@ module SiloMigrate
       @output.puts "[WARN] #{e.message}"
     end
 
-    def convert_xml_to_project(customer, phase, source, exclude_files: nil, batch_size: 1000)
+    def convert_xml_to_project(customer, phase, source, exclude_files: nil, batch_size: 1000, include_tables: nil,
+                               exclude_tables: nil, output_compressed: true)
       source_path = Pathname(source)
-      output = converted_dump_output(customer, phase, source_path, ".xml")
+      output = converted_dump_output(customer, phase, source_path, ".xml", compressed: output_compressed)
       unless output
         @output.puts "[WARN] XML conversion skipped; existing dump left unchanged."
         return nil
       end
 
-      show_conversion_summary("XML", source_path, ".xml", output, exclude_files: exclude_files, batch_size: batch_size)
-      XMLToSQLConverter.new(exclude_files: exclude_files, batch_size: batch_size, verbose: false)
+      show_conversion_summary(
+        "XML",
+        source_path,
+        ".xml",
+        output,
+        exclude_files: exclude_files,
+        batch_size: batch_size,
+        include_tables: include_tables,
+        exclude_tables: exclude_tables,
+        output_compressed: output_compressed
+      )
+      XMLToSQLConverter.new(exclude_files: exclude_files, batch_size: batch_size, include_tables: include_tables,
+                            exclude_tables: exclude_tables, verbose: false)
                        .convert(source_path, output, progress_callback: conversion_progress_printer)
       @output.puts "[OK] XML converted and staged: #{output}"
       output
@@ -524,7 +558,7 @@ module SiloMigrate
 
     def convert_json_to_project(customer, phase, source, exclude_files: nil, batch_size: 1000, schema_dir: nil, recover_truncated: false)
       source_path = Pathname(source)
-      output = converted_dump_output(customer, phase, source_path, ".json")
+      output = converted_dump_output(customer, phase, source_path, ".json", compressed: true)
       unless output
         @output.puts "[WARN] JSON conversion skipped; existing dump left unchanged."
         return nil
@@ -559,15 +593,16 @@ module SiloMigrate
 
     # Returns the staged dump path for a conversion, or nil when the user
     # declines to replace an existing dump.
-    def converted_dump_output(customer, phase, source_path, ext)
+    def converted_dump_output(customer, phase, source_path, ext, compressed: true)
       base = source_path.file? ? source_path.basename.to_s.sub(/\.gz\z/, "").sub(/#{Regexp.escape(ext)}\z/, "") : "combined"
-      output = Pathname(File.join(@project_service.project_path(customer), "dumps", phase, "#{base}.sql.gz"))
+      output = Pathname(File.join(@project_service.project_path(customer), "dumps", phase, "#{base}.sql#{compressed ? '.gz' : ''}"))
       return nil if output.exist? && !confirm?("Replace existing converted dump #{output.basename}?", default: false)
 
       output
     end
 
-    def show_conversion_summary(label, source_path, ext, output, exclude_files:, batch_size:)
+    def show_conversion_summary(label, source_path, ext, output, exclude_files:, batch_size:, include_tables: nil,
+                                exclude_tables: nil, output_compressed: nil)
       summary = source_summary(source_path, ext, exclude_files: exclude_files)
       @output.puts "\nConverting #{label} dump..."
       @output.puts "Source: #{source_path}"
@@ -579,32 +614,66 @@ module SiloMigrate
       end
       @output.puts "Input size: #{DumpTools.format_size(summary[:bytes])} across #{summary[:files]} file#{summary[:files] == 1 ? '' : 's'}"
       @output.puts "Insert batch size: #{batch_size}"
+      @output.puts "Table filter: #{table_filter_description(include_tables: include_tables, exclude_tables: exclude_tables)}" if label == "XML"
+      @output.puts "Output compression: #{output_compressed ? 'gzip (.sql.gz)' : 'plain SQL (.sql)'}" unless output_compressed.nil?
       @output.puts "Output: #{output}"
       @output.puts "Large #{label} conversions can take a while; progress will update periodically."
     end
 
-    def prompt_xml_batch_size
-      prompt_batch_size("XML")
+    def prompt_xml_batch_size(source_path = nil)
+      default = large_conversion_source?(source_path, ".xml") ? 5000 : 1000
+      @output.puts "Large XML source detected; using #{default} rows per INSERT batch unless you override it." if default > 1000
+      prompt_batch_size("XML", default: default)
     end
 
     def prompt_json_batch_size
       prompt_batch_size("JSON")
     end
 
-    def prompt_batch_size(label)
-      return 1000 unless confirm?("Use a custom #{label} insert batch size? (default 1000)", default: false)
+    def prompt_batch_size(label, default: 1000)
+      return default unless confirm?("Use a custom #{label} insert batch size? (default #{default})", default: false)
 
       value = ask("#{label} insert batch size").to_s.strip
-      return 1000 if value.empty?
+      return default if value.empty?
 
       batch_size = Integer(value, 10)
       return batch_size if batch_size.positive?
 
-      @output.puts "[WARN] Invalid #{label} batch size; using 1000."
-      1000
+      @output.puts "[WARN] Invalid #{label} batch size; using #{default}."
+      default
     rescue ArgumentError
-      @output.puts "[WARN] Invalid #{label} batch size; using 1000."
-      1000
+      @output.puts "[WARN] Invalid #{label} batch size; using #{default}."
+      default
+    end
+
+    def prompt_xml_table_filters
+      mode = ask("XML table filter: all, include, or exclude (blank for all)").to_s.strip.downcase
+      case mode
+      when "", "all", "a"
+        { include_tables: nil, exclude_tables: nil }
+      when "include", "i"
+        tables = csv_answer(ask("Tables to include (comma-separated)"))
+        return warn_empty_xml_table_filter if tables.empty?
+
+        { include_tables: tables, exclude_tables: nil }
+      when "exclude", "x"
+        tables = csv_answer(ask("Tables to exclude (comma-separated)"))
+        return warn_empty_xml_table_filter if tables.empty?
+
+        { include_tables: nil, exclude_tables: tables }
+      else
+        @output.puts "[WARN] Unknown XML table filter mode; converting all tables."
+        { include_tables: nil, exclude_tables: nil }
+      end
+    end
+
+    def prompt_converted_output_compression(label)
+      confirm?("Write compressed #{label} output as .sql.gz? (recommended for disk safety)", default: true)
+    end
+
+    def warn_empty_xml_table_filter
+      @output.puts "[WARN] No XML table names provided; converting all tables."
+      { include_tables: nil, exclude_tables: nil }
     end
 
     def prompt_xml_file_exclusions(source_path)
@@ -666,6 +735,26 @@ module SiloMigrate
       exclude_files.include?(file_name) || exclude_files.include?(base)
     end
 
+    def large_conversion_source?(source_path, ext)
+      source_files(source_path, ext).sum { |file| file.size rescue 0 } >= 1024 * 1024 * 1024
+    end
+
+    def csv_answer(value)
+      value.to_s.split(",").map(&:strip).reject(&:empty?)
+    end
+
+    def table_filter_description(include_tables:, exclude_tables:)
+      if include_tables && include_tables.any?
+        description = "include only #{include_tables.join(', ')}"
+        description += "; then exclude #{exclude_tables.join(', ')}" if exclude_tables && exclude_tables.any?
+        description
+      elsif exclude_tables && exclude_tables.any?
+        "exclude #{exclude_tables.join(', ')}"
+      else
+        "all tables"
+      end
+    end
+
     def conversion_progress_printer
       proc do |progress|
         case progress[:event]
@@ -679,7 +768,7 @@ module SiloMigrate
           next unless file
 
           percent = file[:size].positive? ? format(" %.1f%%", (file[:bytes_read].to_f / file[:size]) * 100) : ""
-          @output.puts "  #{file[:name]}: #{DumpTools.format_size(file[:bytes_read])}/#{DumpTools.format_size(file[:size])}#{percent}, rows #{progress[:rows_processed]}, tables #{progress[:tables_processed]}, elapsed #{DumpTools.format_elapsed(progress[:elapsed])}"
+          @output.puts "  #{file[:name]}: #{DumpTools.format_size(file[:bytes_read])}/#{DumpTools.format_size(file[:size])}#{percent}, #{conversion_rate_text(progress)}, #{conversion_eta_text(progress)}, rows #{progress[:rows_processed]}, tables #{progress[:tables_processed]}, elapsed #{DumpTools.format_elapsed(progress[:elapsed])}"
         when :file_complete
           file = progress[:current_file]
           @output.puts "Finished #{file[:name]}: rows #{progress[:rows_processed]}, tables #{progress[:tables_processed]}"
@@ -689,6 +778,24 @@ module SiloMigrate
           @output.puts "[WARN] #{progress[:message]}"
         end
       end
+    end
+
+    def conversion_rate_text(progress)
+      elapsed = progress[:elapsed].to_f
+      return "rate n/a" unless elapsed.positive?
+
+      mb_per_second = progress[:bytes_read].to_i / 1024.0 / 1024.0 / elapsed
+      format("%.1f MB/s", mb_per_second)
+    end
+
+    def conversion_eta_text(progress)
+      elapsed = progress[:elapsed].to_f
+      bytes_read = progress[:bytes_read].to_i
+      total = progress[:total_input_bytes].to_i
+      return "ETA n/a" unless elapsed.positive? && bytes_read.positive? && total > bytes_read
+
+      seconds = (total - bytes_read) / (bytes_read / elapsed)
+      "ETA #{DumpTools.format_elapsed(seconds)}"
     end
 
     def setup_converter(customer)
