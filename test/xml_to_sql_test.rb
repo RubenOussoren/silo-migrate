@@ -180,6 +180,82 @@ class XMLToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_table_discovery_accepts_single_and_double_quoted_name_attributes
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name='single_quote' />
+          <table_data name="double_quote"><row /></table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new.discover(Pathname(input))
+
+      assert_equal %w[double_quote single_quote], result.tables
+    end
+  end
+
+  def test_table_discovery_handles_tags_split_across_chunks
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="split_tag" />
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new(chunk_size: 7).discover(Pathname(input))
+
+      assert_equal ["split_tag"], result.tables
+    end
+  end
+
+  def test_table_discovery_uses_table_data_when_structure_is_absent
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_data name="rows_only"><row><field name="id">1</field></row></table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new.discover(Pathname(input))
+
+      assert_equal ["rows_only"], result.tables
+    end
+  end
+
+  def test_table_discovery_ignores_table_like_text_inside_cdata
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="users" />
+          <table_data name="users">
+            <row><field name="body"><![CDATA[<table_data name="not_a_table">]]></field></row>
+          </table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new(chunk_size: 11).discover(Pathname(input))
+
+      assert_equal ["users"], result.tables
+    end
+  end
+
   def test_rejects_non_positive_batch_size
     error = assert_raises(SiloMigrate::UsageError) do
       SiloMigrate::XMLToSQLConverter.new(batch_size: 0, verbose: false)

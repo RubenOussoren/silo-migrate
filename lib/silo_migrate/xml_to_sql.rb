@@ -522,9 +522,20 @@ module SiloMigrate
 
     Result = Struct.new(:tables, :files, :files_found, :files_skipped, :skipped, keyword_init: true)
 
-    def initialize(include_files: nil, exclude_files: nil)
+    CDATA_START = "<![CDATA[".b
+    CDATA_END = "]]>".b
+    COMMENT_START = "<!--".b
+    COMMENT_END = "-->".b
+    PROCESSING_START = "<?".b
+    PROCESSING_END = "?>".b
+    INTERESTING_TAG = /<\s*(?:table_structure|table_data)\b/n
+    NAME_ATTR = /\bname\s*=\s*(['"])(.*?)\1/mn
+    SCAN_TAIL_BYTES = 64
+
+    def initialize(include_files: nil, exclude_files: nil, chunk_size: XMLToSQLConverter::XML_CHUNK_SIZE)
       @include_files = include_files&.to_set
       @exclude_files = Array(exclude_files).to_set
+      @chunk_size = chunk_size
     end
 
     def discover(source, file_pattern: "*.xml")
@@ -549,62 +560,164 @@ module SiloMigrate
 
     private
 
-    class DiscoveryListener
-      include REXML::StreamListener
-
-      def initialize(&table_handler)
-        @table_handler = table_handler
-      end
-
-      def tag_start(name, attrs)
-        return unless name == "table_structure" || name == "table_data"
-
-        table = attrs["name"].to_s
-        @table_handler.call(table) unless table.empty?
-      end
-    end
-
     def discover_file(path)
       tables = Set.new
-      parse_xml_file(path) { |table| tables << table }
+      scanner = TableTagScanner.new(chunk_size: @chunk_size) { |table| tables << table }
+      open_input(path) do |input|
+        while (chunk = input.read(@chunk_size))
+          scanner.feed(chunk)
+        end
+      end
+      scanner.finish
       tables.to_a
     end
 
-    def parse_xml_file(xml_path, &block)
-      reader, writer = IO.pipe
-      writer_error = nil
-      parser_error = nil
-      writer_thread = Thread.new do
-        begin
-          stream_fixed_xml(xml_path) { |chunk| writer.write(chunk) }
-        rescue Errno::EPIPE, IOError
-          raise unless parser_error
-        rescue StandardError => e
-          writer_error = e
-        ensure
-          writer.close unless writer.closed?
+    class TableTagScanner
+      def initialize(chunk_size:, &table_handler)
+        @table_handler = table_handler
+        @chunk_size = chunk_size
+        @buffer = +"".b
+        @skip_until = nil
+      end
+
+      def feed(chunk)
+        @buffer << chunk.to_s.b
+        scan(final: false)
+      end
+
+      def finish
+        scan(final: true)
+      end
+
+      private
+
+      def scan(final:)
+        loop do
+          if @skip_until
+            break unless drain_skip(final: final)
+
+            next
+          end
+
+          marker = next_marker
+          unless marker
+            trim_buffer(final: final)
+            break
+          end
+
+          index, type = marker
+          if type == :tag
+            tag_end = start_tag_end(index)
+            unless tag_end
+              @buffer.slice!(0, index) if index.positive?
+              trim_oversized_partial_tag
+              break
+            end
+
+            process_tag(@buffer.byteslice(index, tag_end - index + 1))
+            @buffer.slice!(0, tag_end + 1)
+          else
+            start, ending = skip_markers(type)
+            @buffer.slice!(0, index + start.bytesize)
+            @skip_until = ending
+            drain_skip(final: final)
+          end
         end
       end
 
-      REXML::Parsers::StreamParser.new(reader, DiscoveryListener.new(&block)).parse
-    rescue StandardError => e
-      parser_error = e
-      raise
-    ensure
-      reader.close unless reader.closed?
-      writer.close unless writer.closed?
-      writer_thread&.join
-      raise writer_error if writer_error && !parser_error
-    end
+      def next_marker
+        candidates = []
+        tag = @buffer.index(INTERESTING_TAG)
+        candidates << [tag, :tag] if tag
+        cdata = @buffer.index(CDATA_START)
+        candidates << [cdata, :cdata] if cdata
+        comment = @buffer.index(COMMENT_START)
+        candidates << [comment, :comment] if comment
+        processing = @buffer.index(PROCESSING_START)
+        candidates << [processing, :processing] if processing
+        candidates.min_by(&:first)
+      end
 
-    def stream_fixed_xml(path)
-      sanitizer = XMLToSQLConverter::XMLStreamSanitizer.new
-      open_input(path) do |input|
-        while (chunk = input.read(XMLToSQLConverter::XML_CHUNK_SIZE))
-          sanitizer.feed(chunk) { |fixed| yield fixed }
+      def start_tag_end(index)
+        quote = nil
+        i = index
+        while i < @buffer.bytesize
+          char = @buffer.getbyte(i)
+          if quote
+            quote = nil if char == quote
+          elsif char == 34 || char == 39
+            quote = char
+          elsif char == 62
+            return i
+          end
+          i += 1
+        end
+        nil
+      end
+
+      def process_tag(tag)
+        match = tag.match(NAME_ATTR)
+        return unless match
+
+        value = match[2].dup.force_encoding("UTF-8").encode("UTF-8", invalid: :replace, undef: :replace)
+        table = unescape_xml_attribute(value)
+        @table_handler.call(table) unless table.empty?
+      end
+
+      def unescape_xml_attribute(value)
+        value.gsub(/&(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/) do |entity|
+          case entity
+          when "&amp;" then "&"
+          when "&lt;" then "<"
+          when "&gt;" then ">"
+          when "&quot;" then '"'
+          when "&apos;" then "'"
+          when /\A&#(\d+);\z/ then Regexp.last_match(1).to_i.chr(Encoding::UTF_8)
+          when /\A&#x([0-9a-fA-F]+);\z/ then Regexp.last_match(1).to_i(16).chr(Encoding::UTF_8)
+          else entity
+          end
+        rescue RangeError
+          entity
         end
       end
-      sanitizer.finish { |fixed| yield fixed }
+
+      def skip_markers(type)
+        case type
+        when :cdata then [CDATA_START, CDATA_END]
+        when :comment then [COMMENT_START, COMMENT_END]
+        when :processing then [PROCESSING_START, PROCESSING_END]
+        end
+      end
+
+      def drain_skip(final:)
+        index = @buffer.index(@skip_until)
+        if index
+          @buffer.slice!(0, index + @skip_until.bytesize)
+          @skip_until = nil
+          true
+        else
+          keep = final ? 0 : [SCAN_TAIL_BYTES, @skip_until.bytesize - 1].max
+          @buffer = keep.positive? ? buffer_tail(keep) : +"".b
+          false
+        end
+      end
+
+      def trim_buffer(final:)
+        keep = final ? 0 : SCAN_TAIL_BYTES
+        @buffer = keep.positive? ? buffer_tail(keep) : +"".b
+      end
+
+      def trim_oversized_partial_tag
+        return unless @buffer.bytesize > @chunk_size + SCAN_TAIL_BYTES
+
+        @buffer = @buffer.byteslice(1, @buffer.bytesize - 1) || +"".b
+      end
+
+      def buffer_tail(bytes)
+        return @buffer if @buffer.bytesize <= bytes
+
+        @buffer.byteslice(-bytes, bytes) || +"".b
+      end
     end
 
     def open_input(path)
