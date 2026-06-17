@@ -66,7 +66,21 @@ class CLITest < SiloMigrateTest
 
       assert_equal 0, cli.run(["self-update"])
       assert_includes runtime.commands, [:run, ["git", "pull", "--ff-only"], source_root, true, 120, nil]
-      assert File.executable?(File.join(dir, "bin", "silo-migrate"))
+      assert_includes runtime.commands, [
+        :run,
+        [
+          File.join(source_root, "script", "install"),
+          "--install-deps",
+          "--install-dir", source_root,
+          "--bin-dir", File.join(dir, "bin"),
+          "--repo", "https://github.com/RubenOussoren/silo-migrate.git",
+          "--branch", "main"
+        ],
+        source_root,
+        false,
+        1_200,
+        nil
+      ]
       assert_includes out.string, "silo-migrate"
     end
   end

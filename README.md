@@ -45,30 +45,44 @@ Requirements:
 
 ### Global install
 
-Install from the Git-managed checkout. This keeps a local clone under
-`~/.local/share/silo-migrate/source`, installs gems there, and writes global
-shims to `~/.local/bin` for `silo-migrate`, `migration-tool`, and `xml-to-sql`.
+Install from the Git-managed checkout. This keeps a local clone, installs gems
+there, and writes global shims for `silo-migrate`, `migration-tool`, and
+`xml-to-sql`. The default repository URL is HTTPS so a fresh machine does not
+need SSH keys just to install the CLI.
 
 ```bash
-git clone git@github.com:RubenOussoren/silo-migrate.git
+git clone https://github.com/RubenOussoren/silo-migrate.git
 cd silo-migrate
 script/install
-silo-migrate doctor
 ```
 
-On a fresh Debian/Ubuntu host, `script/install` can install the baseline host
-packages before installing the tool:
+On a fresh machine, use `--install-deps` to install host dependencies first.
+The installer supports macOS, Debian/Ubuntu, and Fedora/RHEL family hosts. It
+prompts before installing Docker, Homebrew, Oh My Zsh, or editing shell files
+unless `--yes` is passed. It runs `silo-migrate doctor` at the end.
 
 ```bash
 script/install --install-deps
 ```
 
-For non-interactive root setup:
+Common one-line installs:
 
 ```bash
-SILO_MIGRATE_INSTALL_DIR=/migrations/silo-migrate \
-SILO_MIGRATE_BIN_DIR=/usr/local/bin \
-script/install --yes
+# macOS or normal Linux user
+script/install --install-deps
+
+# non-interactive Debian/Ubuntu root setup
+script/install --yes --install-dir /migrations/silo-migrate --bin-dir /usr/local/bin
+
+# normal user, non-interactive, without Docker package installation
+script/install --yes --skip-docker
+```
+
+Docker packages default to Docker's official repositories on Linux. Use distro
+packages instead when needed:
+
+```bash
+script/install --install-deps --docker-source distro
 ```
 
 If `~/.local/bin` is not on `PATH`, add it to your shell profile:
@@ -80,27 +94,35 @@ export PATH="$HOME/.local/bin:$PATH"
 Install/update settings can be overridden:
 
 ```bash
-SILO_MIGRATE_REPO=git@github.com:RubenOussoren/silo-migrate.git
+SILO_MIGRATE_REPO=https://github.com/RubenOussoren/silo-migrate.git
 SILO_MIGRATE_BRANCH=main
 SILO_MIGRATE_INSTALL_DIR="$HOME/.local/share/silo-migrate/source"
 SILO_MIGRATE_BIN_DIR="$HOME/.local/bin"
+```
+
+Installer flags:
+
+```bash
+script/install --dry-run                 # print planned commands
+script/install --with-oh-my-zsh          # explicitly opt into Oh My Zsh
+script/install --repo git@github.com:RubenOussoren/silo-migrate.git
+script/install --branch main
 ```
 
 Upgrade after fixes are pushed:
 
 ```bash
 silo-migrate self-update
-silo-migrate doctor
 ```
 
 ### New machine bootstrap
 
-For a fresh macOS or Linux machine, run the bootstrap script from a clone. It
-checks or installs the host dependencies, asks before editing `.zshrc`, asks
-before installing Oh My Zsh, then runs `script/install`.
+`script/bootstrap` remains as a compatibility wrapper for existing notes and
+scripts. It delegates to `script/install --install-deps`; use `script/install`
+directly for new setup flows.
 
 ```bash
-git clone git@github.com:RubenOussoren/silo-migrate.git
+git clone https://github.com/RubenOussoren/silo-migrate.git
 cd silo-migrate
 script/bootstrap
 ```

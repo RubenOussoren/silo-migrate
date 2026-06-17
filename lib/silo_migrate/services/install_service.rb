@@ -6,7 +6,7 @@ require "shellwords"
 module SiloMigrate
   module Services
     class InstallService
-      DEFAULT_REPO = "git@github.com:RubenOussoren/silo-migrate.git"
+      DEFAULT_REPO = "https://github.com/RubenOussoren/silo-migrate.git"
       DEFAULT_BRANCH = "main"
       EXECUTABLES = %w[silo-migrate migration-tool xml-to-sql].freeze
 
@@ -25,7 +25,9 @@ module SiloMigrate
       end
 
       def self.bin_dir(env)
-        env["SILO_MIGRATE_BIN_DIR"].to_s.empty? ? File.join(home(env), ".local", "bin") : env["SILO_MIGRATE_BIN_DIR"]
+        return env["SILO_MIGRATE_BIN_DIR"] unless env["SILO_MIGRATE_BIN_DIR"].to_s.empty?
+
+        Process.uid.zero? ? "/usr/local/bin" : File.join(home(env), ".local", "bin")
       end
 
       def self.repo(env)
@@ -74,11 +76,9 @@ module SiloMigrate
 
         @output.puts "Updating #{@source_root}..."
         run!(["git", "pull", "--ff-only"], chdir: @source_root, timeout: 120)
-        run_bundle_install!
 
         bin_dir = self.class.bin_dir(@env)
-        self.class.write_shims(@source_root, bin_dir)
-        @output.puts "[OK] Updated shims in #{bin_dir}"
+        run_installer!(bin_dir)
         @output.puts "[OK] silo-migrate #{VERSION} is ready."
         hint = self.class.path_hint(@env)
         @output.puts "[WARN] #{hint}" if hint
@@ -92,12 +92,25 @@ module SiloMigrate
         raise UsageError, "self-update requires a Git checkout. Install with script/install or set SILO_MIGRATE_SOURCE_ROOT to the managed checkout."
       end
 
-      def run_bundle_install!
-        run!(["bundle", "install"], chdir: @source_root, timeout: 600)
+      def run_installer!(bin_dir)
+        installer = File.join(@source_root, "script", "install")
+        run!(
+          [
+            installer,
+            "--install-deps",
+            "--install-dir", @source_root,
+            "--bin-dir", bin_dir,
+            "--repo", self.class.repo(@env),
+            "--branch", self.class.branch(@env)
+          ],
+          chdir: @source_root,
+          timeout: 1_200,
+          capture: false
+        )
       end
 
-      def run!(cmd, chdir:, timeout:)
-        result = @runtime.run(cmd, chdir: chdir, capture: true, timeout: timeout)
+      def run!(cmd, chdir:, timeout:, capture: true)
+        result = @runtime.run(cmd, chdir: chdir, capture: capture, timeout: timeout)
         return result if result.success?
 
         detail = [result.stderr, result.stdout].compact.join("\n").strip

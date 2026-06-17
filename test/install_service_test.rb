@@ -3,7 +3,7 @@
 require_relative "test_helper"
 
 class InstallServiceTest < SiloMigrateTest
-  def test_self_update_pulls_bundle_installs_and_refreshes_shims
+  def test_self_update_pulls_and_runs_installer
     with_tmp_base do |dir, _env|
       source_root = File.join(dir, "source")
       bin_dir = File.join(dir, "bin")
@@ -23,16 +23,22 @@ class InstallServiceTest < SiloMigrateTest
       ).self_update
 
       assert_includes runtime.commands, [:run, ["git", "pull", "--ff-only"], source_root, true, 120, nil]
-      assert_includes runtime.commands, [:run, ["bundle", "install"], source_root, true, 600, nil]
-
-      %w[silo-migrate migration-tool xml-to-sql].each do |name|
-        shim = File.join(bin_dir, name)
-        assert File.executable?(shim), "#{shim} should be executable"
-        content = File.read(shim)
-        assert_includes content, "cd #{Shellwords.escape(source_root)}"
-        assert_includes content, "exec bundle exec ruby bin/#{name}"
-      end
-      assert_includes out.string, "[OK] Updated shims"
+      assert_includes runtime.commands, [
+        :run,
+        [
+          File.join(source_root, "script", "install"),
+          "--install-deps",
+          "--install-dir", source_root,
+          "--bin-dir", bin_dir,
+          "--repo", "https://github.com/RubenOussoren/silo-migrate.git",
+          "--branch", "main"
+        ],
+        source_root,
+        false,
+        1_200,
+        nil
+      ]
+      assert_includes out.string, "[OK] silo-migrate"
     end
   end
 
@@ -65,5 +71,9 @@ class InstallServiceTest < SiloMigrateTest
     assert_equal "/custom/bin", SiloMigrate::Services::InstallService.bin_dir(env)
     assert_equal "git@example.invalid:custom/repo.git", SiloMigrate::Services::InstallService.repo(env)
     assert_equal "stable", SiloMigrate::Services::InstallService.branch(env)
+  end
+
+  def test_default_repo_uses_https_for_fresh_machines
+    assert_equal "https://github.com/RubenOussoren/silo-migrate.git", SiloMigrate::Services::InstallService.repo("HOME" => "/home/example")
   end
 end
