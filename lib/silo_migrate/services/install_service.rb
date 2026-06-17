@@ -101,20 +101,22 @@ module SiloMigrate
 
       def run_installer!(bin_dir)
         installer = File.join(@source_root, "script", "install")
-        run!(
-          [
-            installer,
-            "--install-deps",
-            "--skip-docker",
-            "--install-dir", @source_root,
-            "--bin-dir", bin_dir,
-            "--repo", self.class.repo(@env),
-            "--branch", self.class.branch(@env)
-          ],
-          chdir: @source_root,
-          timeout: 1_200,
-          capture: false
-        )
+        with_unbundled_env do
+          run!(
+            [
+              installer,
+              "--install-deps",
+              "--skip-docker",
+              "--install-dir", @source_root,
+              "--bin-dir", bin_dir,
+              "--repo", self.class.repo(@env),
+              "--branch", self.class.branch(@env)
+            ],
+            chdir: @source_root,
+            timeout: 1_200,
+            capture: false
+          )
+        end
       end
 
       def run_uninstaller!(bin_dir)
@@ -142,6 +144,19 @@ module SiloMigrate
         message = "Command failed: #{cmd.join(' ')}"
         message = "#{message}\n#{detail}" unless detail.empty?
         raise UsageError, message
+      end
+
+      def with_unbundled_env(&block)
+        bundler = Object.const_defined?(:Bundler) ? ::Bundler : nil
+        return yield unless bundler
+
+        if bundler.respond_to?(:with_unbundled_env)
+          bundler.with_unbundled_env(&block)
+        elsif bundler.respond_to?(:with_clean_env)
+          bundler.with_clean_env(&block)
+        else
+          yield
+        end
       end
     end
   end

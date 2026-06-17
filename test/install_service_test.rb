@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "bundler"
 require "open3"
 
 class InstallServiceTest < SiloMigrateTest
@@ -41,6 +42,87 @@ class InstallServiceTest < SiloMigrateTest
         nil
       ]
       assert_includes out.string, "[OK] silo-migrate"
+    end
+  end
+
+  def test_self_update_runs_installer_without_bundler_environment
+    with_tmp_base do |dir, _env|
+      source_root = File.join(dir, "source")
+      bin_dir = File.join(dir, "bin")
+      FileUtils.mkdir_p(File.join(source_root, ".git"))
+      env = {
+        "HOME" => dir,
+        "SILO_MIGRATE_BIN_DIR" => bin_dir
+      }
+      runtime = Class.new(SiloMigrate::Runtime::Fake) do
+        attr_reader :installer_env
+
+        def run(cmd, **kwargs)
+          if cmd.first == File.join(kwargs.fetch(:chdir), "script", "install")
+            @installer_env = {
+              "BUNDLE_GEMFILE" => ENV["BUNDLE_GEMFILE"],
+              "BUNDLE_BIN_PATH" => ENV["BUNDLE_BIN_PATH"],
+              "RUBYOPT" => ENV["RUBYOPT"]
+            }
+          end
+
+          super
+        end
+      end.new
+
+      original_env = {
+        "BUNDLE_GEMFILE" => ENV["BUNDLE_GEMFILE"],
+        "BUNDLE_BIN_PATH" => ENV["BUNDLE_BIN_PATH"],
+        "RUBYOPT" => ENV["RUBYOPT"]
+      }
+
+      begin
+        ENV["BUNDLE_GEMFILE"] = File.join(dir, "Gemfile")
+        ENV["BUNDLE_BIN_PATH"] = File.join(dir, "bundle")
+        ENV["RUBYOPT"] = "-rbundler/setup"
+
+        SiloMigrate::Services::InstallService.new(
+          runtime: runtime,
+          env: env,
+          output: StringIO.new,
+          source_root: source_root
+        ).self_update
+
+        assert_includes runtime.commands, [
+          :run,
+          [
+            File.join(source_root, "script", "install"),
+            "--install-deps",
+            "--skip-docker",
+            "--install-dir", source_root,
+            "--bin-dir", bin_dir,
+            "--repo", "https://github.com/RubenOussoren/silo-migrate.git",
+            "--branch", "main"
+          ],
+          source_root,
+          false,
+          1_200,
+          nil
+        ]
+        assert_equal(
+          {
+            "BUNDLE_GEMFILE" => nil,
+            "BUNDLE_BIN_PATH" => nil,
+            "RUBYOPT" => nil
+          },
+          runtime.installer_env
+        )
+      ensure
+        original_env.each do |name, value|
+          value.nil? ? ENV.delete(name) : ENV[name] = value
+        end
+      end
+
+      assert_equal original_env, {
+        "BUNDLE_GEMFILE" => ENV["BUNDLE_GEMFILE"],
+        "BUNDLE_BIN_PATH" => ENV["BUNDLE_BIN_PATH"],
+        "RUBYOPT" => ENV["RUBYOPT"]
+      }
     end
   end
 
