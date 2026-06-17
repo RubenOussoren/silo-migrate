@@ -122,6 +122,8 @@ module SiloMigrate
       @progress_interval = progress_interval
       @last_progress_at = nil
       @current_file_progress = nil
+      @current_xml_table = nil
+      @current_xml_table_included = nil
       @conversion_started_at = Time.now
       @total_input_bytes = 0
       @invalid_xml_report = nil
@@ -181,6 +183,8 @@ module SiloMigrate
       FileUtils.rm_f(write_path) if atomic && write_path && output_path && write_path != output_path && File.exist?(write_path)
       @progress_callback = nil
       @current_file_progress = nil
+      @current_xml_table = nil
+      @current_xml_table_included = nil
       @invalid_xml_report = nil
     end
 
@@ -197,6 +201,7 @@ module SiloMigrate
       parse_xml_file(xml_path) do |event_type, table, data|
         case event_type
         when :structure
+          set_current_xml_table(table)
           @stats[:tables_observed] += 1
           unless process_table?(table)
             @stats[:tables_skipped] += 1
@@ -349,6 +354,10 @@ module SiloMigrate
         drain(final: true, &block)
       end
 
+      def skip_input_bytes(bytes)
+        @input_byte_offset += bytes
+      end
+
       private
 
       def drain(final:, &block)
@@ -382,10 +391,20 @@ module SiloMigrate
           yield fix_text(@buffer.slice!(0, @buffer.length)) unless @buffer.empty?
           false
         else
-          length = [@buffer.length - XML_SANITIZER_TAIL, 0].max
+          length = safe_text_drain_length([@buffer.length - XML_SANITIZER_TAIL, 0].max)
           yield fix_text(@buffer.slice!(0, length)) if length.positive?
           false
         end
+      end
+
+      def safe_text_drain_length(length)
+        return length unless length.positive?
+
+        amp = @buffer.rindex("&", length - 1)
+        return length unless amp
+
+        semicolon = @buffer.index(";", amp)
+        semicolon && semicolon < length ? length : amp
       end
 
       def fix_text(text)
@@ -429,6 +448,307 @@ module SiloMigrate
 
       def format_codepoint(codepoint)
         format("U+%04X", codepoint)
+      end
+    end
+
+    class XMLTableDataBodyFilter
+      CDATA_START = "<![CDATA[".b
+      CDATA_END = "]]>".b
+      COMMENT_START = "<!--".b
+      COMMENT_END = "-->".b
+      PROCESSING_START = "<?".b
+      PROCESSING_END = "?>".b
+      TABLE_DATA_START = /<\s*table_data\b/n
+      TABLE_DATA_END = /<\s*\/\s*table_data\b/n
+      ATTR = /\b([A-Za-z_:][\w:.-]*)\s*=\s*(['"])(.*?)\2/mn
+      SCAN_TAIL_BYTES = 128
+
+      def initialize(path:, table_included:, event_handler:, skipped_byte_handler:)
+        @path = path
+        @table_included = table_included
+        @event_handler = event_handler
+        @skipped_byte_handler = skipped_byte_handler
+        @buffer = +"".b
+        @passthrough_until = nil
+        @skip_until = nil
+        @skipping_table = nil
+      end
+
+      def feed(chunk, &block)
+        @buffer << chunk.to_s.b
+        drain(final: false, &block)
+      end
+
+      def finish(&block)
+        drain(final: true, &block)
+        return unless @skipping_table
+
+        raise UsageError,
+              "Missing closing </table_data> for excluded XML table #{@skipping_table.inspect} in #{@path}. " \
+              "The converter skipped that table body but could not find its end; re-export the XML or include the table to inspect the malformed block."
+      end
+
+      private
+
+      def drain(final:, &block)
+        loop do
+          progressed =
+            if @skipping_table
+              drain_excluded_table_body(final: final, &block)
+            elsif @passthrough_until
+              drain_passthrough_until(final: final, &block)
+            else
+              drain_normal(final: final, &block)
+            end
+          break unless progressed
+        end
+      end
+
+      def drain_normal(final:)
+        marker = next_normal_marker
+        unless marker
+          emit_safe_prefix(final: final) { |chunk| yield chunk }
+          return false
+        end
+
+        index, type = marker
+        if type == :table_data
+          emit(@buffer.slice!(0, index)) { |chunk| yield chunk } if index.positive?
+          tag_end = start_tag_end(0)
+          unless tag_end
+            trim_oversized_partial_tag
+            return false
+          end
+
+          tag = @buffer.slice!(0, tag_end + 1)
+          table = decoded_attribute(parse_attributes(tag)["name"])
+          included = @table_included.call(table)
+          @event_handler.call(:table_data_start, table, included)
+          emit(tag) { |chunk| yield chunk }
+          if included || self_closing_tag?(tag)
+            @event_handler.call(:table_data_end, table, included) if self_closing_tag?(tag)
+          else
+            @skipping_table = table
+          end
+          true
+        else
+          start, ending = skip_markers(type)
+          emit(@buffer.slice!(0, index + start.bytesize)) { |chunk| yield chunk }
+          @passthrough_until = ending
+          true
+        end
+      end
+
+      def drain_passthrough_until(final:)
+        index = @buffer.index(@passthrough_until)
+        if index
+          emit(@buffer.slice!(0, index + @passthrough_until.bytesize)) { |chunk| yield chunk }
+          @passthrough_until = nil
+          true
+        elsif final
+          emit(@buffer.slice!(0, @buffer.bytesize)) { |chunk| yield chunk }
+          @passthrough_until = nil
+          false
+        else
+          keep = [SCAN_TAIL_BYTES, @passthrough_until.bytesize - 1].max
+          length = [@buffer.bytesize - keep, 0].max
+          emit(@buffer.slice!(0, length)) { |chunk| yield chunk } if length.positive?
+          false
+        end
+      end
+
+      def drain_excluded_table_body(final:)
+        if @skip_until
+          return drain_skipped_until(final: final)
+        end
+
+        marker = next_excluded_marker
+        unless marker
+          discard_safe_prefix(final: final)
+          return false
+        end
+
+        index, type = marker
+        if type == :table_data_end
+          if (tag_start = enclosing_tag_start(index))
+            tag_end = start_tag_end(tag_start)
+            unless tag_end
+              discard(@buffer.slice!(0, tag_start)) if tag_start.positive?
+              trim_oversized_partial_tag
+              return false
+            end
+
+            discard(@buffer.slice!(0, tag_end + 1))
+            return true
+          end
+
+          tag_end = start_tag_end(index)
+          unless tag_end
+            discard(@buffer.slice!(0, index)) if index.positive?
+            trim_oversized_partial_tag
+            return false
+          end
+
+          discard(@buffer.slice!(0, index)) if index.positive?
+          table = @skipping_table
+          emit(@buffer.slice!(0, tag_end - index + 1)) { |chunk| yield chunk }
+          @skipping_table = nil
+          @event_handler.call(:table_data_end, table, false)
+          true
+        else
+          start, ending = skip_markers(type)
+          discard(@buffer.slice!(0, index + start.bytesize))
+          @skip_until = ending
+          true
+        end
+      end
+
+      def drain_skipped_until(final:)
+        index = @buffer.index(@skip_until)
+        if index
+          discard(@buffer.slice!(0, index + @skip_until.bytesize))
+          @skip_until = nil
+          true
+        elsif final
+          discard(@buffer.slice!(0, @buffer.bytesize))
+          false
+        else
+          keep = [SCAN_TAIL_BYTES, @skip_until.bytesize - 1].max
+          length = [@buffer.bytesize - keep, 0].max
+          discard(@buffer.slice!(0, length)) if length.positive?
+          false
+        end
+      end
+
+      def next_normal_marker
+        candidates = []
+        table_data = @buffer.index(TABLE_DATA_START)
+        candidates << [table_data, :table_data] if table_data
+        cdata = @buffer.index(CDATA_START)
+        candidates << [cdata, :cdata] if cdata
+        comment = @buffer.index(COMMENT_START)
+        candidates << [comment, :comment] if comment
+        processing = @buffer.index(PROCESSING_START)
+        candidates << [processing, :processing] if processing
+        candidates.min_by(&:first)
+      end
+
+      def next_excluded_marker
+        candidates = []
+        table_data_end = @buffer.index(TABLE_DATA_END)
+        candidates << [table_data_end, :table_data_end] if table_data_end
+        cdata = @buffer.index(CDATA_START)
+        candidates << [cdata, :cdata] if cdata
+        comment = @buffer.index(COMMENT_START)
+        candidates << [comment, :comment] if comment
+        processing = @buffer.index(PROCESSING_START)
+        candidates << [processing, :processing] if processing
+        candidates.min_by(&:first)
+      end
+
+      def start_tag_end(index)
+        quote = nil
+        i = index
+        while i < @buffer.bytesize
+          char = @buffer.getbyte(i)
+          if quote
+            quote = nil if char == quote
+          elsif char == 34 || char == 39
+            quote = char
+          elsif char == 62
+            return i
+          end
+          i += 1
+        end
+        nil
+      end
+
+      def enclosing_tag_start(index)
+        tag_start = @buffer.rindex("<", index - 1)
+        return nil unless tag_start
+
+        tag_end = @buffer.rindex(">", index - 1)
+        return nil if tag_end && tag_end > tag_start
+
+        tag_start
+      end
+
+      def emit_safe_prefix(final:)
+        if final
+          emit(@buffer.slice!(0, @buffer.bytesize)) { |chunk| yield chunk } unless @buffer.empty?
+        else
+          keep = SCAN_TAIL_BYTES
+          length = [@buffer.bytesize - keep, 0].max
+          emit(@buffer.slice!(0, length)) { |chunk| yield chunk } if length.positive?
+        end
+      end
+
+      def discard_safe_prefix(final:)
+        keep = final ? 0 : SCAN_TAIL_BYTES
+        length = [@buffer.bytesize - keep, 0].max
+        discard(@buffer.slice!(0, length)) if length.positive?
+      end
+
+      def emit(chunk)
+        yield chunk if chunk && !chunk.empty?
+      end
+
+      def discard(chunk)
+        return if chunk.nil? || chunk.empty?
+
+        @skipped_byte_handler.call(chunk.bytesize)
+      end
+
+      def parse_attributes(tag)
+        tag.scan(ATTR).each_with_object({}) do |(name, _quote, value), attrs|
+          attrs[name] = value
+        end
+      end
+
+      def decoded_attribute(value)
+        return "" if value.nil?
+
+        value = value.dup.force_encoding("UTF-8").encode("UTF-8", invalid: :replace, undef: :replace)
+        unescape_xml_attribute(value)
+      end
+
+      def unescape_xml_attribute(value)
+        value.gsub(/&(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/) do |entity|
+          case entity
+          when "&amp;" then "&"
+          when "&lt;" then "<"
+          when "&gt;" then ">"
+          when "&quot;" then '"'
+          when "&apos;" then "'"
+          when /\A&#(\d+);\z/ then Regexp.last_match(1).to_i.chr(Encoding::UTF_8)
+          when /\A&#x([0-9a-fA-F]+);\z/ then Regexp.last_match(1).to_i(16).chr(Encoding::UTF_8)
+          else entity
+          end
+        rescue RangeError
+          entity
+        end
+      end
+
+      def skip_markers(type)
+        case type
+        when :cdata then [CDATA_START, CDATA_END]
+        when :comment then [COMMENT_START, COMMENT_END]
+        when :processing then [PROCESSING_START, PROCESSING_END]
+        end
+      end
+
+      def self_closing_tag?(tag)
+        tag.to_s.b.sub(/>\z/n, "").rstrip.end_with?("/".b)
+      end
+
+      def trim_oversized_partial_tag
+        return unless @buffer.bytesize > XML_CHUNK_SIZE + SCAN_TAIL_BYTES
+
+        if @skipping_table
+          discard(@buffer.slice!(0, @buffer.bytesize - SCAN_TAIL_BYTES))
+        else
+          @buffer = @buffer.byteslice(1, @buffer.bytesize - 1) || +"".b
+        end
       end
     end
 
@@ -543,15 +863,44 @@ module SiloMigrate
         scrub_invalid_xml_chars: @scrub_invalid_xml_chars,
         invalid_xml_handler: method(:record_invalid_xml_char)
       )
+      table_data_filter = XMLTableDataBodyFilter.new(
+        path: path.to_s,
+        table_included: method(:process_table?),
+        event_handler: method(:handle_table_data_filter_event),
+        skipped_byte_handler: proc do |bytes|
+          sanitizer.skip_input_bytes(bytes)
+          track_excluded_table_data_bytes(bytes)
+        end
+      )
       open_input(path) do |input|
         while (chunk = input.read(XML_CHUNK_SIZE))
           track_input_bytes(chunk.bytesize)
-          sanitizer.feed(chunk) { |fixed| yield fixed }
+          table_data_filter.feed(chunk) do |filtered|
+            sanitizer.feed(filtered) { |fixed| yield fixed }
+          end
           warn_if_no_tables_after_bytes
         end
       end
+      table_data_filter.finish do |filtered|
+        sanitizer.feed(filtered) { |fixed| yield fixed }
+      end
       sanitizer.finish { |fixed| yield fixed }
       warn_if_no_tables_after_bytes
+    end
+
+    def handle_table_data_filter_event(event, table, included)
+      case event
+      when :table_data_start
+        set_current_xml_table(table, included: included)
+      when :table_data_end
+        set_current_xml_table(nil, included: nil)
+      end
+    end
+
+    def set_current_xml_table(table, included: process_table?(table))
+      @current_xml_table = table
+      @current_xml_table_included = table.nil? ? nil : included
+      report_progress(:bytes, force: true) if @current_file_progress && table
     end
 
     def track_input_bytes(bytes)
@@ -562,11 +911,18 @@ module SiloMigrate
       report_progress(:bytes)
     end
 
+    def track_excluded_table_data_bytes(bytes)
+      @stats[:excluded_table_data_bytes_skipped] += bytes
+      report_progress(:bytes)
+    end
+
     def warn_if_no_tables_after_bytes
       return if @zero_progress_warning_emitted
       return unless @zero_progress_warning_bytes && @zero_progress_warning_bytes.positive?
       return unless @stats[:bytes_read] >= @zero_progress_warning_bytes
       return unless @stats[:tables_observed].zero? && @stats[:rows_observed].zero?
+      return if @current_xml_table
+      return if @stats[:excluded_table_data_bytes_skipped].positive?
 
       @zero_progress_warning_emitted = true
       emit_warning(
@@ -644,9 +1000,14 @@ module SiloMigrate
         elapsed: Time.now - @conversion_started_at,
         files_processed: @stats[:files_processed],
         tables_processed: @stats[:tables_processed],
+        tables_observed: @stats[:tables_observed],
+        tables_skipped: @stats[:tables_skipped],
         rows_processed: @stats[:rows_processed],
         bytes_read: @stats[:bytes_read],
+        excluded_table_data_bytes_skipped: @stats[:excluded_table_data_bytes_skipped],
         total_input_bytes: @total_input_bytes,
+        current_xml_table: @current_xml_table,
+        current_xml_table_included: @current_xml_table_included,
         current_file: @current_file_progress&.dup
       }.merge(extra)
     end
@@ -674,6 +1035,7 @@ module SiloMigrate
         files_processed: 0,
         files_skipped: 0,
         tables_skipped: 0,
+        excluded_table_data_bytes_skipped: 0,
         invalid_xml_chars_removed: 0,
         warnings: []
       }

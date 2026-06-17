@@ -192,6 +192,30 @@ class XMLToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_invalid_xml_audit_offsets_stay_raw_after_skipping_excluded_table_body
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="user_log"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+          <table_data name="user_log"><row><field name="id">skipped #{'x' * 512}</field></row></table_data>
+          <table_structure name="messages"><field Field="body" Type="text" Null="YES" /></table_structure>
+          <table_data name="messages"><row><field name="body">bad\x1Bbody</field></row></table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.xml"), xml)
+      output = File.join(dir, "messages.sql")
+      stats = SiloMigrate::XMLToSQLConverter.new(exclude_tables: ["user_log"], verbose: false).convert(Pathname(input), Pathname(output))
+
+      assert_equal 1, stats[:invalid_xml_chars_removed]
+      events = File.readlines("#{output}.invalid-xml-chars.events.jsonl").map { |line| JSON.parse(line) }
+      assert_equal [xml.b.index("\x1B")], events.map { |event| event.fetch("input_byte_offset") }
+    end
+  end
+
   def test_no_scrub_invalid_xml_controls_fails_with_actionable_error
     xml = messages_xml(body: "<![CDATA[before\x1Bafter]]>", raw_body: "")
 
@@ -294,6 +318,156 @@ class XMLToSQLTest < SiloMigrateTest
       assert_includes sql, "CREATE TABLE `users`"
       refute_includes sql, "CREATE TABLE `logs`"
       refute_includes sql, "INSERT INTO `logs`"
+    end
+  end
+
+  def test_excluded_table_body_is_skipped_before_later_included_table
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="user_log">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+          </table_structure>
+          <table_data name="user_log">
+            <row><field name="id">1</field></row>
+            <!-- #{"x" * 4096} -->
+          </table_data>
+          <table_structure name="messages">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+          </table_structure>
+          <table_data name="messages"><row><field name="id">9</field></row></table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      output = File.join(dir, "dump.sql")
+      snapshots = []
+
+      stats = SiloMigrate::XMLToSQLConverter.new(exclude_tables: ["user_log"], verbose: false).convert(
+        Pathname(input),
+        Pathname(output),
+        progress_callback: proc { |snapshot| snapshots << snapshot },
+        progress_interval: 0
+      )
+
+      sql = File.read(output)
+      assert_equal 1, stats[:tables_processed]
+      assert_equal 1, stats[:tables_skipped]
+      assert_operator stats[:excluded_table_data_bytes_skipped], :>, 4096
+      refute_includes sql, "CREATE TABLE `user_log`"
+      refute_includes sql, "INSERT INTO `user_log`"
+      assert_includes sql, "CREATE TABLE `messages`"
+      assert_includes sql, "INSERT INTO `messages`"
+      assert snapshots.any? { |snapshot| snapshot[:current_xml_table] == "user_log" && snapshot[:current_xml_table_included] == false && snapshot[:rows_processed].zero? && snapshot[:tables_processed].zero? }
+      assert snapshots.any? { |snapshot| snapshot[:current_xml_table] == "messages" && snapshot[:current_xml_table_included] == true && snapshot[:tables_processed] == 1 }
+      assert snapshots.any? { |snapshot| snapshot[:excluded_table_data_bytes_skipped].to_i.positive? }
+    end
+  end
+
+  def test_malformed_xml_inside_excluded_table_body_does_not_fail_conversion
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="user_log"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+          <table_data name="user_log">
+            <row><field name="id">1</field><field name="bad"><not_closed></field></row>
+          </table_data>
+          <table_structure name="messages"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+          <table_data name="messages"><row><field name="id">2</field></row></table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      output = File.join(dir, "dump.sql")
+
+      stats = SiloMigrate::XMLToSQLConverter.new(exclude_tables: ["user_log"], verbose: false).convert(Pathname(input), Pathname(output))
+
+      assert_equal 1, stats[:rows_processed]
+      assert_includes File.read(output), "INSERT INTO `messages`"
+    end
+  end
+
+  def test_invalid_xml_controls_inside_excluded_table_body_are_not_scrubbed_or_audited
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="user_log"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+          <table_data name="user_log"><row><field name="id">bad\x1Bvalue</field></row></table_data>
+          <table_structure name="messages"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+          <table_data name="messages"><row><field name="id">2</field></row></table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      output = File.join(dir, "dump.sql")
+
+      stats = SiloMigrate::XMLToSQLConverter.new(exclude_tables: ["user_log"], verbose: false, scrub_invalid_xml_chars: false).convert(Pathname(input), Pathname(output))
+
+      assert_equal 0, stats[:invalid_xml_chars_removed]
+      refute File.exist?("#{output}.invalid-xml-chars.json")
+      assert_includes File.read(output), "INSERT INTO `messages`"
+    end
+  end
+
+  def test_excluded_table_skip_scanner_ignores_nested_end_text_until_real_close
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="user_log"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+          <table_data name="user_log">
+            <row data="</table_data>"><field name="id"><![CDATA[not the end </table_data>]]></field></row>
+            <!-- not the end </table_data> -->
+            <?target not the end </table_data> ?>
+          </table_data>
+          <table_structure name="messages"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+          <table_data name="messages"><row><field name="id">2</field></row></table_data>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      output = File.join(dir, "dump.sql")
+
+      stats = SiloMigrate::XMLToSQLConverter.new(exclude_tables: ["user_log"], verbose: false).convert(Pathname(input), Pathname(output))
+
+      assert_operator stats[:excluded_table_data_bytes_skipped], :>, 100
+      assert_includes File.read(output), "INSERT INTO `messages`"
+    end
+  end
+
+  def test_missing_excluded_table_data_close_reports_table_and_file
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="user_log"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+          <table_data name="user_log"><row><field name="id">1</field></row>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      output = File.join(dir, "dump.sql")
+
+      error = assert_raises(SiloMigrate::UsageError) do
+        SiloMigrate::XMLToSQLConverter.new(exclude_tables: ["user_log"], verbose: false).convert(Pathname(input), Pathname(output))
+      end
+
+      assert_includes error.message, "user_log"
+      assert_includes error.message, input
+      assert_includes error.message, "Missing closing </table_data>"
     end
   end
 

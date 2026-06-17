@@ -873,7 +873,7 @@ module SiloMigrate
           @output.puts "First table detected: #{progress[:current_table]}" if progress[:event] == :table && progress[:tables_processed] == 1 && progress[:current_table]
           @output.puts "First row converted from #{progress[:current_table]}" if progress[:event] == :rows && progress[:rows_processed] == 1 && progress[:current_table]
           percent = file[:size].positive? ? format(" %.1f%%", (file[:bytes_read].to_f / file[:size]) * 100) : ""
-          @output.puts "  #{file[:name]}: #{DumpTools.format_size(file[:bytes_read])}/#{DumpTools.format_size(file[:size])}#{percent}, #{conversion_rate_text(progress)}, #{conversion_eta_text(progress)}, rows #{progress[:rows_processed]}, tables #{progress[:tables_processed]}, elapsed #{DumpTools.format_elapsed(progress[:elapsed])}"
+          @output.puts "  #{file[:name]}: #{xml_conversion_reading_text(progress)}, converted rows #{progress[:rows_processed]}, converted tables #{progress[:tables_processed]}, #{DumpTools.format_size(file[:bytes_read])}/#{DumpTools.format_size(file[:size])}#{percent}, #{conversion_rate_text(progress)}, #{conversion_eta_text(progress)}, elapsed #{DumpTools.format_elapsed(progress[:elapsed])}"
         when :file_complete
           file = progress[:current_file]
           @output.puts "Finished #{file[:name]}: rows #{progress[:rows_processed]}, tables #{progress[:tables_processed]}"
@@ -883,6 +883,14 @@ module SiloMigrate
           @output.puts "[WARN] #{progress[:message]}"
         end
       end
+    end
+
+    def xml_conversion_reading_text(progress)
+      table = progress[:current_xml_table]
+      return "reading XML" if table.to_s.empty?
+
+      status = progress[:current_xml_table_included] ? "included" : "excluded"
+      "reading #{table} #{status}"
     end
 
     def conversion_rate_text(progress)

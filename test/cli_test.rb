@@ -1426,6 +1426,44 @@ class CLITest < SiloMigrateTest
     end
   end
 
+  def test_guided_advanced_convert_xml_progress_identifies_excluded_table
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      xml_file = write(File.join(dir, "forum.xml"), <<~XML)
+        <?xml version="1.0"?>
+        <mysqldump>
+          <database name="forum">
+            <table_structure name="user_log"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+            <table_data name="user_log"><row><field name="id">1</field></row><!-- #{"x" * 2048} --></table_data>
+            <table_structure name="messages"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+            <table_data name="messages"><row><field name="id">2</field></row></table_data>
+          </database>
+        </mysqldump>
+      XML
+      prompt = FakePrompt.new([
+        "Advanced actions",
+        "Convert XML dump",
+        "initial",
+        xml_file,
+        "exclude",
+        "user_log",
+        "",
+        "",
+        "n"
+      ])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      assert_includes out.string, "reading user_log excluded"
+      assert_includes out.string, "converted rows 0, converted tables 0"
+      assert_includes out.string, "reading messages included"
+    end
+  end
+
   def test_guided_advanced_convert_xml_can_include_only_selected_tables
     with_tmp_base do |dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
