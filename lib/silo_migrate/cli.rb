@@ -9,7 +9,7 @@ module SiloMigrate
     COMMANDS = %w[
       interactive go init list status cleanup start stop regenerate import-dump replace-dump
       analyze-dump preprocess-dump convert-xml convert-json stage-dump setup-converter add-final-db
-      run-converter converter schema findings fixtures ai trusted doctor self-update help
+      run-converter converter schema findings fixtures ai trusted doctor self-update uninstall help
     ].freeze
 
     COMMAND_HELP = {
@@ -203,10 +203,16 @@ module SiloMigrate
         Checks Ruby/Bundler/gems, the Docker daemon, Compose v2, git, and the
         configured base path; exits non-zero when a required check fails.
       HELP
-      "self-update" => <<~HELP
+      "self-update" => <<~HELP,
         Usage: silo-migrate self-update
         Pulls the managed Git checkout, runs bundle install, and refreshes the
         global shims for silo-migrate, migration-tool, and xml-to-sql.
+      HELP
+      "uninstall" => <<~HELP
+        Usage: silo-migrate uninstall
+        Removes global shims, the installer-managed PATH block, and the managed
+        checkout. Does not remove migration projects, Docker volumes, Ruby gems,
+        Homebrew, Docker, or OS packages.
       HELP
     }.freeze
 
@@ -261,6 +267,7 @@ module SiloMigrate
       when "trusted" then trusted(argv)
       when "doctor" then return doctor
       when "self-update" then return self_update
+      when "uninstall" then return uninstall
       when "help", nil then return argv.empty? ? help(0) : command_help(argv.shift)
       else
         raise UsageError, "Unknown command: #{command}"
@@ -292,6 +299,7 @@ module SiloMigrate
           interactive [customer]       Guided workflow (alias: go)
           doctor                       Check Ruby, Docker, git, and base path setup
           self-update                  Pull updates and refresh global shims
+          uninstall                    Remove global shims and managed checkout
           init CUSTOMER                Initialize a migration project
           list                         List migration projects
           status CUSTOMER              Show project and container status
@@ -343,6 +351,11 @@ module SiloMigrate
 
     def self_update
       Services::InstallService.new(runtime: @runtime, env: @env, output: @output).self_update
+      0
+    end
+
+    def uninstall
+      Services::InstallService.new(runtime: @runtime, env: @env, output: @output).uninstall
       0
     end
 

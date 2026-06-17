@@ -19,6 +19,7 @@ class CLITest < SiloMigrateTest
     assert_includes out.string, "--bundle-install also builds/starts"
     assert_includes out.string, "doctor"
     assert_includes out.string, "self-update"
+    assert_includes out.string, "uninstall"
     assert_includes out.string, "converter summary"
     assert_includes out.string, "alias: go"
     assert_includes out.string, "migration-tool = silo-migrate"
@@ -49,6 +50,9 @@ class CLITest < SiloMigrateTest
 
     assert_equal 0, cli.run(["self-update", "--help"])
     assert_includes out.string, "Pulls the managed Git checkout"
+
+    assert_equal 0, cli.run(["uninstall", "--help"])
+    assert_includes out.string, "Does not remove migration projects"
   end
 
   def test_self_update_command_uses_install_service
@@ -82,6 +86,37 @@ class CLITest < SiloMigrateTest
         nil
       ]
       assert_includes out.string, "silo-migrate"
+    end
+  end
+
+  def test_uninstall_command_uses_install_service
+    Dir.mktmpdir do |dir|
+      source_root = File.join(dir, "source")
+      FileUtils.mkdir_p(File.join(source_root, ".git"))
+      env = {
+        "HOME" => dir,
+        "SILO_MIGRATE_SOURCE_ROOT" => source_root,
+        "SILO_MIGRATE_BIN_DIR" => File.join(dir, "bin")
+      }
+      runtime = SiloMigrate::Runtime::Fake.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: StringIO.new)
+
+      assert_equal 0, cli.run(["uninstall"])
+      assert_includes runtime.commands, [
+        :run,
+        [
+          File.join(source_root, "script", "install"),
+          "--uninstall",
+          "--install-dir", source_root,
+          "--bin-dir", File.join(dir, "bin"),
+          "--repo", "https://github.com/RubenOussoren/silo-migrate.git",
+          "--branch", "main"
+        ],
+        source_root,
+        false,
+        300,
+        nil
+      ]
     end
   end
 

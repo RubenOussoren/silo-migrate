@@ -6,6 +6,7 @@ install_deps=0
 with_oh_my_zsh=0
 skip_docker=0
 dry_run=0
+uninstall_mode=0
 docker_source="auto"
 repo=""
 branch=""
@@ -32,6 +33,7 @@ Options:
   --repo URL                    Git repository URL (default: HTTPS GitHub repo)
   --branch BRANCH               Git branch (default: main)
   --dry-run                     print commands without running them
+  --uninstall                   remove shims, PATH block, and managed checkout
   -h, --help                    show this help
 
 Environment overrides are still supported:
@@ -197,6 +199,7 @@ while [ "$#" -gt 0 ]; do
     --with-oh-my-zsh) with_oh_my_zsh=1 ;;
     --skip-docker) skip_docker=1 ;;
     --dry-run|--check-only) dry_run=1 ;;
+    --uninstall) uninstall_mode=1 ;;
     --docker-source|--docker-source=*)
       docker_source="$(parse_value_option "$1" "${2:-}")"
       [[ "$1" == *=* ]] || shift
@@ -236,6 +239,14 @@ branch="${branch:-${SILO_MIGRATE_BRANCH:-main}}"
 install_dir="${install_dir:-${SILO_MIGRATE_INSTALL_DIR:-$(default_install_dir)}}"
 bin_dir="${bin_dir:-${SILO_MIGRATE_BIN_DIR:-$(default_bin_dir)}}"
 
+path_marker_begin() {
+  printf '%s\n' "# >>> silo-migrate PATH >>>"
+}
+
+path_marker_end() {
+  printf '%s\n' "# <<< silo-migrate PATH <<<"
+}
+
 install_homebrew() {
   if command_exists brew; then
     return
@@ -264,6 +275,7 @@ install_macos_deps() {
   local formulas=()
   command_exists git || formulas+=(git)
   ruby_ready || formulas+=(ruby)
+  command_exists pkg-config || formulas+=(pkg-config)
   command_exists zsh || formulas+=(zsh)
 
   if [ "${#formulas[@]}" -gt 0 ]; then
@@ -295,7 +307,7 @@ docker_conflicts_installed() {
 }
 
 install_apt_base_packages() {
-  local packages=(git ruby ruby-dev build-essential zlib1g-dev libsqlite3-dev zsh curl ca-certificates gnupg)
+  local packages=(git ruby ruby-dev build-essential pkg-config zlib1g-dev libsqlite3-dev zsh curl ca-certificates gnupg)
   log "Installing Debian/Ubuntu base packages: ${packages[*]}"
   setup_sudo || fail "sudo is missing. Re-run as root or install sudo before --install-deps."
   run_root_cmd apt-get update
@@ -355,7 +367,7 @@ install_apt_packages() {
 }
 
 install_dnf_base_packages() {
-  local packages=(git ruby ruby-devel gcc gcc-c++ make zlib-devel sqlite-devel zsh curl ca-certificates)
+  local packages=(git ruby ruby-devel gcc gcc-c++ make pkgconf-pkg-config zlib-devel sqlite-devel zsh curl ca-certificates)
   log "Installing Fedora/RHEL base packages: ${packages[*]}"
   setup_sudo || fail "sudo is missing. Re-run as root or install sudo before --install-deps."
   run_root_cmd dnf install -y "${packages[@]}"
@@ -404,9 +416,9 @@ install_dnf_packages() {
 }
 
 enable_docker_service() {
-  [ "$skip_docker" -eq 0 ] || return
-  command_exists systemctl || return
-  command_exists docker || [ "$dry_run" -eq 1 ] || return
+  [ "$skip_docker" -eq 0 ] || return 0
+  command_exists systemctl || return 0
+  command_exists docker || [ "$dry_run" -eq 1 ] || return 0
 
   if confirm "Enable and start the Docker service?"; then
     setup_sudo || fail "sudo is missing. Re-run as root or start Docker manually."
@@ -486,8 +498,8 @@ shell_profile_path() {
 ensure_shell_path() {
   local profile marker_begin marker_end path_prefix shellenv_line
   profile="$(shell_profile_path)"
-  marker_begin="# >>> silo-migrate PATH >>>"
-  marker_end="# <<< silo-migrate PATH <<<"
+  marker_begin="$(path_marker_begin)"
+  marker_end="$(path_marker_end)"
 
   if [ -f "$profile" ] && grep -Fq "$marker_begin" "$profile"; then
     return
@@ -528,6 +540,32 @@ ensure_shell_path() {
   } >> "$profile"
 }
 
+remove_shell_path_block() {
+  local profile marker_begin marker_end tmp
+  profile="$(shell_profile_path)"
+  marker_begin="$(path_marker_begin)"
+  marker_end="$(path_marker_end)"
+
+  if [ ! -f "$profile" ] || ! grep -Fq "$marker_begin" "$profile"; then
+    log "No silo-migrate PATH block found in $profile"
+    return 0
+  fi
+
+  if [ "$dry_run" -eq 1 ]; then
+    log "[dry-run] remove silo-migrate PATH block from $profile"
+    return 0
+  fi
+
+  tmp="${profile}.silo-migrate-uninstall.$$"
+  awk -v begin="$marker_begin" -v end="$marker_end" '
+    $0 == begin { skipping = 1; next }
+    $0 == end { skipping = 0; next }
+    !skipping { print }
+  ' "$profile" > "$tmp"
+  mv "$tmp" "$profile"
+  log "Removed silo-migrate PATH block from $profile"
+}
+
 ensure_command() {
   command_exists "$1" || fail "$1 is required. Re-run with --install-deps or install it manually."
 }
@@ -550,6 +588,76 @@ cd $escaped_dir
 exec bundle exec ruby bin/$name "\$@"
 SHIM
   chmod +x "$shim"
+}
+
+shim_owned_by_install() {
+  local name="$1"
+  local shim="$bin_dir/$name"
+  local escaped_dir
+  escaped_dir="$(shell_quote "$install_dir")"
+
+  [ -f "$shim" ] || return 1
+  grep -Fq "cd $escaped_dir" "$shim" && grep -Fq "exec bundle exec ruby bin/$name" "$shim"
+}
+
+remove_shim() {
+  local name="$1"
+  local shim="$bin_dir/$name"
+
+  if [ ! -e "$shim" ]; then
+    log "No shim found at $shim"
+    return 0
+  fi
+
+  if ! shim_owned_by_install "$name"; then
+    warn "Skipping $shim because it does not look like a silo-migrate installer shim."
+    return 0
+  fi
+
+  if [ "$dry_run" -eq 1 ]; then
+    log "[dry-run] remove $shim"
+    return 0
+  fi
+
+  rm -f "$shim"
+  log "Removed $shim"
+}
+
+managed_checkout() {
+  [ -d "$install_dir/.git" ] &&
+    [ -f "$install_dir/script/install" ] &&
+    [ -f "$install_dir/bin/silo-migrate" ] &&
+    [ -f "$install_dir/silo-migrate.gemspec" ]
+}
+
+remove_managed_checkout() {
+  if [ ! -e "$install_dir" ]; then
+    log "No managed checkout found at $install_dir"
+    return 0
+  fi
+
+  if ! managed_checkout; then
+    fail "$install_dir does not look like a managed silo-migrate checkout. Refusing to remove it."
+  fi
+
+  if [ "$dry_run" -eq 1 ]; then
+    log "[dry-run] remove managed checkout $install_dir"
+    return 0
+  fi
+
+  rm -rf "$install_dir"
+  log "Removed managed checkout $install_dir"
+}
+
+uninstall_silo_migrate() {
+  log "Uninstalling silo-migrate CLI artifacts..."
+  remove_shim silo-migrate
+  remove_shim migration-tool
+  remove_shim xml-to-sql
+  remove_shell_path_block
+  remove_managed_checkout
+  log "[OK] Uninstalled silo-migrate CLI artifacts."
+  log "Migration projects, Docker volumes, Ruby gems, Homebrew, Docker, and OS packages were not removed."
 }
 
 clone_or_update_checkout() {
@@ -590,6 +698,11 @@ run_doctor() {
 
   warn "silo-migrate doctor still reports actionable setup items."
 }
+
+if [ "$uninstall_mode" -eq 1 ]; then
+  uninstall_silo_migrate
+  exit 0
+fi
 
 ensure_host_dependencies
 if [ "$dry_run" -eq 1 ] && [ "$install_deps" -eq 1 ]; then

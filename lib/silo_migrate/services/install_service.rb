@@ -84,6 +84,13 @@ module SiloMigrate
         @output.puts "[WARN] #{hint}" if hint
       end
 
+      def uninstall
+        ensure_git_checkout!
+
+        bin_dir = self.class.bin_dir(@env)
+        run_uninstaller!(bin_dir)
+      end
+
       private
 
       def ensure_git_checkout!
@@ -105,6 +112,23 @@ module SiloMigrate
           ],
           chdir: @source_root,
           timeout: 1_200,
+          capture: false
+        )
+      end
+
+      def run_uninstaller!(bin_dir)
+        installer = File.join(@source_root, "script", "install")
+        run!(
+          [
+            installer,
+            "--uninstall",
+            "--install-dir", @source_root,
+            "--bin-dir", bin_dir,
+            "--repo", self.class.repo(@env),
+            "--branch", self.class.branch(@env)
+          ],
+          chdir: @source_root,
+          timeout: 300,
           capture: false
         )
       end

@@ -42,6 +42,8 @@ Requirements:
 - **Docker** with Compose v2 — Docker Desktop on macOS, Docker Engine + compose
   plugin on Linux
 - **git** (used by `setup-converter` to clone `discourse-converters`)
+- Native gem build tools: a compiler toolchain, Ruby headers, SQLite headers,
+  and `pkg-config` for gems such as `sqlite3`
 
 ### Global install
 
@@ -60,6 +62,9 @@ On a fresh machine, use `--install-deps` to install host dependencies first.
 The installer supports macOS, Debian/Ubuntu, and Fedora/RHEL family hosts. It
 prompts before installing Docker, Homebrew, Oh My Zsh, or editing shell files
 unless `--yes` is passed. It runs `silo-migrate doctor` at the end.
+The installer is safe to rerun: package installs are idempotent, the managed
+checkout is updated, shims are overwritten, `bundle install` is rerun, and the
+marked PATH block is written only once.
 
 ```bash
 script/install --install-deps
@@ -113,6 +118,21 @@ Upgrade after fixes are pushed:
 
 ```bash
 silo-migrate self-update
+```
+
+Uninstall the global CLI artifacts:
+
+```bash
+silo-migrate uninstall
+```
+
+Uninstall removes only the global shims, the installer-managed PATH block, and
+the managed checkout. It does not remove migration projects, dumps, Docker
+volumes, Ruby gems, Homebrew, Docker, or OS packages. The installer script also
+supports a dry run:
+
+```bash
+script/install --dry-run --uninstall
 ```
 
 ### New machine bootstrap
