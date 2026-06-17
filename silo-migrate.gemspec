@@ -7,7 +7,7 @@ Gem::Specification.new do |spec|
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.1"
 
-  spec.files = Dir["bin/*", "lib/**/*.rb", "README.md"]
+  spec.files = Dir["bin/*", "lib/**/*.rb", "script/*", "README.md"]
   spec.bindir = "bin"
   spec.executables = ["silo-migrate", "migration-tool", "xml-to-sql"]
   spec.require_paths = ["lib"]

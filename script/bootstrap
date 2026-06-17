@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+yes_mode=0
+check_only=0
+with_oh_my_zsh=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --yes) yes_mode=1 ;;
+    --check-only) check_only=1 ;;
+    --with-oh-my-zsh) with_oh_my_zsh=1 ;;
+    -h|--help)
+      cat <<'HELP'
+Usage: script/bootstrap [--yes] [--check-only] [--with-oh-my-zsh]
+
+Checks or installs the host dependencies for silo-migrate, then runs script/install.
+Oh My Zsh is only installed when confirmed interactively or when --with-oh-my-zsh is passed.
+HELP
+      exit 0
+      ;;
+    *) printf 'Error: unknown option %s\n' "$1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+home_dir="${HOME:?HOME is required}"
+bin_dir="${SILO_MIGRATE_BIN_DIR:-$home_dir/.local/bin}"
+brew_ruby_bin=""
+
+log() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
+}
+
+run_cmd() {
+  if [ "$check_only" -eq 1 ]; then
+    log "[check-only] $*"
+  else
+    "$@"
+  fi
+}
+
+confirm() {
+  local prompt="$1"
+  [ "$yes_mode" -eq 1 ] && return 0
+  [ -t 0 ] || return 1
+  local answer
+  read -r -p "$prompt [y/N] " answer
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+ruby_ready() {
+  command_exists ruby && ruby -e 'exit(Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("3.1.0"))' >/dev/null 2>&1
+}
+
+prefer_homebrew_ruby() {
+  command_exists brew || return 0
+  local prefix
+  prefix="$(brew --prefix ruby 2>/dev/null || true)"
+  [ -n "$prefix" ] || return 0
+  [ -x "$prefix/bin/ruby" ] || return 0
+  brew_ruby_bin="$prefix/bin"
+  export PATH="$brew_ruby_bin:$PATH"
+}
+
+install_brew_packages() {
+  local formulas=()
+  command_exists git || formulas+=(git)
+  ruby_ready || formulas+=(ruby)
+  command_exists zsh || formulas+=(zsh)
+
+  if [ "${#formulas[@]}" -gt 0 ]; then
+    log "Installing Homebrew packages: ${formulas[*]}"
+    run_cmd brew install "${formulas[@]}"
+  fi
+
+  if ! command_exists docker; then
+    if confirm "Install Docker Desktop with Homebrew cask?"; then
+      run_cmd brew install --cask docker
+      warn "Open Docker Desktop once after installation so the daemon starts."
+    else
+      warn "Docker is missing. Install Docker Desktop before running migration containers."
+    fi
+  fi
+
+  prefer_homebrew_ruby
+}
+
+install_apt_packages() {
+  local packages=(git ruby ruby-dev build-essential zlib1g-dev libsqlite3-dev zsh docker.io docker-compose-plugin)
+  log "Installing apt packages: ${packages[*]}"
+  run_cmd sudo apt-get update
+  run_cmd sudo apt-get install -y "${packages[@]}"
+}
+
+install_dnf_packages() {
+  local packages=(git ruby ruby-devel gcc make zlib-devel sqlite-devel zsh docker docker-compose-plugin)
+  log "Installing dnf packages: ${packages[*]}"
+  run_cmd sudo dnf install -y "${packages[@]}"
+}
+
+install_linux_packages() {
+  if command_exists apt-get; then
+    install_apt_packages
+  elif command_exists dnf; then
+    install_dnf_packages
+  else
+    warn "Unsupported Linux package manager. Install git, Ruby >= 3.1, Bundler, Docker Compose v2, and zsh manually."
+  fi
+
+  if command_exists systemctl && command_exists docker; then
+    if confirm "Enable and start the Docker service?"; then
+      run_cmd sudo systemctl enable --now docker
+    fi
+  fi
+}
+
+install_bundler() {
+  if command_exists bundle; then
+    return
+  fi
+
+  log "Installing Bundler..."
+  run_cmd gem install bundler
+}
+
+install_oh_my_zsh() {
+  if [ -d "$home_dir/.oh-my-zsh" ]; then
+    log "Oh My Zsh already exists at $home_dir/.oh-my-zsh"
+    return
+  fi
+
+  if [ "$with_oh_my_zsh" -ne 1 ] && [ "$yes_mode" -eq 1 ]; then
+    log "Skipping Oh My Zsh; pass --with-oh-my-zsh to install it non-interactively."
+    return
+  fi
+
+  if [ "$with_oh_my_zsh" -eq 1 ] || confirm "Install Oh My Zsh?"; then
+    if ! command_exists curl; then
+      warn "curl is required to install Oh My Zsh."
+      return
+    fi
+    if [ "$check_only" -eq 1 ]; then
+      log "[check-only] install Oh My Zsh"
+      return
+    fi
+    run_cmd sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+  fi
+}
+
+ensure_zsh_path() {
+  local zshrc="$home_dir/.zshrc"
+  local marker_begin="# >>> silo-migrate PATH >>>"
+  local marker_end="# <<< silo-migrate PATH <<<"
+
+  mkdir -p "$bin_dir"
+  if [ -f "$zshrc" ] && grep -Fq "$marker_begin" "$zshrc"; then
+    return
+  fi
+
+  if confirm "Add $bin_dir to PATH in $zshrc?"; then
+    if [ "$check_only" -eq 1 ]; then
+      log "[check-only] update $zshrc"
+      return
+    fi
+    local path_prefix="$bin_dir"
+    if [ -n "$brew_ruby_bin" ]; then
+      path_prefix="$brew_ruby_bin:$path_prefix"
+    fi
+    {
+      printf '\n%s\n' "$marker_begin"
+      printf 'export PATH="%s:$PATH"\n' "$path_prefix"
+      printf '%s\n' "$marker_end"
+    } >> "$zshrc"
+  fi
+}
+
+case "$(uname -s)" in
+  Darwin)
+    if ! command_exists brew; then
+      warn "Homebrew is missing. Install it from https://brew.sh/ or use --check-only for manual setup guidance."
+    else
+      install_brew_packages
+    fi
+    ;;
+  Linux)
+    install_linux_packages
+    ;;
+  *)
+    warn "Unsupported OS. Install git, Ruby >= 3.1, Bundler, Docker Compose v2, and zsh manually."
+    ;;
+esac
+
+install_bundler
+install_oh_my_zsh
+ensure_zsh_path
+
+if [ "$check_only" -eq 1 ]; then
+  log "[check-only] $script_dir/install"
+else
+  "$script_dir/install"
+fi

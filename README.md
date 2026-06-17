@@ -43,10 +43,72 @@ Requirements:
   plugin on Linux
 - **git** (used by `setup-converter` to clone `discourse-converters`)
 
+### Global install
+
+Install from the Git-managed checkout. This keeps a local clone under
+`~/.local/share/silo-migrate/source`, installs gems there, and writes global
+shims to `~/.local/bin` for `silo-migrate`, `migration-tool`, and `xml-to-sql`.
+
+```bash
+git clone git@github.com:RubenOussoren/silo-migrate.git
+cd silo-migrate
+script/install
+silo-migrate doctor
+```
+
+If `~/.local/bin` is not on `PATH`, add it to your shell profile:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Install/update settings can be overridden:
+
+```bash
+SILO_MIGRATE_REPO=git@github.com:RubenOussoren/silo-migrate.git
+SILO_MIGRATE_BRANCH=main
+SILO_MIGRATE_INSTALL_DIR="$HOME/.local/share/silo-migrate/source"
+SILO_MIGRATE_BIN_DIR="$HOME/.local/bin"
+```
+
+Upgrade after fixes are pushed:
+
+```bash
+silo-migrate self-update
+silo-migrate doctor
+```
+
+### New machine bootstrap
+
+For a fresh macOS or Linux machine, run the bootstrap script from a clone. It
+checks or installs the host dependencies, asks before editing `.zshrc`, asks
+before installing Oh My Zsh, then runs `script/install`.
+
+```bash
+git clone git@github.com:RubenOussoren/silo-migrate.git
+cd silo-migrate
+script/bootstrap
+```
+
+Useful bootstrap flags:
+
+```bash
+script/bootstrap --check-only        # show what would run
+script/bootstrap --yes               # non-interactive package/PATH setup
+script/bootstrap --with-oh-my-zsh    # explicitly opt into Oh My Zsh install
+```
+
+Docker may still need normal OS-specific startup after installation: open Docker
+Desktop on macOS, or start/enable the Docker service on Linux.
+
+### Development checkout
+
+For local development without global shims:
+
 ```bash
 cd silo-migrate
 bundle install
-bin/silo-migrate doctor     # verifies Ruby, gems, Docker, git, and the base path
+bin/silo-migrate doctor
 ```
 
 ### Where projects are stored

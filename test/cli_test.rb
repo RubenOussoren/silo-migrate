@@ -18,6 +18,7 @@ class CLITest < SiloMigrateTest
     assert_includes out.string, "trusted session"
     assert_includes out.string, "--bundle-install also builds/starts"
     assert_includes out.string, "doctor"
+    assert_includes out.string, "self-update"
     assert_includes out.string, "converter summary"
     assert_includes out.string, "alias: go"
     assert_includes out.string, "migration-tool = silo-migrate"
@@ -45,6 +46,29 @@ class CLITest < SiloMigrateTest
 
     assert_equal 0, cli.run(["trusted", "--help"])
     assert_includes out.string, "mysql -u root -e"
+
+    assert_equal 0, cli.run(["self-update", "--help"])
+    assert_includes out.string, "Pulls the managed Git checkout"
+  end
+
+  def test_self_update_command_uses_install_service
+    Dir.mktmpdir do |dir|
+      source_root = File.join(dir, "source")
+      FileUtils.mkdir_p(File.join(source_root, ".git"))
+      env = {
+        "HOME" => dir,
+        "SILO_MIGRATE_SOURCE_ROOT" => source_root,
+        "SILO_MIGRATE_BIN_DIR" => File.join(dir, "bin")
+      }
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
+
+      assert_equal 0, cli.run(["self-update"])
+      assert_includes runtime.commands, [:run, ["git", "pull", "--ff-only"], source_root, true, 120, nil]
+      assert File.executable?(File.join(dir, "bin", "silo-migrate"))
+      assert_includes out.string, "silo-migrate"
+    end
   end
 
   def test_convert_json_command_writes_sql_output

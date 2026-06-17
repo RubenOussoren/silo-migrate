@@ -9,7 +9,7 @@ module SiloMigrate
     COMMANDS = %w[
       interactive go init list status cleanup start stop regenerate import-dump replace-dump
       analyze-dump preprocess-dump convert-xml convert-json stage-dump setup-converter add-final-db
-      run-converter converter schema findings fixtures ai trusted doctor help
+      run-converter converter schema findings fixtures ai trusted doctor self-update help
     ].freeze
 
     COMMAND_HELP = {
@@ -198,10 +198,15 @@ module SiloMigrate
         so the conclusion can later flow to the safe zone via:
           silo-migrate trusted redact acme trusted/findings/finding-inspect-....yml --notes "safe summary"
       HELP
-      "doctor" => <<~HELP
+      "doctor" => <<~HELP,
         Usage: silo-migrate doctor
         Checks Ruby/Bundler/gems, the Docker daemon, Compose v2, git, and the
         configured base path; exits non-zero when a required check fails.
+      HELP
+      "self-update" => <<~HELP
+        Usage: silo-migrate self-update
+        Pulls the managed Git checkout, runs bundle install, and refreshes the
+        global shims for silo-migrate, migration-tool, and xml-to-sql.
       HELP
     }.freeze
 
@@ -255,6 +260,7 @@ module SiloMigrate
       when "ai" then ai(argv)
       when "trusted" then trusted(argv)
       when "doctor" then return doctor
+      when "self-update" then return self_update
       when "help", nil then return argv.empty? ? help(0) : command_help(argv.shift)
       else
         raise UsageError, "Unknown command: #{command}"
@@ -285,6 +291,7 @@ module SiloMigrate
         Commands:
           interactive [customer]       Guided workflow (alias: go)
           doctor                       Check Ruby, Docker, git, and base path setup
+          self-update                  Pull updates and refresh global shims
           init CUSTOMER                Initialize a migration project
           list                         List migration projects
           status CUSTOMER              Show project and container status
@@ -332,6 +339,11 @@ module SiloMigrate
 
     def doctor
       Services::DoctorService.new(runtime: @runtime, env: @env, output: @output).run ? 0 : 1
+    end
+
+    def self_update
+      Services::InstallService.new(runtime: @runtime, env: @env, output: @output).self_update
+      0
     end
 
     def converter(argv)

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo="${SILO_MIGRATE_REPO:-git@github.com:RubenOussoren/silo-migrate.git}"
+branch="${SILO_MIGRATE_BRANCH:-main}"
+home_dir="${HOME:?HOME is required}"
+data_home="${XDG_DATA_HOME:-$home_dir/.local/share}"
+install_dir="${SILO_MIGRATE_INSTALL_DIR:-$data_home/silo-migrate/source}"
+bin_dir="${SILO_MIGRATE_BIN_DIR:-$home_dir/.local/bin}"
+
+log() {
+  printf '%s\n' "$*"
+}
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+ensure_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "$1 is required. Run script/bootstrap or install it manually first."
+}
+
+write_shim() {
+  local name="$1"
+  local shim="$bin_dir/$name"
+  local escaped_dir
+  escaped_dir="$(printf '%q' "$install_dir")"
+
+  cat > "$shim" <<SHIM
+#!/usr/bin/env bash
+set -euo pipefail
+cd $escaped_dir
+exec bundle exec ruby bin/$name "\$@"
+SHIM
+  chmod +x "$shim"
+}
+
+ensure_command git
+ensure_command ruby
+
+if ! ruby -e 'exit(Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("3.1.0"))' >/dev/null 2>&1; then
+  fail "Ruby >= 3.1 is required. Run script/bootstrap or install Ruby with rbenv, asdf, or Homebrew."
+fi
+
+if ! command -v bundle >/dev/null 2>&1; then
+  log "Bundler is missing; installing it with gem..."
+  gem install bundler
+fi
+
+mkdir -p "$(dirname "$install_dir")"
+if [ -d "$install_dir/.git" ]; then
+  log "Updating existing checkout at $install_dir..."
+  git -C "$install_dir" fetch origin "$branch"
+  git -C "$install_dir" checkout "$branch"
+  git -C "$install_dir" pull --ff-only origin "$branch"
+elif [ -e "$install_dir" ]; then
+  fail "$install_dir exists but is not a Git checkout. Move it away or set SILO_MIGRATE_INSTALL_DIR."
+else
+  log "Cloning $repo into $install_dir..."
+  git clone --branch "$branch" "$repo" "$install_dir"
+fi
+
+log "Installing Ruby gems..."
+(cd "$install_dir" && bundle install)
+
+mkdir -p "$bin_dir"
+write_shim silo-migrate
+write_shim migration-tool
+write_shim xml-to-sql
+
+log "[OK] Installed silo-migrate shims in $bin_dir"
+if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
+  log "[WARN] $bin_dir is not on PATH."
+  log "       Add this to your shell profile: export PATH=\"$bin_dir:\$PATH\""
+fi
+log "Run: silo-migrate doctor"
