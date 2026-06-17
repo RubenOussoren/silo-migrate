@@ -350,8 +350,11 @@ bin/silo-migrate import-dump acme initial --no-fix-collations
 `import-dump` streams dump content into the database container. Table exclusion
 filters matching table DDL/DML while streaming.
 
-XML conversion writes import-friendly SQL without wrapping the dump in a single
-large transaction. The default XML insert batch size is `1000`; lowering
+XML conversion is for mysqldump XML exports, not arbitrary nested XML. It
+streams each `.xml`/`.xml.gz` file with a SAX parser, so a directory of table
+files and one large all-tables XML file use the same low-memory path. The
+converter writes import-friendly SQL without wrapping the dump in a single large
+transaction. The default XML insert batch size is `1000`; lowering
 `--batch-size` can help isolate a failing statement, but it may not fix Docker
 Desktop storage or InnoDB fsync errors.
 

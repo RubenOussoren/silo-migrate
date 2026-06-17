@@ -2,6 +2,11 @@
 
 require "rexml/parsers/streamparser"
 require "rexml/streamlistener"
+begin
+  require "nokogiri"
+rescue LoadError
+  nil
+end
 require "pathname"
 require "fileutils"
 require "set"
@@ -231,9 +236,7 @@ module SiloMigrate
 
     private
 
-    class XMLStreamListener
-      include REXML::StreamListener
-
+    class XMLStreamHandler
       def initialize(&event_handler)
         @event_handler = event_handler
         @current_structure = nil
@@ -285,6 +288,34 @@ module SiloMigrate
           @current_row = nil
         when "table_data"
           @current_table_data = nil
+        end
+      end
+    end
+
+    class REXMLStreamListener < XMLStreamHandler
+      include REXML::StreamListener
+    end
+
+    if defined?(Nokogiri::XML::SAX::Document)
+      class NokogiriStreamListener < Nokogiri::XML::SAX::Document
+        def initialize(&event_handler)
+          @handler = XMLStreamHandler.new(&event_handler)
+        end
+
+        def start_element(name, attrs = [])
+          @handler.tag_start(name, attrs.to_h)
+        end
+
+        def characters(value)
+          @handler.text(value)
+        end
+
+        def cdata_block(value)
+          @handler.cdata(value)
+        end
+
+        def end_element(name)
+          @handler.tag_end(name)
         end
       end
     end
@@ -352,6 +383,22 @@ module SiloMigrate
     end
 
     def parse_xml_file(xml_path, &block)
+      if defined?(NokogiriStreamListener)
+        parse_xml_file_with_nokogiri(xml_path, &block)
+      else
+        parse_xml_file_with_rexml(xml_path, &block)
+      end
+    end
+
+    def parse_xml_file_with_nokogiri(xml_path, &block)
+      parser = Nokogiri::XML::SAX::PushParser.new(NokogiriStreamListener.new(&block))
+      stream_fixed_xml(xml_path) { |chunk| parser << chunk }
+      parser.finish
+    rescue Nokogiri::XML::SyntaxError => e
+      raise REXML::ParseException, e.message
+    end
+
+    def parse_xml_file_with_rexml(xml_path, &block)
       reader, writer = IO.pipe
       writer_error = nil
       parser_error = nil
@@ -367,7 +414,7 @@ module SiloMigrate
         end
       end
 
-      REXML::Parsers::StreamParser.new(reader, XMLStreamListener.new(&block)).parse
+      REXML::Parsers::StreamParser.new(reader, REXMLStreamListener.new(&block)).parse
     rescue StandardError => e
       parser_error = e
       raise

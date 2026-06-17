@@ -15,6 +15,7 @@ Gem::Specification.new do |spec|
   spec.add_dependency "tty-prompt", ">= 0.23", "< 1.0"
   spec.add_dependency "sqlite3", ">= 2.8", "< 2.9"
   spec.add_dependency "oj", ">= 3.16", "< 4.0"
+  spec.add_dependency "nokogiri", ">= 1.16", "< 2.0"
   spec.add_dependency "rexml", ">= 3.3", "< 4.0"
 
   spec.add_development_dependency "minitest", ">= 5.0", "< 6.0"
