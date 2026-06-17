@@ -19,7 +19,7 @@ Use script/install directly for new setup flows.
 Common flags:
   --yes                         non-interactive package/PATH setup
   --check-only                  compatibility alias for --dry-run
-  --with-oh-my-zsh              explicitly opt into Oh My Zsh install
+  --with-oh-my-zsh              explicitly opt into Oh My Zsh and zsh login shell
   --shell-preset PRESET         configure curated shell add-ons: migration
   --zsh-theme THEME             zsh theme: robbyrussell or powerlevel10k
   --zsh-plugins LIST            comma-separated allowlisted zsh plugins

@@ -83,7 +83,7 @@ script/install --yes --install-dir /migrations/silo-migrate --bin-dir /usr/local
 script/install --yes --skip-docker
 
 # migration host with curated Oh My Zsh add-ons
-script/install --yes --shell-preset migration
+script/install --yes --shell-preset migration --zsh-theme powerlevel10k
 ```
 
 Docker packages default to Docker's official repositories on Linux. Use distro
@@ -112,7 +112,7 @@ Installer flags:
 
 ```bash
 script/install --dry-run                 # print planned commands
-script/install --with-oh-my-zsh          # explicitly opt into Oh My Zsh
+script/install --with-oh-my-zsh          # explicitly opt into Oh My Zsh and zsh login shell
 script/install --shell-preset migration  # Oh My Zsh + safe server add-ons
 script/install --zsh-theme powerlevel10k # optional; requires a compatible local terminal font
 script/install --zsh-plugins git,zsh-autosuggestions,zsh-syntax-highlighting
@@ -129,6 +129,16 @@ Identity Center/SSO for persistent access, and prefix any sensitive one-off
 export command with a leading space. When Oh My Zsh is requested, the installer
 also sets zsh as the login shell when `chsh` can do that safely; start it in the
 current session with `exec zsh -l` or log out and back in.
+
+Powerlevel10k has an interactive first-run configuration:
+
+```bash
+exec zsh -l
+p10k configure
+```
+
+If prompt icons render as boxes or question marks, install a Nerd Font in your
+local terminal app or pick simpler/ASCII prompt options in the wizard.
 
 If an earlier run left `/root/.oh-my-zsh` partially installed, move it aside
 before retrying:

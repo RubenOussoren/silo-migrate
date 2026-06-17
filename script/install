@@ -28,7 +28,7 @@ This is the primary installer for macOS, Debian/Ubuntu, and Fedora/RHEL hosts.
 Options:
   --yes                         non-interactive install; also enables --install-deps
   --install-deps                install missing host dependencies first
-  --with-oh-my-zsh              install Oh My Zsh when dependencies are installed
+  --with-oh-my-zsh              install Oh My Zsh and set zsh as the login shell
   --shell-preset PRESET         configure curated shell add-ons: migration
   --zsh-theme THEME             zsh theme: robbyrussell or powerlevel10k
   --zsh-plugins LIST            comma-separated allowlisted zsh plugins
