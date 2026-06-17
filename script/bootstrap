@@ -28,6 +28,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 home_dir="${HOME:?HOME is required}"
 bin_dir="${SILO_MIGRATE_BIN_DIR:-$home_dir/.local/bin}"
 brew_ruby_bin=""
+sudocmd=()
 
 log() {
   printf '%s\n' "$*"
@@ -59,6 +60,17 @@ confirm() {
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
+}
+
+setup_sudo() {
+  if [ "$(id -u)" -eq 0 ]; then
+    sudocmd=()
+  elif command_exists sudo; then
+    sudocmd=(sudo)
+  else
+    warn "sudo is missing. Re-run as root, or install sudo before using bootstrap."
+    return 1
+  fi
 }
 
 ruby_ready() {
@@ -101,14 +113,16 @@ install_brew_packages() {
 install_apt_packages() {
   local packages=(git ruby ruby-dev build-essential zlib1g-dev libsqlite3-dev zsh docker.io docker-compose-plugin)
   log "Installing apt packages: ${packages[*]}"
-  run_cmd sudo apt-get update
-  run_cmd sudo apt-get install -y "${packages[@]}"
+  setup_sudo || return
+  run_cmd "${sudocmd[@]}" apt-get update
+  run_cmd "${sudocmd[@]}" apt-get install -y "${packages[@]}"
 }
 
 install_dnf_packages() {
   local packages=(git ruby ruby-devel gcc make zlib-devel sqlite-devel zsh docker docker-compose-plugin)
   log "Installing dnf packages: ${packages[*]}"
-  run_cmd sudo dnf install -y "${packages[@]}"
+  setup_sudo || return
+  run_cmd "${sudocmd[@]}" dnf install -y "${packages[@]}"
 }
 
 install_linux_packages() {
@@ -122,7 +136,8 @@ install_linux_packages() {
 
   if command_exists systemctl && command_exists docker; then
     if confirm "Enable and start the Docker service?"; then
-      run_cmd sudo systemctl enable --now docker
+      setup_sudo || return
+      run_cmd "${sudocmd[@]}" systemctl enable --now docker
     fi
   fi
 }
