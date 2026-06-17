@@ -50,6 +50,7 @@ class CLITest < SiloMigrateTest
 
     assert_equal 0, cli.run(["self-update", "--help"])
     assert_includes out.string, "Pulls the managed Git checkout"
+    assert_includes out.string, "Skips Docker host package and service management"
 
     assert_equal 0, cli.run(["uninstall", "--help"])
     assert_includes out.string, "Does not remove migration projects"
@@ -75,6 +76,7 @@ class CLITest < SiloMigrateTest
         [
           File.join(source_root, "script", "install"),
           "--install-deps",
+          "--skip-docker",
           "--install-dir", source_root,
           "--bin-dir", File.join(dir, "bin"),
           "--repo", "https://github.com/RubenOussoren/silo-migrate.git",

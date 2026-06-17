@@ -154,6 +154,12 @@ Upgrade after fixes are pushed:
 silo-migrate self-update
 ```
 
+`self-update` refreshes the managed checkout, runs `bundle install`, and rewrites
+the global shims. It deliberately skips Docker host package and service
+management, so it will not install Docker or enable/start the Docker service; run
+`script/install --install-deps` directly when you want the installer to handle
+Docker setup.
+
 Uninstall the global CLI artifacts:
 
 ```bash

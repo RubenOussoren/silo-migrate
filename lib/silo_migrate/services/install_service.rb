@@ -105,6 +105,7 @@ module SiloMigrate
           [
             installer,
             "--install-deps",
+            "--skip-docker",
             "--install-dir", @source_root,
             "--bin-dir", bin_dir,
             "--repo", self.class.repo(@env),
