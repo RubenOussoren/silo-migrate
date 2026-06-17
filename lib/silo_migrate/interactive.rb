@@ -11,6 +11,9 @@ module SiloMigrate
     BACK = :__back
     BACK_LABEL = "Back"
     BACK_COMMANDS = %w[b back ..].freeze
+    GUIDED_XML_DISCOVERY_BYTES = 64 * 1024 * 1024
+    LARGE_XML_TABLE_BYTES = 100 * 1024 * 1024
+    LARGE_XML_TABLE_ROWS = 1_000_000
 
     def initialize(project_service:, import_service:, schema_service: nil, findings_service: nil, fixture_service: nil, prompt: nil, output: $stdout, stdin: $stdin)
       @project_service = project_service
@@ -260,8 +263,8 @@ module SiloMigrate
                   when :xml
                     source_path = Pathname(source)
                     exclude_files = prompt_xml_file_exclusions(source_path)
-                    discover_xml_tables(source_path, exclude_files: exclude_files)
-                    table_filters = prompt_xml_table_filters
+                    discovery = discover_xml_tables(source_path, exclude_files: exclude_files)
+                    table_filters = prompt_xml_table_filters(discovery)
                     batch_size = prompt_xml_batch_size(source_path)
                     compressed = prompt_converted_output_compression("XML")
                     convert_xml_to_project(
@@ -428,8 +431,8 @@ module SiloMigrate
 
       source_path = Pathname(source)
       exclude_files = prompt_xml_file_exclusions(source_path)
-      discover_xml_tables(source_path, exclude_files: exclude_files)
-      table_filters = prompt_xml_table_filters
+      discovery = discover_xml_tables(source_path, exclude_files: exclude_files)
+      table_filters = prompt_xml_table_filters(discovery)
       batch_size = prompt_xml_batch_size(source_path)
       compressed = prompt_converted_output_compression("XML")
       output = convert_xml_to_project(
@@ -660,8 +663,8 @@ module SiloMigrate
       default
     end
 
-    def prompt_xml_table_filters
-      mode = ask("XML table filter: all, include, or exclude (blank for all)").to_s.strip.downcase
+    def prompt_xml_table_filters(discovery = nil)
+      mode = ask("XML table filter: all, include, or exclude (blank for all#{xml_table_filter_hint(discovery)})").to_s.strip.downcase
       case mode
       when "", "all", "a"
         { include_tables: nil, exclude_tables: nil }
@@ -757,21 +760,32 @@ module SiloMigrate
 
     def discover_xml_tables(source_path, exclude_files: nil)
       @output.puts "\nScanning XML tables (discovery only; conversion will run after filter selection)..."
-      discovery = XMLTableDiscovery.new(exclude_files: exclude_files).discover(source_path)
+      discovery = XMLTableDiscovery.new(exclude_files: exclude_files, max_bytes: GUIDED_XML_DISCOVERY_BYTES).discover(source_path)
       if discovery.files_skipped.positive?
         @output.puts "Files skipped before table discovery: #{discovery.files_skipped}"
         discovery.skipped.first(10).each { |file| @output.puts "  - #{file.basename}" }
         @output.puts "  ... and #{discovery.skipped.length - 10} more" if discovery.skipped.length > 10
       end
+      if discovery.truncated
+        @output.puts "Fast discovery scanned the first #{DumpTools.format_size(discovery.bytes_scanned)}. " \
+                     "More tables may exist later in the dump, but early large tables are shown now so you can filter before conversion."
+      end
       @output.puts "Tables discovered:"
       if discovery.tables.empty?
         @output.puts "  (none found)"
       else
-        discovery.tables.each { |table| @output.puts "  - #{table}" }
+        discovery.tables.each do |table|
+          @output.puts "  - #{table}#{xml_table_metadata_text(discovery.table_metadata[table])}"
+        end
       end
+      show_large_xml_table_candidates(discovery)
       @output.puts "Discovery by file:"
       discovery.files.each do |file|
         @output.puts "  #{file.path.basename}: #{file.count} table#{file.count == 1 ? '' : 's'}"
+        file.tables.each do |table|
+          metadata = file.table_metadata[table]
+          @output.puts "    - #{table}#{xml_table_metadata_text(metadata)}" if metadata && metadata.any?
+        end
       end
       discovery
     rescue UsageError => e
@@ -781,6 +795,54 @@ module SiloMigrate
 
     def csv_answer(value)
       value.to_s.split(",").map(&:strip).reject(&:empty?)
+    end
+
+    def xml_table_metadata_text(metadata)
+      return "" unless metadata && metadata.any?
+
+      parts = []
+      parts << "rows #{metadata[:rows]}" if metadata[:rows]
+      parts << "data #{DumpTools.format_size(metadata[:data_length])}" if metadata[:data_length]
+      parts << "index #{DumpTools.format_size(metadata[:index_length])}" if metadata[:index_length]
+      total = metadata.values_at(:data_length, :index_length).compact.sum
+      parts << "total #{DumpTools.format_size(total)}" if total.positive?
+      " (#{parts.join(', ')})"
+    end
+
+    def show_large_xml_table_candidates(discovery)
+      candidates = large_xml_table_candidates(discovery)
+      return if candidates.empty?
+
+      @output.puts "Large table candidates:"
+      candidates.first(10).each do |table, metadata|
+        @output.puts "  - #{table}#{xml_table_metadata_text(metadata)}"
+      end
+      @output.puts "Tip: type \"exclude\" next to skip large or nonessential tables."
+    end
+
+    def large_xml_table_candidates(discovery)
+      discovery.tables.filter_map do |table|
+        metadata = discovery.table_metadata[table]
+        next unless metadata
+
+        total = xml_table_total_bytes(metadata)
+        rows = metadata[:rows].to_i
+        next unless total >= LARGE_XML_TABLE_BYTES || rows >= LARGE_XML_TABLE_ROWS
+
+        [table, metadata]
+      end.sort_by { |_table, metadata| [-xml_table_total_bytes(metadata), -metadata[:rows].to_i] }
+    end
+
+    def xml_table_total_bytes(metadata)
+      metadata.values_at(:data_length, :index_length).compact.sum
+    end
+
+    def xml_table_filter_hint(discovery)
+      return "" unless discovery && discovery.tables.any?
+
+      examples = large_xml_table_candidates(discovery).map(&:first)
+      examples = discovery.tables.first(5) if examples.empty?
+      "; discovered: #{examples.first(5).join(', ')}"
     end
 
     def table_filter_description(include_tables:, exclude_tables:)
@@ -807,6 +869,8 @@ module SiloMigrate
           file = progress[:current_file]
           next unless file
 
+          @output.puts "First table detected: #{progress[:current_table]}" if progress[:event] == :table && progress[:tables_processed] == 1 && progress[:current_table]
+          @output.puts "First row converted from #{progress[:current_table]}" if progress[:event] == :rows && progress[:rows_processed] == 1 && progress[:current_table]
           percent = file[:size].positive? ? format(" %.1f%%", (file[:bytes_read].to_f / file[:size]) * 100) : ""
           @output.puts "  #{file[:name]}: #{DumpTools.format_size(file[:bytes_read])}/#{DumpTools.format_size(file[:size])}#{percent}, #{conversion_rate_text(progress)}, #{conversion_eta_text(progress)}, rows #{progress[:rows_processed]}, tables #{progress[:tables_processed]}, elapsed #{DumpTools.format_elapsed(progress[:elapsed])}"
         when :file_complete

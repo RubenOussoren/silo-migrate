@@ -13,6 +13,7 @@ require "set"
 require "zlib"
 require "time"
 require "json"
+require "shellwords"
 require_relative "sql_text"
 
 module SiloMigrate
@@ -96,9 +97,10 @@ module SiloMigrate
     XML_CHUNK_SIZE = 64 * 1024
     XML_SANITIZER_TAIL = 128
     DEFAULT_PROGRESS_INTERVAL = 5
+    ZERO_PROGRESS_WARNING_BYTES = 64 * 1024 * 1024
 
     def initialize(batch_size: 1000, include_tables: nil, exclude_tables: nil, include_files: nil, exclude_files: nil, schema_only: false, verbose: true,
-                   scrub_invalid_xml_chars: true, invalid_xml_report_path: nil)
+                   scrub_invalid_xml_chars: true, invalid_xml_report_path: nil, zero_progress_warning_bytes: ZERO_PROGRESS_WARNING_BYTES)
       raise UsageError, "XML batch size must be greater than 0" unless batch_size.to_i.positive?
 
       @batch_size = batch_size
@@ -110,6 +112,7 @@ module SiloMigrate
       @verbose = verbose
       @scrub_invalid_xml_chars = scrub_invalid_xml_chars
       @invalid_xml_report_path = invalid_xml_report_path
+      @zero_progress_warning_bytes = zero_progress_warning_bytes
       reset_stats
     end
 
@@ -124,6 +127,8 @@ module SiloMigrate
       @invalid_xml_report = nil
       @invalid_xml_report_finalized = false
       source = Pathname(source)
+      @source_path = source
+      @zero_progress_warning_emitted = false
       output_path = Pathname(output_path)
       prepare_invalid_xml_report(source, output_path)
       files = source.file? ? [source] : source.glob(file_pattern).to_a.concat(source.glob("#{file_pattern}.gz").to_a).sort
@@ -187,10 +192,7 @@ module SiloMigrate
       structures = {}
       current_rows = []
       current_table = nil
-      current_columns = []
-      current_column_types = {}
-      current_column_nulls = {}
-      current_column_uniques = {}
+      current_column_formats = []
 
       parse_xml_file(xml_path) do |event_type, table, data|
         case event_type
@@ -201,7 +203,7 @@ module SiloMigrate
           end
 
           if current_rows.any?
-            write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls, column_uniques: current_column_uniques)
+            write_rows_batch(output, current_table, current_rows, column_formats: current_column_formats)
             current_rows = []
           end
           structures[table] = data
@@ -209,40 +211,29 @@ module SiloMigrate
           output.write(data.to_create_table_sql)
           output.write("\n")
           @stats[:tables_processed] += 1
-          report_progress(:table, current_table: table)
+          report_progress(:table, current_table: table, force: @stats[:tables_processed] == 1)
         when :row
           next unless process_table?(table)
           next if @schema_only
 
           if current_table != table
-            write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls, column_uniques: current_column_uniques) if current_rows.any?
+            write_rows_batch(output, current_table, current_rows, column_formats: current_column_formats) if current_rows.any?
             current_table = table
             current_rows = []
-
-            if structures[table]
-              current_columns = structures[table].column_names
-              current_column_types = structures[table].columns.to_h { |col| [col[:name], col[:type]] }
-              current_column_nulls = structures[table].columns.to_h { |col| [col[:name], col[:null]] }
-              current_column_uniques = structures[table].columns.to_h { |col| [col[:name], col[:key] == "UNI"] }
-            else
-              current_columns = data.keys
-              current_column_types = {}
-              current_column_nulls = {}
-              current_column_uniques = {}
-            end
+            current_column_formats = column_formats_for(structures[table], data)
           end
 
           current_rows << data
           @stats[:rows_processed] += 1
-          report_progress(:rows)
+          report_progress(:rows, current_table: table, force: @stats[:rows_processed] == 1)
           if current_rows.length >= @batch_size
-            write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls, column_uniques: current_column_uniques)
+            write_rows_batch(output, current_table, current_rows, column_formats: current_column_formats)
             current_rows = []
           end
         end
       end
 
-      write_rows_batch(output, current_table, nil, current_rows, columns: current_columns, column_types: current_column_types, column_nulls: current_column_nulls, column_uniques: current_column_uniques) if current_rows.any?
+      write_rows_batch(output, current_table, current_rows, column_formats: current_column_formats) if current_rows.any?
       @stats[:files_processed] += 1
       report_progress(:file_complete, force: true)
       @current_file_progress = nil
@@ -564,7 +555,34 @@ module SiloMigrate
 
       @current_file_progress[:bytes_read] += bytes
       @stats[:bytes_read] += bytes
+      warn_if_no_tables_after_bytes
       report_progress(:bytes)
+    end
+
+    def warn_if_no_tables_after_bytes
+      return if @zero_progress_warning_emitted
+      return unless @zero_progress_warning_bytes && @zero_progress_warning_bytes.positive?
+      return unless @stats[:bytes_read] >= @zero_progress_warning_bytes
+      return unless @stats[:tables_processed].zero? && @stats[:rows_processed].zero?
+
+      @zero_progress_warning_emitted = true
+      emit_warning(
+        "Read #{DumpTools.format_size(@stats[:bytes_read])} from XML source #{@source_path} without discovering any tables or rows. " \
+        "Check: input path, command path, file format, current checkout. " \
+        "Recommended command: #{recommended_convert_command}"
+      )
+    end
+
+    def recommended_convert_command
+      repo_root = Pathname(__dir__).parent.parent
+      source = @source_path ? @source_path.to_s : "SOURCE"
+      "cd #{Shellwords.escape(repo_root.to_s)} && bin/silo-migrate convert-xml #{Shellwords.escape(source)}"
+    end
+
+    def emit_warning(message)
+      @stats[:warnings] << message
+      log "[WARN] #{message}"
+      report_progress(:warning, message: message, force: true)
     end
 
     def record_invalid_xml_char(file:, offset:, codepoint:)
@@ -643,7 +661,7 @@ module SiloMigrate
     end
 
     def reset_stats
-      @stats = { tables_processed: 0, rows_processed: 0, bytes_read: 0, bytes_written: 0, files_processed: 0, files_skipped: 0, tables_skipped: 0, invalid_xml_chars_removed: 0 }
+      @stats = { tables_processed: 0, rows_processed: 0, bytes_read: 0, bytes_written: 0, files_processed: 0, files_skipped: 0, tables_skipped: 0, invalid_xml_chars_removed: 0, warnings: [] }
     end
 
     def open_output(path, gzip: nil)
@@ -671,38 +689,65 @@ module SiloMigrate
       true
     end
 
-    def write_rows_batch(out, table, structure, rows, columns: nil, column_types: nil, column_nulls: nil, column_uniques: nil)
-      return if rows.empty?
-
-      columns ||= structure ? structure.column_names : rows.first.keys
-      col_defs = structure ? structure.columns.to_h { |col| [col[:name], col] } : {}
-      column_types ||= {}
-      column_nulls ||= {}
-      column_uniques ||= {}
-      out.write("INSERT INTO #{SQLXML.escape_identifier(table)} (#{columns.map { |col| SQLXML.escape_identifier(col) }.join(', ')}) VALUES\n")
-      value_rows = rows.map do |row|
-        values = columns.map do |col|
-          definition = col_defs[col]
-          type = definition&.dig(:type) || column_types[col] || "text"
-          allows_null = definition ? definition[:null] : column_nulls.fetch(col, true)
-          unique = definition ? definition[:key] == "UNI" : column_uniques.fetch(col, false)
-          format_value(row[col], type, allows_null, unique: unique)
+    def column_formats_for(structure, sample_row)
+      if structure
+        structure.columns.map do |col|
+          {
+            name: col[:name],
+            escaped_name: SQLXML.escape_identifier(col[:name]),
+            type: col[:type],
+            allows_null: col[:null],
+            unique: col[:key] == "UNI",
+            numeric: numeric_type?(col[:type])
+          }
         end
-        "  (#{values.join(', ')})"
+      else
+        sample_row.keys.map do |name|
+          {
+            name: name,
+            escaped_name: SQLXML.escape_identifier(name),
+            type: "text",
+            allows_null: true,
+            unique: false,
+            numeric: false
+          }
+        end
       end
-      out.write(value_rows.join(",\n"))
-      out.write(";\n")
     end
 
-    def format_value(value, type, allows_null, unique: false)
+    def write_rows_batch(out, table, rows, column_formats:)
+      return if rows.empty?
+
+      buffer = +"INSERT INTO #{SQLXML.escape_identifier(table)} ("
+      column_formats.each_with_index do |format, index|
+        buffer << ", " if index.positive?
+        buffer << format[:escaped_name]
+      end
+      buffer << ") VALUES\n"
+
+      rows.each_with_index do |row, row_index|
+        buffer << ",\n" if row_index.positive?
+        buffer << "  ("
+        column_formats.each_with_index do |format, column_index|
+          buffer << ", " if column_index.positive?
+          buffer << format_value(row[format[:name]], format)
+        end
+        buffer << ")"
+      end
+      buffer << ";\n"
+      out.write(buffer)
+    end
+
+    def format_value(value, format)
+      allows_null = format[:allows_null]
       if value.nil? || value == "null"
         return "NULL" if allows_null
-        return "0" if type.match?(/\A(?:int|bigint|tinyint|smallint|mediumint|float|double|decimal|numeric)/i)
+        return "0" if format[:numeric]
 
         return "''"
       end
 
-      if type.match?(/\A(?:int|bigint|tinyint|smallint|mediumint|float|double|decimal|numeric)/i)
+      if format[:numeric]
         return allows_null ? "NULL" : "0" if value == ""
         return value if value.to_s.match?(/\A-?\d+(?:\.\d+)?\z/)
       end
@@ -711,9 +756,13 @@ module SiloMigrate
       # values violate the unique index, and under UNIQUE_CHECKS=0 MariaDB's
       # bulk-insert path reports that only at COMMIT as a misleading
       # "Got error 1 'Operation not permitted'" failure.
-      return "NULL" if unique && allows_null && value == ""
+      return "NULL" if format[:unique] && allows_null && value == ""
 
       SQLXML.escape_sql_string(value)
+    end
+
+    def numeric_type?(type)
+      type.match?(/\A(?:int|bigint|tinyint|smallint|mediumint|float|double|decimal|numeric)/i)
     end
 
     def log(message)
@@ -722,13 +771,13 @@ module SiloMigrate
   end
 
   class XMLTableDiscovery
-    FileResult = Struct.new(:path, :tables, keyword_init: true) do
+    FileResult = Struct.new(:path, :tables, :table_metadata, :bytes_scanned, :truncated, keyword_init: true) do
       def count
         tables.length
       end
     end
 
-    Result = Struct.new(:tables, :files, :files_found, :files_skipped, :skipped, keyword_init: true)
+    Result = Struct.new(:tables, :files, :files_found, :files_skipped, :skipped, :table_metadata, :bytes_scanned, :truncated, keyword_init: true)
 
     CDATA_START = "<![CDATA[".b
     CDATA_END = "]]>".b
@@ -736,14 +785,16 @@ module SiloMigrate
     COMMENT_END = "-->".b
     PROCESSING_START = "<?".b
     PROCESSING_END = "?>".b
-    INTERESTING_TAG = /<\s*(?:table_structure|table_data)\b/n
-    NAME_ATTR = /\bname\s*=\s*(['"])(.*?)\1/mn
+    INTERESTING_TAG = /<\s*(?:table_structure|table_data|options)\b/n
+    TAG_NAME = /\A<\s*([A-Za-z_:][\w:.-]*)/n
+    ATTR = /\b([A-Za-z_:][\w:.-]*)\s*=\s*(['"])(.*?)\2/mn
     SCAN_TAIL_BYTES = 64
 
-    def initialize(include_files: nil, exclude_files: nil, chunk_size: XMLToSQLConverter::XML_CHUNK_SIZE)
+    def initialize(include_files: nil, exclude_files: nil, chunk_size: XMLToSQLConverter::XML_CHUNK_SIZE, max_bytes: nil)
       @include_files = include_files&.to_set
       @exclude_files = Array(exclude_files).to_set
       @chunk_size = chunk_size
+      @max_bytes = max_bytes
     end
 
     def discover(source, file_pattern: "*.xml")
@@ -755,14 +806,18 @@ module SiloMigrate
       raise UsageError, "No XML files to scan after filtering. All #{files.length} files were excluded." if selected.empty?
 
       file_results = selected.map do |file|
-        FileResult.new(path: file, tables: discover_file(file).sort)
+        tables, metadata, bytes_scanned, truncated = discover_file(file)
+        FileResult.new(path: file, tables: tables.sort, table_metadata: metadata, bytes_scanned: bytes_scanned, truncated: truncated)
       end
       Result.new(
         tables: file_results.flat_map(&:tables).uniq.sort,
         files: file_results,
         files_found: files.length,
         files_skipped: skipped.length,
-        skipped: skipped
+        skipped: skipped,
+        table_metadata: merge_table_metadata(file_results),
+        bytes_scanned: file_results.sum(&:bytes_scanned),
+        truncated: file_results.any?(&:truncated)
       )
     end
 
@@ -770,22 +825,63 @@ module SiloMigrate
 
     def discover_file(path)
       tables = Set.new
-      scanner = TableTagScanner.new(chunk_size: @chunk_size) { |table| tables << table }
+      metadata = {}
+      bytes_scanned = 0
+      truncated = false
+      scanner = TableTagScanner.new(chunk_size: @chunk_size) do |event, table, info|
+        case event
+        when :table
+          tables << table
+        when :metadata
+          tables << table
+          metadata[table] = merge_metadata(metadata[table], info)
+        end
+      end
       open_input(path) do |input|
         while (chunk = input.read(@chunk_size))
+          if @max_bytes && bytes_scanned + chunk.bytesize > @max_bytes
+            remaining = @max_bytes - bytes_scanned
+            scanner.feed(chunk.byteslice(0, remaining)) if remaining.positive?
+            bytes_scanned += remaining if remaining.positive?
+            truncated = true
+            break
+          end
+
           scanner.feed(chunk)
+          bytes_scanned += chunk.bytesize
         end
       end
       scanner.finish
-      tables.to_a
+      [tables.to_a, metadata, bytes_scanned, truncated]
+    end
+
+    def merge_table_metadata(file_results)
+      file_results.each_with_object({}) do |file, merged|
+        file.table_metadata.each do |table, info|
+          merged[table] = merge_metadata(merged[table], info)
+        end
+      end
+    end
+
+    def merge_metadata(existing, incoming)
+      return incoming if existing.nil?
+
+      existing.merge(incoming) do |_key, old_value, new_value|
+        if old_value.is_a?(Integer) && new_value.is_a?(Integer)
+          [old_value, new_value].max
+        else
+          old_value || new_value
+        end
+      end
     end
 
     class TableTagScanner
-      def initialize(chunk_size:, &table_handler)
-        @table_handler = table_handler
+      def initialize(chunk_size:, &event_handler)
+        @event_handler = event_handler
         @chunk_size = chunk_size
         @buffer = +"".b
         @skip_until = nil
+        @current_structure_table = nil
       end
 
       def feed(chunk)
@@ -864,12 +960,54 @@ module SiloMigrate
       end
 
       def process_tag(tag)
-        match = tag.match(NAME_ATTR)
-        return unless match
+        tag_name = tag[TAG_NAME, 1]
+        attrs = parse_attributes(tag)
 
-        value = match[2].dup.force_encoding("UTF-8").encode("UTF-8", invalid: :replace, undef: :replace)
-        table = unescape_xml_attribute(value)
-        @table_handler.call(table) unless table.empty?
+        case tag_name
+        when "table_structure"
+          table = decoded_attribute(attrs["name"])
+          return if table.empty?
+
+          @current_structure_table = table
+          @event_handler.call(:table, table, nil)
+        when "table_data"
+          table = decoded_attribute(attrs["name"])
+          @event_handler.call(:table, table, nil) unless table.empty?
+        when "options"
+          table = decoded_attribute(attrs["Name"] || attrs["name"]) || @current_structure_table
+          table = @current_structure_table if table.to_s.empty?
+          metadata = options_metadata(attrs)
+          @event_handler.call(:metadata, table, metadata) if table && !table.empty? && metadata.any?
+        end
+      end
+
+      def parse_attributes(tag)
+        tag.scan(ATTR).each_with_object({}) do |(name, _quote, value), attrs|
+          attrs[name] = value
+        end
+      end
+
+      def decoded_attribute(value)
+        return "" if value.nil?
+
+        value = value.dup.force_encoding("UTF-8").encode("UTF-8", invalid: :replace, undef: :replace)
+        unescape_xml_attribute(value)
+      end
+
+      def options_metadata(attrs)
+        {
+          rows: integer_attribute(attrs["Rows"] || attrs["rows"]),
+          data_length: integer_attribute(attrs["Data_length"] || attrs["data_length"]),
+          index_length: integer_attribute(attrs["Index_length"] || attrs["index_length"])
+        }.compact
+      end
+
+      def integer_attribute(value)
+        return nil if value.nil? || value.empty?
+
+        Integer(value, 10)
+      rescue ArgumentError
+        nil
       end
 
       def unescape_xml_attribute(value)

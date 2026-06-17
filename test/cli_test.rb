@@ -1159,7 +1159,10 @@ class CLITest < SiloMigrateTest
         <?xml version="1.0"?>
         <mysqldump>
           <database name="forum">
-            <table_structure name="users"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+            <table_structure name="users">
+              <field Field="id" Type="int" Null="NO" Key="PRI" />
+              <options Name="users" Rows="1234567" Data_length="157286400" Index_length="524288" />
+            </table_structure>
             <table_data name="users"><row><field name="id">1</field></row></table_data>
           </database>
         </mysqldump>
@@ -1172,11 +1175,17 @@ class CLITest < SiloMigrateTest
       assert File.exist?(staged)
       assert_includes out.string, "Converting XML dump..."
       assert_includes out.string, "XML files found:"
+      assert_includes out.string, "Large table candidates:"
+      assert_includes out.string, "- users (rows 1234567, data 150.0 MB, index 512.0 KB, total 150.5 MB)"
+      assert_includes out.string, "Tip: type \"exclude\" next to skip large or nonessential tables."
       assert_includes out.string, "Files to process: 1"
       assert_includes out.string, "Processing 1/1: users.xml"
+      assert_includes out.string, "First table detected: users"
+      assert_includes out.string, "First row converted from users"
       assert_includes out.string, "Conversion output size:"
       assert_includes out.string, "[OK] XML converted and staged"
       assert_includes out.string, "[OK] XML converted:"
+      assert_includes prompt.asked, "XML table filter: all, include, or exclude (blank for all; discovered: users)"
     end
   end
 
@@ -1191,7 +1200,10 @@ class CLITest < SiloMigrateTest
         <?xml version="1.0"?>
         <mysqldump>
           <database name="forum">
-            <table_structure name="users"><field Field="id" Type="int" Null="NO" Key="PRI" /></table_structure>
+            <table_structure name="users">
+              <field Field="id" Type="int" Null="NO" Key="PRI" />
+              <options Name="users" Rows="12" Data_length="1048576" Index_length="524288" />
+            </table_structure>
             <table_data name="users"><row><field name="id">1</field></row></table_data>
           </database>
         </mysqldump>
@@ -1218,7 +1230,7 @@ class CLITest < SiloMigrateTest
       assert_includes out.string, "Input size:"
       assert_includes out.string, "across 1 file"
       assert_includes out.string, "Tables discovered:"
-      assert_includes out.string, "- users"
+      assert_includes out.string, "- users (rows 12, data 1.0 MB, index 512.0 KB, total 1.5 MB)"
       assert_includes out.string, "Processing 1/1: intel_20260609.xml"
       assert_includes out.string, "Dump: intel_20260609.sql.gz"
       refute_includes prompt.asked, "Exclude any XML files from conversion? [y/N]"

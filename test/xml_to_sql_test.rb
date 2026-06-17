@@ -320,6 +320,32 @@ class XMLToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_discovers_table_options_metadata
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="email_tracking2">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+            <options Name="email_tracking2" Rows="12345" Data_length="67108864" Index_length="8388608" />
+          </table_structure>
+          <table_structure name="users">
+            <field Field="id" Type="int" Null="NO" Key="PRI" />
+          </table_structure>
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new.discover(Pathname(input))
+
+      assert_equal %w[email_tracking2 users], result.tables
+      assert_equal({ rows: 12_345, data_length: 67_108_864, index_length: 8_388_608 }, result.table_metadata.fetch("email_tracking2"))
+      assert_equal({ rows: 12_345, data_length: 67_108_864, index_length: 8_388_608 }, result.files.first.table_metadata.fetch("email_tracking2"))
+    end
+  end
+
   def test_discovers_tables_from_gzip_xml
     Dir.mktmpdir do |dir|
       input = gzip_write(File.join(dir, "dump.xml.gz"), XML)
@@ -406,6 +432,29 @@ class XMLToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_table_discovery_can_stop_after_byte_limit
+    xml = <<~XML
+      <?xml version="1.0"?>
+      <mysqldump>
+        <database name="forum">
+          <table_structure name="early" />
+          #{"x" * 200}
+          <table_structure name="late" />
+        </database>
+      </mysqldump>
+    XML
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), xml)
+      result = SiloMigrate::XMLTableDiscovery.new(chunk_size: 32, max_bytes: 128).discover(Pathname(input))
+
+      assert_equal ["early"], result.tables
+      assert_equal 128, result.bytes_scanned
+      assert_equal true, result.truncated
+      assert_equal true, result.files.first.truncated
+    end
+  end
+
   def test_table_discovery_ignores_table_like_text_inside_cdata
     xml = <<~XML
       <?xml version="1.0"?>
@@ -474,7 +523,51 @@ class XMLToSQLTest < SiloMigrateTest
       assert_equal :complete, snapshots.last[:event]
       assert snapshots.any? { |snapshot| snapshot[:event] == :bytes && snapshot[:current_file][:bytes_read].positive? }
       assert snapshots.any? { |snapshot| snapshot[:event] == :rows && snapshot[:rows_processed].positive? }
+      assert snapshots.any? { |snapshot| snapshot[:event] == :rows && snapshot[:current_table] == "users" }
       assert snapshots.any? { |snapshot| snapshot[:event] == :table && snapshot[:tables_processed].positive? }
+    end
+  end
+
+  def test_first_table_and_row_progress_ignore_throttle
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "dump.xml"), XML)
+      output = File.join(dir, "dump.sql")
+      snapshots = []
+
+      SiloMigrate::XMLToSQLConverter.new(batch_size: 1000, verbose: false).convert(
+        Pathname(input),
+        Pathname(output),
+        progress_callback: proc { |snapshot| snapshots << snapshot },
+        progress_interval: 3600
+      )
+
+      assert_equal [:start, :file_start, :table, :rows, :complete], snapshots.map { |snapshot| snapshot[:event] } & [:start, :file_start, :table, :rows, :complete]
+      assert snapshots.any? { |snapshot| snapshot[:event] == :table && snapshot[:tables_processed] == 1 }
+      assert snapshots.any? { |snapshot| snapshot[:event] == :rows && snapshot[:rows_processed] == 1 }
+    end
+  end
+
+  def test_warns_when_bytes_advance_without_tables_or_rows
+    Dir.mktmpdir do |dir|
+      body = "x" * 2048
+      input = write(File.join(dir, "dump.xml"), "<?xml version=\"1.0\"?><mysqldump><!-- #{body} --></mysqldump>")
+      output = File.join(dir, "dump.sql")
+      snapshots = []
+
+      stats = SiloMigrate::XMLToSQLConverter.new(verbose: false, zero_progress_warning_bytes: 128).convert(
+        Pathname(input),
+        Pathname(output),
+        progress_callback: proc { |snapshot| snapshots << snapshot },
+        progress_interval: 3600
+      )
+
+      warning = snapshots.find { |snapshot| snapshot[:event] == :warning }
+      refute_nil warning
+      assert_includes warning[:message], "without discovering any tables or rows"
+      assert_includes warning[:message], "Check: input path, command path, file format, current checkout."
+      assert_includes warning[:message], input
+      assert_includes warning[:message], "bin/silo-migrate convert-xml"
+      assert_equal [warning[:message]], stats[:warnings]
     end
   end
 
