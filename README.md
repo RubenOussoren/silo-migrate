@@ -126,7 +126,9 @@ autosuggestions to use completion instead of shell history, keeps syntax
 highlighting last in the plugin list, and adds history settings intended to keep
 one-off AWS credential exports out of history. Prefer AWS profiles or IAM
 Identity Center/SSO for persistent access, and prefix any sensitive one-off
-export command with a leading space.
+export command with a leading space. When Oh My Zsh is requested, the installer
+also sets zsh as the login shell when `chsh` can do that safely; start it in the
+current session with `exec zsh -l` or log out and back in.
 
 If an earlier run left `/root/.oh-my-zsh` partially installed, move it aside
 before retrying:

@@ -339,6 +339,16 @@ manual_oh_my_zsh_cleanup_hint() {
     "$zsh_dir" "${zsh_dir}.broken-\$(date +%Y%m%d%H%M%S)"
 }
 
+zsh_shell_path() {
+  if command_exists zsh; then
+    command -v zsh
+  elif [ -x /usr/bin/zsh ]; then
+    printf '%s\n' /usr/bin/zsh
+  elif [ -x /bin/zsh ]; then
+    printf '%s\n' /bin/zsh
+  fi
+}
+
 zsh_plugin_enabled() {
   local wanted="$1"
   case " $zsh_plugins " in
@@ -847,6 +857,35 @@ configure_zsh_preset() {
   log "Updated zsh preset block in $profile"
 }
 
+ensure_zsh_login_shell() {
+  [ "$with_oh_my_zsh" -eq 1 ] || return 0
+
+  case "${SHELL:-}" in
+    */zsh) return 0 ;;
+  esac
+
+  local zsh_path user
+  zsh_path="$(zsh_shell_path)"
+  if [ -z "$zsh_path" ]; then
+    warn "zsh was not found on PATH. Install zsh, then run: chsh -s /usr/bin/zsh $(id -un)"
+    return 0
+  fi
+
+  if ! command_exists chsh && [ "$dry_run" -eq 0 ]; then
+    warn "chsh is unavailable. Set zsh as the login shell manually: chsh -s $zsh_path $(id -un)"
+    return 0
+  fi
+
+  user="$(id -un)"
+  if [ "$(id -u)" -ne 0 ] && [ ! -t 0 ] && [ "$dry_run" -eq 0 ]; then
+    warn "Set zsh as the login shell manually: chsh -s $zsh_path $user"
+    return 0
+  fi
+
+  log "Setting login shell for $user to $zsh_path..."
+  run_cmd chsh -s "$zsh_path" "$user" || warn "Could not set login shell automatically. Run manually: chsh -s $zsh_path $user"
+}
+
 remove_zsh_preset() {
   local custom_dir profile
   custom_dir="$(zsh_custom_dir)"
@@ -1012,6 +1051,7 @@ fi
 install_bundler
 install_oh_my_zsh
 configure_zsh_preset
+ensure_zsh_login_shell
 
 clone_or_update_checkout
 

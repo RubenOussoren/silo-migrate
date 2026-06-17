@@ -211,6 +211,23 @@ class InstallServiceTest < SiloMigrateTest
       assert_includes stdout, 'export ZSH="${ZSH:-$HOME/.oh-my-zsh}"'
       assert_includes stdout, 'source "$ZSH/oh-my-zsh.sh"'
       refute_includes stdout, "source \"#{dir}/.oh-my-zsh/oh-my-zsh.sh\""
+      refute_includes stdout, "chsh -s"
+    end
+  end
+
+  def test_install_script_shell_preset_dry_run_sets_zsh_login_shell
+    Dir.mktmpdir do |dir|
+      stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/bash", "ZSH" => File.join(dir, ".oh-my-zsh"), "ZSH_CUSTOM" => File.join(dir, ".oh-my-zsh", "custom") },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--shell-preset", "migration",
+        "--skip-docker"
+      )
+
+      assert status.success?, stderr
+      assert_includes stdout, "Setting login shell for"
+      assert_match(/\+ chsh -s \S+zsh \S+/, stdout)
     end
   end
 
