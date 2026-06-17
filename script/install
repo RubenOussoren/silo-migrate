@@ -1,12 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+yes_mode=0
+install_deps=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --yes) yes_mode=1; install_deps=1 ;;
+    --install-deps) install_deps=1 ;;
+    -h|--help)
+      cat <<'HELP'
+Usage: script/install [--yes] [--install-deps]
+
+Installs silo-migrate from a Git-managed checkout and writes global shims.
+On Debian/Ubuntu, --install-deps offers to install missing host packages first.
+--yes installs missing Debian/Ubuntu packages without prompting.
+HELP
+      exit 0
+      ;;
+    *) printf 'Error: unknown option %s\n' "$1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
 repo="${SILO_MIGRATE_REPO:-git@github.com:RubenOussoren/silo-migrate.git}"
 branch="${SILO_MIGRATE_BRANCH:-main}"
 home_dir="${HOME:?HOME is required}"
 data_home="${XDG_DATA_HOME:-$home_dir/.local/share}"
 install_dir="${SILO_MIGRATE_INSTALL_DIR:-$data_home/silo-migrate/source}"
 bin_dir="${SILO_MIGRATE_BIN_DIR:-$home_dir/.local/bin}"
+debian_packages=(git ruby ruby-dev build-essential zlib1g-dev libsqlite3-dev zsh docker.io docker-compose-plugin)
+sudocmd=()
 
 log() {
   printf '%s\n' "$*"
@@ -17,8 +41,79 @@ fail() {
   exit 1
 }
 
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+confirm() {
+  local prompt="$1"
+  [ "$yes_mode" -eq 1 ] && return 0
+  [ -t 0 ] || return 1
+  local answer
+  read -r -p "$prompt [y/N] " answer
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+setup_sudo() {
+  if [ "$(id -u)" -eq 0 ]; then
+    sudocmd=()
+  elif command_exists sudo; then
+    sudocmd=(sudo)
+  else
+    return 1
+  fi
+}
+
+ruby_ready() {
+  command_exists ruby && ruby -e 'exit(Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("3.1.0"))' >/dev/null 2>&1
+}
+
+print_debian_commands() {
+  cat <<COMMANDS
+Run these commands, then re-run script/install:
+
+  apt-get update
+  apt-get install -y ${debian_packages[*]}
+  gem install bundler
+COMMANDS
+}
+
+install_debian_deps() {
+  command_exists apt-get || return 1
+  setup_sudo || return 1
+
+  log "Installing Debian/Ubuntu dependencies..."
+  "${sudocmd[@]}" apt-get update
+  "${sudocmd[@]}" apt-get install -y "${debian_packages[@]}"
+}
+
+ensure_host_dependencies() {
+  if command_exists git && ruby_ready; then
+    return
+  fi
+
+  if command_exists apt-get; then
+    if [ "$install_deps" -eq 1 ] || confirm "Install missing Debian/Ubuntu dependencies now?"; then
+      install_debian_deps || fail "Could not install Debian/Ubuntu dependencies."
+      return
+    fi
+
+    print_debian_commands
+    exit 1
+  fi
+
+  fail "git and Ruby >= 3.1 are required. Run script/bootstrap or install them manually first."
+}
+
 ensure_command() {
-  command -v "$1" >/dev/null 2>&1 || fail "$1 is required. Run script/bootstrap or install it manually first."
+  command_exists "$1" || fail "$1 is required. Run script/bootstrap or install it manually first."
 }
 
 write_shim() {
@@ -36,14 +131,15 @@ SHIM
   chmod +x "$shim"
 }
 
+ensure_host_dependencies
 ensure_command git
 ensure_command ruby
 
-if ! ruby -e 'exit(Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("3.1.0"))' >/dev/null 2>&1; then
+if ! ruby_ready; then
   fail "Ruby >= 3.1 is required. Run script/bootstrap or install Ruby with rbenv, asdf, or Homebrew."
 fi
 
-if ! command -v bundle >/dev/null 2>&1; then
+if ! command_exists bundle; then
   log "Bundler is missing; installing it with gem..."
   gem install bundler
 fi

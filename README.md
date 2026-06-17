@@ -56,6 +56,21 @@ script/install
 silo-migrate doctor
 ```
 
+On a fresh Debian/Ubuntu host, `script/install` can install the baseline host
+packages before installing the tool:
+
+```bash
+script/install --install-deps
+```
+
+For non-interactive root setup:
+
+```bash
+SILO_MIGRATE_INSTALL_DIR=/migrations/silo-migrate \
+SILO_MIGRATE_BIN_DIR=/usr/local/bin \
+script/install --yes
+```
+
 If `~/.local/bin` is not on `PATH`, add it to your shell profile:
 
 ```bash
