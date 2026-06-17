@@ -197,12 +197,43 @@ class InstallServiceTest < SiloMigrateTest
     assert_equal "https://github.com/RubenOussoren/silo-migrate.git", SiloMigrate::Services::InstallService.repo("HOME" => "/home/example")
   end
 
+  def test_lifecycle_shim_bypasses_bundler_environment
+    Dir.mktmpdir do |dir|
+      bin_dir = File.join(dir, "bin")
+      SiloMigrate::Services::InstallService.write_shims(SiloMigrate.root, bin_dir)
+
+      stdout, stderr, status = Open3.capture3(
+        {
+          "BUNDLE_GEMFILE" => File.join(dir, "missing-gemfile"),
+          "BUNDLE_BIN_PATH" => File.join(dir, "missing-bundle"),
+          "RUBYOPT" => "-rbundler/setup"
+        },
+        File.join(bin_dir, "silo-migrate"),
+        "self-update",
+        "--help"
+      )
+
+      assert status.success?, stderr
+      assert_includes stdout, "Usage: silo-migrate self-update"
+    end
+  end
+
   def test_install_script_includes_pkg_config_for_native_gem_builds
     script = File.read(File.expand_path("../script/install", __dir__))
 
     assert_match(/formulas\+=\(pkg-config\)/, script)
     assert_match(/install_apt_base_packages\(\).*pkg-config/m, script)
     assert_match(/install_dnf_base_packages\(\).*pkgconf-pkg-config/m, script)
+  end
+
+  def test_install_script_writes_lifecycle_shims_that_bypass_bundler
+    script = File.read(File.expand_path("../script/install", __dir__))
+
+    assert_includes script, 'if [[ "\${1:-}" == "self-update" || "\${1:-}" == "uninstall" ]]; then'
+    assert_includes script, 'for var in \${!BUNDLE_@}; do unset "\$var"; done'
+    assert_includes script, "unset BUNDLER_VERSION RUBYOPT"
+    assert_includes script, 'exec ruby bin/$name "\$@"'
+    assert_includes script, 'exec bundle exec ruby bin/$name "\$@"'
   end
 
   def test_install_script_uninstall_removes_only_cli_artifacts

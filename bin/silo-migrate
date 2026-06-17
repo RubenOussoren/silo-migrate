@@ -3,6 +3,36 @@
 
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 
+if %w[self-update uninstall].include?(ARGV.first)
+  if ARGV[1] == "--help" || ARGV[1] == "-h"
+    command = ARGV.first
+    puts command == "self-update" ? "Usage: silo-migrate self-update" : "Usage: silo-migrate uninstall"
+    exit 0
+  end
+
+  require "silo_migrate/version"
+  require "silo_migrate/errors"
+  require "silo_migrate/runtime/docker"
+  require "silo_migrate/services/install_service"
+
+  module SiloMigrate
+    ROOT = File.expand_path("..", __dir__) unless const_defined?(:ROOT)
+
+    def self.root
+      ROOT
+    end
+  end
+
+  begin
+    service = SiloMigrate::Services::InstallService.new
+    ARGV.first == "self-update" ? service.self_update : service.uninstall
+    exit 0
+  rescue SiloMigrate::UsageError => e
+    warn "Error: #{e.message}"
+    exit 1
+  end
+end
+
 require "silo_migrate"
 
 exit SiloMigrate::CLI.new.run(ARGV)

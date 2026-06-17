@@ -56,6 +56,11 @@ module SiloMigrate
           #!/usr/bin/env bash
           set -euo pipefail
           cd #{Shellwords.escape(File.expand_path(source_root))}
+          if [[ "${1:-}" == "self-update" || "${1:-}" == "uninstall" ]]; then
+            for var in ${!BUNDLE_@}; do unset "$var"; done
+            unset BUNDLER_VERSION RUBYOPT
+            exec ruby bin/#{executable} "$@"
+          fi
           exec bundle exec ruby bin/#{executable} "$@"
         SH
       end

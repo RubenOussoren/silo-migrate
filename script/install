@@ -916,6 +916,11 @@ write_shim() {
 #!/usr/bin/env bash
 set -euo pipefail
 cd $escaped_dir
+if [[ "\${1:-}" == "self-update" || "\${1:-}" == "uninstall" ]]; then
+  for var in \${!BUNDLE_@}; do unset "\$var"; done
+  unset BUNDLER_VERSION RUBYOPT
+  exec ruby bin/$name "\$@"
+fi
 exec bundle exec ruby bin/$name "\$@"
 SHIM
   chmod +x "$shim"
@@ -928,7 +933,10 @@ shim_owned_by_install() {
   escaped_dir="$(shell_quote "$install_dir")"
 
   [ -f "$shim" ] || return 1
-  grep -Fq "cd $escaped_dir" "$shim" && grep -Fq "exec bundle exec ruby bin/$name" "$shim"
+  grep -Fq "cd $escaped_dir" "$shim" && {
+    grep -Fq "exec bundle exec ruby bin/$name" "$shim" ||
+      grep -Fq "exec ruby bin/$name" "$shim"
+  }
 }
 
 remove_shim() {
