@@ -300,14 +300,17 @@ Main workflows:
   SSH/passphrase issues, and optionally build/start the converter container and
   run `bundle install`.
 - **Discourse uploads container** — configure Discourse container files when
-  needed, rebuild/start the uploads container, prepare uploads-container
-  dependencies, then run the upload importer only after
-  `output/intermediate.db` exists.
+  selected, then stop with the converter next step until
+  `output/intermediate.db` exists. Once converter output exists, guided mode
+  rebuilds/starts the uploads container, prepares uploads-container
+  dependencies, and runs the upload importer.
 - **Discourse import container** — configure Discourse container files when
-  needed, rebuild/start the import container, prepare import-container
-  dependencies, restore a backup when selected, then run `generic_bulk.rb` only
-  after `output/intermediate.db` exists. Guided mode offers the final backup
-  after a successful import; advanced actions can run it explicitly.
+  selected, then stop with the converter next step until
+  `output/intermediate.db` exists. Once converter output exists, guided mode
+  rebuilds/starts the import container, prepares import-container dependencies,
+  can restore a backup, runs `generic_bulk.rb`, and offers the final backup
+  after a successful import. Advanced import-container actions can explicitly
+  restore a backup before converter output exists.
 
 Typical flow:
 

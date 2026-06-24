@@ -133,12 +133,17 @@ points:
 7. **Run converter command** from `Converter actions` — runs the converter; on completion you are offered
    the chain: redacted summary → findings → synthetic fixtures, each defaulting
    to yes.
-8. **Discourse uploads container** — configures/rebuilds/starts the uploads
-   container, prepares uploads-container dependencies, and runs the upload
-   importer.
-9. **Discourse import container** — configures/rebuilds/starts the import
-   container, prepares import-container dependencies, optionally restores a
-   backup, runs the generic import, and can generate a final backup.
+8. **Discourse uploads container** — configures Discourse container files first.
+   If `output/intermediate.db` is missing, guided mode stops there and points
+   you back to the converter. Once converter output exists, it rebuilds/starts
+   the uploads container, prepares dependencies, and runs the upload importer.
+9. **Discourse import container** — configures Discourse container files first.
+   If `output/intermediate.db` is missing, guided mode stops there and points
+   you back to the converter. Once converter output exists, it rebuilds/starts
+   the import container, prepares dependencies, can restore a backup, runs the
+   generic import, and can generate a final backup. Use the advanced
+   import-container restore action when you intentionally need to restore a
+   backup before converter output exists.
 10. **Advanced actions** are grouped by area: initial dump/database, final
     dump/database, conversion, converter, Discourse uploads, Discourse import,
     and project/service actions.

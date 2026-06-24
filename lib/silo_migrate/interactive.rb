@@ -246,18 +246,18 @@ module SiloMigrate
       show_workflow_preview(
         "Discourse uploads container",
         [
-          "Setup phase: configure stock Discourse container files, rebuild/start the uploads container, and prepare uploads dependencies.",
-          "Import phase: run the upload importer only after output/intermediate.db exists."
+          "Setup phase: write/update stock Discourse container files and uploads_importer.yml.",
+          "Container build, dependency setup, and uploads import require output/intermediate.db from the converter."
         ]
       )
       return BACK unless confirm?("Continue with Discourse uploads container workflow?", default: true)
 
-      ensure_discourse_configured(customer)
+      @discourse_service.setup(customer)
+      return unless discourse_intermediate_db_ready?(customer, next_step: "Run the converter to create output/intermediate.db, then rerun this workflow or run 'silo-migrate discourse run-uploads #{customer}'.")
+
       @discourse_service.rebuild(customer, role: "uploads")
       @discourse_service.start(customer, role: "uploads")
       @discourse_service.prepare_deps(customer, role: "uploads")
-      return unless discourse_intermediate_db_ready?(customer, next_step: "Run the converter to create output/intermediate.db, then rerun this workflow or run 'silo-migrate discourse run-uploads #{customer}'.")
-
       @discourse_service.run_uploads(customer)
       show_discourse_manual_commands(customer)
     rescue UsageError => e
@@ -272,13 +272,15 @@ module SiloMigrate
       show_workflow_preview(
         "Discourse import container",
         [
-          "Setup phase: configure stock Discourse container files, rebuild/start the import container, prepare import dependencies, and optionally restore a backup.",
-          "Import phase: run generic_bulk.rb only after output/intermediate.db exists; final backup is offered after a successful import."
+          "Setup phase: write/update stock Discourse container files.",
+          "Container build, dependency setup, optional backup restore, generic import, and final backup require output/intermediate.db from the converter."
         ]
       )
       return BACK unless confirm?("Continue with Discourse import container workflow?", default: true)
 
-      ensure_discourse_configured(customer)
+      @discourse_service.setup(customer)
+      return unless discourse_intermediate_db_ready?(customer, next_step: "Run the converter to create output/intermediate.db, then rerun this workflow or run 'silo-migrate discourse import #{customer}'.")
+
       @discourse_service.rebuild(customer, role: "import")
       @discourse_service.start(customer, role: "import")
       @discourse_service.prepare_deps(customer, role: "import")
@@ -288,8 +290,6 @@ module SiloMigrate
 
         @discourse_service.restore_import(customer, backup: backup)
       end
-      return unless discourse_intermediate_db_ready?(customer, next_step: "Run the converter to create output/intermediate.db, then rerun this workflow or run 'silo-migrate discourse import #{customer}'.")
-
       details = @discourse_service.status_details(customer)
       skip_uploads_db = details[:uploads_db] && confirm?("Skip uploads.sqlite3 and import intermediate.db only?", default: false)
       @discourse_service.import(customer, no_uploads_db: skip_uploads_db)

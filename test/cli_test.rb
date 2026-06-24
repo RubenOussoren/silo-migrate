@@ -1250,7 +1250,7 @@ class CLITest < SiloMigrateTest
     end
   end
 
-  def test_guided_discourse_uploads_workflow_stops_before_importer_without_intermediate_db
+  def test_guided_discourse_uploads_workflow_stops_after_setup_without_intermediate_db
     with_tmp_base do |_dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
       out = StringIO.new
@@ -1263,10 +1263,7 @@ class CLITest < SiloMigrateTest
       SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
 
       assert_equal [
-        [:setup, "acme"],
-        [:rebuild, "acme", "uploads"],
-        [:start, "acme", "uploads"],
-        [:prepare_deps, "acme", "uploads"]
+        [:setup, "acme"]
       ], discourse.calls
       assert_includes out.string, "output/intermediate.db is missing"
       assert_includes out.string, "Run the converter"
@@ -1295,7 +1292,29 @@ class CLITest < SiloMigrateTest
     end
   end
 
-  def test_guided_discourse_import_workflow_allows_restore_before_intermediate_db
+  def test_guided_discourse_import_workflow_stops_after_setup_without_intermediate_db
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      discourse = FakeDiscourseService.new(status_details: { intermediate_db: false })
+      project.init("acme")
+      prompt = FakePrompt.new(["Discourse import container", "y"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
+
+      assert_equal [
+        [:setup, "acme"]
+      ], discourse.calls
+      assert_includes out.string, "output/intermediate.db is missing"
+      refute discourse.calls.any? { |call| call.first == :restore_import }
+      refute_includes discourse.calls, [:import, "acme", false]
+      refute discourse.calls.any? { |call| call.first == :backup_import }
+    end
+  end
+
+  def test_guided_advanced_import_restore_action_remains_explicitly_available_without_intermediate_db
     with_tmp_base do |dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
       out = StringIO.new
@@ -1304,20 +1323,11 @@ class CLITest < SiloMigrateTest
       discourse = FakeDiscourseService.new(status_details: { intermediate_db: false })
       project.init("acme")
       backup = write(File.join(dir, "backup.tar.gz"), "backup")
-      prompt = FakePrompt.new(["Discourse import container", "y", "y", backup])
+      prompt = FakePrompt.new(["Advanced actions", "Discourse import container actions", "Restore backup onto import container", backup])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
 
-      assert_equal [
-        [:setup, "acme"],
-        [:rebuild, "acme", "import"],
-        [:start, "acme", "import"],
-        [:prepare_deps, "acme", "import"],
-        [:restore_import, "acme", backup]
-      ], discourse.calls
-      assert_includes out.string, "output/intermediate.db is missing"
-      refute_includes discourse.calls, [:import, "acme", false]
-      refute discourse.calls.any? { |call| call.first == :backup_import }
+      assert_includes discourse.calls, [:restore_import, "acme", backup]
     end
   end
 
