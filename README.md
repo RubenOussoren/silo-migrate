@@ -265,11 +265,47 @@ bin/silo-migrate import-dump acme final
 bin/silo-migrate schema bundle acme --phase final
 ```
 
+For the optional Discourse handoff containers:
+
+```bash
+# one-time Linux launcher checkout setup; skip if /var/discourse already exists
+bin/silo-migrate discourse install-launcher
+
+bin/silo-migrate discourse setup acme
+bin/silo-migrate discourse rebuild acme --role uploads
+bin/silo-migrate discourse prepare-deps acme --role uploads
+bin/silo-migrate discourse run-uploads acme
+bin/silo-migrate discourse rebuild acme --role import
+bin/silo-migrate discourse prepare-deps acme --role import
+bin/silo-migrate discourse restore-import acme --backup /path/to/backup.tar.gz
+bin/silo-migrate discourse import acme
+bin/silo-migrate discourse backup-import acme
+```
+
 ## Guided Workflow
 
 Guided mode is the primary operator experience. It shows project location,
 configured databases, dump counts, schema-bundle status, and container status
-before prompting for the next action.
+before prompting for the next workflow. The main menu stays intentionally
+coarse-grained so it does not repeat the steps that a workflow already performs.
+
+Main workflows:
+
+- **Initial dump** — stage or convert the initial dump, start the initial DB,
+  wait for health, import, write the import marker, and generate the initial
+  schema bundle.
+- **Final dump** — add final DB configuration when needed, then stage/convert,
+  start, import, mark, and bundle the final dump.
+- **Converter setup** — clone or verify `discourse-converters`, recover from
+  SSH/passphrase issues, and optionally build/start the converter container and
+  run `bundle install`.
+- **Discourse uploads container** — configure Discourse container files when
+  needed, rebuild/start the uploads container, prepare uploads-container
+  dependencies, and run the upload importer.
+- **Discourse import container** — configure Discourse container files when
+  needed, rebuild/start the import container, prepare import-container
+  dependencies, restore a backup when selected, run `generic_bulk.rb`, and
+  optionally generate a final backup.
 
 Typical flow:
 
@@ -287,15 +323,26 @@ Typical flow:
 11. Generate structured findings from that summary.
 12. Generate shape-only synthetic fixtures from those findings.
 13. Iterate on converter code using safe artifacts, then rerun the converter.
+14. Use the Discourse uploads/import container workflows for the final handoff.
 
 Submenus include `Back` where returning to the project menu is useful. Path
 prompts accept `back`, `b`, or `..`, and support tab completion in a normal
 terminal.
 
-Advanced actions expose direct service control, XML conversion, JSON
-conversion, schema bundle
-generation, converter execution, redacted summary generation, findings
-generation, fixture generation, regeneration, reset, cleanup, and status.
+Advanced actions are grouped by the part of the migration they affect:
+
+- Initial dump/database actions.
+- Final dump/database actions.
+- Conversion actions.
+- Converter actions.
+- Discourse uploads container actions.
+- Discourse import container actions.
+- Project/service actions.
+
+Use advanced actions for direct service control, XML/JSON conversion, dump
+analysis/preprocessing, schema bundle generation, converter execution, redacted
+summary generation, findings/fixture generation, regeneration, reset, cleanup,
+and status.
 
 ## Command Workflow
 

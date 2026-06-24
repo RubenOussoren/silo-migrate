@@ -9,15 +9,18 @@ module SiloMigrate
     COMMANDS = %w[
       interactive go init list status cleanup start stop regenerate import-dump replace-dump
       analyze-dump preprocess-dump convert-xml convert-json stage-dump setup-converter add-final-db
-      run-converter converter schema findings fixtures ai trusted doctor self-update uninstall help
+      run-converter converter discourse schema findings fixtures ai trusted doctor self-update uninstall help
     ].freeze
 
     COMMAND_HELP = {
       "interactive" => <<~HELP,
         Usage: silo-migrate interactive [CUSTOMER]   (alias: go)
 
-        Guided workflow: create/select a project, stage and import dumps, set up
-        and run the converter, and generate schema bundles step by step.
+        Guided workflow: create/select a project, then drive the migration
+        through five workflow-level actions: Initial dump, Final dump,
+        Converter setup, Discourse uploads container, and Discourse import
+        container. Granular recovery and maintenance actions live under grouped
+        Advanced actions.
         Shortcut: 'silo-migrate' (no args) or 'silo-migrate CUSTOMER'.
       HELP
       "init" => <<~HELP,
@@ -164,6 +167,47 @@ module SiloMigrate
         Generates redacted converter log/summary artifacts from output/intermediate.db
         without re-running the converter.
       HELP
+      "discourse" => <<~HELP,
+        Usage: silo-migrate discourse install-launcher [options]
+               silo-migrate discourse setup CUSTOMER [options]
+               silo-migrate discourse rebuild CUSTOMER [--role uploads|import|both]
+               silo-migrate discourse start CUSTOMER [--role uploads|import|both]
+               silo-migrate discourse stop CUSTOMER [--role uploads|import|both]
+               silo-migrate discourse status CUSTOMER [--role uploads|import|both]
+               silo-migrate discourse prepare-deps CUSTOMER [--role uploads|import|both]
+               silo-migrate discourse run-uploads CUSTOMER
+               silo-migrate discourse restore-import CUSTOMER --backup PATH
+               silo-migrate discourse import CUSTOMER [--no-uploads-db]
+               silo-migrate discourse backup-import CUSTOMER
+
+        import uses output/intermediate.db. If output/uploads.sqlite3 exists it is
+        passed to generic_bulk.rb too; --no-uploads-db skips it explicitly.
+
+        setup writes two discourse_docker container YAML files:
+          <customer>-uploads on 127.0.0.1:8080
+          <customer>-import  on 127.0.0.1:8081
+
+        install-launcher clones the discourse_docker launcher checkout on Linux.
+        It does not run Discourse's interactive public-site setup wizard.
+
+        Options for install-launcher:
+          --docker-path PATH          discourse_docker checkout (default /var/discourse)
+          --branch BRANCH            discourse_docker branch (default main)
+          --repo REPO                discourse_docker repository
+
+        Options for setup:
+          --docker-path PATH          discourse_docker checkout (default /var/discourse)
+          --uploads-port PORT         uploads instance host port (default 8080)
+          --import-port PORT          import instance host port (default 8081)
+          --guest-root PATH           mount root inside both containers (default /migrations/CUSTOMER)
+          --developer-emails EMAILS   Discourse developer emails
+          --uploads-hostname HOST     hostname for uploads instance
+          --import-hostname HOST      hostname for import instance
+          --workers N                 Unicorn workers
+          --db-pool N                 Rails DB pool
+          --shared-buffers VALUE      Postgres shared buffers
+          --max-connections N         Postgres max connections
+      HELP
       "schema" => <<~HELP,
         Usage: silo-migrate schema export CUSTOMER [--phase PHASE] [-o DIR]
                silo-migrate schema bundle CUSTOMER [--phase PHASE] [-o DIR]
@@ -234,6 +278,7 @@ module SiloMigrate
       @fixture_service = Services::SyntheticFixtureService.new(env: env, output: output)
       @ai_workspace_service = Services::AIWorkspaceService.new(env: env, output: output)
       @trusted_service = Services::TrustedWorkflowService.new(runtime: runtime, env: env, output: output)
+      @discourse_service = Services::DiscourseService.new(runtime: runtime, env: env, output: output)
     end
 
     def run(argv)
@@ -266,6 +311,7 @@ module SiloMigrate
       when "add-final-db" then add_final_db(argv)
       when "run-converter" then run_converter(argv)
       when "converter" then converter(argv)
+      when "discourse" then discourse(argv)
       when "schema" then schema(argv)
       when "findings" then findings(argv)
       when "fixtures" then fixtures(argv)
@@ -325,6 +371,8 @@ module SiloMigrate
           add-final-db CUSTOMER        Add final database configuration
           run-converter CUSTOMER [TYPE] Run converter TYPE shortcut or container command after --
           converter summary CUSTOMER   Generate redacted converter summary from existing output
+          discourse setup CUSTOMER     Configure two discourse_docker handoff containers
+          discourse import CUSTOMER    Run final generic_bulk import in the import container
           schema export CUSTOMER       Export source/final DB schema
           schema bundle CUSTOMER       Export AI-safe schema metadata bundle
           findings generate CUSTOMER   Generate structured findings from a redacted summary
@@ -372,6 +420,75 @@ module SiloMigrate
       @project_service.generate_converter_summary(required_arg(argv, "CUSTOMER"))
     end
 
+    def discourse(argv)
+      subcommand = required_arg(argv, "SUBCOMMAND")
+      case subcommand
+      when "install-launcher" then discourse_install_launcher(argv)
+      when "setup" then discourse_setup(argv)
+      when "rebuild" then discourse_role_command(argv) { |customer, role| @discourse_service.rebuild(customer, role: role) }
+      when "start" then discourse_role_command(argv) { |customer, role| @discourse_service.start(customer, role: role) }
+      when "stop" then discourse_role_command(argv) { |customer, role| @discourse_service.stop(customer, role: role) }
+      when "status" then discourse_role_command(argv) { |customer, role| @discourse_service.status(customer, role: role) }
+      when "prepare-deps" then discourse_role_command(argv) { |customer, role| @discourse_service.prepare_deps(customer, role: role) }
+      when "run-uploads"
+        @discourse_service.run_uploads(required_arg(argv, "CUSTOMER"))
+      when "restore-import"
+        options = {}
+        OptionParser.new { |opts| opts.on("--backup PATH") { |value| options[:backup] = value } }.parse!(argv)
+        raise UsageError, "Missing required option: --backup PATH" if options[:backup].to_s.empty?
+
+        @discourse_service.restore_import(required_arg(argv, "CUSTOMER"), backup: options[:backup])
+      when "import"
+        options = { no_uploads_db: false }
+        OptionParser.new { |opts| opts.on("--no-uploads-db") { options[:no_uploads_db] = true } }.parse!(argv)
+        @discourse_service.import(required_arg(argv, "CUSTOMER"), **options)
+      when "backup-import"
+        @discourse_service.backup_import(required_arg(argv, "CUSTOMER"))
+      else
+        raise UsageError, "Unknown discourse command: #{subcommand}"
+      end
+    end
+
+    def discourse_install_launcher(argv)
+      options = {
+        docker_path: Services::DiscourseService::DEFAULT_DOCKER_PATH,
+        branch: "main",
+        repo: Services::DiscourseService::DEFAULT_DOCKER_REPO
+      }
+      OptionParser.new do |opts|
+        opts.on("--docker-path PATH") { |value| options[:docker_path] = value }
+        opts.on("--branch BRANCH") { |value| options[:branch] = value }
+        opts.on("--repo REPO") { |value| options[:repo] = value }
+      end.parse!(argv)
+      @discourse_service.install_launcher(**options)
+    end
+
+    def discourse_setup(argv)
+      options = {}
+      OptionParser.new do |opts|
+        opts.on("--docker-path PATH") { |value| options[:docker_path] = value }
+        opts.on("--uploads-port PORT", Integer) { |value| options[:uploads_port] = value }
+        opts.on("--import-port PORT", Integer) { |value| options[:import_port] = value }
+        opts.on("--guest-root PATH") { |value| options[:import_guest_root] = value }
+        opts.on("--developer-emails EMAILS") { |value| options[:developer_emails] = value }
+        opts.on("--uploads-hostname HOST") { |value| options[:uploads_hostname] = value }
+        opts.on("--import-hostname HOST") { |value| options[:import_hostname] = value }
+        opts.on("--workers N", Integer) { |value| options[:workers] = value }
+        opts.on("--db-pool N", Integer) { |value| options[:db_pool] = value }
+        opts.on("--shared-buffers VALUE") { |value| options[:db_shared_buffers] = value }
+        opts.on("--max-connections N", Integer) { |value| options[:db_max_connections] = value }
+      end.parse!(argv)
+      @discourse_service.setup(required_arg(argv, "CUSTOMER"), options)
+    end
+
+    def discourse_role_command(argv)
+      options = { role: "both" }
+      OptionParser.new do |opts|
+        opts.on("--role ROLE") { |value| options[:role] = validate_discourse_role(value) }
+      end.parse!(argv)
+      yield required_arg(argv, "CUSTOMER"), options[:role]
+    end
+
     def run_interactive(customer)
       Interactive.new(
         project_service: @project_service,
@@ -379,6 +496,7 @@ module SiloMigrate
         schema_service: @schema_service,
         findings_service: @findings_service,
         fixture_service: @fixture_service,
+        discourse_service: @discourse_service,
         output: @output
       ).run(customer)
       0
@@ -811,6 +929,12 @@ module SiloMigrate
 
     def validate_profile(value)
       raise UsageError, "Invalid profile: #{value}" unless %w[initial-db final-db converter all].include?(value)
+
+      value
+    end
+
+    def validate_discourse_role(value)
+      raise UsageError, "Invalid Discourse role: #{value}" unless %w[uploads import both].include?(value)
 
       value
     end

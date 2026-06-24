@@ -180,4 +180,51 @@ class InteractiveTest < SiloMigrateTest
       assert_includes out.string, "Invalid selection"
     end
   end
+
+  def test_guided_mode_exposes_discourse_workflows_after_intermediate_db_exists
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: StringIO.new)
+      discourse = SiloMigrate::Services::DiscourseService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      write(File.join(project.project_path("acme"), "output", "intermediate.db"), "sqlite")
+      out = StringIO.new
+      prompt = SelectPrompt.new(["Quit"])
+
+      interactive = SiloMigrate::Interactive.new(
+        project_service: project,
+        import_service: import,
+        discourse_service: discourse,
+        prompt: prompt,
+        output: out
+      )
+      interactive.run("acme")
+
+      main_menu = prompt.choice_sets.find { |message, _choices| message == "Migration workflow" }.last
+      assert_includes main_menu, "Discourse uploads container"
+      assert_includes main_menu, "Discourse import container"
+      assert_includes out.string, "Discourse handoff: ready"
+    end
+  end
+
+  class SelectPrompt
+    attr_reader :selected, :choice_sets
+
+    def initialize(answers)
+      @answers = answers
+      @selected = []
+      @choice_sets = []
+    end
+
+    def ask(_message)
+      @answers.shift
+    end
+
+    def select(message, choices)
+      @selected << message
+      @choice_sets << [message, choices]
+      choices.fetch(@answers.shift)
+    end
+  end
 end

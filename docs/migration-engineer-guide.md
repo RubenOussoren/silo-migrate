@@ -19,6 +19,11 @@ database over a private Docker network, and collects the converter's output
 (`output/intermediate.db`) plus AI-safe artifacts (schema bundles, redacted
 logs, findings, synthetic fixtures).
 
+It can also configure scratch Discourse uploads/import containers for the final
+handoff: the uploads container produces `output/uploads.sqlite3`, and the import
+container runs Discourse's `generic_bulk.rb` against `output/intermediate.db`
+and optionally that uploads database.
+
 Nothing it creates is production infrastructure. Every container exists only to
 host data long enough for conversion and can be destroyed and rebuilt from the
 dump at any time.
@@ -45,7 +50,7 @@ flowchart LR
     CONV -- "reads source data<br/>(container DNS, e.g. acme_initial_mariadb:3306)" --> IDB
     CONV -- writes --> OUT[("output/intermediate.db")]
     OUT -- "redacted summary → findings →<br/>fixtures → ai prepare" --> SAFE["Safe AI artifacts<br/>(no raw data, no credentials)"]
-    OUT -. "hand off to a Discourse instance:<br/>script/bulk_import/generic_bulk.rb<br/>(outside this tool)" .-> DISC[("Discourse")]
+    OUT -. "guided Discourse uploads/import<br/>container workflows" .-> DISC[("Discourse")]
 ```
 
 Key wiring facts:
@@ -72,15 +77,16 @@ Key wiring facts:
 | Databases | MariaDB 10.11, MySQL 8.0, PostgreSQL 15 containers with healthchecks, utf8mb4 defaults, and import-friendly InnoDB settings; optional separate **final** database |
 | Import | Streamed restore (constant memory, progress + ETA), waits for container health, MySQL-8-collation auto-fix on MariaDB, table exclusion, `--fast`/`--turbo` modes, per-error diagnostics with exact recovery commands |
 | Converter | Clones/builds `discourse-converters` in its own container; platform shortcut (`run-converter acme vbulletin`) with auto-generated in-network settings, or any custom command after `--` |
+| Discourse handoff | Configures two scratch Discourse containers (`uploads` and `import`), prepares role-specific dependencies, runs the uploads importer, restores a backup to the import container, runs `generic_bulk.rb`, and copies out a final backup |
 | Artifacts | Schema bundles (`schema bundle`), redacted converter logs/summaries, structured findings, shape-only synthetic fixtures, `safe-artifacts/` in the converter clone (`ai prepare`, auto-refreshed by the generators) |
 | Data safety | Raw dumps, live DBs, `intermediate.db`, and generated credentials never reach AI workspaces or logs; restricted data goes through the audited `trusted ...` workflow |
 
 ## What the tool CANNOT do (by design)
 
-- **It does not import into Discourse.** The pipeline ends at
-  `output/intermediate.db`. The final step — running Discourse's
-  `script/bulk_import/generic_bulk.rb` against that file — happens in a
-  Discourse instance, outside this tool.
+- **It does not create production Discourse infrastructure.** The Discourse
+  uploads/import containers are local scratch handoff containers. They are meant
+  to run upload import, restore, generic import, and final backup steps, not to
+  host a live site.
 - **It does not host production databases.** Containers bind to `127.0.0.1`,
   use root credentials from `config.env`, and trade durability for import speed
   (`innodb-doublewrite=0` etc.). Treat them as scratch space.
@@ -100,9 +106,12 @@ Key wiring facts:
 
 ## Happy path — interactive mode
 
-Run `bin/silo-migrate` (or `bin/silo-migrate acme`). The guided mode computes a
-**recommended next step** from project state each time you return to the menu,
-so the happy path is mostly "press enter on the recommendation":
+Run `bin/silo-migrate` (or `bin/silo-migrate acme`). The guided mode shows a
+small set of workflow-level choices instead of every individual substep:
+`Initial dump`, `Final dump`, `Converter setup`, `Discourse uploads container`,
+and `Discourse import container`. Each workflow previews what it will do, then
+chains the existing setup/start/import/bundle steps with explicit back/cancel
+points:
 
 1. **First run only** — prompted for a base path (default `~/migrations/customers`),
    persisted to `~/.config/silo-migrate/config.env`. Warned early if Docker is down.
@@ -119,14 +128,20 @@ so the happy path is mostly "press enter on the recommendation":
    for >1 GB), streams the import with progress, and writes an
    `.imported.json` marker. A schema bundle is generated automatically after.
 5. **Add final database** (optional) — same flow for the target-side DB.
-6. **Set up converter** — clones `discourse-converters` (with SSH passphrase
+6. **Converter setup** — clones `discourse-converters` (with SSH passphrase
    retry if needed), builds the container, runs `bundle install`.
-7. **Run converter command** — runs the converter; on completion you are offered
+7. **Run converter command** from `Converter actions` — runs the converter; on completion you are offered
    the chain: redacted summary → findings → synthetic fixtures, each defaulting
    to yes.
-8. **Advanced actions** menu covers everything else: status, start/stop by
-   profile, convert XML, convert JSON, schema bundle, converter summary,
-   replace dump, regenerate compose, cleanup.
+8. **Discourse uploads container** — configures/rebuilds/starts the uploads
+   container, prepares uploads-container dependencies, and runs the upload
+   importer.
+9. **Discourse import container** — configures/rebuilds/starts the import
+   container, prepares import-container dependencies, optionally restores a
+   backup, runs the generic import, and can generate a final backup.
+10. **Advanced actions** are grouped by area: initial dump/database, final
+    dump/database, conversion, converter, Discourse uploads, Discourse import,
+    and project/service actions.
 
 ## Happy path — CLI command mode
 
@@ -162,8 +177,19 @@ bin/silo-migrate findings generate acme
 bin/silo-migrate fixtures generate acme
 bin/silo-migrate ai prepare acme
 
-# 7. hand off: output/intermediate.db goes to a Discourse instance's
-#    script/bulk_import/generic_bulk.rb (outside this tool)
+# 7. optional Discourse handoff containers
+# one-time Linux launcher checkout setup; skip if /var/discourse already exists
+bin/silo-migrate discourse install-launcher
+
+bin/silo-migrate discourse setup acme
+bin/silo-migrate discourse rebuild acme --role uploads
+bin/silo-migrate discourse prepare-deps acme --role uploads
+bin/silo-migrate discourse run-uploads acme
+bin/silo-migrate discourse rebuild acme --role import
+bin/silo-migrate discourse prepare-deps acme --role import
+bin/silo-migrate discourse restore-import acme --backup /path/to/backup.tar.gz
+bin/silo-migrate discourse import acme
+bin/silo-migrate discourse backup-import acme
 
 # done? park or remove the workbench
 bin/silo-migrate stop acme
@@ -198,7 +224,7 @@ flowchart TD
     J -- "fails" --> J2["converter summary → findings<br/>(debug with safe artifacts, fix upstream)"] --> J
     J --> K[("output/intermediate.db")]
     K --> L[findings generate → fixtures generate → ai prepare]
-    K --> M["Discourse generic_bulk import<br/>(outside this tool)"]
+    K --> M["Discourse uploads/import<br/>handoff containers"]
 ```
 
 ## Data-safety zones (what AI tooling may see)

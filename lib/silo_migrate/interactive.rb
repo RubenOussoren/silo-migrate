@@ -13,12 +13,13 @@ module SiloMigrate
     BACK_COMMANDS = %w[b back ..].freeze
     GUIDED_XML_DISCOVERY_DISPLAY_LIMIT = 50
 
-    def initialize(project_service:, import_service:, schema_service: nil, findings_service: nil, fixture_service: nil, prompt: nil, output: $stdout, stdin: $stdin)
+    def initialize(project_service:, import_service:, schema_service: nil, findings_service: nil, fixture_service: nil, discourse_service: nil, prompt: nil, output: $stdout, stdin: $stdin)
       @project_service = project_service
       @import_service = import_service
       @schema_service = schema_service
       @findings_service = findings_service
       @fixture_service = fixture_service
+      @discourse_service = discourse_service
       @external_prompt = !prompt.nil?
       @prompt = prompt || default_prompt
       @output = output
@@ -156,65 +157,141 @@ module SiloMigrate
       @output.puts "Dumps: #{initial_dumps.length} initial, #{final_dumps.length} final"
       @output.puts "Imports: #{import_status(customer)}"
       @output.puts "Schema bundle: #{schema_bundle_status(customer)}"
+      @output.puts "Discourse handoff: #{discourse_handoff_status(customer)}" if intermediate_db_present?(customer)
       @output.puts "\nContainer status:"
       @output.puts @project_service.container_status(customer) if @project_service.respond_to?(:container_status)
     end
 
     def select_next_action(customer)
-      config = Project.load_config(customer, env_for_project)
-      actions = {}
-      next_action = recommended_action(customer, config)
-      actions[next_action.fetch(:label)] = next_action.fetch(:action) if next_action
-      add_action(actions, "Add/import initial source dump", :initial_dump)
-      add_action(actions, "Start initial DB and import dump", :import_initial) if dump_files(customer, "initial").any?
-      add_action(actions, "Generate initial schema bundle", :bundle_initial_schema) if phase_imported?(customer, "initial") || dump_files(customer, "initial").any?
-      add_action(actions, "Add final database", :add_final_db) unless config["FINAL_DB_TYPE"]
-      add_action(actions, "Add/import final dump", :final_dump) if config["FINAL_DB_TYPE"]
-      add_action(actions, "Start final DB and import dump", :import_final) if config["FINAL_DB_TYPE"] && dump_files(customer, "final").any?
-      add_action(actions, "Generate final schema bundle", :bundle_final_schema) if config["FINAL_DB_TYPE"] && (phase_imported?(customer, "final") || dump_files(customer, "final").any?)
-      add_action(actions, "Set up converter", :setup_converter) unless converter_setup?(customer)
-      add_action(actions, "Run converter command", :run_converter) if converter_setup?(customer)
-      actions["View detailed status"] = :status
-      actions["Advanced actions"] = :advanced
-      actions["Quit"] = :quit
-      select("Recommended next step", actions)
-    end
-
-    def add_action(actions, label, action)
-      actions[label] ||= action
-    end
-
-    def recommended_action(customer, config)
-      return { label: "Add/import initial source dump", action: :initial_dump } if dump_files(customer, "initial").empty?
-      return { label: "Start initial DB and import dump", action: :import_initial } unless phase_imported?(customer, "initial")
-      return { label: "Generate initial schema bundle", action: :bundle_initial_schema } unless schema_bundle_present?(customer, "initial")
-      return { label: "Add final database", action: :add_final_db } unless config["FINAL_DB_TYPE"]
-      return { label: "Add/import final dump", action: :final_dump } if dump_files(customer, "final").empty?
-      return { label: "Start final DB and import dump", action: :import_final } unless phase_imported?(customer, "final")
-      return { label: "Generate final schema bundle", action: :bundle_final_schema } unless schema_bundle_present?(customer, "final")
-      return { label: "Set up converter", action: :setup_converter } unless converter_setup?(customer)
-
-      { label: "Run converter command", action: :run_converter }
+      select(
+        "Migration workflow",
+        {
+          "Initial dump" => :initial_dump,
+          "Final dump" => :final_dump,
+          "Converter setup" => :converter_setup,
+          "Discourse uploads container" => :discourse_uploads,
+          "Discourse import container" => :discourse_import,
+          "View detailed status" => :status,
+          "Advanced actions" => :advanced,
+          "Quit" => :quit
+        }
+      )
     end
 
     def run_action(customer, action)
       case action
-      when :initial_dump then prompt_dump_flow(customer, "initial")
-      when :final_dump then prompt_dump_flow(customer, "final")
-      when :import_initial then offer_start_and_import(customer, "initial", select_dump_for_import(customer, "initial"))
-      when :import_final then offer_start_and_import(customer, "final", select_dump_for_import(customer, "final"))
-      when :add_final_db
-        return BACK if add_final_db(customer) == BACK
-
-        prompt_dump_flow(customer, "final") if confirm?("Add a final dump now?", default: true)
-      when :setup_converter then setup_converter(customer)
-      when :bundle_initial_schema then generate_schema_bundle(customer, "initial")
-      when :bundle_final_schema then generate_schema_bundle(customer, "final")
-      when :run_converter then run_converter(customer)
+      when :initial_dump then initial_dump_workflow(customer)
+      when :final_dump then final_dump_workflow(customer)
+      when :converter_setup then converter_setup_workflow(customer)
+      when :discourse_uploads then discourse_uploads_workflow(customer)
+      when :discourse_import then discourse_import_workflow(customer)
       when :status then @project_service.status(customer)
       when :advanced then run_advanced_action(customer)
       when :quit then @output.puts "No changes made."
       end
+    end
+
+    def initial_dump_workflow(customer)
+      show_workflow_preview(
+        "Initial dump",
+        [
+          dump_workflow_status(customer, "initial"),
+          "Stages or converts the initial dump, starts the initial DB, imports it, and generates the initial schema bundle."
+        ]
+      )
+      return BACK unless confirm?("Continue with initial dump workflow?", default: true)
+
+      prompt_dump_flow(customer, "initial")
+    end
+
+    def final_dump_workflow(customer)
+      show_workflow_preview(
+        "Final dump",
+        [
+          final_database_status(customer),
+          dump_workflow_status(customer, "final"),
+          "Adds final DB configuration if needed, stages or converts the final dump, imports it, and generates the final schema bundle."
+        ]
+      )
+      return BACK unless confirm?("Continue with final dump workflow?", default: true)
+
+      config = Project.load_config(customer, env_for_project)
+      return BACK if !config["FINAL_DB_TYPE"] && add_final_db(customer) == BACK
+
+      prompt_dump_flow(customer, "final")
+    end
+
+    def converter_setup_workflow(customer)
+      show_workflow_preview(
+        "Converter setup",
+        [
+          "Converter repo: #{converter_setup?(customer) ? 'present' : 'missing'}",
+          "Clones or verifies discourse-converters, handles SSH recovery, and can start the converter container with bundle install."
+        ]
+      )
+      return BACK unless confirm?("Continue with converter setup workflow?", default: true)
+
+      if converter_setup?(customer)
+        @output.puts "[OK] Converter repository is already present."
+        start_converter_if_requested(customer)
+      else
+        setup_converter(customer)
+      end
+    end
+
+    def discourse_uploads_workflow(customer)
+      return unless ensure_discourse_service_available
+
+      show_discourse_handoff_summary(customer)
+      show_workflow_preview(
+        "Discourse uploads container",
+        [
+          "Configures Discourse containers if needed, rebuilds/starts the uploads container, prepares uploads dependencies, and runs the upload importer."
+        ]
+      )
+      return BACK unless confirm?("Continue with Discourse uploads container workflow?", default: true)
+
+      ensure_discourse_configured(customer)
+      @discourse_service.rebuild(customer, role: "uploads")
+      @discourse_service.start(customer, role: "uploads")
+      @discourse_service.prepare_deps(customer, role: "uploads")
+      @discourse_service.run_uploads(customer)
+      show_discourse_manual_commands(customer)
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+      show_discourse_manual_commands(customer)
+    end
+
+    def discourse_import_workflow(customer)
+      return unless ensure_discourse_service_available
+
+      show_discourse_handoff_summary(customer)
+      show_workflow_preview(
+        "Discourse import container",
+        [
+          "Configures Discourse containers if needed, rebuilds/starts the import container, prepares import dependencies, restores a backup when selected, runs generic import, and can generate a final backup."
+        ]
+      )
+      return BACK unless confirm?("Continue with Discourse import container workflow?", default: true)
+
+      ensure_discourse_configured(customer)
+      @discourse_service.rebuild(customer, role: "import")
+      @discourse_service.start(customer, role: "import")
+      @discourse_service.prepare_deps(customer, role: "import")
+      if confirm?("Restore a Discourse backup onto the import container first?", default: true)
+        backup = ask_path("Path to Discourse backup for import container")
+        return BACK if backup == BACK
+
+        @discourse_service.restore_import(customer, backup: backup)
+      end
+      details = @discourse_service.status_details(customer)
+      skip_uploads_db = details[:uploads_db] && confirm?("Skip uploads.sqlite3 and import intermediate.db only?", default: false)
+      @discourse_service.import(customer, no_uploads_db: skip_uploads_db)
+      @discourse_service.backup_import(customer) if confirm?("Generate final backup from import container?", default: true)
+      show_discourse_manual_commands(customer)
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+      show_discourse_manual_commands(customer)
     end
 
     def prompt_dump_flow(customer, phase)
@@ -359,64 +436,365 @@ module SiloMigrate
     end
 
     def run_advanced_action(customer)
-      action = select(
-        "Advanced action",
+      group = select(
+        "Advanced action group",
         {
-          "Show status" => :status,
-          "Start services" => :start,
-          "Stop services" => :stop,
-          "Convert XML dump" => :convert_xml,
-          "Convert JSON dump" => :convert_json,
-          "Generate schema bundle" => :schema_bundle,
-          "Run converter command" => :run_converter,
-          "Generate redacted summary from latest converter logs" => :converter_summary,
-          "Generate findings from latest redacted summary" => :findings,
-          "Generate synthetic fixtures from latest findings" => :fixtures,
-          "Regenerate runtime config" => :regenerate,
-          "Replace/reset DB data" => :replace_dump,
-          "Clean up project" => :cleanup,
+          "Initial dump/database actions" => :initial,
+          "Final dump/database actions" => :final,
+          "Conversion actions" => :conversion,
+          "Converter actions" => :converter,
+          "Discourse uploads container actions" => :discourse_uploads,
+          "Discourse import container actions" => :discourse_import,
+          "Project/service actions" => :project,
           "Quit" => :quit
         },
         allow_back: true
+      )
+      return BACK if group == BACK
+
+      case group
+      when :initial then run_initial_advanced_action(customer)
+      when :final then run_final_advanced_action(customer)
+      when :conversion then run_conversion_advanced_action(customer)
+      when :converter then run_converter_advanced_action(customer)
+      when :discourse_uploads then run_discourse_uploads_advanced_action(customer)
+      when :discourse_import then run_discourse_import_advanced_action(customer)
+      when :project then run_project_advanced_action(customer)
+      when :quit
+        @output.puts "No changes made."
+      end
+    end
+
+    def run_initial_advanced_action(customer)
+      action = select(
+        "Initial dump/database action",
+        {
+          "Add/select initial dump" => :dump,
+          "Start/import initial dump" => :import,
+          "Generate initial schema bundle" => :schema_bundle,
+          "Start initial DB service" => :start,
+          "Stop initial DB service" => :stop,
+          "Replace/reset initial DB data" => :replace,
+          "Back" => BACK
+        }
+      )
+      return BACK if action == BACK
+
+      case action
+      when :dump then prompt_dump_flow(customer, "initial")
+      when :import then offer_start_and_import(customer, "initial", select_dump_for_import(customer, "initial"))
+      when :schema_bundle then generate_schema_bundle(customer, "initial")
+      when :start then start_services_with_recovery(customer, "initial-db")
+      when :stop then @project_service.stop(customer, profile: "initial-db", remove: confirm?("Remove stopped containers?", default: false))
+      when :replace then replace_phase_dump(customer, "initial")
+      end
+    end
+
+    def run_final_advanced_action(customer)
+      action = select(
+        "Final dump/database action",
+        {
+          "Add final database configuration" => :add_final_db,
+          "Add/select final dump" => :dump,
+          "Start/import final dump" => :import,
+          "Generate final schema bundle" => :schema_bundle,
+          "Start final DB service" => :start,
+          "Stop final DB service" => :stop,
+          "Replace/reset final DB data" => :replace,
+          "Back" => BACK
+        }
+      )
+      return BACK if action == BACK
+
+      case action
+      when :add_final_db then add_final_db(customer)
+      when :dump
+        return BACK if ensure_final_database(customer) == BACK
+
+        prompt_dump_flow(customer, "final")
+      when :import
+        return BACK if ensure_final_database(customer) == BACK
+
+        offer_start_and_import(customer, "final", select_dump_for_import(customer, "final"))
+      when :schema_bundle then generate_schema_bundle(customer, "final")
+      when :start
+        return BACK if ensure_final_database(customer) == BACK
+
+        start_services_with_recovery(customer, "final-db")
+      when :stop then @project_service.stop(customer, profile: "final-db", remove: confirm?("Remove stopped containers?", default: false))
+      when :replace
+        return BACK if ensure_final_database(customer) == BACK
+
+        replace_phase_dump(customer, "final")
+      end
+    end
+
+    def run_conversion_advanced_action(customer)
+      action = select(
+        "Conversion action",
+        {
+          "Convert XML dump" => :convert_xml,
+          "Convert JSON dump" => :convert_json,
+          "Analyze staged or source dump" => :analyze,
+          "Preprocess staged or source dump" => :preprocess,
+          "Back" => BACK
+        }
+      )
+      return BACK if action == BACK
+
+      case action
+      when :convert_xml then convert_xml(customer)
+      when :convert_json then convert_json(customer)
+      when :analyze then analyze_dump_interactively
+      when :preprocess then preprocess_dump_interactively
+      end
+    end
+
+    def run_converter_advanced_action(customer)
+      action = select(
+        "Converter action",
+        {
+          "Set up converter" => :setup,
+          "Start converter service" => :start,
+          "Stop converter service" => :stop,
+          "Run converter command" => :run,
+          "Generate redacted summary from latest converter logs" => :summary,
+          "Generate findings from latest redacted summary" => :findings,
+          "Generate synthetic fixtures from latest findings" => :fixtures,
+          "Back" => BACK
+        }
+      )
+      return BACK if action == BACK
+
+      case action
+      when :setup then setup_converter(customer)
+      when :start then @project_service.start_converter(customer, bundle_install: confirm?("Run bundle install after starting?", default: true), hard_fail: false)
+      when :stop then @project_service.stop(customer, profile: "converter", remove: confirm?("Remove stopped containers?", default: false))
+      when :run then run_converter(customer)
+      when :summary then generate_converter_summary(customer)
+      when :findings then generate_findings(customer)
+      when :fixtures then generate_synthetic_fixtures(customer)
+      end
+    end
+
+    def run_discourse_uploads_advanced_action(customer)
+      return unless ensure_discourse_service_available
+
+      action = select(
+        "Discourse uploads container action",
+        {
+          "Configure Discourse containers" => :setup,
+          "Rebuild/start uploads container" => :start,
+          "Prepare uploads-container dependencies" => :prepare_deps,
+          "Run upload importer" => :run_uploads,
+          "Show uploads container status" => :status,
+          "Back" => BACK
+        }
+      )
+      return BACK if action == BACK
+
+      case action
+      when :setup then @discourse_service.setup(customer)
+      when :start
+        ensure_discourse_configured(customer)
+        @discourse_service.rebuild(customer, role: "uploads")
+        @discourse_service.start(customer, role: "uploads")
+      when :prepare_deps
+        ensure_discourse_configured(customer)
+        @discourse_service.prepare_deps(customer, role: "uploads")
+      when :run_uploads then @discourse_service.run_uploads(customer)
+      when :status then @discourse_service.status(customer, role: "uploads")
+      end
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+      show_discourse_manual_commands(customer)
+    end
+
+    def run_discourse_import_advanced_action(customer)
+      return unless ensure_discourse_service_available
+
+      action = select(
+        "Discourse import container action",
+        {
+          "Configure Discourse containers" => :setup,
+          "Rebuild/start import container" => :start,
+          "Prepare import-container dependencies" => :prepare_deps,
+          "Restore backup onto import container" => :restore,
+          "Run final generic import" => :import,
+          "Generate final backup" => :backup,
+          "Show import container status" => :status,
+          "Back" => BACK
+        }
+      )
+      return BACK if action == BACK
+
+      case action
+      when :setup then @discourse_service.setup(customer)
+      when :start
+        ensure_discourse_configured(customer)
+        @discourse_service.rebuild(customer, role: "import")
+        @discourse_service.start(customer, role: "import")
+      when :prepare_deps
+        ensure_discourse_configured(customer)
+        @discourse_service.prepare_deps(customer, role: "import")
+      when :restore
+        backup = ask_path("Path to Discourse backup for import container")
+        return BACK if backup == BACK
+
+        @discourse_service.restore_import(customer, backup: backup)
+      when :import
+        details = @discourse_service.status_details(customer)
+        skip_uploads_db = details[:uploads_db] && confirm?("Skip uploads.sqlite3 and import intermediate.db only?", default: false)
+        @discourse_service.import(customer, no_uploads_db: skip_uploads_db)
+      when :backup then @discourse_service.backup_import(customer)
+      when :status then @discourse_service.status(customer, role: "import")
+      end
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+      show_discourse_manual_commands(customer)
+    end
+
+    def run_project_advanced_action(customer)
+      action = select(
+        "Project/service action",
+        {
+          "Show detailed project status" => :status,
+          "Start all services" => :start_all,
+          "Stop all services" => :stop_all,
+          "Start selected service profile" => :start_selected,
+          "Stop selected service profile" => :stop_selected,
+          "Regenerate runtime config" => :regenerate,
+          "Clean up project" => :cleanup,
+          "Back" => BACK
+        }
       )
       return BACK if action == BACK
 
       case action
       when :status then @project_service.status(customer)
-      when :start
+      when :start_all then start_services_with_recovery(customer, "all")
+      when :stop_all then @project_service.stop(customer, profile: "all", remove: confirm?("Remove stopped containers?", default: false))
+      when :start_selected
         profile = select_profile
         return BACK if profile == BACK
 
         start_services_with_recovery(customer, profile)
-      when :stop
+      when :stop_selected
         profile = select_profile
         return BACK if profile == BACK
 
         @project_service.stop(customer, profile: profile, remove: confirm?("Remove stopped containers?", default: false))
-      when :convert_xml then convert_xml(customer)
-      when :convert_json then convert_json(customer)
-      when :schema_bundle
-        phase = select_phase
-        return BACK if phase == BACK
-
-        generate_schema_bundle(customer, phase)
-      when :run_converter then run_converter(customer)
-      when :converter_summary then generate_converter_summary(customer)
-      when :findings then generate_findings(customer)
-      when :fixtures then generate_synthetic_fixtures(customer)
       when :regenerate then @project_service.regenerate(customer)
-      when :replace_dump
-        phase = select_phase
-        return BACK if phase == BACK
+      when :cleanup then @project_service.cleanup(customer, yes: confirm!("Delete project #{customer}?"))
+      end
+    end
 
-        @import_service.replace_dump(customer, phase, yes: confirm!("Reset #{phase} database data?"))
-        clear_import_marker(customer, phase)
-        dump = select_dump_for_import(customer, phase)
-        offer_start_and_import(customer, phase, dump) if dump
-      when :cleanup
-        @project_service.cleanup(customer, yes: confirm!("Delete project #{customer}?"))
-      when :quit
-        @output.puts "No changes made."
+    def show_workflow_preview(title, lines)
+      @output.puts "\n#{title} workflow"
+      lines.each { |line| @output.puts "  #{line}" }
+    end
+
+    def dump_workflow_status(customer, phase)
+      dumps = dump_files(customer, phase)
+      imported = phase_imported?(customer, phase) ? "imported" : "not imported"
+      schema = schema_bundle_present?(customer, phase) ? "schema bundle present" : "schema bundle missing"
+      "#{phase.capitalize} dump: #{dumps.length} staged, #{imported}, #{schema}"
+    end
+
+    def final_database_status(customer)
+      config = Project.load_config(customer, env_for_project)
+      return "Final DB: #{config['FINAL_DB_TYPE']} on port #{config['FINAL_PORT']}" if config["FINAL_DB_TYPE"]
+
+      "Final DB: not configured yet"
+    end
+
+    def ensure_final_database(customer)
+      config = Project.load_config(customer, env_for_project)
+      return true if config["FINAL_DB_TYPE"]
+
+      add_final_db(customer)
+    end
+
+    def replace_phase_dump(customer, phase)
+      @import_service.replace_dump(customer, phase, yes: confirm!("Reset #{phase} database data?"))
+      clear_import_marker(customer, phase)
+      dump = select_dump_for_import(customer, phase)
+      offer_start_and_import(customer, phase, dump) if dump
+    end
+
+    def analyze_dump_interactively
+      path = ask_path("Path to SQL dump to analyze")
+      return BACK if path == BACK
+      return if path.to_s.strip.empty?
+
+      @output.puts "\nAnalyzing: #{File.basename(path)}"
+      @output.puts "File size: #{DumpTools.format_size(File.size(path))}"
+      detection = SQLTools.detect_dump_type(path)
+      @output.puts "Detected type:    #{detection[:detected]}" if detection[:detected]
+      @output.puts "Recommended:      #{DATABASE_TYPES.dig(detection[:recommended], :display_name) || detection[:recommended]}" if detection[:recommended]
+      analysis = SQLTools.analyze_sql_dump(path, sample_bytes: confirm?("Scan the full dump?", default: false) ? nil : 200 * 1024 * 1024)
+      @output.puts "Tables found:             #{analysis[:total_tables]}"
+      analysis[:tables].sort_by { |_, info| -info[:size] }.first(30).each do |table, info|
+        @output.puts format("%-40s %12s %15s", table, DumpTools.format_size(info[:size]), info[:rows])
+      end
+    rescue Errno::ENOENT
+      @output.puts "[WARN] Dump not found: #{path}"
+    end
+
+    def preprocess_dump_interactively
+      path = ask_path("Path to SQL dump to preprocess")
+      return BACK if path == BACK
+      return if path.to_s.strip.empty?
+
+      info = SQLTools.detect_generated_columns(path, validate_inserts: true)
+      unless info[:has_generated_columns]
+        @output.puts "[OK] No generated columns found in this dump."
+        return
+      end
+      return if confirm?("Dry run only?", default: false)
+
+      output = ask("Output path (blank for #{default_preprocess_output(path)})").to_s.strip
+      output = default_preprocess_output(path) if output.empty?
+      if File.exist?(output) && !confirm?("Replace existing output file?", default: false)
+        @output.puts "[WARN] Preprocess skipped; existing output left unchanged."
+        return
+      end
+      result = SQLTools.preprocess_mysql_dump(path, output, info)
+      raise UsageError, result[:error] unless result[:success]
+
+      @output.puts "[OK] Dump preprocessed successfully!"
+      @output.puts "Output file: #{output}"
+    rescue Errno::ENOENT
+      @output.puts "[WARN] Dump not found: #{path}"
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+    end
+
+    def default_preprocess_output(path)
+      return path.sub(/\.sql\.gz\z/, "_preprocessed.sql.gz") if path.end_with?(".sql.gz")
+      return path.sub(/\.sql\z/, "_preprocessed.sql") if path.end_with?(".sql")
+
+      "#{path}_preprocessed"
+    end
+
+    def ensure_discourse_service_available
+      return true if @discourse_service
+
+      @output.puts "[WARN] Discourse handoff service is not available."
+      false
+    end
+
+    def ensure_discourse_configured(customer)
+      @discourse_service.setup(customer) unless @discourse_service.respond_to?(:configured?) && @discourse_service.configured?(customer)
+    end
+
+    def start_converter_if_requested(customer)
+      if confirm?("Build/start converter and run bundle install now?", default: true)
+        @project_service.start_converter(customer, bundle_install: true, hard_fail: false)
+      else
+        @output.puts "\nTo start the converter later:"
+        @output.puts "  silo-migrate start #{customer} --profile converter --build"
+        @output.puts "  docker exec -it #{customer}_converter bundle install"
       end
     end
 
@@ -529,6 +907,102 @@ module SiloMigrate
       @output.puts "[WARN] No synthetic fixtures were generated." if artifacts.fetch(:fixtures).empty?
     rescue UsageError => e
       @output.puts "[WARN] #{e.message}"
+    end
+
+    def discourse_handoff(customer)
+      unless @discourse_service
+        @output.puts "[WARN] Discourse handoff service is not available."
+        return
+      end
+
+      loop do
+        show_discourse_handoff_summary(customer)
+        action = select(
+          "Discourse handoff",
+          {
+            "Set up two Discourse containers" => :setup,
+            "Rebuild/start uploads container" => :uploads_start,
+            "Prepare dependencies" => :prepare_deps,
+            "Run upload importer" => :run_uploads,
+            "Rebuild/start import container" => :import_start,
+            "Restore backup onto import container" => :restore_import,
+            "Run final generic import" => :import,
+            "Generate final backup" => :backup,
+            "Show Discourse status" => :status,
+            "Back" => BACK
+          }
+        )
+        return BACK if action == BACK
+
+        run_discourse_handoff_action(customer, action)
+      end
+    end
+
+    def run_discourse_handoff_action(customer, action)
+      case action
+      when :setup
+        @discourse_service.setup(customer)
+        show_discourse_manual_commands(customer)
+      when :uploads_start
+        @discourse_service.rebuild(customer, role: "uploads")
+        @discourse_service.start(customer, role: "uploads")
+        show_discourse_manual_commands(customer)
+      when :prepare_deps
+        role = select_discourse_role
+        return BACK if role == BACK
+
+        @discourse_service.prepare_deps(customer, role: role)
+        show_discourse_manual_commands(customer)
+      when :run_uploads
+        @discourse_service.run_uploads(customer)
+        show_discourse_manual_commands(customer)
+      when :import_start
+        @discourse_service.rebuild(customer, role: "import")
+        @discourse_service.start(customer, role: "import")
+        show_discourse_manual_commands(customer)
+      when :restore_import
+        backup = ask_path("Path to Discourse backup for import container")
+        return BACK if backup == BACK
+
+        @discourse_service.restore_import(customer, backup: backup)
+        show_discourse_manual_commands(customer)
+      when :import
+        details = @discourse_service.status_details(customer)
+        skip_uploads_db = details[:uploads_db] && confirm?("Skip uploads.sqlite3 and import intermediate.db only?", default: false)
+        @discourse_service.import(customer, no_uploads_db: skip_uploads_db)
+        show_discourse_manual_commands(customer)
+      when :backup
+        @discourse_service.backup_import(customer)
+        show_discourse_manual_commands(customer)
+      when :status
+        @discourse_service.status(customer, role: "both")
+      end
+    rescue UsageError => e
+      @output.puts "[WARN] #{e.message}"
+      show_discourse_manual_commands(customer)
+    end
+
+    def show_discourse_handoff_summary(customer)
+      details = @discourse_service.status_details(customer)
+      @output.puts "\nDiscourse handoff status:"
+      @output.puts "  intermediate.db: #{details[:intermediate_db] ? 'present' : 'missing'}"
+      @output.puts "  uploads.sqlite3: #{details[:uploads_db] ? 'present' : 'missing'}"
+      @output.puts "  uploads container: #{details.dig(:uploads_container, :name)} #{details.dig(:uploads_container, :running) ? 'running' : 'stopped'}"
+      @output.puts "  import container: #{details.dig(:import_container, :name)} #{details.dig(:import_container, :running) ? 'running' : 'stopped'}"
+      @output.puts "  dependency config: #{details[:uploads_importer_config] ? 'present' : 'missing'}"
+      @output.puts "  import restore: #{details[:import_restored] ? 'done' : 'not marked'}"
+      @output.puts "  final import: #{details[:import_complete] ? 'done' : 'not marked'}"
+      @output.puts "  final backups: #{details[:final_backups].length}"
+    end
+
+    def show_discourse_manual_commands(customer)
+      @output.puts "Recovery commands:"
+      @output.puts "  silo-migrate discourse setup #{customer}"
+      @output.puts "  silo-migrate discourse rebuild #{customer} --role uploads"
+      @output.puts "  silo-migrate discourse run-uploads #{customer}"
+      @output.puts "  silo-migrate discourse restore-import #{customer} --backup /path/to/backup.tar.gz"
+      @output.puts "  silo-migrate discourse import #{customer}"
+      @output.puts "  silo-migrate discourse backup-import #{customer}"
     end
 
     def convert_xml_to_project(customer, phase, source, exclude_files: nil, batch_size: 1000, include_tables: nil,
@@ -1103,6 +1577,24 @@ module SiloMigrate
       Dir.exist?(File.join(@project_service.project_path(customer), "discourse-converters"))
     end
 
+    def intermediate_db_present?(customer)
+      File.exist?(File.join(@project_service.project_path(customer), "output", "intermediate.db"))
+    end
+
+    def discourse_handoff_status(customer)
+      return "service unavailable" unless @discourse_service
+
+      details = @discourse_service.status_details(customer)
+      parts = []
+      parts << "uploads.sqlite3" if details[:uploads_db]
+      parts << "import restored" if details[:import_restored]
+      parts << "final import complete" if details[:import_complete]
+      parts << "#{details[:final_backups].length} backup(s)" if details[:final_backups].any?
+      parts.empty? ? "ready" : parts.join(", ")
+    rescue UsageError
+      "not configured"
+    end
+
     def env_for_project
       @project_service.respond_to?(:env) ? @project_service.env : ENV
     end
@@ -1119,6 +1611,18 @@ module SiloMigrate
           "initial-db" => "initial-db",
           "final-db" => "final-db",
           "converter" => "converter"
+        },
+        allow_back: true
+      )
+    end
+
+    def select_discourse_role
+      select(
+        "Discourse role",
+        {
+          "both" => "both",
+          "uploads" => "uploads",
+          "import" => "import"
         },
         allow_back: true
       )

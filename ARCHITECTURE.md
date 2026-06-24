@@ -36,6 +36,7 @@ Implemented:
 
 - Ruby CLI entrypoint and command parser under `silo-migrate/`.
 - Guided interactive mode via `silo-migrate`, `silo-migrate <customer>`, and `silo-migrate interactive [customer]`.
+- Guided main menu is workflow-level: Initial dump, Final dump, Converter setup, Discourse uploads container, and Discourse import container.
 - Guided menus support returning to the project menu with `Back`; path prompts accept `back`, `b`, or `..` and use tab completion in a normal terminal.
 - Docker runtime adapter for local Linux/macOS execution.
 - Fake runtime adapter for command and orchestration tests, including runtime operation recording.
@@ -80,12 +81,14 @@ Implemented:
   - `silo-migrate ai prepare CUSTOMER` and `ai refresh CUSTOMER` write the locally git-ignored `safe-artifacts/` directory inside the project's `discourse-converters` clone (schema bundles, redacted logs, safe findings, synthetic fixtures, `allowed-commands.json`) plus generated `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json`, and `.silo/normal-dev-ai.yml` beside the code. Converter code itself is never copied or touched.
   - Safe AI workspaces exclude `dumps/`, `trusted/`, `output/intermediate.db`, credentials, raw logs, restricted findings, and trusted-only findings.
   - `silo-migrate trusted session CUSTOMER --provider bedrock --runtime silo --reason REASON` is Linux/Silo-only and writes a Trusted Data AI Silo config plus audit metadata before snapshot and launch commands.
-- Guided mode shows project path, configured databases, dump counts, and container status before prompting.
+- Guided mode shows project path, configured databases, dump counts, schema bundle status, Discourse handoff status, and container status before prompting.
 - Guided import paths detect dump format/source type, analyze large-table suggestions, allow table exclusions, detect port conflicts before Docker start, and wait for DB health before import.
 - Guided import paths automatically generate the schema bundle for the imported phase after a successful import; bundle failures are warnings and do not invalidate the import.
-- Guided mode shows schema bundle status in the project summary and exposes schema bundle generation from the main and advanced menus.
+- Guided mode exposes schema bundle generation through grouped Initial dump/database and Final dump/database advanced actions.
+- Guided advanced actions are grouped by initial dump/database, final dump/database, conversion, converter, Discourse uploads container, Discourse import container, and project/service actions.
 - Guided converter runs prompt for an AI-safe redacted converter summary after the run completes or fails, then offer structured findings and shape-only fixture generation. Advanced actions expose redacted summary, findings, and fixture generation.
 - Guided converter setup keeps SSH recovery actionable through preflight, terminal SSH prompt retry, alternate repository URL retry, and manual recovery commands for converter start or bundle install failures.
+- Guided Discourse workflows split uploads-container and import-container actions so dependency preparation and status are role-specific instead of hidden behind a generic handoff menu.
 - Opt-in Docker end-to-end smoke coverage uses only synthetic local data and a local fixture converter repository, and now exercises schema bundle generation against a real container.
 - Compatibility aliases:
   - `migration-tool` forwards to `silo-migrate`.
@@ -311,6 +314,7 @@ Required guided-mode behavior:
 - List existing projects and create a new project when none exists.
 - Jump directly into a project when a customer name is provided.
 - Show project location, configured services, running state, and dump counts.
+- Keep the main menu workflow-level: Initial dump, Final dump, Converter setup, Discourse uploads container, and Discourse import container.
 - Prompt for source data format: SQL dump, gzipped SQL dump, tar archive containing SQL, or mysqldump XML.
 - Let users return from submenus to the project menu with a Back option.
 - Support path-entry ergonomics for dump/XML prompts, including `back`, `b`, or `..` to return and tab completion in a normal terminal.
@@ -325,6 +329,8 @@ Required guided-mode behavior:
 - Export source/final DB schema.
 - Set up the converter.
 - Run converter commands.
+- Configure and run Discourse uploads/import handoff containers with role-specific dependency preparation.
+- Group advanced actions by area so users can tell whether an action affects initial dump/database, final dump/database, conversion, converter, Discourse uploads, Discourse import, or project/service state.
 - Regenerate runtime config.
 - Replace/reset DB data.
 - Clean up the project.
@@ -905,7 +911,7 @@ Goal: make converter development easier without changing data access boundaries.
 Status: implemented for the planned Phase 2 slice. AI-safe schema bundles, redacted converter run summaries, durable structured findings, and shape-only synthetic fixture generation are implemented in `silo-migrate/`.
 
 - Implemented: `silo-migrate schema bundle` exports an AI-safe schema bundle with schema SQL, tables, columns, indexes, summary metadata, and migration notes.
-- Implemented: guided imports automatically generate a schema bundle after successful import, and guided mode exposes bundle generation from the main and advanced menus.
+- Implemented: guided imports automatically generate a schema bundle after successful import, and guided mode exposes manual bundle generation from grouped Initial dump/database and Final dump/database advanced actions.
 - Implemented: Docker and Fake runtimes expose Phase 2 metadata command support; Silo keeps the same method surface as a Phase 4 placeholder.
 - Implemented: `silo-migrate run-converter CUSTOMER TYPE` expands to `./convert --from TYPE --reset`, validates the converter directory, supports `--no-reset` and `--settings`, and keeps `-- COMMAND...` for low-level passthrough.
 - Implemented: `silo-migrate run-converter CUSTOMER --redacted-logs` and `--redacted-summary` generate redacted process logs and AI-safe summary JSON under `findings/redacted-logs/`.

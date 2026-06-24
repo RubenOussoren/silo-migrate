@@ -16,6 +16,8 @@ class CLITest < SiloMigrateTest
     assert_includes out.string, "ai prepare"
     assert_includes out.string, "trusted inspect"
     assert_includes out.string, "trusted session"
+    assert_includes out.string, "discourse setup"
+    assert_includes out.string, "discourse import"
     assert_includes out.string, "--bundle-install also builds/starts"
     assert_includes out.string, "doctor"
     assert_includes out.string, "self-update"
@@ -49,6 +51,10 @@ class CLITest < SiloMigrateTest
 
     assert_equal 0, cli.run(["trusted", "--help"])
     assert_includes out.string, "mysql -u root -e"
+
+    assert_equal 0, cli.run(["discourse", "--help"])
+    assert_includes out.string, "restore-import"
+    assert_includes out.string, "--no-uploads-db"
 
     assert_equal 0, cli.run(["self-update", "--help"])
     assert_includes out.string, "Pulls the managed Git checkout"
@@ -201,6 +207,56 @@ class CLITest < SiloMigrateTest
       summary = JSON.parse(File.read(File.join(artifact_dir, "latest.summary.json")))
       assert_equal false, summary.dig("sources", "intermediate_db", "available")
       assert_includes out.string, "Redacted converter summary:"
+    end
+  end
+
+  def test_discourse_cli_setup_and_import_commands
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
+      assert_equal 0, cli.run(["init", "acme"])
+
+      docker_path = File.join(dir, "discourse")
+      FileUtils.mkdir_p(docker_path)
+      launcher = write(File.join(docker_path, "launcher"), "#!/usr/bin/env bash\n")
+      FileUtils.chmod(0o755, launcher)
+      assert_equal 0, cli.run(["discourse", "setup", "acme", "--docker-path", docker_path, "--uploads-port", "18080", "--import-port", "18081"])
+      write(File.join(SiloMigrate::Project.project_path("acme", env), "output", "intermediate.db"), "sqlite")
+      assert_equal 0, cli.run(["discourse", "import", "acme"])
+
+      assert File.exist?(File.join(docker_path, "containers", "acme-uploads.yml"))
+      import_command = runtime.commands.reverse.find { |entry| entry[0] == :run && entry[1].join(" ").include?("generic_bulk.rb") }
+      assert_equal "acme-import", import_command[1][2]
+      refute_includes import_command[1].join(" "), "uploads.sqlite3"
+      assert_includes out.string, "Discourse containers configured"
+    end
+  end
+
+  def test_discourse_cli_install_launcher_command
+    with_tmp_base do |dir, env|
+      env = env.merge("SILO_MIGRATE_HOST_OS" => "linux")
+      runtime = SiloMigrate::Runtime::Fake.new
+      def runtime.run(cmd, **kwargs)
+        result = super
+        if cmd[0, 3] == ["git", "clone", "-b"] && cmd[3].include?("discourse_docker")
+          target = cmd.last
+          FileUtils.mkdir_p(target)
+          File.write(File.join(target, "launcher"), "#!/usr/bin/env bash\n")
+          FileUtils.chmod(0o755, File.join(target, "launcher"))
+        end
+        result
+      end
+
+      out = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
+      docker_path = File.join(dir, "discourse")
+
+      assert_equal 0, cli.run(["discourse", "install-launcher", "--docker-path", docker_path])
+
+      assert File.executable?(File.join(docker_path, "launcher"))
+      assert runtime.commands.any? { |command| command[0] == :run && command[1][0, 3] == ["git", "clone", "-b"] }
+      assert_includes out.string, "Discourse Docker launcher installed"
     end
   end
 
@@ -933,7 +989,7 @@ class CLITest < SiloMigrateTest
       project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
-      prompt = FakePrompt.new(["Set up converter", ""])
+      prompt = FakePrompt.new(["Converter setup", "y", ""])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1016,7 +1072,7 @@ class CLITest < SiloMigrateTest
       first = write(File.join(project.project_path("acme"), "dumps", "initial", "first.sql"), "-- MySQL dump\nCREATE TABLE first_table (id int);\n")
       second = write(File.join(project.project_path("acme"), "dumps", "initial", "second.sql"), "-- MySQL dump\nCREATE TABLE second_table (id int);\n")
       selected_label = "#{File.basename(second)} (#{SiloMigrate::DumpTools.format_size(File.size(second))})"
-      prompt = FakePrompt.new(["Start initial DB and import dump", selected_label, "y", "n", "n", "n"])
+      prompt = FakePrompt.new(["Initial dump", "y", "Use existing dump", selected_label, "y", "n", "n", "n"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1037,7 +1093,7 @@ class CLITest < SiloMigrateTest
       project.init("acme", db_type: "mariadb", initial_port: 3310)
       runtime.running_containers["acme_initial_mariadb"] = false
       write(File.join(project.project_path("acme"), "dumps", "initial", "dump.sql"), "-- MySQL dump\nCREATE TABLE users (id int);\n")
-      prompt = FakePrompt.new(["Start initial DB and import dump", "y", "Cancel start/import"])
+      prompt = FakePrompt.new(["Initial dump", "y", "Use existing dump", "y", "Cancel start/import"])
 
       project.stub(:port_listening?, ->(_port) { true }) do
         SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
@@ -1059,7 +1115,7 @@ class CLITest < SiloMigrateTest
       project.init("acme", db_type: "mariadb", initial_port: 3310)
       runtime.running_containers["acme_initial_mariadb"] = false
       write(File.join(project.project_path("acme"), "dumps", "initial", "dump.sql"), "-- MySQL dump\nCREATE TABLE users (id int);\n")
-      prompt = FakePrompt.new(["Start initial DB and import dump", "y", "Use another available port", "n", "n"])
+      prompt = FakePrompt.new(["Initial dump", "y", "Use existing dump", "y", "Use another available port", "n", "n"])
 
       project.stub(:port_listening?, ->(port) { port.to_i == 3310 }) do
         project.stub(:available_port, ->(_preferred, avoid: []) { 3311 }) do
@@ -1085,7 +1141,7 @@ class CLITest < SiloMigrateTest
       schema = SiloMigrate::Services::SchemaService.new(runtime: runtime, env: env, output: out)
       project.init("acme", db_type: "mariadb")
       dump = write(File.join(project.project_path("acme"), "dumps", "initial", "dump.sql"), "-- MySQL dump\nCREATE TABLE users (id int);\n")
-      prompt = FakePrompt.new(["Start initial DB and import dump", "y", "n", "n"])
+      prompt = FakePrompt.new(["Initial dump", "y", "Use existing dump", "y", "n", "n"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, schema_service: schema, prompt: prompt, output: out).run("acme")
 
@@ -1105,7 +1161,7 @@ class CLITest < SiloMigrateTest
       project = FakeProjectService.new(runtime: runtime, env: env, output: out)
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
-      prompt = FakePrompt.new(["Set up converter", ""])
+      prompt = FakePrompt.new(["Converter setup", "y", ""])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1113,21 +1169,24 @@ class CLITest < SiloMigrateTest
     end
   end
 
-  def test_guided_mode_can_generate_schema_bundle_from_main_actions
+  def test_guided_main_menu_uses_workflow_actions
     with_tmp_base do |_dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
       out = StringIO.new
       project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
-      schema = SiloMigrate::Services::SchemaService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
-      write(File.join(project.project_path("acme"), "dumps", "initial", "dump.sql"), "-- MySQL dump\nCREATE TABLE users (id int);\n")
-      prompt = FakePrompt.new(["Generate initial schema bundle"])
+      prompt = FakePrompt.new(["Quit"])
 
-      SiloMigrate::Interactive.new(project_service: project, import_service: import, schema_service: schema, prompt: prompt, output: out).run("acme")
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
-      assert File.exist?(File.join(project.project_path("acme"), "schema", "initial", "summary.json"))
-      assert_includes out.string, "Container status:"
+      main_menu = prompt.choice_sets.find { |message, _choices| message == "Migration workflow" }.last
+      assert_includes main_menu, "Initial dump"
+      assert_includes main_menu, "Final dump"
+      assert_includes main_menu, "Converter setup"
+      assert_includes main_menu, "Discourse uploads container"
+      assert_includes main_menu, "Discourse import container"
+      refute_includes main_menu, "Generate initial schema bundle"
     end
   end
 
@@ -1139,11 +1198,99 @@ class CLITest < SiloMigrateTest
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       schema = SiloMigrate::Services::SchemaService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
-      prompt = FakePrompt.new(["Advanced actions", "Generate schema bundle", "initial"])
+      prompt = FakePrompt.new(["Advanced actions", "Initial dump/database actions", "Generate initial schema bundle"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, schema_service: schema, prompt: prompt, output: out).run("acme")
 
       assert File.exist?(File.join(project.project_path("acme"), "schema", "initial", "summary.json"))
+    end
+  end
+
+  def test_guided_advanced_actions_are_grouped
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      prompt = FakePrompt.new(["Advanced actions", "Back", "Quit"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      groups = prompt.choice_sets.find { |message, _choices| message == "Advanced action group" }.last
+      assert_includes groups, "Initial dump/database actions"
+      assert_includes groups, "Final dump/database actions"
+      assert_includes groups, "Conversion actions"
+      assert_includes groups, "Converter actions"
+      assert_includes groups, "Discourse uploads container actions"
+      assert_includes groups, "Discourse import container actions"
+      assert_includes groups, "Project/service actions"
+    end
+  end
+
+  def test_guided_discourse_uploads_workflow_uses_uploads_role
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      discourse = FakeDiscourseService.new
+      project.init("acme")
+      prompt = FakePrompt.new(["Discourse uploads container", "y"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
+
+      assert_equal [
+        [:setup, "acme"],
+        [:rebuild, "acme", "uploads"],
+        [:start, "acme", "uploads"],
+        [:prepare_deps, "acme", "uploads"],
+        [:run_uploads, "acme"]
+      ], discourse.calls
+    end
+  end
+
+  def test_guided_discourse_import_workflow_uses_import_role
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      discourse = FakeDiscourseService.new
+      project.init("acme")
+      prompt = FakePrompt.new(["Discourse import container", "y", "n", "n"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
+
+      assert_equal [
+        [:setup, "acme"],
+        [:rebuild, "acme", "import"],
+        [:start, "acme", "import"],
+        [:prepare_deps, "acme", "import"],
+        [:import, "acme", false]
+      ], discourse.calls
+    end
+  end
+
+  def test_guided_discourse_dependency_actions_are_role_specific
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      discourse = FakeDiscourseService.new
+      project.init("acme")
+      prompt = FakePrompt.new(["Advanced actions", "Discourse uploads container actions", "Prepare uploads-container dependencies"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
+
+      assert_includes discourse.calls, [:prepare_deps, "acme", "uploads"]
+
+      discourse = FakeDiscourseService.new
+      prompt = FakePrompt.new(["Advanced actions", "Discourse import container actions", "Prepare import-container dependencies"])
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
+
+      assert_includes discourse.calls, [:prepare_deps, "acme", "import"]
     end
   end
 
@@ -1167,7 +1314,7 @@ class CLITest < SiloMigrateTest
           </database>
         </mysqldump>
       XML
-      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir])
+      prompt = FakePrompt.new(["Advanced actions", "Conversion actions", "Convert XML dump", "initial", xml_dir])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1208,7 +1355,8 @@ class CLITest < SiloMigrateTest
         </mysqldump>
       XML
       prompt = FakePrompt.new([
-        "Add/import initial source dump",
+        "Initial dump",
+        "y",
         "XML dump files (mysqldump --xml)",
         xml_file,
         "",
@@ -1255,7 +1403,7 @@ class CLITest < SiloMigrateTest
         <?xml version="1.0"?>
         <mysqldump><database name="forum">#{structures}</database></mysqldump>
       XML
-      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_file, "", "", "n", "Quit"])
+      prompt = FakePrompt.new(["Advanced actions", "Conversion actions", "Convert XML dump", "initial", xml_file, "", "", "n", "Quit"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1284,7 +1432,7 @@ class CLITest < SiloMigrateTest
           </database>
         </mysqldump>
       XML
-      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_file, "", "", "n", "n"])
+      prompt = FakePrompt.new(["Advanced actions", "Conversion actions", "Convert XML dump", "initial", xml_file, "", "", "n", "n"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1326,7 +1474,7 @@ class CLITest < SiloMigrateTest
           </database>
         </mysqldump>
       XML
-      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir, "y", "email_tracking2"])
+      prompt = FakePrompt.new(["Advanced actions", "Conversion actions", "Convert XML dump", "initial", xml_dir, "y", "email_tracking2"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1356,7 +1504,7 @@ class CLITest < SiloMigrateTest
         <?xml version="1.0"?>
         <mysqldump><database name="forum"></database></mysqldump>
       XML
-      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir, "y", "users"])
+      prompt = FakePrompt.new(["Advanced actions", "Conversion actions", "Convert XML dump", "initial", xml_dir, "y", "users"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1383,7 +1531,7 @@ class CLITest < SiloMigrateTest
       XML
       staged = File.join(project.project_path("acme"), "dumps", "initial", "combined.sql.gz")
       gzip_write(staged, "existing")
-      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_dir, "n", "", "n", "", "n"])
+      prompt = FakePrompt.new(["Advanced actions", "Conversion actions", "Convert XML dump", "initial", xml_dir, "n", "", "n", "", "n"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1404,6 +1552,7 @@ class CLITest < SiloMigrateTest
       xml_file = write(File.join(dir, "forum.xml"), xml_with_users_and_logs)
       prompt = FakePrompt.new([
         "Advanced actions",
+        "Conversion actions",
         "Convert XML dump",
         "initial",
         xml_file,
@@ -1446,6 +1595,7 @@ class CLITest < SiloMigrateTest
       XML
       prompt = FakePrompt.new([
         "Advanced actions",
+        "Conversion actions",
         "Convert XML dump",
         "initial",
         xml_file,
@@ -1474,6 +1624,7 @@ class CLITest < SiloMigrateTest
       xml_file = write(File.join(dir, "forum.xml"), xml_with_users_and_logs)
       prompt = FakePrompt.new([
         "Advanced actions",
+        "Conversion actions",
         "Convert XML dump",
         "initial",
         xml_file,
@@ -1504,7 +1655,7 @@ class CLITest < SiloMigrateTest
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
       xml_file = write(File.join(dir, "forum.xml"), xml_with_users_and_logs)
-      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_file, "", ""])
+      prompt = FakePrompt.new(["Advanced actions", "Conversion actions", "Convert XML dump", "initial", xml_file, "", ""])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1524,7 +1675,7 @@ class CLITest < SiloMigrateTest
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
       xml_file = write(File.join(dir, "forum.xml"), xml_with_users_and_logs)
-      prompt = FakePrompt.new(["Advanced actions", "Convert XML dump", "initial", xml_file, "", "", "n", "n"])
+      prompt = FakePrompt.new(["Advanced actions", "Conversion actions", "Convert XML dump", "initial", xml_file, "", "", "n", "n"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1606,7 +1757,7 @@ class CLITest < SiloMigrateTest
       FileUtils.mkdir_p(converter_dir)
       write(File.join(converter_dir, "Gemfile"), "source 'https://rubygems.org'\n")
       write(File.join(converter_dir, "convert"), "#!/usr/bin/env ruby\n")
-      prompt = FakePrompt.new(["Run converter command", "ruby converter.rb --dry-run"])
+      prompt = FakePrompt.new(["Advanced actions", "Converter actions", "Run converter command", "ruby converter.rb --dry-run"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1623,7 +1774,7 @@ class CLITest < SiloMigrateTest
       project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
-      prompt = FakePrompt.new(["Advanced actions", "Generate redacted summary from latest converter logs"])
+      prompt = FakePrompt.new(["Advanced actions", "Converter actions", "Generate redacted summary from latest converter logs"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1645,7 +1796,7 @@ class CLITest < SiloMigrateTest
       FileUtils.mkdir_p(converter_dir)
       write(File.join(converter_dir, "Gemfile"), "source 'https://rubygems.org'\n")
       write(File.join(converter_dir, "convert"), "#!/usr/bin/env ruby\n")
-      prompt = FakePrompt.new(["Run converter command", "ruby converter.rb --dry-run", "", "", ""])
+      prompt = FakePrompt.new(["Advanced actions", "Converter actions", "Run converter command", "ruby converter.rb --dry-run", "", "", ""])
 
       SiloMigrate::Interactive.new(
         project_service: project,
@@ -1673,7 +1824,7 @@ class CLITest < SiloMigrateTest
       fixtures = SiloMigrate::Services::SyntheticFixtureService.new(env: env, output: out)
       project.init("acme")
       write(File.join(project.project_path("acme"), "findings", "redacted-logs", "latest.summary.json"), JSON.pretty_generate(cli_redacted_summary))
-      prompt = FakePrompt.new(["Advanced actions", "Generate findings from latest redacted summary", ""])
+      prompt = FakePrompt.new(["Advanced actions", "Converter actions", "Generate findings from latest redacted summary", ""])
 
       SiloMigrate::Interactive.new(
         project_service: project,
@@ -1687,7 +1838,7 @@ class CLITest < SiloMigrateTest
       assert File.exist?(File.join(project.project_path("acme"), "findings", "latest-findings.json"))
       assert_equal 1, Dir[File.join(project.project_path("acme"), "synthetic-fixtures", "*.yml")].length
 
-      prompt = FakePrompt.new(["Advanced actions", "Generate synthetic fixtures from latest findings"])
+      prompt = FakePrompt.new(["Advanced actions", "Converter actions", "Generate synthetic fixtures from latest findings"])
       SiloMigrate::Interactive.new(
         project_service: project,
         import_service: import,
@@ -1708,7 +1859,7 @@ class CLITest < SiloMigrateTest
       project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
-      prompt = FakePrompt.new(["Add/import initial source dump", "Back", "Quit"])
+      prompt = FakePrompt.new(["Initial dump", "y", "Back", "Quit"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1724,7 +1875,7 @@ class CLITest < SiloMigrateTest
       project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
-      prompt = FakePrompt.new(["Add/import initial source dump", "SQL dump file (.sql or .sql.gz)", "back", "Quit"])
+      prompt = FakePrompt.new(["Initial dump", "y", "SQL dump file (.sql or .sql.gz)", "back", "Quit"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
 
@@ -1775,7 +1926,8 @@ class CLITest < SiloMigrateTest
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
       prompt = FakePrompt.new([
-        "Set up converter",
+        "Converter setup",
+        "y",
         "y",
         "n"
       ])
@@ -1799,7 +1951,8 @@ class CLITest < SiloMigrateTest
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
       prompt = FakePrompt.new([
-        "Set up converter",
+        "Converter setup",
+        "y",
         "n",
         "y",
         "https://github.com/discourse/discourse-converters.git",
@@ -1893,12 +2046,13 @@ class CLITest < SiloMigrateTest
   end
 
   class FakePrompt
-    attr_reader :asked, :selected
+    attr_reader :asked, :selected, :choice_sets
 
     def initialize(answers)
       @answers = answers
       @asked = []
       @selected = []
+      @choice_sets = []
     end
 
     def ask(message)
@@ -1908,6 +2062,7 @@ class CLITest < SiloMigrateTest
 
     def select(message, choices)
       @selected << message
+      @choice_sets << [message, choices]
       answer = @answers.shift
       choices.is_a?(Hash) ? choices.fetch(answer) : answer
     end
@@ -1950,6 +2105,69 @@ class CLITest < SiloMigrateTest
   class FailingImportService
     def import_dump(*)
       raise SiloMigrate::UsageError, "synthetic import failure"
+    end
+  end
+
+  class FakeDiscourseService
+    attr_reader :calls
+
+    def initialize
+      @calls = []
+      @configured = false
+    end
+
+    def configured?(_customer)
+      @configured
+    end
+
+    def setup(customer)
+      @configured = true
+      @calls << [:setup, customer]
+    end
+
+    def rebuild(customer, role:)
+      @calls << [:rebuild, customer, role]
+    end
+
+    def start(customer, role:)
+      @calls << [:start, customer, role]
+    end
+
+    def prepare_deps(customer, role:)
+      @calls << [:prepare_deps, customer, role]
+    end
+
+    def run_uploads(customer)
+      @calls << [:run_uploads, customer]
+    end
+
+    def restore_import(customer, backup:)
+      @calls << [:restore_import, customer, backup]
+    end
+
+    def import(customer, no_uploads_db:)
+      @calls << [:import, customer, no_uploads_db]
+    end
+
+    def backup_import(customer)
+      @calls << [:backup_import, customer]
+    end
+
+    def status(customer, role:)
+      @calls << [:status, customer, role]
+    end
+
+    def status_details(_customer)
+      {
+        intermediate_db: true,
+        uploads_db: false,
+        uploads_container: { name: "acme-uploads", running: false },
+        import_container: { name: "acme-import", running: false },
+        uploads_importer_config: false,
+        import_restored: false,
+        import_complete: false,
+        final_backups: []
+      }
     end
   end
 
