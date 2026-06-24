@@ -239,7 +239,7 @@ class CLITest < SiloMigrateTest
       runtime = SiloMigrate::Runtime::Fake.new
       def runtime.run(cmd, **kwargs)
         result = super
-        if cmd[0, 3] == ["git", "clone", "-b"] && cmd[3].include?("discourse_docker")
+        if cmd[0, 3] == ["git", "clone", "-b"] && cmd[4].include?("discourse_docker")
           target = cmd.last
           FileUtils.mkdir_p(target)
           File.write(File.join(target, "launcher"), "#!/usr/bin/env bash\n")
@@ -1250,6 +1250,29 @@ class CLITest < SiloMigrateTest
     end
   end
 
+  def test_guided_discourse_uploads_workflow_stops_before_importer_without_intermediate_db
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      discourse = FakeDiscourseService.new(status_details: { intermediate_db: false })
+      project.init("acme")
+      prompt = FakePrompt.new(["Discourse uploads container", "y"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
+
+      assert_equal [
+        [:setup, "acme"],
+        [:rebuild, "acme", "uploads"],
+        [:start, "acme", "uploads"],
+        [:prepare_deps, "acme", "uploads"]
+      ], discourse.calls
+      assert_includes out.string, "output/intermediate.db is missing"
+      assert_includes out.string, "Run the converter"
+    end
+  end
+
   def test_guided_discourse_import_workflow_uses_import_role
     with_tmp_base do |_dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
@@ -1269,6 +1292,32 @@ class CLITest < SiloMigrateTest
         [:prepare_deps, "acme", "import"],
         [:import, "acme", false]
       ], discourse.calls
+    end
+  end
+
+  def test_guided_discourse_import_workflow_allows_restore_before_intermediate_db
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      discourse = FakeDiscourseService.new(status_details: { intermediate_db: false })
+      project.init("acme")
+      backup = write(File.join(dir, "backup.tar.gz"), "backup")
+      prompt = FakePrompt.new(["Discourse import container", "y", "y", backup])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
+
+      assert_equal [
+        [:setup, "acme"],
+        [:rebuild, "acme", "import"],
+        [:start, "acme", "import"],
+        [:prepare_deps, "acme", "import"],
+        [:restore_import, "acme", backup]
+      ], discourse.calls
+      assert_includes out.string, "output/intermediate.db is missing"
+      refute_includes discourse.calls, [:import, "acme", false]
+      refute discourse.calls.any? { |call| call.first == :backup_import }
     end
   end
 
@@ -2111,9 +2160,10 @@ class CLITest < SiloMigrateTest
   class FakeDiscourseService
     attr_reader :calls
 
-    def initialize
+    def initialize(status_details: nil)
       @calls = []
       @configured = false
+      @status_details = default_status_details.merge(status_details || {})
     end
 
     def configured?(_customer)
@@ -2158,6 +2208,10 @@ class CLITest < SiloMigrateTest
     end
 
     def status_details(_customer)
+      @status_details
+    end
+
+    def default_status_details
       {
         intermediate_db: true,
         uploads_db: false,

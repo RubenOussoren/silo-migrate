@@ -65,7 +65,8 @@ module SiloMigrate
       end
 
       def start(customer, profile: "all", build: false, force: false, wait_for_health: false, health_timeout: 60, on_port_conflict: nil)
-        config = Project.load_config(customer, @env)
+        config_path = Project.config_path(customer, @env)
+        config = File.exist?(config_path) ? Project.load_config(customer, @env) : {}
         conflicts = port_conflicts_for_config(config, profile, customer: customer)
         if conflicts.any? && !force
           if on_port_conflict
@@ -203,6 +204,7 @@ module SiloMigrate
         raise UsageError, "Project not found: #{customer}" unless Dir.exist?(path)
         raise UsageError, "Cleanup deletes the project and volumes. Re-run with --yes to confirm." unless yes
 
+        config = Project.load_config(customer, @env)
         if File.exist?(File.join(path, "docker-compose.yml"))
           result = @runtime.compose(customer, ["--profile", "all", "--profile", "initial-db", "--profile", "final-db", "--profile", "converter", "down", "--volumes", "--remove-orphans"], capture: true)
           unless result.success?
@@ -217,6 +219,7 @@ module SiloMigrate
             @output.puts "[WARN] Containers/volumes could not be stopped; deleting project directory anyway (--force)."
           end
         end
+        cleanup_discourse_handoff(customer, config, path, force: force)
         FileUtils.rm_rf(path)
         @output.puts "[OK] Project '#{customer}' has been deleted"
       end
@@ -476,6 +479,64 @@ module SiloMigrate
       def tail_with_truncation_marker(buffer)
         text = buffer.tail_string
         buffer.truncated? ? "[earlier output truncated]\n#{text}" : text
+      end
+
+      def cleanup_discourse_handoff(customer, config, project_path, force:)
+        return unless discourse_handoff_configured?(config)
+
+        docker_path = config["DISCOURSE_DOCKER_PATH"].to_s
+        unless valid_discourse_launcher?(docker_path)
+          handle_discourse_cleanup_failure(customer, project_path, "Discourse Docker launcher is not installed or invalid at #{docker_path.empty? ? '(not set)' : docker_path}.", force: force)
+          return
+        end
+
+        containers = [
+          config["DISCOURSE_UPLOADS_CONTAINER"] || "#{customer}-uploads",
+          config["DISCOURSE_IMPORT_CONTAINER"] || "#{customer}-import"
+        ].uniq
+        failures = []
+        containers.each do |container|
+          result = @runtime.run(["./launcher", "destroy", container], chdir: docker_path, capture: true)
+          failures << "#{container}: #{command_failure_detail(result)}" unless result.success?
+        end
+
+        if failures.empty?
+          @output.puts "[OK] Discourse handoff containers destroyed"
+        else
+          handle_discourse_cleanup_failure(customer, project_path, failures.join("; "), force: force)
+        end
+      end
+
+      def discourse_handoff_configured?(config)
+        config.any? { |key, value| key.start_with?("DISCOURSE_") && !value.to_s.empty? }
+      end
+
+      def valid_discourse_launcher?(path)
+        return false if path.to_s.empty?
+
+        expanded = File.expand_path(path)
+        Dir.exist?(expanded) &&
+          File.file?(File.join(expanded, "launcher")) &&
+          File.executable?(File.join(expanded, "launcher"))
+      end
+
+      def handle_discourse_cleanup_failure(customer, project_path, detail, force:)
+        if force
+          @output.puts "[WARN] Discourse handoff containers could not be destroyed; deleting project directory anyway (--force)."
+          @output.puts "[WARN] #{detail}" unless detail.to_s.empty?
+          return
+        end
+
+        raise UsageError, <<~MSG.chomp
+          Could not destroy Discourse handoff containers for '#{customer}': #{detail}
+          Project directory NOT deleted: #{project_path}
+          Fix discourse_docker (or destroy the containers manually) and retry, or re-run with --force to delete the directory anyway.
+        MSG
+      end
+
+      def command_failure_detail(result)
+        detail = (result.stderr.to_s.empty? ? result.stdout.to_s : result.stderr.to_s).strip
+        detail.empty? ? "exit #{result.status || 'unknown'}" : detail
       end
 
       # Generates in-network connection settings for the platform shortcut.

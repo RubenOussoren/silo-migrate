@@ -9,6 +9,14 @@ class ProjectTest < SiloMigrateTest
     assert_raises(SiloMigrate::UsageError) { SiloMigrate::Project.validate_customer_name!("") }
   end
 
+  def fake_discourse_docker(base)
+    path = File.join(base, "discourse")
+    FileUtils.mkdir_p(path)
+    launcher = write(File.join(path, "launcher"), "#!/usr/bin/env bash\n")
+    FileUtils.chmod(0o755, launcher)
+    path
+  end
+
   def test_base_path_resolution_chain
     with_tmp_base do |dir, env|
       assert_equal env["SILO_MIGRATE_BASE_PATH"], SiloMigrate::Project.base_path(env)
@@ -44,6 +52,78 @@ class ProjectTest < SiloMigrateTest
       assert Dir.exist?(path)
 
       runtime.compose_results << SiloMigrate::Runtime::CommandResult.new(success?: false, stdout: "", stderr: "Cannot connect to the Docker daemon", status: 1)
+      project.cleanup("acme", yes: true, force: true)
+      refute Dir.exist?(path)
+    end
+  end
+
+  def test_cleanup_destroys_configured_discourse_handoff_containers
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      discourse = SiloMigrate::Services::DiscourseService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      docker_path = fake_discourse_docker(dir)
+      discourse.setup("acme", docker_path: docker_path)
+      path = project.project_path("acme")
+
+      project.cleanup("acme", yes: true)
+
+      assert_includes runtime.commands, [:run, ["./launcher", "destroy", "acme-uploads"], docker_path, true, nil, nil]
+      assert_includes runtime.commands, [:run, ["./launcher", "destroy", "acme-import"], docker_path, true, nil, nil]
+      refute Dir.exist?(path)
+      assert File.exist?(File.join(docker_path, "containers", "acme-uploads.yml"))
+      assert File.exist?(File.join(docker_path, "containers", "acme-import.yml"))
+      assert_includes out.string, "Discourse handoff containers destroyed"
+    end
+  end
+
+  def test_cleanup_preserves_project_when_discourse_launcher_is_invalid
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      path = project.project_path("acme")
+      config = SiloMigrate::Project.load_config("acme", env).merge(
+        "DISCOURSE_DOCKER_PATH" => File.join(dir, "missing-discourse"),
+        "DISCOURSE_UPLOADS_CONTAINER" => "acme-uploads",
+        "DISCOURSE_IMPORT_CONTAINER" => "acme-import"
+      )
+      SiloMigrate::Project.save_config("acme", config, env)
+
+      error = assert_raises(SiloMigrate::UsageError) { project.cleanup("acme", yes: true) }
+      assert_includes error.message, "Discourse Docker launcher"
+      assert_includes error.message, "NOT deleted"
+      assert Dir.exist?(path)
+
+      project.cleanup("acme", yes: true, force: true)
+      refute Dir.exist?(path)
+      assert_includes out.string, "Discourse handoff containers could not be destroyed"
+    end
+  end
+
+  def test_cleanup_preserves_project_when_discourse_destroy_fails
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      def runtime.run(cmd, **kwargs)
+        super
+        return SiloMigrate::Runtime::CommandResult.new(success?: false, stdout: "", stderr: "launcher failed", status: 1) if cmd[0, 2] == ["./launcher", "destroy"]
+
+        SiloMigrate::Runtime::CommandResult.new(success?: true, stdout: "", stderr: "", status: 0)
+      end
+
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      discourse = SiloMigrate::Services::DiscourseService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      discourse.setup("acme", docker_path: fake_discourse_docker(dir))
+      path = project.project_path("acme")
+
+      error = assert_raises(SiloMigrate::UsageError) { project.cleanup("acme", yes: true) }
+      assert_includes error.message, "launcher failed"
+      assert Dir.exist?(path)
+
       project.cleanup("acme", yes: true, force: true)
       refute Dir.exist?(path)
     end

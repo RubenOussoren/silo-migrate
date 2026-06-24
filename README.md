@@ -301,11 +301,13 @@ Main workflows:
   run `bundle install`.
 - **Discourse uploads container** — configure Discourse container files when
   needed, rebuild/start the uploads container, prepare uploads-container
-  dependencies, and run the upload importer.
+  dependencies, then run the upload importer only after
+  `output/intermediate.db` exists.
 - **Discourse import container** — configure Discourse container files when
   needed, rebuild/start the import container, prepare import-container
-  dependencies, restore a backup when selected, run `generic_bulk.rb`, and
-  optionally generate a final backup.
+  dependencies, restore a backup when selected, then run `generic_bulk.rb` only
+  after `output/intermediate.db` exists. Guided mode offers the final backup
+  after a successful import; advanced actions can run it explicitly.
 
 Typical flow:
 
@@ -355,7 +357,10 @@ bin/silo-migrate status acme
 bin/silo-migrate cleanup acme --yes
 ```
 
-`cleanup` is destructive and requires `--yes` in command-driven mode.
+`cleanup` is destructive and requires `--yes` in command-driven mode. When a
+project has Discourse handoff containers configured, cleanup destroys those
+launcher containers too, while keeping the discourse_docker checkout, generated
+container YAML, and shared Discourse data under `/var/discourse`.
 
 ### Runtime Operations
 

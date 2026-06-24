@@ -180,8 +180,11 @@ module SiloMigrate
                silo-migrate discourse import CUSTOMER [--no-uploads-db]
                silo-migrate discourse backup-import CUSTOMER
 
-        import uses output/intermediate.db. If output/uploads.sqlite3 exists it is
-        passed to generic_bulk.rb too; --no-uploads-db skips it explicitly.
+        setup/rebuild/start/prepare-deps and restore-import can run before
+        output/intermediate.db exists. run-uploads and import consume converter
+        output and require output/intermediate.db. If output/uploads.sqlite3
+        exists it is passed to generic_bulk.rb too; --no-uploads-db skips it
+        explicitly.
 
         setup writes two discourse_docker container YAML files:
           <customer>-uploads on 127.0.0.1:8080

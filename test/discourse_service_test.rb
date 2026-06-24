@@ -188,7 +188,7 @@ class DiscourseServiceTest < SiloMigrateTest
 
       def runtime.run(cmd, **kwargs)
         result = super
-        if cmd[0, 3] == ["git", "clone", "-b"] && cmd[3].include?("discourse_docker")
+        if cmd[0, 3] == ["git", "clone", "-b"] && cmd[4].include?("discourse_docker")
           target = cmd.last
           FileUtils.mkdir_p(target)
           File.write(File.join(target, "launcher"), "#!/usr/bin/env bash\n")
