@@ -273,9 +273,11 @@ bin/silo-migrate discourse install-launcher
 
 bin/silo-migrate discourse setup acme
 bin/silo-migrate discourse rebuild acme --role uploads
+bin/silo-migrate discourse start acme --role uploads
 bin/silo-migrate discourse prepare-deps acme --role uploads
 bin/silo-migrate discourse run-uploads acme
 bin/silo-migrate discourse rebuild acme --role import
+bin/silo-migrate discourse start acme --role import
 bin/silo-migrate discourse prepare-deps acme --role import
 bin/silo-migrate discourse restore-import acme --backup /path/to/backup.tar.gz
 bin/silo-migrate discourse import acme
@@ -300,17 +302,17 @@ Main workflows:
   SSH/passphrase issues, and optionally build/start the converter container and
   run `bundle install`.
 - **Discourse uploads container** — configure Discourse container files when
-  selected, then stop with the converter next step until
-  `output/intermediate.db` exists. Once converter output exists, guided mode
-  rebuilds/starts the uploads container, prepares uploads-container
-  dependencies, and runs the upload importer.
+  selected, rebuild/start a vanilla Discourse uploads container, then stop with
+  the converter next step until `output/intermediate.db` exists. Once converter
+  output exists, guided mode prepares uploads-container dependencies and runs
+  the upload importer.
 - **Discourse import container** — configure Discourse container files when
-  selected, then stop with the converter next step until
-  `output/intermediate.db` exists. Once converter output exists, guided mode
-  rebuilds/starts the import container, prepares import-container dependencies,
-  can restore a backup, runs `generic_bulk.rb`, and offers the final backup
-  after a successful import. Advanced import-container actions can explicitly
-  restore a backup before converter output exists.
+  selected, rebuild/start a vanilla Discourse import container, then show an
+  explicit action menu. Restore, backup, and status are available immediately;
+  import actions appear once `output/intermediate.db` exists. Import actions
+  prepare import dependencies immediately before running `generic_bulk.rb`, and
+  the uploads+import action bootstraps the uploads container and runs the
+  uploads importer first.
 
 Typical flow:
 

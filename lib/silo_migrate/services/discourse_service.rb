@@ -15,10 +15,11 @@ module SiloMigrate
       DEFAULT_DOCKER_REPO = "https://github.com/discourse/discourse_docker.git"
       DEFAULT_UPLOADS_PORT = "8080"
       DEFAULT_IMPORT_PORT = "8081"
-      DEFAULT_WORKERS = "2"
-      DEFAULT_DB_POOL = "5"
-      DEFAULT_SHARED_BUFFERS = "256MB"
-      DEFAULT_MAX_CONNECTIONS = "100"
+      DEFAULT_DEVELOPER_EMAILS = "ruben@discourse.org"
+      DEFAULT_WORKERS = "4"
+      DEFAULT_DB_POOL = "200"
+      DEFAULT_SHARED_BUFFERS = "32GB"
+      DEFAULT_MAX_CONNECTIONS = "250"
       DEPENDENCY_TIMEOUT = 1_200
       IMPORT_TIMEOUT = nil
       REBUILD_TIMEOUT = nil
@@ -242,9 +243,9 @@ module SiloMigrate
           "DISCOURSE_UPLOADS_PORT" => DEFAULT_UPLOADS_PORT,
           "DISCOURSE_IMPORT_PORT" => DEFAULT_IMPORT_PORT,
           "DISCOURSE_IMPORT_GUEST_ROOT" => "/migrations/#{customer}",
-          "DISCOURSE_UPLOADS_HOSTNAME" => "#{customer}-uploads.localhost",
-          "DISCOURSE_IMPORT_HOSTNAME" => "#{customer}-import.localhost",
-          "DISCOURSE_DEVELOPER_EMAILS" => "migration@example.com",
+          "DISCOURSE_UPLOADS_HOSTNAME" => "discourse.local",
+          "DISCOURSE_IMPORT_HOSTNAME" => "discourse.local",
+          "DISCOURSE_DEVELOPER_EMAILS" => DEFAULT_DEVELOPER_EMAILS,
           "DISCOURSE_WORKERS" => DEFAULT_WORKERS,
           "DISCOURSE_DB_POOL" => DEFAULT_DB_POOL,
           "DISCOURSE_DB_SHARED_BUFFERS" => DEFAULT_SHARED_BUFFERS,
@@ -303,17 +304,47 @@ module SiloMigrate
           ],
           "expose" => ["127.0.0.1:#{port}:80"],
           "params" => {
+            "db_default_text_search_config" => "pg_catalog.english",
             "db_shared_buffers" => config.fetch("DISCOURSE_DB_SHARED_BUFFERS"),
             "db_max_connections" => config.fetch("DISCOURSE_DB_MAX_CONNECTIONS")
           },
           "env" => {
+            "LC_ALL" => "en_US.UTF-8",
+            "LANG" => "en_US.UTF-8",
+            "LANGUAGE" => "en_US.UTF-8",
+            "UNICORN_WORKERS" => config.fetch("DISCOURSE_WORKERS"),
+            "UNICORN_SIDEKIQS" => "0",
             "DISCOURSE_HOSTNAME" => hostname,
             "DISCOURSE_DEVELOPER_EMAILS" => config.fetch("DISCOURSE_DEVELOPER_EMAILS"),
-            "UNICORN_WORKERS" => config.fetch("DISCOURSE_WORKERS"),
+            "DISCOURSE_USE_HTTPS" => false,
             "DISCOURSE_DB_POOL" => config.fetch("DISCOURSE_DB_POOL"),
             "DISCOURSE_SMTP_ADDRESS" => "localhost",
             "DISCOURSE_SMTP_PORT" => "25"
           },
+          "hooks" => {
+            "after_postgres" => [
+              {
+                "exec" => {
+                  "cmd" => "sudo -E -u postgres psql -d template1 -c \"ALTER SYSTEM SET enable_memoize = off;\""
+                }
+              }
+            ],
+            "after_code" => [
+              {
+                "exec" => {
+                  "cd" => "$home/plugins",
+                  "cmd" => [
+                    "git clone https://github.com/discourse/docker_manager.git",
+                    "git clone https://github.com/discourse/discourse-signatures.git"
+                  ]
+                }
+              }
+            ]
+          },
+          "run" => [
+            { "exec" => "echo \"Beginning of custom commands\"" },
+            { "exec" => "echo \"End of custom commands\"" }
+          ],
           "volumes" => [
             { "volume" => { "host" => File.join(config.fetch("DISCOURSE_DOCKER_PATH"), "shared", container_name(customer, role, config)), "guest" => "/shared" } },
             { "volume" => { "host" => File.join(config.fetch("DISCOURSE_DOCKER_PATH"), "shared", container_name(customer, role, config), "log", "var-log"), "guest" => "/var/log" } },

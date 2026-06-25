@@ -133,17 +133,16 @@ points:
 7. **Run converter command** from `Converter actions` — runs the converter; on completion you are offered
    the chain: redacted summary → findings → synthetic fixtures, each defaulting
    to yes.
-8. **Discourse uploads container** — configures Discourse container files first.
-   If `output/intermediate.db` is missing, guided mode stops there and points
-   you back to the converter. Once converter output exists, it rebuilds/starts
-   the uploads container, prepares dependencies, and runs the upload importer.
-9. **Discourse import container** — configures Discourse container files first.
-   If `output/intermediate.db` is missing, guided mode stops there and points
-   you back to the converter. Once converter output exists, it rebuilds/starts
-   the import container, prepares dependencies, can restore a backup, runs the
-   generic import, and can generate a final backup. Use the advanced
-   import-container restore action when you intentionally need to restore a
-   backup before converter output exists.
+8. **Discourse uploads container** — configures Discourse container files,
+   rebuilds/starts a vanilla Discourse uploads container, then stops before the
+   uploads importer if `output/intermediate.db` is missing. Once converter
+   output exists, it prepares dependencies and runs the upload importer.
+9. **Discourse import container** — configures Discourse container files,
+   rebuilds/starts a vanilla Discourse import container, then shows an explicit
+   action menu. Restore, backup, and status are available immediately; importing
+   `intermediate.db` or running uploads+import appears once converter output
+   exists. Import actions prepare dependencies immediately before running
+   `generic_bulk.rb`.
 10. **Advanced actions** are grouped by area: initial dump/database, final
     dump/database, conversion, converter, Discourse uploads, Discourse import,
     and project/service actions.
@@ -188,9 +187,11 @@ bin/silo-migrate discourse install-launcher
 
 bin/silo-migrate discourse setup acme
 bin/silo-migrate discourse rebuild acme --role uploads
+bin/silo-migrate discourse start acme --role uploads
 bin/silo-migrate discourse prepare-deps acme --role uploads
 bin/silo-migrate discourse run-uploads acme
 bin/silo-migrate discourse rebuild acme --role import
+bin/silo-migrate discourse start acme --role import
 bin/silo-migrate discourse prepare-deps acme --role import
 bin/silo-migrate discourse restore-import acme --backup /path/to/backup.tar.gz
 bin/silo-migrate discourse import acme

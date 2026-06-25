@@ -35,11 +35,32 @@ class DiscourseServiceTest < SiloMigrateTest
       assert_includes uploads_yml.fetch("templates"), "templates/web.template.yml"
       assert_includes uploads_yml.fetch("templates"), "templates/web.ratelimited.template.yml"
       assert_equal "dev@example.test", uploads_yml.dig("env", "DISCOURSE_DEVELOPER_EMAILS")
+      assert_equal "pg_catalog.english", uploads_yml.dig("params", "db_default_text_search_config")
+      assert_equal "32GB", uploads_yml.dig("params", "db_shared_buffers")
+      assert_equal "250", uploads_yml.dig("params", "db_max_connections")
+      assert_equal "en_US.UTF-8", uploads_yml.dig("env", "LC_ALL")
+      assert_equal "en_US.UTF-8", uploads_yml.dig("env", "LANG")
+      assert_equal "en_US.UTF-8", uploads_yml.dig("env", "LANGUAGE")
+      assert_equal "4", uploads_yml.dig("env", "UNICORN_WORKERS")
+      assert_equal "0", uploads_yml.dig("env", "UNICORN_SIDEKIQS")
+      assert_equal false, uploads_yml.dig("env", "DISCOURSE_USE_HTTPS")
+      assert_equal "200", uploads_yml.dig("env", "DISCOURSE_DB_POOL")
+      assert_equal "sudo -E -u postgres psql -d template1 -c \"ALTER SYSTEM SET enable_memoize = off;\"",
+                   uploads_yml.dig("hooks", "after_postgres", 0, "exec", "cmd")
+      assert_equal "$home/plugins", uploads_yml.dig("hooks", "after_code", 0, "exec", "cd")
+      assert_equal [
+        "git clone https://github.com/discourse/docker_manager.git",
+        "git clone https://github.com/discourse/discourse-signatures.git"
+      ], uploads_yml.dig("hooks", "after_code", 0, "exec", "cmd")
+      assert_equal [{ "exec" => "echo \"Beginning of custom commands\"" }, { "exec" => "echo \"End of custom commands\"" }],
+                   uploads_yml.fetch("run")
 
       guests = uploads_yml.fetch("volumes").map { |entry| entry.fetch("volume").fetch("guest") }
       assert_includes guests, "/migrations/acme/uploads"
       assert_includes guests, "/migrations/acme/output"
       assert_includes guests, "/migrations/acme/shared"
+      assert_equal uploads_yml.reject { |key, _| %w[expose volumes].include?(key) },
+                   import_yml.reject { |key, _| %w[expose volumes].include?(key) }
 
       config = SiloMigrate::Project.load_config("acme", env)
       assert_equal docker_path, config.fetch("DISCOURSE_DOCKER_PATH")
