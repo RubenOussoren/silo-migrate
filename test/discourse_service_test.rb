@@ -70,7 +70,7 @@ class DiscourseServiceTest < SiloMigrateTest
 
   def test_role_commands_never_restore_backup_on_uploads_container
     with_tmp_base do |dir, env|
-      project, service, runtime, = build_service(env)
+      project, service, runtime, out = build_service(env)
       project.init("acme")
       service.setup("acme", docker_path: fake_discourse_docker(dir))
       backup = write(File.join(dir, "backup.tar.gz"), "backup")
@@ -82,12 +82,16 @@ class DiscourseServiceTest < SiloMigrateTest
       assert_includes docker_cp[1].last, "acme-import:"
       assert_equal "acme-import", restore[1][2]
       refute runtime.commands.any? { |command| command[0] == :run && command[1].include?("acme-uploads") && command[1].join(" ").include?("restore") }
+      assert_includes out.string, "[INFO] Copying Discourse backup into acme-import..."
+      assert_includes out.string, "[INFO] Running: docker cp"
+      assert_includes out.string, "[INFO] Restoring Discourse backup in acme-import..."
+      assert_includes out.string, "DISCOURSE_ENABLE_RESTORE\\=true"
     end
   end
 
   def test_builds_dependency_upload_import_final_import_and_backup_commands
     with_tmp_base do |dir, env|
-      project, service, runtime, = build_service(env)
+      project, service, runtime, out = build_service(env)
       project.init("acme")
       service.setup("acme", docker_path: fake_discourse_docker(dir))
       write(File.join(project.project_path("acme"), "output", "intermediate.db"), "sqlite")
@@ -104,6 +108,14 @@ class DiscourseServiceTest < SiloMigrateTest
       assert command_texts.any? { |cmd| cmd.include?("uploads_importer.rb /migrations/acme/shared/bulk_import_scripts/uploads_importer.yml") }
       assert command_texts.any? { |cmd| cmd.include?("IMPORT=1 bundle exec ruby script/bulk_import/generic_bulk.rb /migrations/acme/output/intermediate.db /migrations/acme/output/uploads.sqlite3") }
       assert command_texts.any? { |cmd| cmd.include?("acme-import su discourse -c bundle exec script/discourse backup") }
+      assert_includes out.string, "[INFO] Preparing Discourse uploads dependencies in acme-uploads..."
+      assert_includes out.string, "[INFO] Preparing Discourse import dependencies in acme-import..."
+      assert_includes out.string, "[INFO] Running Discourse uploads importer in acme-uploads..."
+      assert_includes out.string, "uploads_importer.rb"
+      assert_includes out.string, "[INFO] Running Discourse generic import in acme-import..."
+      assert_includes out.string, "generic_bulk.rb"
+      assert_includes out.string, "[INFO] Generating final Discourse backup in acme-import..."
+      assert_includes out.string, "[INFO] Finding latest Discourse backup in acme-import..."
     end
   end
 
@@ -135,7 +147,7 @@ class DiscourseServiceTest < SiloMigrateTest
 
   def test_rebuild_start_stop_use_launcher_for_selected_roles
     with_tmp_base do |dir, env|
-      project, service, runtime, = build_service(env)
+      project, service, runtime, out = build_service(env)
       project.init("acme")
       docker_path = fake_discourse_docker(dir)
       service.setup("acme", docker_path: docker_path)
@@ -148,6 +160,12 @@ class DiscourseServiceTest < SiloMigrateTest
       assert_includes runtime.commands, [:run, ["./launcher", "start", "acme-import"], docker_path, false, 300, nil]
       assert_includes runtime.commands, [:run, ["./launcher", "stop", "acme-uploads"], docker_path, false, 300, nil]
       assert_includes runtime.commands, [:run, ["./launcher", "stop", "acme-import"], docker_path, false, 300, nil]
+      assert_includes out.string, "[INFO] Rebuilding Discourse uploads container acme-uploads..."
+      assert_includes out.string, "[INFO] Running: ./launcher rebuild acme-uploads"
+      assert_includes out.string, "[INFO] Starting Discourse import container acme-import..."
+      assert_includes out.string, "[INFO] Running: ./launcher start acme-import"
+      assert_includes out.string, "[INFO] Stopping Discourse uploads container acme-uploads..."
+      assert_includes out.string, "[INFO] Running: ./launcher stop acme-import"
     end
   end
 

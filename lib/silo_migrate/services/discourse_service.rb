@@ -2,6 +2,7 @@
 
 require "fileutils"
 require "rbconfig"
+require "shellwords"
 require "time"
 require "yaml"
 
@@ -81,21 +82,21 @@ module SiloMigrate
 
       def rebuild(customer, role: ROLE_BOTH)
         each_role(role) do |selected_role|
-          run_launcher(customer, "rebuild", container_name(customer, selected_role), timeout: REBUILD_TIMEOUT)
+          run_launcher(customer, "rebuild", container_name(customer, selected_role), role: selected_role, timeout: REBUILD_TIMEOUT)
         end
         @output.puts "[OK] Discourse rebuild completed for #{role}"
       end
 
       def start(customer, role: ROLE_BOTH)
         each_role(role) do |selected_role|
-          run_launcher(customer, "start", container_name(customer, selected_role))
+          run_launcher(customer, "start", container_name(customer, selected_role), role: selected_role)
         end
         @output.puts "[OK] Discourse container(s) started for #{role}"
       end
 
       def stop(customer, role: ROLE_BOTH)
         each_role(role) do |selected_role|
-          run_launcher(customer, "stop", container_name(customer, selected_role))
+          run_launcher(customer, "stop", container_name(customer, selected_role), role: selected_role)
         end
         @output.puts "[OK] Discourse container(s) stopped for #{role}"
       end
@@ -116,10 +117,10 @@ module SiloMigrate
 
       def prepare_deps(customer, role: ROLE_BOTH)
         each_role(role) do |selected_role|
-          result = @runtime.run(
-            ["docker", "exec", container_name(customer, selected_role), "su", "discourse", "-c", "bundle config set --local with generic_import && bundle install"],
-            timeout: DEPENDENCY_TIMEOUT
-          )
+          container = container_name(customer, selected_role)
+          command = ["docker", "exec", container, "su", "discourse", "-c", "bundle config set --local with generic_import && bundle install"]
+          log_command_notice("Preparing Discourse #{selected_role} dependencies in #{container}...", command)
+          result = @runtime.run(command, timeout: DEPENDENCY_TIMEOUT)
           raise UsageError, "Dependency preparation failed for #{selected_role}" unless result.success?
         end
         @output.puts "[OK] Discourse import dependencies prepared for #{role}"
@@ -129,13 +130,13 @@ module SiloMigrate
         ensure_file!(intermediate_db_path(customer), "Run the converter first to create output/intermediate.db.")
         setup(customer) unless discourse_configured?(customer)
 
-        result = @runtime.run(
-          [
-            "docker", "exec", container_name(customer, "uploads"), "su", "discourse", "-c",
-            "bundle exec ruby /var/www/discourse/script/bulk_import/uploads_importer.rb #{uploads_importer_guest_config_path(customer)}"
-          ],
-          timeout: IMPORT_TIMEOUT
-        )
+        container = container_name(customer, "uploads")
+        command = [
+          "docker", "exec", container, "su", "discourse", "-c",
+          "bundle exec ruby /var/www/discourse/script/bulk_import/uploads_importer.rb #{uploads_importer_guest_config_path(customer)}"
+        ]
+        log_command_notice("Running Discourse uploads importer in #{container}...", command)
+        result = @runtime.run(command, timeout: IMPORT_TIMEOUT)
         raise UsageError, "Upload import failed" unless result.success?
 
         @output.puts "[OK] Upload import completed: #{uploads_db_path(customer)}"
@@ -148,13 +149,14 @@ module SiloMigrate
         name = container_name(customer, "import")
         backup_basename = File.basename(backup)
         backup_dir = "/var/www/discourse/public/backups/default"
-        copy = @runtime.run(["docker", "cp", backup, "#{name}:#{backup_dir}/#{backup_basename}"], timeout: BACKUP_TIMEOUT)
+        copy_command = ["docker", "cp", backup, "#{name}:#{backup_dir}/#{backup_basename}"]
+        log_command_notice("Copying Discourse backup into #{name}...", copy_command)
+        copy = @runtime.run(copy_command, timeout: BACKUP_TIMEOUT)
         raise UsageError, "Could not copy backup into #{name}" unless copy.success?
 
-        restore = @runtime.run(
-          ["docker", "exec", name, "su", "discourse", "-c", "DISCOURSE_ENABLE_RESTORE=true bundle exec script/discourse restore #{backup_basename}"],
-          timeout: BACKUP_TIMEOUT
-        )
+        restore_command = ["docker", "exec", name, "su", "discourse", "-c", "DISCOURSE_ENABLE_RESTORE=true bundle exec script/discourse restore #{backup_basename}"]
+        log_command_notice("Restoring Discourse backup in #{name}...", restore_command)
+        restore = @runtime.run(restore_command, timeout: BACKUP_TIMEOUT)
         raise UsageError, "Backup restore failed in #{name}" unless restore.success?
 
         marker = File.join(Project.project_path(customer, @env), "output", "discourse-import-restored.txt")
@@ -175,7 +177,10 @@ module SiloMigrate
         elsif !use_uploads_db
           @output.puts "[WARN] uploads.sqlite3 not found; importing with intermediate.db only."
         end
-        result = @runtime.run(["docker", "exec", container_name(customer, "import"), "su", "discourse", "-c", command], timeout: IMPORT_TIMEOUT)
+        container = container_name(customer, "import")
+        docker_command = ["docker", "exec", container, "su", "discourse", "-c", command]
+        log_command_notice("Running Discourse generic import in #{container}...", docker_command)
+        result = @runtime.run(docker_command, timeout: IMPORT_TIMEOUT)
         raise UsageError, "Generic bulk import failed" unless result.success?
 
         marker = File.join(Project.project_path(customer, @env), "output", "discourse-import-complete.txt")
@@ -186,15 +191,21 @@ module SiloMigrate
       def backup_import(customer)
         setup(customer) unless discourse_configured?(customer)
         name = container_name(customer, "import")
-        backup = @runtime.run(["docker", "exec", name, "su", "discourse", "-c", "bundle exec script/discourse backup"], timeout: BACKUP_TIMEOUT)
+        backup_command = ["docker", "exec", name, "su", "discourse", "-c", "bundle exec script/discourse backup"]
+        log_command_notice("Generating final Discourse backup in #{name}...", backup_command)
+        backup = @runtime.run(backup_command, timeout: BACKUP_TIMEOUT)
         raise UsageError, "Discourse backup failed in #{name}" unless backup.success?
 
         destination = File.join(Project.project_path(customer, @env), "output", "discourse-backups")
         FileUtils.mkdir_p(destination)
-        latest = @runtime.run(["docker", "exec", name, "bash", "-lc", "ls -1t /var/www/discourse/public/backups/default/*.tar.gz 2>/dev/null | head -1"], capture: true, timeout: 30)
+        latest_command = ["docker", "exec", name, "bash", "-lc", "ls -1t /var/www/discourse/public/backups/default/*.tar.gz 2>/dev/null | head -1"]
+        log_command_notice("Finding latest Discourse backup in #{name}...", latest_command)
+        latest = @runtime.run(latest_command, capture: true, timeout: 30)
         if latest.success? && !latest.stdout.to_s.strip.empty?
           remote_path = latest.stdout.strip.lines.first.strip
-          copy = @runtime.run(["docker", "cp", "#{name}:#{remote_path}", destination], timeout: BACKUP_TIMEOUT)
+          copy_command = ["docker", "cp", "#{name}:#{remote_path}", destination]
+          log_command_notice("Copying final Discourse backup to #{destination}...", copy_command)
+          copy = @runtime.run(copy_command, timeout: BACKUP_TIMEOUT)
           raise UsageError, "Could not copy final backup out of #{name}" unless copy.success?
         else
           @output.puts "[WARN] Backup completed, but the latest backup path could not be detected automatically."
@@ -425,13 +436,29 @@ module SiloMigrate
         raise UsageError, "Invalid Discourse role: #{role}. Use uploads, import, or both."
       end
 
-      def run_launcher(customer, action, container, timeout: 300)
+      def run_launcher(customer, action, container, role:, timeout: 300)
         config = discourse_config(customer)
         validate_discourse_docker_path!(config.fetch("DISCOURSE_DOCKER_PATH"))
-        result = @runtime.run(["./launcher", action, container], chdir: config.fetch("DISCOURSE_DOCKER_PATH"), timeout: timeout)
+        command = ["./launcher", action, container]
+        log_command_notice("#{launcher_action_label(action)} Discourse #{role} container #{container}...", command)
+        result = @runtime.run(command, chdir: config.fetch("DISCOURSE_DOCKER_PATH"), timeout: timeout)
         raise UsageError, "Discourse #{action} failed for #{container}" unless result.success?
 
         result
+      end
+
+      def launcher_action_label(action)
+        case action
+        when "rebuild" then "Rebuilding"
+        when "start" then "Starting"
+        when "stop" then "Stopping"
+        else "Running #{action} for"
+        end
+      end
+
+      def log_command_notice(message, command)
+        @output.puts "[INFO] #{message}"
+        @output.puts "[INFO] Running: #{Shellwords.join(command)}"
       end
 
       def container_name(customer, role, config = nil)
