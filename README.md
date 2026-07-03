@@ -392,6 +392,7 @@ bin/silo-migrate convert-xml /path/to/xml_dumps -c acme --phase initial --batch-
 bin/silo-migrate convert-json /path/to/json_exports -c acme --phase initial
 bin/silo-migrate convert-json /path/to/json_exports -c acme --schema-dir /path/to/schemas
 bin/silo-migrate convert-json /path/to/json_exports -c acme --records-path data.users
+bin/silo-migrate convert-json /path/to/json_exports -c acme --ndjson --records-path data.users.edges
 bin/silo-migrate convert-json /path/to/json_exports -c acme --recover-truncated
 ```
 
@@ -439,8 +440,17 @@ Per-file config entries override `--records-path` for listed files; unlisted
 files fall back to `--records-path` or the default `data` detection. Relay
 connection metadata such as `pageInfo`, `totalCount`, and edge `cursor` is
 discarded during automatic `edges/node` unwrapping; the migrated rows come from
-`node`. See `silo-migrate help convert-json` for all flags (table overrides,
-depth limits, raw JSON columns).
+`node`.
+
+Paginated API exports may be newline-delimited JSON (NDJSON), with one complete
+JSON page per line. `convert-json` auto-detects seekable multi-line NDJSON and
+streams all pages with the same `--records-path`; use `--ndjson` to force this
+mode, especially for `.json.gz` NDJSON where auto-detection cannot rewind the
+gzip stream. Use `--no-ndjson` to force legacy single-document parsing. With
+`--recover-truncated`, malformed NDJSON lines are skipped and reported as a
+file-level recovery warning; re-export or repair skipped lines for the full data.
+See `silo-migrate help convert-json` for all flags (table overrides, depth
+limits, raw JSON columns).
 Malformed or truncated JSON files produce a clear error naming the file and
 position (truncated exports are called out explicitly). `--recover-truncated`
 (or the guided-mode recovery prompt) keeps the complete records from a

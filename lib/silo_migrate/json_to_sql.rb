@@ -28,7 +28,8 @@ module SiloMigrate
     def initialize(batch_size: 1000, include_tables: nil, exclude_tables: nil, include_files: nil,
                    exclude_files: nil, schema_only: false, records_path: nil, records_path_config: nil,
                    table_name: nil, max_depth: DEFAULT_MAX_DEPTH, json_columns: nil, graphql_unwrap: true,
-                   raw_dates: false, schema_dir: nil, meta_table: true, recover_truncated: false, verbose: true)
+                   raw_dates: false, schema_dir: nil, meta_table: true, recover_truncated: false,
+                   ndjson: :auto, verbose: true)
       raise UsageError, "JSON batch size must be greater than 0" unless batch_size.to_i.positive?
       raise UsageError, "JSON max depth must be greater than 0" unless max_depth.to_i.positive?
       raise UsageError, "Schema directory not found: #{schema_dir}" if schema_dir && !Dir.exist?(schema_dir)
@@ -50,6 +51,7 @@ module SiloMigrate
       @schema_dir = schema_dir
       @meta_table = meta_table
       @recover_truncated = recover_truncated
+      @ndjson = ndjson
       @verbose = verbose
       @emitter = JSONToSQL::SqlEmitter.new
       reset_stats
@@ -224,6 +226,12 @@ module SiloMigrate
         @stats[:files_recovered] += 1
         expected = result.envelope["total_records"]
         expected_clause = expected.is_a?(Integer) ? ", expected #{expected}" : ""
+        if result.skipped_lines.to_i.positive?
+          emit_warning "#{File.basename(path)} contains malformed NDJSON line(s) (#{result.parse_error}); " \
+                       "skipped #{result.skipped_lines} line(s) and recovered #{result.record_count} complete record(s)#{expected_clause}. " \
+                       "Re-export or repair the skipped line(s) for the full data."
+          return
+        end
         emit_warning "#{File.basename(path)} is truncated (#{result.parse_error}); " \
                      "recovered #{result.record_count} complete record(s)#{expected_clause}. " \
                      "The remaining records are lost — re-export the file for the full data."
@@ -324,7 +332,7 @@ module SiloMigrate
     def stream_records(path, &block)
       open_input(path) do |io|
         counting = JSONToSQL::CountingIO.new(io) { |bytes| track_input_bytes(bytes) }
-        JSONToSQL::RecordStreamer.new(records_path: records_path_for(path)).each_record(counting, recover: @recover_truncated, &block)
+        JSONToSQL::RecordStreamer.new(records_path: records_path_for(path)).each_record(counting, recover: @recover_truncated, ndjson: @ndjson, &block)
       end
     end
 

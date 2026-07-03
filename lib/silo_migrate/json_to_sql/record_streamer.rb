@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "oj"
+require "stringio"
 
 module SiloMigrate
   module JSONToSQL
@@ -16,8 +17,19 @@ module SiloMigrate
     #      so only suitable for modest non-"data" files; use records_path for
     #      huge ones)
     #   4. none: the whole document is a single record
+    #
+    # NDJSON (newline-delimited JSON) support:
+    #   When ndjson: true is passed, or auto-detection determines the stream
+    #   contains multiple top-level JSON documents (one per line), each line is
+    #   parsed independently and records from all lines are yielded in order.
+    #   All lines must share the same structure (same records_path). The
+    #   envelope is taken from the first non-empty line; subsequent lines'
+    #   envelopes are ignored (they are structurally identical page wrappers).
     class RecordStreamer
-      Result = Struct.new(:envelope, :records_key, :record_count, :truncated, :parse_error, keyword_init: true)
+      Result = Struct.new(:envelope, :records_key, :record_count, :truncated, :parse_error, :skipped_lines, keyword_init: true)
+
+      # Maximum bytes read for each line considered during NDJSON probing.
+      NDJSON_PROBE_LINE_BYTES = 16 * 1024 * 1024
 
       def initialize(records_path: nil)
         @records_path = records_path
@@ -31,11 +43,26 @@ module SiloMigrate
       # failure (each yielded record is a fully parsed tree, so everything
       # already yielded is intact); the partial tail record is discarded.
       # Failures before the first complete record still raise.
-      def each_record(io, recover: false, &block)
-        path_keys = @records_path ? @records_path.split(".") : nil
-        # Single-key path: legacy behaviour — treat it as the flat records key
-        # at depth 1 (same as before this change, so old callers are unaffected).
-        records_key = (path_keys && path_keys.length == 1) ? path_keys.first : "data"
+      #
+      # With ndjson: true, each line of +io+ is treated as a separate JSON
+      # document. Auto-detection (ndjson: :auto, the default) probes the first
+      # two non-empty lines; set ndjson: false to disable auto-detection.
+      def each_record(io, recover: false, ndjson: :auto, &block)
+        if ndjson == true || (ndjson == :auto && ndjson_stream?(io))
+          each_record_ndjson(io, recover: recover, &block)
+        else
+          each_record_single(io, recover: recover, &block)
+        end
+      end
+
+      private
+
+      # ---------------------------------------------------------------------------
+      # Single-document path (original behaviour)
+      # ---------------------------------------------------------------------------
+
+      def each_record_single(io, recover: false, &block)
+        path_keys, records_key = path_keys_and_root_key
         handler = Handler.new(records_key: records_key, records_path: path_keys, on_record: block)
         begin
           Oj.sc_parse(handler, io)
@@ -60,7 +87,133 @@ module SiloMigrate
         fallback_records(root, handler, &block)
       end
 
-      private
+      # ---------------------------------------------------------------------------
+      # NDJSON path — one JSON document per line
+      # ---------------------------------------------------------------------------
+
+      def each_record_ndjson(io, recover: false, &block)
+        path_keys, records_key = path_keys_and_root_key
+        total_count = 0
+        envelope = nil
+        records_key_used = nil
+        truncated = false
+        parse_error = nil
+        skipped_lines = 0
+        line_number = 0
+
+        io.each_line do |line|
+          line_number += 1
+          next if line.strip.empty?
+
+          line_io = StringIO.new(line)
+          # Wrap with an ordinal-offsetting lambda so ordinals are global.
+          on_record = ->(rec, _local_ordinal) { block.call(rec, total_count); total_count += 1 }
+          handler = Handler.new(records_key: records_key, records_path: path_keys, on_record: on_record)
+          begin
+            Oj.sc_parse(handler, line_io)
+          rescue Oj::ParseError, EncodingError => e
+            if recover
+              truncated = true
+              skipped_lines += 1
+              parse_error = e.message.sub(/ \[\S+\]\z/, "")
+              next
+            end
+            raise
+          end
+          if handler.records_found
+            envelope ||= handler.envelope
+            records_key_used ||= handler.records_key_used
+            next
+          end
+
+          if @records_path
+            raise UsageError, "No array found under records path '#{@records_path}' in JSON input on NDJSON line #{line_number}"
+          end
+
+          result = fallback_records(handler.root_value, handler) do |record, _local_ordinal|
+            block.call(record, total_count)
+            total_count += 1
+          end
+          envelope ||= result.envelope
+          records_key_used ||= result.records_key
+        end
+
+        if recover && skipped_lines.positive? && total_count.zero?
+          raise UsageError, "No complete records could be recovered from NDJSON input (skipped #{skipped_lines} malformed line(s))"
+        end
+
+        Result.new(
+          envelope: envelope || {},
+          records_key: records_key_used,
+          record_count: total_count,
+          truncated: truncated || nil,
+          parse_error: parse_error,
+          skipped_lines: skipped_lines.positive? ? skipped_lines : nil
+        )
+      end
+
+      # ---------------------------------------------------------------------------
+      # NDJSON auto-detection
+      # ---------------------------------------------------------------------------
+
+      # Returns true if +io+ looks like a newline-delimited multi-document
+      # stream. The probe reads up to two non-empty lines and checks whether the
+      # first is a complete JSON object/array. The IO is rewound to its original
+      # position after probing, so the caller continues from where it started.
+      #
+      # This works for seekable IO objects. CountingIO wraps readpartial/read but
+      # does not expose seek; we reach through to the underlying IO when
+      # available, otherwise we fall back to false (no auto-detection). Forced
+      # ndjson: true does not require seeking.
+      def ndjson_stream?(io)
+        # Unwrap CountingIO so we can seek.
+        raw_io = io.respond_to?(:__raw_io__) ? io.__raw_io__ : io
+        return false unless raw_io.respond_to?(:seek) && raw_io.respond_to?(:gets) && raw_io.respond_to?(:pos)
+
+        original_pos = raw_io.pos
+        raw_io.seek(original_pos)
+        lines = []
+        while lines.length < 2
+          line = raw_io.gets(NDJSON_PROBE_LINE_BYTES)
+          break if line.nil?
+
+          lines << line unless line.strip.empty?
+        end
+        return false unless lines.length >= 2
+
+        first_line = lines.first
+
+        # The first line must be a syntactically complete JSON object/array.
+        begin
+          first_value = Oj.load(first_line)
+        rescue Oj::ParseError, EncodingError
+          return false
+        end
+        return false unless first_value.is_a?(Hash) || first_value.is_a?(Array)
+
+        # There is more content after that first line.
+        true
+      rescue IOError, SystemCallError
+        false
+      ensure
+        begin
+          raw_io.seek(original_pos) if raw_io && original_pos
+        rescue IOError, SystemCallError
+          nil
+        end
+      end
+
+      # ---------------------------------------------------------------------------
+      # Shared helpers
+      # ---------------------------------------------------------------------------
+
+      def path_keys_and_root_key
+        path_keys = @records_path ? @records_path.split(".") : nil
+        # Single-key path: legacy behaviour — treat it as the flat records key
+        # at depth 1 (same as before this change, so old callers are unaffected).
+        records_key = (path_keys && path_keys.length == 1) ? path_keys.first : "data"
+        [path_keys, records_key]
+      end
 
       def fallback_records(root, handler, &block)
         raise UsageError, "JSON input is a bare scalar value and cannot be converted" unless root.is_a?(Hash)
@@ -225,6 +378,12 @@ module SiloMigrate
         @on_bytes = on_bytes
       end
 
+      # Exposed so RecordStreamer can reach the underlying IO for seek-based
+      # NDJSON probe/rewind without going through the counting wrapper.
+      def __raw_io__
+        @io
+      end
+
       def readpartial(max_length, out_buffer = nil)
         chunk = out_buffer ? @io.readpartial(max_length, out_buffer) : @io.readpartial(max_length)
         @on_bytes.call(chunk.bytesize) if chunk
@@ -235,6 +394,17 @@ module SiloMigrate
         chunk = out_buffer ? @io.read(length, out_buffer) : @io.read(length)
         @on_bytes.call(chunk.bytesize) if chunk
         chunk
+      end
+
+      # Delegates each_line to the underlying IO, reporting bytes as each line
+      # is yielded so progress tracking still works during NDJSON iteration.
+      def each_line(&block)
+        return enum_for(:each_line) unless block
+
+        @io.each_line do |line|
+          @on_bytes.call(line.bytesize)
+          block.call(line)
+        end
       end
     end
   end

@@ -130,6 +130,10 @@ module SiloMigrate
           --recover-truncated        keep the complete records from truncated files
                                      (the partial tail record is discarded; recovered
                                      counts are reported as warnings)
+          --ndjson                   treat each non-empty line as a separate JSON
+                                     document; useful for paginated exports and
+                                     required for gzip-compressed NDJSON
+          --no-ndjson                disable NDJSON auto-detection
 
         Nested objects flatten into prefixed columns (avatar.url -> avatar_url);
         arrays become child tables with _sid/_parent_sid/_parent_id/_ordinal keys.
@@ -726,6 +730,8 @@ module SiloMigrate
         opts.on("--raw-dates") { options[:raw_dates] = true }
         opts.on("--no-meta-table") { options[:meta_table] = false }
         opts.on("--recover-truncated") { options[:recover_truncated] = true }
+        opts.on("--ndjson") { options[:ndjson] = true }
+        opts.on("--no-ndjson") { options[:ndjson] = false }
       end.parse!(argv)
       source = Pathname(required_existing_path(required_arg(argv, "SOURCE")))
       output = converted_output_path(source, options, input_ext: ".json")
@@ -746,6 +752,7 @@ module SiloMigrate
         raw_dates: options[:raw_dates],
         meta_table: options[:meta_table],
         recover_truncated: options.fetch(:recover_truncated, false),
+        ndjson: options.fetch(:ndjson, :auto),
         verbose: true
       ).convert(source, output)
       @output.puts "\nTo import this dump, run:\n  silo-migrate import-dump #{options[:customer]} #{options[:phase]}" if options[:customer]

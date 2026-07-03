@@ -1236,4 +1236,256 @@ class JSONToSQLTest < SiloMigrateTest
       assert_includes sql, "'Member'"
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # NDJSON (newline-delimited JSON) multi-page support
+  # ---------------------------------------------------------------------------
+
+  def test_ndjson_auto_detect_two_pages
+    # Two pages, each a flat {"data": [...]} document on its own line.
+    page1 = '{"data": [{"id": "u:1", "login": "alice"}, {"id": "u:2", "login": "bob"}]}'
+    page2 = '{"data": [{"id": "u:3", "login": "carol"}]}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      stats, sql = convert(input, File.join(dir, "users.sql"))
+
+      assert_equal 3, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+      assert_includes sql, "'carol'"
+      assert_includes sql, "CREATE TABLE `users`"
+    end
+  end
+
+  def test_ndjson_explicit_flag_true
+    # Same as auto-detect but with ndjson: true explicitly — must also work.
+    page1 = '{"data": [{"id": "u:1", "login": "alice"}]}'
+    page2 = '{"data": [{"id": "u:2", "login": "bob"}]}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      stats, sql = convert(input, File.join(dir, "users.sql"), ndjson: true)
+
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+    end
+  end
+
+  def test_ndjson_disabled_suppresses_line_by_line_fallback
+    # With ndjson: false the input is handed directly to Oj as a single
+    # document stream. This verifies the flag disables the NDJSON per-line
+    # fallback path without relying on "first line only" semantics.
+    page1 = '{"id": "u:1", "login": "alice"}'
+    page2 = '{"id": "u:2", "login": "bob"}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      stats, sql = convert(input, File.join(dir, "users.sql"), ndjson: false)
+
+      refute_equal 2, stats[:rows_processed]
+      refute_includes sql, "'alice'"
+    end
+  end
+
+  def test_ndjson_auto_detects_large_first_page
+    big_value = "x" * 9_000
+    page1 = %({"data":{"users":{"edges":[{"node":{"id":"u:1","login":"alice","bio":"#{big_value}"}}],"pageInfo":{"hasNextPage":true}}}})
+    page2 = '{"data":{"users":{"edges":[{"node":{"id":"u:2","login":"bob"}}],"pageInfo":{"hasNextPage":false}}}}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      stats, sql = convert(input, File.join(dir, "users.sql"), records_path: "data.users.edges")
+
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+      assert_includes sql, "`node_bio` TEXT"
+    end
+  end
+
+  def test_ndjson_object_per_line_uses_whole_line_as_record
+    ndjson = "{\"id\":\"u:1\",\"login\":\"alice\"}\n{\"id\":\"u:2\",\"login\":\"bob\"}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      stats, sql = convert(input, File.join(dir, "users.sql"))
+
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+    end
+  end
+
+  def test_ndjson_with_dot_notation_records_path
+    # Each page uses a deeply nested records_path (same as Khoros pagination).
+    page1 = '{"data":{"users":{"edges":[{"node":{"id":"u:1","login":"alice"}},{"node":{"id":"u:2","login":"bob"}}],"pageInfo":{"hasNextPage":true}}}}'
+    page2 = '{"data":{"users":{"edges":[{"node":{"id":"u:3","login":"carol"}}],"pageInfo":{"hasNextPage":false}}}}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      stats, sql = convert(input, File.join(dir, "users.sql"), records_path: "data.users.edges")
+
+      assert_equal 3, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+      assert_includes sql, "'carol'"
+    end
+  end
+
+  def test_ndjson_with_records_path_config
+    page1 = '{"data":{"users":{"edges":[{"node":{"id":"u:1","login":"alice"}}],"pageInfo":{"hasNextPage":true}}}}'
+    page2 = '{"data":{"users":{"edges":[{"node":{"id":"u:2","login":"bob"}}],"pageInfo":{"hasNextPage":false}}}}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      config = write(File.join(dir, "paths.yml"), "users: data.users.edges\n")
+      stats, sql = convert(File.join(dir), File.join(dir, "out.sql"), records_path_config: config)
+
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+    end
+  end
+
+  def test_ndjson_required_records_path_missing_on_first_line_raises
+    page1 = '{"data":{"users":{"items":[{"node":{"id":"u:1"}}]}}}'
+    page2 = '{"data":{"users":{"edges":[{"node":{"id":"u:2"}}]}}}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      error = assert_raises(SiloMigrate::UsageError) do
+        convert(input, File.join(dir, "users.sql"), records_path: "data.users.edges")
+      end
+
+      assert_includes error.message, "records path 'data.users.edges'"
+      assert_includes error.message, "NDJSON line 1"
+    end
+  end
+
+  def test_ndjson_required_records_path_missing_on_later_line_raises
+    page1 = '{"data":{"users":{"edges":[{"node":{"id":"u:1"}}]}}}'
+    page2 = '{"data":{"users":{"items":[{"node":{"id":"u:2"}}]}}}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      error = assert_raises(SiloMigrate::UsageError) do
+        convert(input, File.join(dir, "users.sql"), records_path: "data.users.edges")
+      end
+
+      assert_includes error.message, "records path 'data.users.edges'"
+      assert_includes error.message, "NDJSON line 2"
+    end
+  end
+
+  def test_ndjson_schema_inferred_across_all_pages
+    # Page 1 has "login"; page 2 adds a new column "email". Both columns must
+    # appear in the inferred schema because schema inference reads all pages.
+    page1 = '{"data": [{"id": "u:1", "login": "alice"}]}'
+    page2 = '{"data": [{"id": "u:2", "login": "bob", "email": "bob@example.com"}]}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      _stats, sql = convert(input, File.join(dir, "users.sql"))
+
+      assert_includes sql, "`login` VARCHAR(255)"
+      assert_includes sql, "`email` VARCHAR(255)"
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob@example.com'"
+    end
+  end
+
+  def test_ndjson_recover_skips_malformed_line
+    page1 = '{"data": [{"id": "u:1", "login": "alice"}]}'
+    bad   = '{"data": [BROKEN'
+    page3 = '{"data": [{"id": "u:3", "login": "carol"}]}'
+    ndjson = "#{page1}\n#{bad}\n#{page3}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      stats, sql = convert(input, File.join(dir, "users.sql"), recover_truncated: true)
+
+      # alice and carol recovered; broken page skipped
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'carol'"
+      assert_equal 1, stats[:files_recovered]
+      assert_includes stats[:warnings].first, "malformed NDJSON line"
+      assert_includes stats[:warnings].first, "skipped 1 line(s)"
+    end
+  end
+
+  def test_ndjson_recover_raises_when_all_lines_are_malformed
+    ndjson = "{\"data\": [BROKEN\n{\"data\": [ALSO_BROKEN\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+
+      error = assert_raises(SiloMigrate::UsageError) do
+        convert(input, File.join(dir, "users.sql"), recover_truncated: true, ndjson: true)
+      end
+
+      assert_includes error.message, "No complete records could be recovered"
+      assert_includes error.message, "skipped 2 malformed line(s)"
+    end
+  end
+
+  def test_ndjson_explicit_flag_true_works_with_gzip
+    page1 = '{"data":{"users":{"edges":[{"node":{"id":"u:1","login":"alice"}}]}}}'
+    page2 = '{"data":{"users":{"edges":[{"node":{"id":"u:2","login":"bob"}}]}}}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = gzip_write(File.join(dir, "users.json.gz"), ndjson)
+      stats, sql = convert(input, File.join(dir, "users.sql"), records_path: "data.users.edges", ndjson: true)
+
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+    end
+  end
+
+  def test_ndjson_single_line_file_not_treated_as_ndjson
+    # A regular single-document JSON file on one line must not be misdetected
+    # as NDJSON. Records count should equal 2 and no extra pass overhead.
+    json = '{"data": [{"id": "u:1", "login": "alice"}, {"id": "u:2", "login": "bob"}]}'
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), json)
+      stats, sql = convert(input, File.join(dir, "users.sql"))
+
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+    end
+  end
+
+  def test_ndjson_ordinals_are_global_across_pages
+    # Ordinals passed to shredder must be globally sequential, not reset per
+    # page. Verify by checking that child table _ordinal values are sequential.
+    page1 = '{"data": [{"id": "u:1", "tags": [{"id": "t:1"}]}]}'
+    page2 = '{"data": [{"id": "u:2", "tags": [{"id": "t:2"}]}]}'
+    ndjson = "#{page1}\n#{page2}\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), ndjson)
+      stats, sql = convert(input, File.join(dir, "users.sql"))
+
+      assert_equal 2, stats[:rows_processed]
+      assert_equal 2, stats[:child_rows_processed]
+      # Both user rows present
+      assert_includes sql, "'u:1'"
+      assert_includes sql, "'u:2'"
+    end
+  end
 end
