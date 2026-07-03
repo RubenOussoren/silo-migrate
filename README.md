@@ -391,6 +391,7 @@ bin/silo-migrate convert-xml /path/to/xml_dumps -c acme --phase initial --compre
 bin/silo-migrate convert-xml /path/to/xml_dumps -c acme --phase initial --batch-size 250
 bin/silo-migrate convert-json /path/to/json_exports -c acme --phase initial
 bin/silo-migrate convert-json /path/to/json_exports -c acme --schema-dir /path/to/schemas
+bin/silo-migrate convert-json /path/to/json_exports -c acme --records-path data.users
 bin/silo-migrate convert-json /path/to/json_exports -c acme --recover-truncated
 ```
 
@@ -423,8 +424,23 @@ GraphQL `edges/node` wrappers unwrap automatically. Files are streamed (never
 loaded whole), so GB-scale exports are fine. Column types are inferred from the
 data, or taken exactly from Draft-07 `*.schema.json` files via `--schema-dir`,
 which also carries `x-pii` annotations into column comments and a queryable
-`_json_meta` manifest table. See `silo-migrate help convert-json` for all
-flags (records path, table overrides, depth limits, raw JSON columns).
+`_json_meta` manifest table. Use `--records-path` when the records array is
+nested, for example `data.users` or `data.community.roles.edges`; `--schema-dir`
+uses the same records path as inferred mode. For directories whose files use
+different paths, pass `--records-path-config paths.yml` with keys matching the
+JSON filename without `.json` or `.json.gz`:
+
+```yaml
+users: data.users.edges
+roles: data.community.roles.edges
+```
+
+Per-file config entries override `--records-path` for listed files; unlisted
+files fall back to `--records-path` or the default `data` detection. Relay
+connection metadata such as `pageInfo`, `totalCount`, and edge `cursor` is
+discarded during automatic `edges/node` unwrapping; the migrated rows come from
+`node`. See `silo-migrate help convert-json` for all flags (table overrides,
+depth limits, raw JSON columns).
 Malformed or truncated JSON files produce a clear error naming the file and
 position (truncated exports are called out explicitly). `--recover-truncated`
 (or the guided-mode recovery prompt) keeps the complete records from a

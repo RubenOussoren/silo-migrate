@@ -5,6 +5,7 @@ require "fileutils"
 require "set"
 require "zlib"
 require "time"
+require "yaml"
 require_relative "sql_text"
 require_relative "json_to_sql/record_streamer"
 require_relative "json_to_sql/shredder"
@@ -25,12 +26,13 @@ module SiloMigrate
     DEFAULT_MAX_DEPTH = 5
 
     def initialize(batch_size: 1000, include_tables: nil, exclude_tables: nil, include_files: nil,
-                   exclude_files: nil, schema_only: false, records_path: nil, table_name: nil,
-                   max_depth: DEFAULT_MAX_DEPTH, json_columns: nil, graphql_unwrap: true,
+                   exclude_files: nil, schema_only: false, records_path: nil, records_path_config: nil,
+                   table_name: nil, max_depth: DEFAULT_MAX_DEPTH, json_columns: nil, graphql_unwrap: true,
                    raw_dates: false, schema_dir: nil, meta_table: true, recover_truncated: false, verbose: true)
       raise UsageError, "JSON batch size must be greater than 0" unless batch_size.to_i.positive?
       raise UsageError, "JSON max depth must be greater than 0" unless max_depth.to_i.positive?
       raise UsageError, "Schema directory not found: #{schema_dir}" if schema_dir && !Dir.exist?(schema_dir)
+      raise UsageError, "Records path config not found: #{records_path_config}" if records_path_config && !File.exist?(records_path_config)
 
       @batch_size = batch_size
       @include_tables = include_tables&.to_set
@@ -38,7 +40,8 @@ module SiloMigrate
       @include_files = include_files&.to_set
       @exclude_files = Array(exclude_files).to_set
       @schema_only = schema_only
-      @records_path = records_path
+      @records_path = validate_records_path(records_path, "--records-path")
+      @records_path_config = records_path_config ? load_records_path_config(records_path_config) : nil
       @table_name = table_name
       @max_depth = max_depth
       @json_columns = json_columns
@@ -149,13 +152,14 @@ module SiloMigrate
       report_progress(:file_start, force: true)
 
       registry = JSONToSQL::NameRegistry.new
+      records_path = records_path_for(path)
       if schema_path
         loaded = JSONToSQL::JsonSchemaLoader.new(
           registry: registry,
           max_depth: @max_depth,
           graphql_unwrap: @graphql_unwrap,
           raw_dates: @raw_dates
-        ).load(schema_path, records_path: @records_path)
+        ).load(schema_path, records_path: records_path)
         @schema_used = true
         tables = loaded.plans.transform_values { |plan| { defs: plan.defs, child: plan.child } }
         root_table = resolve_root_table({ "object_name" => loaded.root_name }, path)
@@ -320,8 +324,43 @@ module SiloMigrate
     def stream_records(path, &block)
       open_input(path) do |io|
         counting = JSONToSQL::CountingIO.new(io) { |bytes| track_input_bytes(bytes) }
-        JSONToSQL::RecordStreamer.new(records_path: @records_path).each_record(counting, recover: @recover_truncated, &block)
+        JSONToSQL::RecordStreamer.new(records_path: records_path_for(path)).each_record(counting, recover: @recover_truncated, &block)
       end
+    end
+
+    # Returns the records path to use for +path+. Per-file config takes
+    # precedence over the global --records-path flag.
+    def records_path_for(path)
+      if @records_path_config
+        base = File.basename(path.to_s).sub(/\.gz\z/, "").sub(/\.json\z/, "")
+        return @records_path_config[base] if @records_path_config.key?(base)
+      end
+      @records_path
+    end
+
+    # Loads the YAML (or JSON) records-path config file and returns a Hash
+    # mapping filename base (without extension) to a dot-notation path string.
+    def load_records_path_config(config_path)
+      raw = YAML.safe_load(File.read(config_path), permitted_classes: [], permitted_symbols: [], aliases: true)
+      raise UsageError, "Records path config must be a YAML mapping of filename => path (got #{raw.class})" unless raw.is_a?(Hash)
+
+      raw.each_with_object({}) do |(key, value), config|
+        raise UsageError, "Records path config values must be strings, got #{value.inspect}" unless value.is_a?(String)
+
+        config[key.to_s] = validate_records_path(value, "records path config entry #{key.inspect}")
+      end
+    rescue Psych::Exception => e
+      raise UsageError, "Could not parse records path config #{config_path}: #{e.message}"
+    end
+
+    def validate_records_path(path, label)
+      return nil if path.nil?
+
+      value = path.to_s.strip
+      if value.empty? || value.start_with?(".") || value.end_with?(".") || value.split(".", -1).any?(&:empty?)
+        raise UsageError, "Invalid #{label}: #{path.inspect}. Use dot-notation with non-empty path segments."
+      end
+      value
     end
 
     def track_input_bytes(bytes)

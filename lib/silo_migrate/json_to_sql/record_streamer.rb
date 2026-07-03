@@ -9,7 +9,8 @@ module SiloMigrate
     # and one record at a time are held in memory.
     #
     # Records-array detection, first match wins:
-    #   1. the array under the explicit records_path key (error if absent)
+    #   1. the array at the end of the explicit dot-notation records_path
+    #      (e.g. "data.community.roles.edges"); error if absent
     #   2. the array under the top-level "data" key
     #   3. the sole top-level array value (buffered into the envelope first,
     #      so only suitable for modest non-"data" files; use records_path for
@@ -31,7 +32,11 @@ module SiloMigrate
       # already yielded is intact); the partial tail record is discarded.
       # Failures before the first complete record still raise.
       def each_record(io, recover: false, &block)
-        handler = Handler.new(records_key: @records_path || "data", on_record: block)
+        path_keys = @records_path ? @records_path.split(".") : nil
+        # Single-key path: legacy behaviour — treat it as the flat records key
+        # at depth 1 (same as before this change, so old callers are unaffected).
+        records_key = (path_keys && path_keys.length == 1) ? path_keys.first : "data"
+        handler = Handler.new(records_key: records_key, records_path: path_keys, on_record: block)
         begin
           Oj.sc_parse(handler, io)
         rescue Oj::ParseError, EncodingError => e
@@ -80,9 +85,15 @@ module SiloMigrate
 
         attr_reader :envelope, :records_key_used, :record_count, :root_value
 
-        def initialize(records_key:, on_record:)
+        # +records_key+ is the single-key fallback used to match a depth-1 array
+        # (kept for legacy single-key paths and the default "data" case).
+        # +records_path+ is the full key sequence for multi-level paths; when set,
+        # the handler descends through intermediate objects until the final segment
+        # matches an array — that array becomes the RECORDS stream.
+        def initialize(records_key:, on_record:, records_path: nil)
           super()
           @records_key = records_key
+          @records_path = records_path
           @on_record = on_record
           @stack = []
           @pending_key = nil
@@ -91,6 +102,11 @@ module SiloMigrate
           @records_key_used = nil
           @record_count = 0
           @root_value = nil
+          # Number of path segments matched by the current object branch.
+          @path_matched = 0
+          @path_match_stack = []
+          # The most recent key seen at the current path match depth.
+          @path_pending_key = nil
         end
 
         def records_found
@@ -99,17 +115,34 @@ module SiloMigrate
 
         def hash_start
           hash = {}
+          previous_path_matched = @path_matched
+          if path_intermediate_value?
+            @path_matched += 1
+          end
+          @path_match_stack.push(previous_path_matched)
           @envelope = hash if @stack.empty?
           @stack.push(hash)
           hash
         end
 
         def hash_end
-          @stack.pop
+          obj = @stack.pop
+          @path_matched = @path_match_stack.pop || 0
+          obj
         end
 
         def hash_key(key)
+          # Legacy single-level match: track the pending key at depth 1.
           @pending_key = key if @stack.length == 1
+
+          # Multi-level path: track the key seen at the current match depth,
+          # and advance the match counter for non-final segments.
+          if @records_path && !@records_found
+            if @stack.length == @path_matched + 1
+              @path_pending_key = key
+            end
+          end
+
           key
         end
 
@@ -120,6 +153,10 @@ module SiloMigrate
         def array_start
           target = if @stack.empty?
                      @records_found = true
+                     RECORDS
+                   elsif multi_level_records_array?
+                     @records_found = true
+                     @records_key_used = @records_path.join(".")
                      RECORDS
                    elsif @stack.length == 1 && @stack.first.equal?(@envelope) && @pending_key == @records_key
                      @records_found = true
@@ -148,6 +185,33 @@ module SiloMigrate
         def add_value(value)
           @root_value = value
           @envelope = {} if @envelope.nil?
+        end
+
+        private
+
+        # A key matching an intermediate path segment only counts after its
+        # value actually starts as an object. This keeps partial matches from
+        # leaking into sibling branches or across scalar/array values.
+        def path_intermediate_value?
+          return false unless @records_path && !@records_found
+          return false if @stack.empty?
+          return false unless @path_matched < @records_path.length - 1
+
+          @stack.length == @path_matched + 1 &&
+            @path_pending_key == @records_path[@path_matched]
+        end
+
+        # Returns true when the multi-level path has been fully matched and the
+        # current pending_key is the final segment — meaning this array_start
+        # call is the records array.
+        def multi_level_records_array?
+          return false unless @records_path && !@records_found
+
+          # All path segments except the last have been matched via hash keys;
+          # the current @path_pending_key is the final segment.
+          @path_matched == @records_path.length - 1 &&
+            @path_pending_key == @records_path.last &&
+            @stack.length == @path_matched + 1
         end
       end
       # rubocop:enable Naming/MethodName

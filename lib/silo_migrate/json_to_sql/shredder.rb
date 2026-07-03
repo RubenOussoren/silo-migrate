@@ -173,10 +173,19 @@ module SiloMigrate
         @json_column_paths.include?(path.map { |part| NameRegistry.sanitize(part) }.join("."))
       end
 
-      # {"edges": [{"node": {...}}, ...]} unwraps to the array of node values.
+      # Unwraps a Relay-style connection object to the array of node values.
+      #
+      # Tolerates the standard Relay connection shape where sibling keys like
+      # +pageInfo+ and +totalCount+ live alongside +edges+, and where each edge
+      # may carry a +cursor+ (or any other per-edge keys) in addition to +node+.
+      # Only the +node+ value is extracted from each edge; all other edge keys
+      # are silently discarded.
+      #
+      # Returns nil if the object does not look like a connection (no +edges+
+      # key, non-array edges, or any edge that is missing a +node+ key).
       def unwrap_edges(value)
-        return nil unless value.keys == ["edges"] && value["edges"].is_a?(Array)
-        return nil unless value["edges"].all? { |edge| edge.is_a?(Hash) && edge.keys == ["node"] }
+        return nil unless value.key?("edges") && value["edges"].is_a?(Array)
+        return nil unless value["edges"].all? { |edge| edge.is_a?(Hash) && edge.key?("node") }
 
         value["edges"].map { |edge| edge["node"] }
       end

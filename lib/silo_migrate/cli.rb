@@ -113,8 +113,14 @@ module SiloMigrate
           --schema-dir DIR           use FILE.schema.json (Draft-07) files from DIR
                                      to drive column types, NULLability, and x-pii
                                      annotations instead of inferring them
-          --records-path KEY         top-level key holding the records array
-                                     (default: data, with auto-detection fallback)
+          --records-path PATH        key or dot-notation path holding the records array
+                                     (default: data, with auto-detection fallback;
+                                     supports dot-notation for nested paths,
+                                     e.g. data.users.edges or data.community.roles.edges)
+          --records-path-config FILE YAML file mapping filename (without extension)
+                                     to a dot-notation records path, for converting
+                                     files that each have a different path; overrides
+                                     --records-path for matched files
           --table NAME               root table name override (single-file input)
           --max-depth N              flatten depth before storing raw JSON (default 5)
           --json-columns P1,P2       dotted record paths kept as raw JSON columns
@@ -712,6 +718,7 @@ module SiloMigrate
         opts.on("--compress") { options[:compress] = true }
         opts.on("--schema-dir DIR") { |value| options[:schema_dir] = value }
         opts.on("--records-path KEY") { |value| options[:records_path] = value }
+        opts.on("--records-path-config FILE") { |value| options[:records_path_config] = value }
         opts.on("--table NAME") { |value| options[:table_name] = value }
         opts.on("--max-depth N", Integer) { |value| options[:max_depth] = value }
         opts.on("--json-columns PATHS") { |value| options[:json_columns] = csv(value) }
@@ -731,6 +738,7 @@ module SiloMigrate
         schema_only: options[:schema_only],
         schema_dir: options[:schema_dir],
         records_path: options[:records_path],
+        records_path_config: options[:records_path_config],
         table_name: options[:table_name],
         max_depth: options[:max_depth],
         json_columns: options[:json_columns],

@@ -660,6 +660,151 @@ class JSONToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_schema_driven_records_path_supports_dot_notation
+    schema = <<~JSON
+      {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "users": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {"id": {"type": "string"}, "login": {"type": "string"}}
+                }
+              }
+            }
+          }
+        }
+      }
+    JSON
+    json = '{"data": {"users": [{"id": "u:1", "login": "alice"}]}}'
+
+    Dir.mktmpdir do |dir|
+      schema_dir = File.join(dir, "schema")
+      write(File.join(schema_dir, "users.schema.json"), schema)
+      input = write(File.join(dir, "users.json"), json)
+      stats, sql = convert(input, File.join(dir, "users.sql"), schema_dir: schema_dir, records_path: "data.users")
+
+      assert_equal 1, stats[:rows_processed]
+      assert_equal 0, stats[:dropped_values]
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "`id` TEXT"
+      assert_includes sql, "`login` TEXT"
+      assert_includes sql, "(1, 'u:1', 'alice')"
+      refute_includes sql, "CREATE TABLE `users_data_users`"
+    end
+  end
+
+  def test_schema_driven_records_path_config_is_used_for_schema_and_streaming
+    schema = <<~JSON
+      {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "users": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {"id": {"type": "string"}}
+                }
+              }
+            }
+          }
+        }
+      }
+    JSON
+    json = '{"data": {"users": [{"id": "u:1"}]}}'
+
+    Dir.mktmpdir do |dir|
+      schema_dir = File.join(dir, "schema")
+      write(File.join(schema_dir, "users.schema.json"), schema)
+      input = write(File.join(dir, "users.json"), json)
+      config = write(File.join(dir, "paths.yml"), "users: data.users\n")
+      stats, sql = convert(input, File.join(dir, "users.sql"), schema_dir: schema_dir,
+                           records_path: "data", records_path_config: config)
+
+      assert_equal 1, stats[:rows_processed]
+      assert_equal 0, stats[:dropped_values]
+      assert_includes sql, "`id` TEXT"
+      assert_includes sql, "(1, 'u:1')"
+      refute_includes sql, "CREATE TABLE `users_data_users`"
+    end
+  end
+
+  def test_schema_driven_relay_unwrap_tolerates_connection_and_edge_siblings
+    schema = <<~JSON
+      {
+        "type": "object",
+        "properties": {
+          "object_name": {"type": "string", "const": "messages"},
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {"type": "string"},
+                "tags": {
+                  "type": "object",
+                  "properties": {
+                    "totalCount": {"type": "integer"},
+                    "edges": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "cursor": {"type": "string"},
+                          "node": {
+                            "type": "object",
+                            "properties": {"id": {"type": "string"}, "text": {"type": "string"}}
+                          }
+                        }
+                      }
+                    },
+                    "pageInfo": {
+                      "type": "object",
+                      "properties": {"hasNextPage": {"type": "boolean"}}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    JSON
+    json = <<~JSON
+      {"object_name": "messages", "data": [
+        {"id": "message:1", "tags": {
+          "totalCount": 1,
+          "edges": [{"cursor": "abc", "node": {"id": "tag:1", "text": "ruby"}}],
+          "pageInfo": {"hasNextPage": false}
+        }}
+      ]}
+    JSON
+
+    Dir.mktmpdir do |dir|
+      schema_dir = File.join(dir, "schema")
+      write(File.join(schema_dir, "messages.schema.json"), schema)
+      input = write(File.join(dir, "messages.json"), json)
+      stats, sql = convert(input, File.join(dir, "messages.sql"), schema_dir: schema_dir)
+
+      assert_equal 1, stats[:rows_processed]
+      assert_equal 1, stats[:child_rows_processed]
+      assert_equal 0, stats[:dropped_values]
+      assert_includes sql, "CREATE TABLE `messages_tags`"
+      refute_includes sql, "CREATE TABLE `messages_tags_edges`"
+      assert_includes sql, "(1, 1, 'message:1', 0, 'tag:1', 'ruby')"
+      refute_includes sql, "`cursor`"
+      refute_includes sql, "page_info"
+      refute_includes sql, "total_count"
+    end
+  end
+
   def test_malformed_schema_file_raises_usage_error
     Dir.mktmpdir do |dir|
       schema_dir = File.join(dir, "schema")
@@ -700,6 +845,395 @@ class JSONToSQLTest < SiloMigrateTest
       stdout, = capture_io { converter.convert(Pathname(input), Pathname(output)) }
 
       assert_includes stdout, "[WARN] users.json: total_records says 5 but 1 records were found"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # GraphQL / Relay unwrap_edges relaxation (Issues 2 & 3)
+  # ---------------------------------------------------------------------------
+
+  def test_unwrap_edges_tolerates_pageinfo_sibling
+    # Standard Relay connection: edges + pageInfo alongside each other.
+    json = <<~JSON
+      {"data": {"users": {"edges": [
+        {"node": {"id": "user:1", "login": "alice"}},
+        {"node": {"id": "user:2", "login": "bob"}}
+      ], "pageInfo": {"hasNextPage": false, "endCursor": null}}}}
+    JSON
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), json)
+      _, sql = convert(input, File.join(dir, "users.sql"), records_path: "data.users.edges")
+
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "`node_id` VARCHAR(255)"
+      assert_includes sql, "`node_login` VARCHAR(255)"
+      assert_includes sql, "'user:1'"
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'user:2'"
+      assert_includes sql, "'bob'"
+    end
+  end
+
+  def test_unwrap_edges_tolerates_pageinfo_on_nested_connection
+    # pageInfo alongside edges in a nested sub-object (e.g. tags on a message).
+    # Once records are correctly streamed, the Shredder must unwrap nested
+    # connections that carry pageInfo siblings.
+    json = <<~JSON
+      {"object_name": "messages", "total_records": 1, "data": [
+        {
+          "id": "message:1",
+          "subject": "Hello",
+          "tags": {
+            "edges": [
+              {"node": {"id": "tag:1", "text": "ruby"}},
+              {"node": {"id": "tag:2", "text": "sql"}}
+            ],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+          }
+        }
+      ]}
+    JSON
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.json"), json)
+      _, sql = convert(input, File.join(dir, "messages.sql"))
+
+      # tags is a child table, not stored as JSON blob
+      assert_includes sql, "CREATE TABLE `messages_tags`"
+      assert_includes sql, "`id` VARCHAR(255)"
+      assert_includes sql, "`text` VARCHAR(255)"
+      assert_includes sql, "'tag:1'"
+      assert_includes sql, "'ruby'"
+      refute_includes sql, "tags_json"
+    end
+  end
+
+  def test_unwrap_edges_tolerates_cursor_on_edge_objects
+    # Relay per-edge cursor: each edge carries cursor + node.
+    # The cursor is discarded; only node content is shredded.
+    json = <<~JSON
+      {"object_name": "bans", "total_records": 2, "data": [
+        {"cursor": "abc", "node": {"id": "1", "userId": 100, "bannedReason": "spam"}},
+        {"cursor": "def", "node": {"id": "2", "userId": 200, "bannedReason": "crypto"}}
+      ]}
+    JSON
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "bans.json"), json)
+      _, sql = convert(input, File.join(dir, "bans.sql"))
+
+      assert_includes sql, "CREATE TABLE `bans`"
+      # cursor is a scalar column (from the edge object record)
+      assert_includes sql, "`cursor` VARCHAR(255)"
+      # node fields are flattened
+      assert_includes sql, "`node_id` VARCHAR(255)"
+      assert_includes sql, "`node_user_id` BIGINT"
+      assert_includes sql, "`node_banned_reason` VARCHAR(255)"
+    end
+  end
+
+  def test_unwrap_edges_tolerates_cursor_inside_connection
+    json = <<~JSON
+      {"object_name": "messages", "data": [
+        {"id": "message:1", "tags": {"edges": [
+          {"cursor": "abc", "node": {"id": "tag:1", "text": "ruby"}}
+        ]}}
+      ]}
+    JSON
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.json"), json)
+      _, sql = convert(input, File.join(dir, "messages.sql"))
+
+      assert_includes sql, "CREATE TABLE `messages_tags`"
+      assert_includes sql, "'tag:1'"
+      assert_includes sql, "'ruby'"
+      refute_includes sql, "`cursor`"
+    end
+  end
+
+  def test_unwrap_edges_tolerates_totalcount_sibling
+    # totalCount (another common Relay sibling) alongside edges.
+    json = <<~JSON
+      {"object_name": "badge_sets", "data": [
+        {"id": "bs:1", "badges": {
+          "totalCount": 3,
+          "edges": [
+            {"node": {"id": "badge:1", "title": "First"}},
+            {"node": {"id": "badge:2", "title": "Second"}}
+          ]
+        }}
+      ]}
+    JSON
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "badge_sets.json"), json)
+      _, sql = convert(input, File.join(dir, "badge_sets.sql"))
+
+      assert_includes sql, "CREATE TABLE `badge_sets_badges`"
+      assert_includes sql, "`id` VARCHAR(255)"
+      assert_includes sql, "`title` VARCHAR(255)"
+      refute_includes sql, "badges_json"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # RecordStreamer dot-notation records_path (Issue 4)
+  # ---------------------------------------------------------------------------
+
+  def test_records_path_two_segments
+    json = '{"data": {"users": [{"id": "u:1"}, {"id": "u:2"}]}}'
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), json)
+      stats, sql = convert(input, File.join(dir, "users.sql"), records_path: "data.users")
+
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'u:1'"
+      assert_includes sql, "'u:2'"
+    end
+  end
+
+  def test_records_path_three_segments
+    json = '{"data": {"community": {"roles": [{"id": "role:1", "name": "Admin"}, {"id": "role:2", "name": "Member"}]}}}'
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "roles.json"), json)
+      stats, sql = convert(input, File.join(dir, "roles.sql"), records_path: "data.community.roles")
+
+      assert_includes sql, "CREATE TABLE `roles`"
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'role:1'"
+      assert_includes sql, "'Admin'"
+    end
+  end
+
+  def test_records_path_four_segments_with_relay_envelope
+    # data.community.topTags.edges is the path; each edge has cursor+node
+    json = <<~JSON
+      {"data": {"community": {"topTags": {"edges": [
+        {"node": {"id": "tag:1", "text": "ruby", "messagesCount": 42}},
+        {"node": {"id": "tag:2", "text": "sql", "messagesCount": 17}}
+      ], "pageInfo": {"hasNextPage": false}}}}}
+    JSON
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "topTags.json"), json)
+      stats, sql = convert(input, File.join(dir, "topTags.sql"), records_path: "data.community.topTags.edges")
+
+      assert_includes sql, "CREATE TABLE `top_tags`"
+      assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'tag:1'"
+      assert_includes sql, "'ruby'"
+    end
+  end
+
+  def test_records_path_missing_raises_with_dot_notation
+    json = '{"data": {"community": {}}}'
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "roles.json"), json)
+      error = assert_raises(SiloMigrate::UsageError) do
+        convert(input, File.join(dir, "roles.sql"), records_path: "data.community.roles")
+      end
+      assert_includes error.message, "records path 'data.community.roles'"
+    end
+  end
+
+  def test_records_path_partial_match_does_not_leak_to_sibling_branch
+    json = '{"data": {"wrong": {}}, "other": {"users": [{"id": "wrong"}]}}'
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), json)
+      error = assert_raises(SiloMigrate::UsageError) do
+        convert(input, File.join(dir, "users.sql"), records_path: "data.users")
+      end
+      assert_includes error.message, "records path 'data.users'"
+    end
+  end
+
+  def test_records_path_finds_correct_branch_after_unmatched_nested_sibling
+    json = '{"data": {"community": {"users": [{"id": "wrong"}]}, "other": {"users": [{"id": "ok"}]}}}'
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), json)
+      stats, sql = convert(input, File.join(dir, "users.sql"), records_path: "data.other.users")
+
+      assert_equal 1, stats[:rows_processed]
+      assert_includes sql, "'ok'"
+      refute_includes sql, "'wrong'"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Per-file records-path config (Issue 1)
+  # ---------------------------------------------------------------------------
+
+  def test_records_path_config_routes_per_file
+    users_json = '{"data": {"users": [{"id": "u:1", "login": "alice"}]}}'
+    roles_json = '{"data": {"community": {"roles": [{"id": "role:1", "name": "Admin"}]}}}'
+    config_yaml = <<~YAML
+      users: data.users
+      roles: data.community.roles
+    YAML
+
+    Dir.mktmpdir do |dir|
+      write(File.join(dir, "users.json"), users_json)
+      write(File.join(dir, "roles.json"), roles_json)
+      config = write(File.join(dir, "paths.yml"), config_yaml)
+      output = File.join(dir, "out.sql")
+
+      stats, sql = convert(dir, output, records_path_config: config)
+
+      assert_equal 2, stats[:files_processed]
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "CREATE TABLE `roles`"
+      assert_includes sql, "'u:1'"
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'role:1'"
+      assert_includes sql, "'Admin'"
+    end
+  end
+
+  def test_records_path_config_per_file_overrides_global_records_path
+    # Global records_path is "data", but config maps users to "data.users"
+    users_json = '{"data": {"users": [{"id": "u:1"}]}}'
+    config_yaml = "users: data.users\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "users.json"), users_json)
+      config = write(File.join(dir, "paths.yml"), config_yaml)
+      _, sql = convert(input, File.join(dir, "out.sql"), records_path: "data", records_path_config: config)
+
+      assert_includes sql, "CREATE TABLE `users`"
+      # records_path_config wins: data.users → 1 row with id
+      assert_includes sql, "'u:1'"
+    end
+  end
+
+  def test_records_path_config_falls_back_to_global_for_unlisted_files
+    json = '{"data": [{"id": "x:1"}]}'
+    config_yaml = "other: data.other\n"
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "things.json"), json)
+      config = write(File.join(dir, "paths.yml"), config_yaml)
+      stats, sql = convert(input, File.join(dir, "out.sql"), records_path_config: config)
+
+      # Not in config → falls back to default "data" detection
+      assert_includes sql, "CREATE TABLE `things`"
+      assert_equal 1, stats[:rows_processed]
+    end
+  end
+
+  def test_records_path_config_missing_file_raises
+    error = assert_raises(SiloMigrate::UsageError) do
+      SiloMigrate::JSONToSQLConverter.new(records_path_config: "/nonexistent/paths.yml", verbose: false)
+    end
+    assert_includes error.message, "Records path config not found"
+  end
+
+  def test_records_path_config_invalid_yaml_raises
+    Dir.mktmpdir do |dir|
+      config = write(File.join(dir, "bad.yml"), "key: [unclosed")
+      error = assert_raises(SiloMigrate::UsageError) do
+        SiloMigrate::JSONToSQLConverter.new(records_path_config: config, verbose: false)
+      end
+      assert_includes error.message, "Could not parse records path config"
+    end
+  end
+
+  def test_records_path_config_non_mapping_raises
+    Dir.mktmpdir do |dir|
+      config = write(File.join(dir, "bad.yml"), "- item1\n- item2\n")
+      error = assert_raises(SiloMigrate::UsageError) do
+        SiloMigrate::JSONToSQLConverter.new(records_path_config: config, verbose: false)
+      end
+      assert_includes error.message, "must be a YAML mapping"
+    end
+  end
+
+  def test_invalid_records_paths_raise_usage_error
+    ["", ".data", "data.", "data..users"].each do |path|
+      error = assert_raises(SiloMigrate::UsageError) do
+        SiloMigrate::JSONToSQLConverter.new(records_path: path, verbose: false)
+      end
+      assert_includes error.message, "Invalid --records-path"
+    end
+  end
+
+  def test_invalid_records_path_config_value_raises_usage_error
+    Dir.mktmpdir do |dir|
+      config = write(File.join(dir, "bad.yml"), "users: data..users\n")
+      error = assert_raises(SiloMigrate::UsageError) do
+        SiloMigrate::JSONToSQLConverter.new(records_path_config: config, verbose: false)
+      end
+      assert_includes error.message, "Invalid records path config entry \"users\""
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # End-to-end: Khoros-style GraphQL envelope (all three fixes working together)
+  # ---------------------------------------------------------------------------
+
+  def test_khoros_style_graphql_envelope_end_to_end
+    # Simulates the actual Khoros/F5 DevCentral file shape:
+    # data.<entity>.edges[].node with pageInfo sibling and optional cursor on edges.
+    users_json = <<~JSON
+      {"data": {"users": {
+        "edges": [
+          {"node": {"id": "user:1", "login": "alice", "email": "alice@example.com", "banned": false, "uid": 1}},
+          {"node": {"id": "user:2", "login": "bob", "email": "bob@example.com", "banned": true, "uid": 2}}
+        ],
+        "pageInfo": {"hasNextPage": false, "endCursor": null}
+      }}}
+    JSON
+
+    roles_json = <<~JSON
+      {"data": {"community": {
+        "roles": {
+          "edges": [
+            {"node": {"id": "role:t:Admin:core", "name": "Administrator", "usersCount": 13}},
+            {"node": {"id": "role:t:Member:core", "name": "Member", "usersCount": 57709}}
+          ],
+          "pageInfo": {"hasNextPage": false, "endCursor": null}
+        }
+      }}}
+    JSON
+
+    config_yaml = <<~YAML
+      users: data.users.edges
+      roles: data.community.roles.edges
+    YAML
+
+    Dir.mktmpdir do |dir|
+      write(File.join(dir, "users.json"), users_json)
+      write(File.join(dir, "roles.json"), roles_json)
+      config = write(File.join(dir, "paths.yml"), config_yaml)
+      output = File.join(dir, "out.sql")
+
+      stats, sql = convert(dir, output, records_path_config: config)
+
+      assert_equal 2, stats[:files_processed]
+
+      # Users: edges are the records; each record is {"node": {...}} —
+      # node fields are flattened with node_ prefix.
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "`node_id` VARCHAR(255)"
+      assert_includes sql, "`node_login` VARCHAR(255)"
+      assert_includes sql, "`node_banned` TINYINT(1)"
+      assert_includes sql, "`node_uid` BIGINT"
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+
+      # Roles: same pattern via 3-level path
+      assert_includes sql, "CREATE TABLE `roles`"
+      assert_includes sql, "`node_name` VARCHAR(255)"
+      assert_includes sql, "`node_users_count` BIGINT"
+      assert_includes sql, "'Administrator'"
+      assert_includes sql, "'Member'"
     end
   end
 end

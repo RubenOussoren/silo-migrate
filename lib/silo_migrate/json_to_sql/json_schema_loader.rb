@@ -51,18 +51,33 @@ module SiloMigrate
         properties = @schema["properties"]
         return @schema unless properties.is_a?(Hash)
 
-        key = records_path || "data"
-        candidate = properties[key]
-        if candidate.nil? && records_path.nil?
+        if records_path
+          candidate = schema_at_path(records_path.split("."))
+          candidate = resolve(candidate) if candidate
+          return candidate["items"] || {} if candidate && array_schema?(candidate)
+
+          raise UsageError, "JSON Schema has no array under records path '#{records_path}'"
+        end
+
+        candidate = properties["data"]
+        if candidate.nil?
           array_keys = properties.keys.select { |name| array_schema?(resolve(properties[name])) }
           candidate = properties[array_keys.first] if array_keys.length == 1
         end
         candidate = resolve(candidate) if candidate
         return candidate["items"] || {} if candidate && array_schema?(candidate)
 
-        raise UsageError, "JSON Schema has no array under records path '#{records_path}'" if records_path
-
         @schema
+      end
+
+      def schema_at_path(parts)
+        parts.reduce(@schema) do |schema, part|
+          resolved = resolve(schema)
+          properties = resolved["properties"]
+          return nil unless properties.is_a?(Hash)
+
+          properties[part]
+        end
       end
 
       def array_schema?(schema)
@@ -183,19 +198,19 @@ module SiloMigrate
         end
       end
 
-      # Schema-shape counterpart of the Shredder's GraphQL unwrap: an object
-      # whose sole property is an "edges" array of objects whose sole
-      # property is "node". Returns the node schema.
+      # Schema-shape counterpart of the Shredder's GraphQL unwrap. Tolerates
+      # Relay metadata siblings like pageInfo/totalCount on the connection and
+      # cursor on each edge; only node data is migrated.
       def unwrap_edges(schema)
         properties = schema["properties"]
-        return nil unless properties.is_a?(Hash) && properties.keys == ["edges"]
+        return nil unless properties.is_a?(Hash) && properties.key?("edges")
 
         edges = resolve(properties["edges"])
         return nil unless array_schema?(edges)
 
         items = edges["items"]
         items = resolve(items) if items.is_a?(Hash)
-        return nil unless items.is_a?(Hash) && items["properties"].is_a?(Hash) && items["properties"].keys == ["node"]
+        return nil unless items.is_a?(Hash) && items["properties"].is_a?(Hash) && items["properties"].key?("node")
 
         items["properties"]["node"]
       end
