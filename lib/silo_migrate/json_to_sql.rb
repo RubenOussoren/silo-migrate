@@ -69,7 +69,11 @@ module SiloMigrate
       @schema_used = false
       source = Pathname(source)
       output_path = Pathname(output_path)
-      files = source.file? ? [source] : source.glob(file_pattern).to_a.concat(source.glob("#{file_pattern}.gz").to_a).sort
+      files = source.file? ? [source] : source.glob(file_pattern).to_a
+                                               .concat(source.glob("#{file_pattern}.gz").to_a)
+                                               .concat(source.glob("*.jsonl").to_a)
+                                               .concat(source.glob("*.jsonl.gz").to_a)
+                                               .sort
       raise UsageError, "No JSON files found in #{source}" if files.empty?
 
       files_to_process, skipped = files.partition { |file| process_file?(file) }

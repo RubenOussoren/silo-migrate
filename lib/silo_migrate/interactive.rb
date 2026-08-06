@@ -1274,7 +1274,11 @@ module SiloMigrate
     end
 
     def source_files(source_path, ext)
-      source_path.file? ? [source_path] : source_path.glob("*#{ext}").to_a.concat(source_path.glob("*#{ext}.gz").to_a).sort
+      source_path.file? ? [source_path] : source_path.glob("*#{ext}").to_a
+                                                      .concat(source_path.glob("*#{ext}.gz").to_a)
+                                                      .concat(source_path.glob("*.jsonl").to_a)
+                                                      .concat(source_path.glob("*.jsonl.gz").to_a)
+                                                      .sort
     end
 
     def source_file_excluded?(file, ext, exclude_files)
