@@ -289,6 +289,34 @@ class JSONToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_empty_jsonl_file_is_skipped_without_aborting_other_files
+    Dir.mktmpdir do |dir|
+      write(File.join(dir, "boards.jsonl"), "")
+      write(File.join(dir, "accounts.json"), USERS_JSON)
+      output = File.join(dir, "out.sql")
+      snapshots = []
+
+      stats = SiloMigrate::JSONToSQLConverter.new(verbose: false).convert(
+        Pathname(dir),
+        Pathname(output),
+        progress_callback: proc { |snapshot| snapshots << snapshot },
+        progress_interval: 0
+      )
+      sql = File.read(output)
+
+      assert_equal 1, stats[:files_processed]
+      assert_equal 1, stats[:files_skipped]
+      assert_equal ["boards.jsonl is empty and will be skipped"], stats[:warnings]
+      assert_includes sql, "CREATE TABLE `users`"
+      refute_includes sql, "CREATE TABLE `boards`"
+
+      warning = snapshots.find { |snapshot| snapshot[:event] == :warning }
+      refute_nil warning, "expected a :warning progress event"
+      assert_equal "boards.jsonl is empty and will be skipped", warning[:message]
+      assert_nil snapshots.last[:current_file]
+    end
+  end
+
   def test_excluding_root_table_excludes_children_and_child_exclusion_is_targeted
     Dir.mktmpdir do |dir|
       input = write(File.join(dir, "users.json"), USERS_JSON)
@@ -1241,6 +1269,36 @@ class JSONToSQLTest < SiloMigrateTest
   # NDJSON (newline-delimited JSON) multi-page support
   # ---------------------------------------------------------------------------
 
+  def test_ndjson_and_jsonl_extensions_are_discovered_and_force_line_parsing
+    users = "{\"id\":\"u:1\",\"login\":\"alice\"}\n{\"id\":\"u:2\",\"login\":\"bob\"}\n"
+    roles = "{\"id\":\"r:1\",\"name\":\"admin\"}\n{\"id\":\"r:2\",\"name\":\"member\"}\n"
+    tags = "{\"id\":\"t:1\",\"name\":\"one\"}\n{\"id\":\"t:2\",\"name\":\"two\"}\n"
+
+    Dir.mktmpdir do |dir|
+      write(File.join(dir, "users.ndjson"), users)
+      gzip_write(File.join(dir, "roles.ndjson.gz"), roles)
+      gzip_write(File.join(dir, "tags.jsonl.gz"), tags)
+
+      stats, sql = convert(dir, File.join(dir, "combined.sql"))
+
+      assert_equal 3, stats[:files_processed]
+      assert_equal 6, stats[:rows_processed]
+      assert_includes sql, "CREATE TABLE `users`"
+      assert_includes sql, "CREATE TABLE `roles`"
+      assert_includes sql, "CREATE TABLE `tags`"
+      refute_includes sql, "CREATE TABLE `users_ndjson`"
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'admin'"
+      assert_includes sql, "'one'"
+
+      filtered_stats, filtered_sql = convert(dir, File.join(dir, "users.sql"), include_files: ["users"])
+      assert_equal 1, filtered_stats[:files_processed]
+      assert_equal 2, filtered_stats[:files_skipped]
+      assert_includes filtered_sql, "CREATE TABLE `users`"
+      refute_includes filtered_sql, "CREATE TABLE `roles`"
+    end
+  end
+
   def test_ndjson_auto_detect_two_pages
     # Two pages, each a flat {"data": [...]} document on its own line.
     page1 = '{"data": [{"id": "u:1", "login": "alice"}, {"id": "u:2", "login": "bob"}]}'
@@ -1284,7 +1342,7 @@ class JSONToSQLTest < SiloMigrateTest
     ndjson = "#{page1}\n#{page2}\n"
 
     Dir.mktmpdir do |dir|
-      input = write(File.join(dir, "users.json"), ndjson)
+      input = write(File.join(dir, "users.ndjson"), ndjson)
       stats, sql = convert(input, File.join(dir, "users.sql"), ndjson: false)
 
       refute_equal 2, stats[:rows_processed]
@@ -1345,11 +1403,29 @@ class JSONToSQLTest < SiloMigrateTest
     ndjson = "#{page1}\n#{page2}\n"
 
     Dir.mktmpdir do |dir|
-      input = write(File.join(dir, "users.json"), ndjson)
+      write(File.join(dir, "users.ndjson"), ndjson)
       config = write(File.join(dir, "paths.yml"), "users: data.users.edges\n")
       stats, sql = convert(File.join(dir), File.join(dir, "out.sql"), records_path_config: config)
 
       assert_equal 2, stats[:rows_processed]
+      assert_includes sql, "'alice'"
+      assert_includes sql, "'bob'"
+    end
+  end
+
+  def test_ndjson_basename_is_used_for_schema_lookup
+    page1 = '{"object_name":"users","data":[{"id":"user:1","login":"alice"}]}'
+    page2 = '{"object_name":"users","data":[{"id":"user:2","login":"bob"}]}'
+
+    Dir.mktmpdir do |dir|
+      schema_dir = File.join(dir, "schema")
+      write(File.join(schema_dir, "users.schema.json"), USERS_SCHEMA)
+      input = write(File.join(dir, "users.ndjson"), "#{page1}\n#{page2}\n")
+      stats, sql = convert(input, File.join(dir, "users.sql"), schema_dir: schema_dir)
+
+      assert_equal 2, stats[:rows_processed]
+      assert_empty stats[:warnings]
+      assert_includes sql, "CREATE TABLE `users`"
       assert_includes sql, "'alice'"
       assert_includes sql, "'bob'"
     end

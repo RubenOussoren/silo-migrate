@@ -69,6 +69,26 @@ class InteractiveTest < SiloMigrateTest
 
   USERS_JSON = '{"object_name": "users", "total_records": 1, "data": [{"id": "user:1", "login": "alice"}]}'
 
+  def test_json_source_discovery_includes_ndjson_extensions_and_normalizes_exclusions
+    with_tmp_base do |dir, env|
+      interactive, = build_interactive(env)
+      write(File.join(dir, "users.json"), USERS_JSON)
+      write(File.join(dir, "roles.jsonl"), "")
+      write(File.join(dir, "boards.ndjson"), "")
+      gzip_write(File.join(dir, "tags.ndjson.gz"), "")
+
+      files = interactive.send(:source_files, Pathname(dir), ".json")
+      xml_files = interactive.send(:source_files, Pathname(dir), ".xml")
+
+      assert_equal %w[boards.ndjson roles.jsonl tags.ndjson.gz users.json], files.map { |file| file.basename.to_s }
+      assert_empty xml_files
+      boards = files.find { |file| file.basename.to_s == "boards.ndjson" }
+      tags = files.find { |file| file.basename.to_s == "tags.ndjson.gz" }
+      assert interactive.send(:source_file_excluded?, boards, ".json", ["boards"])
+      assert interactive.send(:source_file_excluded?, tags, ".json", ["tags"])
+    end
+  end
+
   def test_convert_json_to_project_writes_staged_dump
     with_tmp_base do |dir, env|
       interactive, project, out = build_interactive(env)

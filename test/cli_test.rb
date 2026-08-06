@@ -150,6 +150,22 @@ class CLITest < SiloMigrateTest
     end
   end
 
+  def test_convert_json_command_uses_normalized_ndjson_output_name
+    with_tmp_base do |dir, env|
+      cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: StringIO.new, error: StringIO.new)
+      input = write(
+        File.join(dir, "users.ndjson"),
+        "{\"id\":\"user:1\",\"login\":\"alice\"}\n{\"id\":\"user:2\",\"login\":\"bob\"}\n"
+      )
+
+      capture_io { assert_equal 0, cli.run(["convert-json", input]) }
+
+      assert File.exist?(File.join(dir, "users.sql"))
+      refute File.exist?(File.join(dir, "users.ndjson.sql"))
+      assert_includes File.read(File.join(dir, "users.sql")), "CREATE TABLE `users`"
+    end
+  end
+
   def test_convert_xml_command_scrubs_invalid_controls_and_honors_custom_report_path
     with_tmp_base do |dir, env|
       out = StringIO.new

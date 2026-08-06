@@ -429,7 +429,8 @@ which also carries `x-pii` annotations into column comments and a queryable
 nested, for example `data.users` or `data.community.roles.edges`; `--schema-dir`
 uses the same records path as inferred mode. For directories whose files use
 different paths, pass `--records-path-config paths.yml` with keys matching the
-JSON filename without `.json` or `.json.gz`:
+JSON filename without `.json`, `.jsonl`, `.ndjson`, or the corresponding `.gz`
+suffix:
 
 ```yaml
 users: data.users.edges
@@ -443,10 +444,12 @@ discarded during automatic `edges/node` unwrapping; the migrated rows come from
 `node`.
 
 Paginated API exports may be newline-delimited JSON (NDJSON), with one complete
-JSON page per line. `convert-json` auto-detects seekable multi-line NDJSON and
-streams all pages with the same `--records-path`; use `--ndjson` to force this
-mode, especially for `.json.gz` NDJSON where auto-detection cannot rewind the
-gzip stream. Use `--no-ndjson` to force legacy single-document parsing. With
+JSON page per line. Directory conversion discovers `.jsonl`, `.ndjson`, and
+their `.gz` variants in addition to regular JSON files. These line-delimited
+extensions automatically select NDJSON parsing, including when compressed;
+regular `.json` files use content-based auto-detection. Use `--ndjson` to force
+this mode for another extension or `--no-ndjson` to force legacy
+single-document parsing. With
 `--recover-truncated`, malformed NDJSON lines are skipped and reported as a
 file-level recovery warning; re-export or repair skipped lines for the full data.
 See `silo-migrate help convert-json` for all flags (table overrides, depth

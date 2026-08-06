@@ -73,6 +73,9 @@ module SiloMigrate
                                                .concat(source.glob("#{file_pattern}.gz").to_a)
                                                .concat(source.glob("*.jsonl").to_a)
                                                .concat(source.glob("*.jsonl.gz").to_a)
+                                               .concat(source.glob("*.ndjson").to_a)
+                                               .concat(source.glob("*.ndjson.gz").to_a)
+                                               .uniq
                                                .sort
       raise UsageError, "No JSON files found in #{source}" if files.empty?
 
@@ -121,7 +124,7 @@ module SiloMigrate
     def convert_file(path, out, index: 1, count: 1)
       convert_file!(path, out, index: index, count: count)
     rescue Oj::ParseError, EncodingError => e
-      base = File.basename(path.to_s).sub(/\.gz\z/, "").sub(/\.json\z/, "")
+      base = json_basename(path)
       message = "Malformed JSON in #{File.basename(path)} (#{e.message.sub(/ \[\S+\]\z/, '')})."
       if truncated_json?(path)
         message += " The file appears to be truncated — it does not end with '}' or ']'."
@@ -156,6 +159,13 @@ module SiloMigrate
       streaming_passes -= 1 if @schema_only
       @current_file_progress = { path: path.to_s, name: File.basename(path), index: index, count: count, size: file_size * [streaming_passes, 1].max, bytes_read: 0, pass: 1 }
       report_progress(:file_start, force: true)
+
+      if file_size.zero?
+        emit_warning "#{File.basename(path)} is empty and will be skipped"
+        @stats[:files_skipped] += 1
+        @current_file_progress = nil
+        return
+      end
 
       registry = JSONToSQL::NameRegistry.new
       records_path = records_path_for(path)
@@ -217,7 +227,7 @@ module SiloMigrate
     def find_schema(path)
       return nil unless @schema_dir
 
-      base = File.basename(path.to_s).sub(/\.gz\z/, "").sub(/\.json\z/, "")
+      base = json_basename(path)
       candidate = File.join(@schema_dir, "#{base}.schema.json")
       return Pathname(candidate) if File.exist?(candidate)
 
@@ -325,7 +335,7 @@ module SiloMigrate
     def resolve_root_table(envelope, path)
       base = @table_name
       base ||= envelope["object_name"] if envelope["object_name"].is_a?(String)
-      base ||= File.basename(path.to_s).sub(/\.gz\z/, "").sub(/\.json\z/, "")
+      base ||= json_basename(path)
       JSONToSQL::NameRegistry.sanitize(base)
     end
 
@@ -336,7 +346,12 @@ module SiloMigrate
     def stream_records(path, &block)
       open_input(path) do |io|
         counting = JSONToSQL::CountingIO.new(io) { |bytes| track_input_bytes(bytes) }
-        JSONToSQL::RecordStreamer.new(records_path: records_path_for(path)).each_record(counting, recover: @recover_truncated, ndjson: @ndjson, &block)
+        JSONToSQL::RecordStreamer.new(records_path: records_path_for(path)).each_record(
+          counting,
+          recover: @recover_truncated,
+          ndjson: ndjson_mode_for(path),
+          &block
+        )
       end
     end
 
@@ -344,10 +359,20 @@ module SiloMigrate
     # precedence over the global --records-path flag.
     def records_path_for(path)
       if @records_path_config
-        base = File.basename(path.to_s).sub(/\.gz\z/, "").sub(/\.json\z/, "")
+        base = json_basename(path)
         return @records_path_config[base] if @records_path_config.key?(base)
       end
       @records_path
+    end
+
+    def ndjson_mode_for(path)
+      return @ndjson unless @ndjson == :auto
+
+      path.to_s.match?(/\.(?:jsonl|ndjson)(?:\.gz)?\z/) ? true : :auto
+    end
+
+    def json_basename(path)
+      File.basename(path.to_s).sub(/\.gz\z/, "").sub(/\.(?:json|jsonl|ndjson)\z/, "")
     end
 
     # Loads the YAML (or JSON) records-path config file and returns a Hash
@@ -440,7 +465,7 @@ module SiloMigrate
 
     def process_file?(file)
       file_name = file.basename.to_s
-      base = file_name.sub(/\.gz\z/, "").sub(/\.json\z/, "")
+      base = json_basename(file)
       return false if @include_files && !@include_files.include?(file_name) && !@include_files.include?(base)
       return false if @exclude_files.include?(file_name) || @exclude_files.include?(base)
 

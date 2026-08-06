@@ -1274,17 +1274,23 @@ module SiloMigrate
     end
 
     def source_files(source_path, ext)
-      source_path.file? ? [source_path] : source_path.glob("*#{ext}").to_a
-                                                      .concat(source_path.glob("*#{ext}.gz").to_a)
-                                                      .concat(source_path.glob("*.jsonl").to_a)
-                                                      .concat(source_path.glob("*.jsonl.gz").to_a)
-                                                      .sort
+      return [source_path] if source_path.file?
+
+      files = source_path.glob("*#{ext}").to_a.concat(source_path.glob("*#{ext}.gz").to_a)
+      if ext == ".json"
+        files.concat(source_path.glob("*.jsonl").to_a)
+             .concat(source_path.glob("*.jsonl.gz").to_a)
+             .concat(source_path.glob("*.ndjson").to_a)
+             .concat(source_path.glob("*.ndjson.gz").to_a)
+      end
+      files.uniq.sort
     end
 
     def source_file_excluded?(file, ext, exclude_files)
       exclude_files = Array(exclude_files)
       file_name = file.basename.to_s
       base = file_name.sub(/\.gz\z/, "").sub(/#{Regexp.escape(ext)}\z/, "")
+      base = base.sub(/\.(?:jsonl|ndjson)\z/, "") if ext == ".json"
       exclude_files.include?(file_name) || exclude_files.include?(base)
     end
 

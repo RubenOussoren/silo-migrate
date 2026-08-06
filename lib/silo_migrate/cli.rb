@@ -132,8 +132,8 @@ module SiloMigrate
                                      counts are reported as warnings)
           --ndjson                   treat each non-empty line as a separate JSON
                                      document; useful for paginated exports and
-                                     required for gzip-compressed NDJSON
-          --no-ndjson                disable NDJSON auto-detection
+                                     forced automatically for .jsonl/.ndjson files
+          --no-ndjson                disable NDJSON parsing and auto-detection
 
         Nested objects flatten into prefixed columns (avatar.url -> avatar_url);
         arrays become child tables with _sid/_parent_sid/_parent_id/_ordinal keys.
@@ -979,18 +979,25 @@ module SiloMigrate
         dumps_dir = File.join(Project.project_path(options[:customer], @env), "dumps", options[:phase])
         raise UsageError, "Customer dumps directory not found: #{dumps_dir}\nRun 'silo-migrate init #{options[:customer]}' first to set up the project." unless Dir.exist?(dumps_dir)
 
-        base = source.file? ? source.basename.to_s.sub(/\.gz\z/, "").sub(/#{Regexp.escape(input_ext)}\z/, "") : "combined"
+        base = source.file? ? converted_input_basename(source, input_ext) : "combined"
         return Pathname(File.join(dumps_dir, "#{base}.sql#{options[:compress] ? '.gz' : ''}"))
       end
 
       path = if options[:output]
                Pathname(options[:output])
              elsif source.file?
-               source.dirname.join("#{source.basename.to_s.sub(/\.gz\z/, '').sub(/#{Regexp.escape(input_ext)}\z/, '')}.sql")
+               source.dirname.join("#{converted_input_basename(source, input_ext)}.sql")
              else
                source.join("combined.sql")
              end
       options[:compress] && path.extname != ".gz" ? Pathname("#{path}.gz") : path
+    end
+
+    def converted_input_basename(source, input_ext)
+      base = source.basename.to_s.sub(/\.gz\z/, "")
+      return base.sub(/\.(?:json|jsonl|ndjson)\z/, "") if input_ext == ".json"
+
+      base.sub(/#{Regexp.escape(input_ext)}\z/, "")
     end
 
     def default_invalid_xml_report_path(output, project_style:)
