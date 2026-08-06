@@ -47,7 +47,7 @@ module SiloMigrate
         out.write("\n-- Table: #{name}\n")
         out.write("DROP TABLE IF EXISTS #{SqlText.escape_identifier(name)};\n")
         out.write("CREATE TABLE #{SqlText.escape_identifier(name)} (\n#{lines.join(",\n")}\n")
-        out.write(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n")
+        out.write(") ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n")
       end
 
       def write_batch(out, name, columns, value_rows)

@@ -22,11 +22,14 @@ class DockerIntegrationTest < SiloMigrateTest
       customer = "smoke#{Time.now.to_i}"
       password_sentinel = "e2e_secret_pw_123"
       port = available_port
-      dump = write(File.join(dir, "dump.sql"), <<~SQL)
-        -- MySQL dump
-        CREATE TABLE users (id int primary key, username varchar(32));
-        INSERT INTO users VALUES (1, 'alice');
-      SQL
+      wide_user = { "id" => 1, "username" => "alice" }
+      80.times { |index| wide_user["field_#{index}"] = "value-#{index}" }
+      json = write(
+        File.join(dir, "users.json"),
+        Oj.dump({ "object_name" => "users", "data" => [wide_user] }, mode: :compat)
+      )
+      dump = File.join(dir, "dump.sql")
+      SiloMigrate::JSONToSQLConverter.new(verbose: false).convert(Pathname(json), Pathname(dump))
       converter_repo = create_converter_fixture_repo(dir)
 
       begin

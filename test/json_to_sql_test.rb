@@ -176,6 +176,83 @@ class JSONToSQLTest < SiloMigrateTest
     end
   end
 
+  def test_wide_inferred_table_promotes_varchars_to_text
+    row = { "id" => "message:1" }
+    80.times { |index| row["field_#{index}"] = "value-#{index}" }
+    json = Oj.dump({ "object_name" => "messages", "data" => [row] }, mode: :compat)
+
+    Dir.mktmpdir do |dir|
+      input = write(File.join(dir, "messages.json"), json)
+      output = File.join(dir, "messages.sql")
+      snapshots = []
+      stats = SiloMigrate::JSONToSQLConverter.new(verbose: false).convert(
+        Pathname(input),
+        Pathname(output),
+        progress_callback: proc { |snapshot| snapshots << snapshot },
+        progress_interval: 0
+      )
+      sql = File.read(output)
+
+      assert_includes sql, "ENGINE=InnoDB ROW_FORMAT=DYNAMIC"
+      assert_includes sql, "`id` VARCHAR(255) NOT NULL"
+      assert_includes sql, "KEY `idx_id` (`id`)"
+      assert_operator sql.scan(/`field_\d+` TEXT NOT NULL/).length, :>, 0
+      assert_equal 1, stats[:warnings].length
+      assert_includes stats[:warnings].first, "messages: estimated utf8mb4 row width"
+      assert_includes stats[:warnings].first, "promoted"
+      assert_includes stats[:warnings].first, "VARCHAR columns to TEXT"
+      warning = snapshots.find { |snapshot| snapshot[:event] == :warning }
+      refute_nil warning
+      assert_includes warning[:message], "messages: estimated utf8mb4 row width"
+    end
+  end
+
+  def test_row_size_limiter_accounts_for_child_metadata
+    defs = 62.times.map do |index|
+      SiloMigrate::JSONToSQL::ColumnDef.new(name: "field_#{index}", kind: :string, sql_type: "VARCHAR(255)", null: false)
+    end
+    limiter = SiloMigrate::JSONToSQL::RowSizeLimiter.new
+
+    root = limiter.fit(defs, child: false)
+    child = limiter.fit(defs, child: true)
+
+    assert_empty root.promoted
+    assert_equal 1, child.promoted.length
+    assert_operator child.estimated_after, :<=, SiloMigrate::JSONToSQL::RowSizeLimiter::MAX_ROW_BYTES
+    assert defs.all? { |column| column.sql_type == "VARCHAR(255)" }, "limiter must not mutate source definitions"
+  end
+
+  def test_wide_schema_driven_table_is_row_size_limited
+    properties = { "id" => { "type" => "string", "maxLength" => 255 } }
+    row = { "id" => "record:1" }
+    70.times do |index|
+      properties["field_#{index}"] = { "type" => "string", "maxLength" => 255 }
+      row["field_#{index}"] = "value-#{index}"
+    end
+    schema = Oj.dump(
+      {
+        "type" => "object",
+        "properties" => {
+          "object_name" => { "type" => "string", "const" => "wide_records" },
+          "data" => { "type" => "array", "items" => { "type" => "object", "properties" => properties } }
+        }
+      },
+      mode: :compat
+    )
+    json = Oj.dump({ "object_name" => "wide_records", "data" => [row] }, mode: :compat)
+
+    Dir.mktmpdir do |dir|
+      schema_dir = File.join(dir, "schema")
+      write(File.join(schema_dir, "wide_records.schema.json"), schema)
+      input = write(File.join(dir, "wide_records.json"), json)
+      stats, sql = convert(input, File.join(dir, "wide_records.sql"), schema_dir: schema_dir)
+
+      assert_includes sql, "`id` VARCHAR(255)"
+      assert_operator sql.scan(/`field_\d+` TEXT/).length, :>, 0
+      assert_includes stats[:warnings].first, "wide_records: estimated utf8mb4 row width"
+    end
+  end
+
   def test_batching_splits_inserts
     Dir.mktmpdir do |dir|
       input = write(File.join(dir, "users.json"), USERS_JSON)

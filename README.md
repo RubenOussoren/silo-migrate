@@ -452,6 +452,10 @@ this mode for another extension or `--no-ndjson` to force legacy
 single-document parsing. With
 `--recover-truncated`, malformed NDJSON lines are skipped and reported as a
 file-level recovery warning; re-export or repair skipped lines for the full data.
+For very wide flattened objects, the converter keeps indexed identifiers as
+`VARCHAR` but automatically promotes enough other string columns to `TEXT` to
+stay within MySQL/MariaDB's utf8mb4 row-size limit. Adjusted tables are reported
+as conversion warnings and emitted with InnoDB's dynamic row format.
 See `silo-migrate help convert-json` for all flags (table overrides, depth
 limits, raw JSON columns).
 Malformed or truncated JSON files produce a clear error naming the file and

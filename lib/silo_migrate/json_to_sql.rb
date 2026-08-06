@@ -11,6 +11,7 @@ require_relative "json_to_sql/record_streamer"
 require_relative "json_to_sql/shredder"
 require_relative "json_to_sql/schema_inferrer"
 require_relative "json_to_sql/json_schema_loader"
+require_relative "json_to_sql/row_size_limiter"
 require_relative "json_to_sql/sql_emitter"
 
 module SiloMigrate
@@ -54,6 +55,7 @@ module SiloMigrate
       @ndjson = ndjson
       @verbose = verbose
       @emitter = JSONToSQL::SqlEmitter.new
+      @row_size_limiter = JSONToSQL::RowSizeLimiter.new
       reset_stats
     end
 
@@ -286,14 +288,26 @@ module SiloMigrate
           next
         end
 
+        begin
+          sizing = @row_size_limiter.fit(table[:defs], child: table[:child])
+        rescue UsageError => e
+          raise UsageError, "#{name}: #{e.message}"
+        end
+        if sizing.promoted.any?
+          emit_warning "#{name}: estimated utf8mb4 row width #{sizing.estimated_before} bytes exceeded the safe " \
+                       "#{JSONToSQL::RowSizeLimiter::MAX_ROW_BYTES}-byte limit; promoted #{sizing.promoted.length} " \
+                       "VARCHAR column#{sizing.promoted.length == 1 ? '' : 's'} to TEXT " \
+                       "(estimated #{sizing.estimated_after} bytes)"
+        end
+
         @emitted_tables[name] = path.to_s
         meta = table[:child] ? JSONToSQL::SqlEmitter::META_CHILD : JSONToSQL::SqlEmitter::META_ROOT
         definitions[rel] = {
           name: name,
-          defs: table[:defs],
+          defs: sizing.defs,
           child: table[:child],
-          columns: meta + table[:defs].map(&:name),
-          known_columns: strict ? table[:defs].map(&:name).to_set : nil
+          columns: meta + sizing.defs.map(&:name),
+          known_columns: strict ? sizing.defs.map(&:name).to_set : nil
         }
       end
       definitions

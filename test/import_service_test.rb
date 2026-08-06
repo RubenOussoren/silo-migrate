@@ -164,6 +164,21 @@ class ImportServiceTest < SiloMigrateTest
     assert_includes summary, "Reported SQL line: 1"
   end
 
+  def test_failure_diagnostics_for_row_size_error_recommends_reconversion
+    diagnostic = SiloMigrate::Services::ImportService::ImportFailureDiagnostic.new(
+      path: write(File.join(Dir.mktmpdir, "dump.sql"), "CREATE TABLE messages (body VARCHAR(255));\n"),
+      output: "ERROR 1118 (42000) at line 1: Row size too large. The maximum row size is 65535",
+      db_type: "mariadb",
+      customer: "intel-delta",
+      phase: "initial"
+    )
+    summary = diagnostic.summary.join("\n")
+
+    assert_includes summary, "Row size too large"
+    assert_includes summary, "regenerate it with the current converter"
+    assert_includes summary, "silo-migrate replace-dump intel-delta initial --yes"
+  end
+
   def test_failure_diagnostics_for_eperm_during_commit_explains_bulk_insert_duplicates
     dump = <<~SQL
       INSERT INTO `users` (`id`, `bio`) VALUES
