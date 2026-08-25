@@ -30,8 +30,6 @@ class InstallServiceTest < SiloMigrateTest
         :run,
         [
           File.join(source_root, "script", "install"),
-          "--install-deps",
-          "--skip-docker",
           "--install-dir", source_root,
           "--bin-dir", bin_dir,
           "--repo", "https://github.com/RubenOussoren/silo-migrate.git",
@@ -93,8 +91,6 @@ class InstallServiceTest < SiloMigrateTest
           :run,
           [
             File.join(source_root, "script", "install"),
-            "--install-deps",
-            "--skip-docker",
             "--install-dir", source_root,
             "--bin-dir", bin_dir,
             "--repo", "https://github.com/RubenOussoren/silo-migrate.git",

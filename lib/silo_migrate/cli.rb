@@ -268,8 +268,8 @@ module SiloMigrate
         Usage: silo-migrate self-update
         Pulls the managed Git checkout, runs bundle install, and refreshes the
         global shims for silo-migrate, migration-tool, and xml-to-sql.
-        Skips Docker host package and service management; run script/install
-        --install-deps directly when you want Docker setup handled.
+        Does not run OS package managers or manage Docker; run script/install
+        --install-deps directly when host dependencies need to be installed.
       HELP
       "uninstall" => <<~HELP
         Usage: silo-migrate uninstall
