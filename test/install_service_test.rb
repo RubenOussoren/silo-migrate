@@ -289,6 +289,30 @@ class InstallServiceTest < SiloMigrateTest
     assert_match(/install_dnf_base_packages\(\).*pkgconf-pkg-config/m, script)
   end
 
+  def test_install_script_dry_run_without_dependency_installation_completes
+    Dir.mktmpdir do |dir|
+      bin_dir = File.join(dir, "bin")
+      stdout, stderr, status = Open3.capture3(
+        { "HOME" => dir, "SHELL" => "/bin/bash" },
+        File.expand_path("../script/install", __dir__),
+        "--dry-run",
+        "--install-dir", SiloMigrate.root,
+        "--bin-dir", bin_dir,
+        "--repo", "https://github.com/RubenOussoren/silo-migrate.git",
+        "--branch", "main"
+      )
+
+      assert status.success?, stderr
+      refute_includes stdout, "apt-get"
+      refute_includes stdout, "dnf install"
+      refute_includes stdout, "brew install"
+      assert_includes stdout, "git -C #{SiloMigrate.root} fetch origin main"
+      assert_includes stdout, "Installing Ruby gems"
+      assert_includes stdout, "[dry-run] write #{bin_dir}/silo-migrate"
+      assert_includes stdout, "[dry-run] #{bin_dir}/silo-migrate doctor"
+    end
+  end
+
   def test_install_script_writes_unbundled_direct_ruby_shims
     script = File.read(File.expand_path("../script/install", __dir__))
 
