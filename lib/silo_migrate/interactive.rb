@@ -167,31 +167,31 @@ module SiloMigrate
       final_dumps = dump_files(customer, "final")
 
       @output.puts "\n#{'=' * 50}"
-      @output.puts "PROJECT: #{customer}"
+      @output.puts paint.bold("PROJECT: #{customer}")
       @output.puts "=" * 50
       @output.puts "\nLocation: #{path}"
       @output.puts "Initial DB: #{config['INITIAL_DB_TYPE'] || 'not set'} on port #{config['INITIAL_PORT'] || 'not set'}"
       @output.puts "Final DB: #{config['FINAL_DB_TYPE']} on port #{config['FINAL_PORT']}" if config["FINAL_DB_TYPE"]
       @output.puts "Dumps: #{initial_dumps.length} initial, #{final_dumps.length} final"
       state = workflow_state(customer)
-      @output.puts "\nWorkflow cards:"
+      @output.puts paint.bold("\nWorkflow cards:")
       %w[initial final].each do |phase|
         data = state.dig("phases", phase)
         loaded = data["import"] ? " — #{data.dig('import', 'filename')} at #{data.dig('import', 'imported_at')}" : ""
-        @output.puts "  [#{phase.capitalize} DB] #{data['state']} (generation #{data['generation']})#{loaded}"
+        @output.puts "  #{paint.bold("[#{phase.capitalize} DB]")} #{paint_state(data['state'])} (generation #{data['generation']})#{loaded}"
       end
-      @output.puts "  [Converter] source=#{state.dig('converter', 'active_source')} output=#{state.dig('converter', 'output_db')}"
-      @output.puts "  [Selected output DB] #{selected_output_status(customer)}"
-      @output.puts "  [Uploads handoff] #{discourse_handoff_status(customer)}"
-      @output.puts "  [Discourse import] #{state.dig('discourse', 'state')}"
+      @output.puts "  #{paint.bold('[Converter]')} source=#{state.dig('converter', 'active_source')} output=#{state.dig('converter', 'output_db')}"
+      @output.puts "  #{paint.bold('[Selected output DB]')} #{paint_status_words(selected_output_status(customer))}"
+      @output.puts "  #{paint.bold('[Uploads handoff]')} #{paint_status_words(discourse_handoff_status(customer))}"
+      @output.puts "  #{paint.bold('[Discourse import]')} #{paint_state(state.dig('discourse', 'state'))}"
       recommendation, blocked = dashboard_guidance(customer, state)
-      @output.puts "\nRecommended next action: #{recommendation}"
+      @output.puts "\nRecommended next action: #{paint.bold.cyan(recommendation)}"
       unless blocked.empty?
         @output.puts "Blocked actions:"
-        blocked.each { |line| @output.puts "  - #{line}" }
+        blocked.each { |line| @output.puts paint.dim("  - #{line}") }
       end
       @output.puts "Schema bundle: #{schema_bundle_status(customer)}"
-      @output.puts "\nContainer status:"
+      @output.puts paint.bold("\nContainer status:")
       @output.puts @project_service.container_status(customer) if @project_service.respond_to?(:container_status)
     end
 
@@ -802,8 +802,49 @@ module SiloMigrate
     end
 
     def show_workflow_preview(title, lines)
-      @output.puts "\n#{title} workflow"
+      @output.puts paint.bold("\n#{title} workflow")
       lines.each { |line| @output.puts "  #{line}" }
+    end
+
+    # Color is applied only when stdout is a real terminal; StringIO, pipes,
+    # and scripted callers see the exact plain strings.
+    def paint
+      @paint ||= begin
+        require "pastel"
+        Pastel.new(enabled: @output.respond_to?(:tty?) && @output.tty?)
+      rescue LoadError
+        PlainPaint.new
+      end
+    end
+
+    STATE_COLORS = {
+      "ready" => :green, "pristine" => :green, "present" => :green,
+      "imported" => :green, "restored" => :green,
+      "importing" => :yellow, "stale" => :yellow,
+      "dirty" => :red, "untracked" => :red, "unknown" => :red, "missing" => :red,
+      "empty" => :dim
+    }.freeze
+
+    def paint_state(word)
+      style = STATE_COLORS[word.to_s]
+      return word.to_s unless style
+
+      paint.public_send(style, word.to_s)
+    end
+
+    def paint_status_words(text)
+      text.to_s.gsub(/\b(#{STATE_COLORS.keys.join('|')})\b/) { paint_state(Regexp.last_match(1)) }
+    end
+
+    # Stand-in when pastel is unavailable: styles chain and strings pass through.
+    class PlainPaint
+      def method_missing(_name, *args)
+        args.empty? ? self : args.join
+      end
+
+      def respond_to_missing?(*)
+        true
+      end
     end
 
     def dump_workflow_status(customer, phase)
@@ -1850,7 +1891,12 @@ module SiloMigrate
 
     def default_prompt
       require "tty-prompt"
-      TTY::Prompt.new
+      TTY::Prompt.new(
+        interrupt: :exit,
+        symbols: { marker: "▸" },
+        active_color: :cyan,
+        help_color: :bright_black
+      )
     rescue LoadError
       nil
     end
@@ -1875,9 +1921,13 @@ module SiloMigrate
       answer
     end
 
+    FILTERABLE_MENU_THRESHOLD = 8
+
     def select(message, choices, allow_back: false)
       choices = choices.merge(BACK_LABEL => BACK) if allow_back
-      return @prompt.select(message, choices) if @prompt&.respond_to?(:select)
+      # Scripted/embedding prompts rely on the plain two-argument contract.
+      return @prompt.select(message, choices) if @external_prompt && @prompt&.respond_to?(:select)
+      return tty_select(message, choices) if @prompt&.respond_to?(:select)
 
       @output.puts message
       choices.keys.each_with_index { |label, idx| @output.puts "  #{idx + 1}. #{label}" }
@@ -1893,6 +1943,29 @@ module SiloMigrate
       end
     end
 
+    def tty_select(message, choices)
+      options = { cycle: true, per_page: select_page_size(choices.length) }
+      if choices.length > FILTERABLE_MENU_THRESHOLD
+        options[:filter] = true
+        options[:show_help] = :always
+        options[:help] = "(↑/↓ move, Enter select, type to filter)"
+      elsif choices.length > options[:per_page]
+        options[:show_help] = :always
+      end
+      @prompt.select(message, choices, **options)
+    end
+
+    # Fill the terminal instead of tty-prompt's default six rows, leaving room
+    # for the question and help lines.
+    def select_page_size(count)
+      rows = begin
+        TTY::Screen.rows.to_i
+      rescue StandardError
+        0
+      end
+      [[count, rows - 4].min, 6].max
+    end
+
     def ask_optional_integer(message)
       value = ask(message).to_s.strip
       return BACK if back_command?(value)
@@ -1901,6 +1974,8 @@ module SiloMigrate
     end
 
     def confirm?(message, default: false)
+      return @prompt.yes?(message, default: default) if !@external_prompt && @prompt&.respond_to?(:yes?)
+
       suffix = default ? "[Y/n]" : "[y/N]"
       answer = ask("#{message} #{suffix}").to_s.strip.downcase
       return default if answer.empty?

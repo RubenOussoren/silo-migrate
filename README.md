@@ -300,7 +300,9 @@ bin/silo-migrate discourse reset-import acme --yes
 
 Guided mode is a persistent dashboard. It refreshes after every action and shows
 stateful cards, one recommended next action, alternatives, and blocked actions
-with recovery reasons. It exits only through `Quit`.
+with recovery reasons. It exits only through `Quit`. Menus fill the terminal
+height and wrap around; lists longer than eight entries support live
+type-to-filter, and a help line appears whenever choices are off-screen.
 
 The durable, credential-free `.silo-migrate/workflow.json` tracks each database
 as `empty`, `importing`, `ready`, `dirty`, `untracked`, or `unknown`; the active
