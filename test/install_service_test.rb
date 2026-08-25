@@ -3,6 +3,7 @@
 require_relative "test_helper"
 require "bundler"
 require "open3"
+require "rbconfig"
 
 class InstallServiceTest < SiloMigrateTest
   def test_self_update_pulls_and_runs_installer
@@ -218,6 +219,72 @@ class InstallServiceTest < SiloMigrateTest
     end
   end
 
+  def test_normal_shim_boots_without_bundle_exec_warnings
+    Dir.mktmpdir do |dir|
+      bin_dir = File.join(dir, "bin")
+      SiloMigrate::Services::InstallService.write_shims(SiloMigrate.root, bin_dir)
+
+      stdout, stderr, status = Open3.capture3(
+        {
+          "BUNDLE_GEMFILE" => File.join(dir, "missing-gemfile"),
+          "BUNDLE_BIN_PATH" => File.join(dir, "missing-bundle"),
+          "RUBYOPT" => "-rbundler/setup"
+        },
+        File.join(bin_dir, "silo-migrate"),
+        "help"
+      )
+
+      assert status.success?, stderr
+      assert_includes stdout, "Usage: silo-migrate"
+      refute_includes stderr, "already initialized constant Gem::Platform"
+    end
+  end
+
+  def test_legacy_shim_keeps_only_the_forwarding_notice
+    Dir.mktmpdir do |dir|
+      bin_dir = File.join(dir, "bin")
+      SiloMigrate::Services::InstallService.write_shims(SiloMigrate.root, bin_dir)
+
+      stdout, stderr, status = Open3.capture3(
+        File.join(bin_dir, "migration-tool"),
+        "help"
+      )
+
+      assert status.success?, stderr
+      assert_includes stdout, "Usage: silo-migrate"
+      assert_equal "migration-tool has been replaced by silo-migrate; forwarding command.\n", stderr
+    end
+  end
+
+  def test_bundler_runner_avoids_platform_constant_warnings
+    clean_env = ENV.each_key.grep(/\ABUNDLE/).to_h { |name| [name, nil] }
+    clean_env["RUBYLIB"] = nil
+    clean_env["RUBYOPT"] = nil
+
+    stdout, stderr, status = Open3.capture3(
+      clean_env,
+      RbConfig.ruby,
+      File.expand_path("../script/bundle", __dir__),
+      "--version",
+      chdir: SiloMigrate.root
+    )
+
+    assert status.success?, stderr
+    assert_includes stdout, "Bundler version 2.6.9"
+    refute_includes stderr, "already initialized constant Gem::Platform"
+  end
+
+  def test_locked_native_dependencies_preserve_the_ruby_31_contract
+    specification = Gem::Specification.load(File.join(SiloMigrate.root, "silo-migrate.gemspec"))
+    nokogiri = specification.dependencies.find { |dependency| dependency.name == "nokogiri" }
+    lockfile = File.read(File.join(SiloMigrate.root, "Gemfile.lock"))
+
+    assert nokogiri.requirement.satisfied_by?(Gem::Version.new("1.18.10"))
+    refute nokogiri.requirement.satisfied_by?(Gem::Version.new("1.19.0"))
+    assert_match(/^    nokogiri \(1\.18\.10\)$/m, lockfile)
+    assert_match(/^   2\.6\.9$/m, lockfile)
+  end
+
   def test_install_script_includes_pkg_config_for_native_gem_builds
     script = File.read(File.expand_path("../script/install", __dir__))
 
@@ -226,14 +293,17 @@ class InstallServiceTest < SiloMigrateTest
     assert_match(/install_dnf_base_packages\(\).*pkgconf-pkg-config/m, script)
   end
 
-  def test_install_script_writes_lifecycle_shims_that_bypass_bundler
+  def test_install_script_writes_unbundled_direct_ruby_shims
     script = File.read(File.expand_path("../script/install", __dir__))
 
-    assert_includes script, 'if [[ "\${1:-}" == "self-update" || "\${1:-}" == "uninstall" ]]; then'
+    assert_includes script, 'for var in \${!BUNDLER_ORIG_@}; do'
     assert_includes script, 'for var in \${!BUNDLE_@}; do unset "\$var"; done'
-    assert_includes script, "unset BUNDLER_VERSION RUBYOPT"
+    assert_includes script, 'for var in \${!BUNDLER_@}; do unset "\$var"; done'
+    assert_includes script, "unset RUBYOPT"
     assert_includes script, 'exec ruby bin/$name "\$@"'
-    assert_includes script, 'exec bundle exec ruby bin/$name "\$@"'
+    refute_includes script, 'exec bundle exec ruby bin/$name "\$@"'
+    assert_includes script, 'BUNDLE_FROZEN=true BUNDLE_SILENCE_ROOT_WARNING=true ruby script/bundle install'
+    assert_includes script, 'gem install bundler --version "$version"'
   end
 
   def test_install_script_uninstall_removes_only_cli_artifacts

@@ -2,8 +2,9 @@ PATH
   remote: .
   specs:
     silo-migrate (0.1.0)
-      nokogiri (>= 1.16, < 2.0)
+      nokogiri (>= 1.16, < 1.19)
       oj (>= 3.16, < 4.0)
+      readline (>= 0, < 1.0)
       rexml (>= 3.3, < 4.0)
       sqlite3 (>= 2.8, < 2.9)
       tty-prompt (>= 0.23, < 1.0)
@@ -12,14 +13,11 @@ GEM
   remote: https://rubygems.org/
   specs:
     bigdecimal (4.1.2)
+    io-console (0.9.2)
     mini_portile2 (2.8.9)
     minitest (5.27.0)
-    nokogiri (1.19.3)
+    nokogiri (1.18.10)
       mini_portile2 (~> 2.8.2)
-      racc (~> 1.4)
-    nokogiri (1.19.3-arm64-darwin)
-      racc (~> 1.4)
-    nokogiri (1.19.3-x86_64-linux-gnu)
       racc (~> 1.4)
     oj (3.17.3)
       bigdecimal (>= 3.0)
@@ -29,11 +27,13 @@ GEM
       tty-color (~> 0.5)
     racc (1.8.1)
     rake (13.4.2)
+    readline (0.0.4)
+      reline
+    reline (0.7.0)
+      io-console (~> 0.5)
     rexml (3.4.4)
     sqlite3 (2.8.1)
       mini_portile2 (~> 2.8.0)
-    sqlite3 (2.8.1-arm64-darwin)
-    sqlite3 (2.8.1-x86_64-linux)
     tty-color (0.6.0)
     tty-cursor (0.7.1)
     tty-prompt (0.23.1)
@@ -58,21 +58,20 @@ DEPENDENCIES
 
 CHECKSUMS
   bigdecimal (4.1.2) sha256=53d217666027eab4280346fba98e7d5b66baaae1b9c3c1c0ffe89d48188a3fbd
+  io-console (0.9.2) sha256=efa74f891dd03c0939a931dfc6e74c2813d904763d456ea9762b0525e748db08
   mini_portile2 (2.8.9) sha256=0cd7c7f824e010c072e33f68bc02d85a00aeb6fce05bb4819c03dfd3c140c289
   minitest (5.27.0) sha256=2d3b17f8a36fe7801c1adcffdbc38233b938eb0b4966e97a6739055a45fa77d5
-  nokogiri (1.19.3) sha256=78312cbac32a40c812780d9678221b79d51288eec00054c1a8d15f7ce05960e8
-  nokogiri (1.19.3-arm64-darwin) sha256=71b9bd424b1b7abc18b05052a1a3cfd3627abdca62be280854cc411791357e42
-  nokogiri (1.19.3-x86_64-linux-gnu) sha256=2f5078620fe12e83669b5b17311b32532a8153d02eee7ad06948b926d6080976
+  nokogiri (1.18.10) sha256=d5cc0731008aa3b3a87b361203ea3d19b2069628cb55e46ac7d84a0445e69cc1
   oj (3.17.3) sha256=ebe3967b0bb7ac4f206561d0d9ac8875b9973f778600d7b61b5c355662a707ed
   ostruct (0.6.3) sha256=95a2ed4a4bd1d190784e666b47b2d3f078e4a9efda2fccf18f84ddc6538ed912
   pastel (0.8.0) sha256=481da9fb7d2f6e6b1a08faf11fa10363172dc40fd47848f096ae21209f805a75
   racc (1.8.1) sha256=4a7f6929691dbec8b5209a0b373bc2614882b55fc5d2e447a21aaa691303d62f
   rake (13.4.2) sha256=cb825b2bd5f1f8e91ca37bddb4b9aaf345551b4731da62949be002fa89283701
+  readline (0.0.4) sha256=6138eef17be2b98298b672c3ea63bf9cb5158d401324f26e1e84f235879c1d6a
+  reline (0.7.0) sha256=5b012d8e55dbf9d450f12bde2cf7d15ff546ae80b3f8f3b30e570d431815583d
   rexml (3.4.4) sha256=19e0a2c3425dfbf2d4fc1189747bdb2f849b6c5e74180401b15734bc97b5d142
   silo-migrate (0.1.0)
   sqlite3 (2.8.1) sha256=acd0ac7912a4d92b2484b5befb6faa8d496497eb1e38bdbe8d7818fb8d05d726
-  sqlite3 (2.8.1-arm64-darwin) sha256=3cb617640577ec9c1b7c09744d1e368ad3d3851c2494540f5f007387da943477
-  sqlite3 (2.8.1-x86_64-linux) sha256=878f4a0c5c2c4d9d4345afe2a142a87805f388a24aa8a3c2dfe2f964d7686b7a
   tty-color (0.6.0) sha256=6f9c37ca3a4e2367fb2e6d09722762647d6f455c111f05b59f35730eeb24332a
   tty-cursor (0.7.1) sha256=79534185e6a777888d88628b14b6a1fdf5154a603f285f80b1753e1908e0bf48
   tty-prompt (0.23.1) sha256=fcdbce905238993f27eecfdf67597a636bc839d92192f6a0eef22b8166449ec8
@@ -81,4 +80,4 @@ CHECKSUMS
   wisper (2.0.1) sha256=ce17bc5c3a166f241a2e6613848b025c8146fce2defba505920c1d1f3f88fae6
 
 BUNDLED WITH
-   2.6.3
+   2.6.9

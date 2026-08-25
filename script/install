@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 yes_mode=0
 install_deps=0
 with_oh_my_zsh=0
@@ -570,15 +571,25 @@ ensure_host_dependencies() {
 }
 
 install_bundler() {
+  local lockfile version
+  lockfile="$install_dir/Gemfile.lock"
+  if [ ! -f "$lockfile" ]; then
+    lockfile="$script_dir/../Gemfile.lock"
+  fi
+  version="$(awk '/^BUNDLED WITH$/ { getline; print $1; exit }' "$lockfile")"
+  [ -n "$version" ] || fail "Could not determine the required Bundler version from $lockfile."
+
   if [ "$dry_run" -eq 1 ] && [ "$install_deps" -eq 1 ]; then
-    log "[dry-run] gem install bundler if missing"
+    log "[dry-run] gem install bundler --version $version if missing"
     return
   fi
 
-  command_exists bundle && return
+  if ruby -e 'gem "bundler", "= #{ARGV.fetch(0)}"' "$version" >/dev/null 2>&1; then
+    return
+  fi
 
-  log "Installing Bundler..."
-  run_cmd gem install bundler
+  log "Installing Bundler $version..."
+  run_cmd gem install bundler --version "$version"
 }
 
 install_oh_my_zsh() {
@@ -916,12 +927,20 @@ write_shim() {
 #!/usr/bin/env bash
 set -euo pipefail
 cd $escaped_dir
-if [[ "\${1:-}" == "self-update" || "\${1:-}" == "uninstall" ]]; then
-  for var in \${!BUNDLE_@}; do unset "\$var"; done
-  unset BUNDLER_VERSION RUBYOPT
-  exec ruby bin/$name "\$@"
-fi
-exec bundle exec ruby bin/$name "\$@"
+for var in \${!BUNDLER_ORIG_@}; do
+  target=\${var#BUNDLER_ORIG_}
+  value=\${!var}
+  if [[ "\$value" == "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL" ]]; then
+    unset "\$target"
+  else
+    export "\$target=\$value"
+  fi
+  unset "\$var"
+done
+for var in \${!BUNDLE_@}; do unset "\$var"; done
+for var in \${!BUNDLER_@}; do unset "\$var"; done
+unset RUBYOPT
+exec ruby bin/$name "\$@"
 SHIM
   chmod +x "$shim"
 }
@@ -1056,18 +1075,18 @@ else
   fi
 fi
 
-install_bundler
 install_oh_my_zsh
 configure_zsh_preset
 ensure_zsh_login_shell
 
 clone_or_update_checkout
+install_bundler
 
 log "Installing Ruby gems..."
 if [ "$dry_run" -eq 1 ]; then
-  run_cmd bundle install
+  run_cmd env BUNDLE_FROZEN=true BUNDLE_SILENCE_ROOT_WARNING=true ruby "$install_dir/script/bundle" install
 else
-  (cd "$install_dir" && bundle install)
+  (cd "$install_dir" && BUNDLE_FROZEN=true BUNDLE_SILENCE_ROOT_WARNING=true ruby script/bundle install)
 fi
 
 if [ "$dry_run" -eq 1 ]; then

@@ -33,6 +33,16 @@ if %w[self-update uninstall].include?(ARGV.first)
   end
 end
 
+# Bundler 2 redefines legacy Gem::Platform constants on RubyGems 4. Silence
+# that deprecated-warning category only while Bundler initializes.
+deprecated_warnings = Warning[:deprecated]
+Warning[:deprecated] = false
+begin
+  require "bundler/setup"
+ensure
+  Warning[:deprecated] = deprecated_warnings
+end
+
 require "silo_migrate"
 
 exit SiloMigrate::CLI.new.run(ARGV)

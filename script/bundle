@@ -1,0 +1,19 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Bundler 2 redefines legacy Gem::Platform constants on RubyGems 4. Silence
+# that deprecated-warning category only while Bundler initializes.
+deprecated_warnings = Warning[:deprecated]
+Warning[:deprecated] = false
+begin
+  require "bundler"
+ensure
+  Warning[:deprecated] = deprecated_warnings
+end
+
+require "bundler/friendly_errors"
+
+Bundler.with_friendly_errors do
+  require "bundler/cli"
+  Bundler::CLI.start(ARGV, debug: true)
+end

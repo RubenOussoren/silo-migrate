@@ -155,10 +155,19 @@ silo-migrate self-update
 ```
 
 `self-update` refreshes the managed checkout, runs `bundle install`, and rewrites
-the global shims. It deliberately skips Docker host package and service
-management, so it will not install Docker or enable/start the Docker service; run
-`script/install --install-deps` directly when you want the installer to handle
-Docker setup.
+the global shims. Dependency installation uses the repository's locked Bundler
+version and keeps the managed lockfile frozen. It deliberately skips Docker host
+package and service management, so it will not install Docker or enable/start
+the Docker service; run `script/install --install-deps` directly when you want
+the installer to handle Docker setup.
+
+If an older installer changed `Gemfile.lock` inside the managed checkout, restore
+that generated change once before updating:
+
+```bash
+git -C "${SILO_MIGRATE_INSTALL_DIR:-$HOME/.local/share/silo-migrate/source}" restore Gemfile.lock
+silo-migrate self-update
+```
 
 Uninstall the global CLI artifacts:
 
