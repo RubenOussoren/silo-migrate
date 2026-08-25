@@ -25,10 +25,8 @@ module SiloMigrate
 
       def init(customer, options = {})
         customer = Project.validate_customer_name!(customer)
-        Project.ensure_project_dirs(customer, @env)
-
         db_type = options[:db_type] || "mariadb"
-        initial_port = (options[:initial_port] || DATABASE_TYPES.fetch(db_type)[:default_port]).to_i
+        initial_port = validate_new_port!(options[:initial_port] || DATABASE_TYPES.fetch(db_type)[:default_port], label: "Initial database", explicit: !options[:initial_port].nil?)
         db_name = options[:db_name] || "#{customer}_initial_db"
         password = options[:password] || DEFAULT_PASSWORD
 
@@ -41,8 +39,7 @@ module SiloMigrate
         }
 
         if options[:final_db_type]
-          final_port = (options[:final_port] || initial_port + 1).to_i
-          raise UsageError, "Initial and final database ports cannot be the same (#{initial_port})" if final_port == initial_port
+          final_port = validate_new_port!(options[:final_port] || initial_port + 1, label: "Final database", used: { "initial database" => initial_port }, explicit: !options[:final_port].nil?)
 
           config["FINAL_DB_TYPE"] = options[:final_db_type]
           config["FINAL_PORT"] = final_port.to_s
@@ -50,7 +47,9 @@ module SiloMigrate
           config["FINAL_DB_PASSWORD"] = options[:final_password] || password
         end
 
+        Project.ensure_project_dirs(customer, @env)
         Project.save_config(customer, config, @env)
+        WorkflowStore.new(customer, env: @env, runtime: @runtime).update { nil }
         @compose.generate(customer, config)
         generate_connection_readme(customer, "initial", db_type, db_name, initial_port, password)
         if config["FINAL_DB_TYPE"]
@@ -100,11 +99,25 @@ module SiloMigrate
       def status(customer)
         config = Project.load_config(customer, @env)
         project_path = Project.project_path(customer, @env)
+        workflow = WorkflowStore.new(customer, env: @env, runtime: @runtime).read
         initial_db_name = config["INITIAL_DB_NAME"] || config["DB_NAME"] || "#{customer}_initial_db"
         @output.puts "\n=== Migration Project: #{customer} ===\n"
         @output.puts "Location: #{project_path}"
         @output.puts "Initial DB: #{config['INITIAL_DB_TYPE'] || 'not set'} on port #{config['INITIAL_PORT'] || 'not set'} (database: #{initial_db_name})"
         @output.puts "Final DB: #{config['FINAL_DB_TYPE']} on port #{config['FINAL_PORT']} (database: #{config['FINAL_DB_NAME']})" if config["FINAL_DB_TYPE"]
+        @output.puts "\nWorkflow state:"
+        %w[initial final].each do |phase|
+          data = workflow.dig("phases", phase)
+          loaded = data["import"] ? " — #{data.dig('import', 'filename')} at #{data.dig('import', 'imported_at')}" : ""
+          @output.puts "  #{phase.capitalize} DB: #{data['state']} (generation #{data['generation']})#{loaded}"
+        end
+        selected_output = ConverterOutput.new(customer, env: @env, runtime: @runtime).selected_path
+        selected_relative = Pathname.new(selected_output).relative_path_from(Pathname.new(project_path)).to_s
+        @output.puts "  Converter source: #{workflow.dig('converter', 'active_source')}"
+        @output.puts "  Converter output: #{selected_relative} (#{File.file?(selected_output) ? 'present' : 'missing'})"
+        @output.puts "  Discourse import: #{workflow.dig('discourse', 'state')}"
+        blocked = workflow.fetch("phases").reject { |_, data| %w[empty importing].include?(data["state"]) }
+        @output.puts "  Import recovery: #{blocked.keys.map { |phase| "reset-db #{customer} #{phase} --yes" }.join('; ')}" unless blocked.empty?
         @output.puts "\nDump files:"
         %w[initial final].each do |phase|
           files = Dir[File.join(project_path, "dumps", phase, "*")].select { |path| File.file?(path) }
@@ -156,23 +169,17 @@ module SiloMigrate
 
       def update_phase_port(customer, phase, port)
         config = Project.load_config(customer, @env)
-        port = Integer(port)
-        raise UsageError, "Port must be between 1 and 65535" unless port.between?(1, 65_535)
 
         case phase
         when "initial"
-          if config["FINAL_PORT"].to_s == port.to_s
-            raise UsageError, "Initial and final database ports cannot be the same (#{port})"
-          end
+          port = validate_new_port!(port, label: "Initial database", used: configured_ports(config, except: "initial"), allow_occupied: config["INITIAL_PORT"].to_s == port.to_s)
           config["INITIAL_PORT"] = port.to_s
           db_type = config["INITIAL_DB_TYPE"] || "mariadb"
           db_name = config["INITIAL_DB_NAME"] || config["DB_NAME"] || "#{customer}_initial_db"
           password = config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"] || DEFAULT_PASSWORD
         when "final"
           raise UsageError, "No final database configured for #{customer}" unless config["FINAL_DB_TYPE"]
-          if config["INITIAL_PORT"].to_s == port.to_s
-            raise UsageError, "Initial and final database ports cannot be the same (#{port})"
-          end
+          port = validate_new_port!(port, label: "Final database", used: configured_ports(config, except: "final"), allow_occupied: config["FINAL_PORT"].to_s == port.to_s)
           config["FINAL_PORT"] = port.to_s
           db_type = config["FINAL_DB_TYPE"]
           db_name = config["FINAL_DB_NAME"] || "#{customer}_final_db"
@@ -189,14 +196,7 @@ module SiloMigrate
       end
 
       def available_port(preferred, avoid: [])
-        port = Integer(preferred)
-        avoid = avoid.map(&:to_i).to_set
-        while port <= 65_535
-          return port if !avoid.include?(port) && port_available?(port)
-
-          port += 1
-        end
-        raise UsageError, "Could not find an available localhost port starting at #{preferred}"
+        PortValidator.new(availability: method(:port_available?)).next_free(preferred, avoid: avoid)
       end
 
       def cleanup(customer, yes: false, force: false)
@@ -230,8 +230,7 @@ module SiloMigrate
 
         db_type = options[:db_type] || config["INITIAL_DB_TYPE"] || "mariadb"
         initial_port = (config["INITIAL_PORT"] || DATABASE_TYPES.fetch("mariadb")[:default_port]).to_i
-        port = (options[:port] || initial_port + 1).to_i
-        raise UsageError, "Final database port cannot be the same as initial port (#{initial_port})" if port == initial_port
+        port = validate_new_port!(options[:port] || initial_port + 1, label: "Final database", used: configured_ports(config), explicit: !options[:port].nil?)
 
         db_name = options[:db_name] || "#{customer}_final_db"
         password = options[:password] || config["INITIAL_DB_PASSWORD"] || config["DB_PASSWORD"] || DEFAULT_PASSWORD
@@ -312,10 +311,26 @@ module SiloMigrate
         false
       end
 
-      def run_converter(customer, command: [], redacted_logs: false)
+      # track: gated conversion runs (platform shortcuts and the default
+      # converter.rb invocation) require a ready source database and record
+      # output lineage afterwards. Arbitrary maintenance commands passed after
+      # '--' run untracked: no source guard, no lineage, no staleness marking.
+      # The lock is held only for the state checks/updates, not while the
+      # converter itself runs.
+      def run_converter(customer, command: [], redacted_logs: false, phase: nil, track: nil)
         Project.load_config(customer, @env)
         command = Array(command).reject(&:empty?)
+        track = command.empty? if track.nil?
         command = ["bundle", "exec", "ruby", "converter.rb"] if command.empty?
+        store = WorkflowStore.new(customer, env: @env, runtime: @runtime)
+        state = store.read
+        source_phase = phase || state.dig("converter", "active_source") || "initial"
+        if track
+          source = state.dig("phases", source_phase)
+          unless source && %w[ready untracked].include?(source["state"])
+            raise UsageError, "Converter source #{source_phase} is #{source ? source['state'] : 'not configured'}; import it successfully before running the converter."
+          end
+        end
         @last_converter_command = command
         args = ["--profile", "converter", "exec", "-T", "converter", *command]
         result = execute_converter_command(customer, args)
@@ -323,16 +338,64 @@ module SiloMigrate
         generate_converter_summary(customer, command: command, result: result) if redacted_logs
         raise UsageError, "Converter command failed with exit code #{result.status}" unless result.success?
 
+        record_converter_lineage!(store, customer, source_phase) if track
         @output.puts "[OK] Converter command completed"
       end
 
-      def run_converter_platform(customer, platform, reset: true, settings: nil, redacted_logs: false)
+      def run_converter_platform(customer, platform, reset: true, settings: nil, redacted_logs: false, phase: nil)
         validate_converter_platform!(customer, platform)
-        settings = generate_default_converter_settings(customer, platform) if settings.to_s.empty?
+        source_phase = phase || WorkflowStore.new(customer, env: @env, runtime: @runtime).read.dig("converter", "active_source") || "initial"
+        settings = generate_default_converter_settings(customer, platform, phase: source_phase) if settings.to_s.empty?
         command = ["./convert", "--from", platform]
         command << "--reset" if reset
         command.concat(["--settings", settings]) if settings && !settings.empty?
-        run_converter(customer, command: command, redacted_logs: redacted_logs)
+        run_converter(customer, command: command, redacted_logs: redacted_logs, phase: source_phase, track: true)
+      end
+
+      def record_converter_lineage!(store, customer, source_phase)
+        store.with_lock do |state|
+          output = ConverterOutput.new(customer, env: @env, runtime: @runtime)
+          candidates = output.discover_candidates
+          selected = candidates.length == 1 ? output.select!(candidates.first) : output.selected_path(discover: false)
+          if candidates.length > 1 && !candidates.include?(selected)
+            choices = candidates.map { |path| Pathname.new(path).relative_path_from(Pathname.new(Project.project_path(customer, @env))).to_s }
+            raise UsageError, "Multiple converter output databases found. Select one with: silo-migrate converter output-db #{customer} RELATIVE_PATH\n  - #{choices.join("\n  - ")}"
+          end
+          state.fetch("converter")["output_lineage"] = {
+            "phase" => source_phase,
+            "generation" => state.dig("phases", source_phase, "generation"),
+            "generated_at" => Time.now.utc.iso8601,
+            "output_db" => Pathname.new(selected).relative_path_from(Pathname.new(Project.project_path(customer, @env))).to_s
+          }
+          state.fetch("discourse")["state"] = "stale" unless state.dig("discourse", "state") == "pristine"
+          store.write_locked(state)
+        end
+      end
+
+      def converter_source(customer, phase = nil)
+        store = WorkflowStore.new(customer, env: @env, runtime: @runtime)
+        if phase
+          raise UsageError, "Invalid converter source: #{phase}" unless %w[initial final].include?(phase)
+          Project.database_config(customer, phase, Project.load_config(customer, @env))
+          store.update { |state| state.fetch("converter")["active_source"] = phase }
+          @output.puts "[OK] Active converter source set to #{phase}"
+        else
+          value = store.read.dig("converter", "active_source")
+          @output.puts value
+          value
+        end
+      end
+
+      def converter_output_db(customer, path = nil)
+        resolver = ConverterOutput.new(customer, env: @env, runtime: @runtime)
+        selected = path ? resolver.select!(path) : resolver.selected_path
+        candidates = resolver.discover_candidates
+        if !path && candidates.length > 1 && !File.file?(selected)
+          raise UsageError, "Multiple converter output databases found; select one with: silo-migrate converter output-db #{customer} RELATIVE_PATH\n#{candidates.map { |item| "  - #{Pathname.new(item).relative_path_from(Pathname.new(Project.project_path(customer, @env)))}" }.join("\n")}"
+        end
+        relative = Pathname.new(selected).relative_path_from(Pathname.new(Project.project_path(customer, @env))).to_s
+        @output.puts relative
+        relative
       end
 
       def generate_converter_summary(customer, command: [], result: nil)
@@ -346,6 +409,10 @@ module SiloMigrate
 
       def export_schema(customer, phase: "initial", output_dir: nil)
         config = Project.load_config(customer, @env)
+        phase_state = WorkflowStore.new(customer, env: @env, runtime: @runtime).read.dig("phases", phase, "state")
+        unless %w[ready untracked].include?(phase_state)
+          raise UsageError, "Cannot export schema from #{phase} database while it is #{phase_state}; import it or reconcile it first."
+        end
         db_type, db_name, password = database_config(customer, phase, config)
         container_name = "#{customer}_#{phase}_#{db_type}"
         raise UsageError, "Container #{container_name} is not running. Start it first." unless @runtime.container_running?(container_name)
@@ -542,8 +609,8 @@ module SiloMigrate
       # Generates in-network connection settings for the platform shortcut.
       # Failures fall back to the platform defaults (matching old behavior)
       # rather than blocking the run.
-      def generate_default_converter_settings(customer, platform)
-        result = ConverterSettingsService.new(env: @env, output: @output).generate(customer, platform)
+      def generate_default_converter_settings(customer, platform, phase: "initial")
+        result = ConverterSettingsService.new(env: @env, output: @output).generate(customer, platform, phase: phase)
         ensure_converter_settings_mount(customer)
         @output.puts "[OK] Generated converter settings: #{result.fetch(:host_path)}"
         result.fetch(:container_path)
@@ -592,11 +659,35 @@ module SiloMigrate
       end
 
       def port_available?(port)
+        return true if @env["SILO_MIGRATE_SKIP_PORT_CHECK"] == "1"
+
         server = TCPServer.new("127.0.0.1", port)
         server.close
         true
-      rescue SystemCallError, IOError
+      rescue Errno::EADDRINUSE, Errno::EACCES
         false
+      rescue SystemCallError, IOError
+        true
+      end
+
+      # Explicitly requested ports fail fast when unusable; ports that came
+      # from a default silently advance to the next free one.
+      def validate_new_port!(port, label:, used: {}, allow_occupied: false, explicit: true)
+        validator = PortValidator.new(availability: method(:port_available?))
+        return validator.validate!(port, label: label, used: used, allow_occupied: allow_occupied) if explicit
+
+        chosen = validator.next_free(port, avoid: used.values)
+        @output.puts "[OK] #{label} default port #{port} is in use; selected free port #{chosen}" if chosen.to_i != port.to_i
+        chosen
+      end
+
+      def configured_ports(config, except: nil)
+        ports = {}
+        ports["initial database"] = config["INITIAL_PORT"] if except != "initial" && config["INITIAL_PORT"]
+        ports["final database"] = config["FINAL_PORT"] if except != "final" && config["FINAL_PORT"]
+        ports["Discourse uploads"] = config["DISCOURSE_UPLOADS_PORT"] if config["DISCOURSE_UPLOADS_PORT"]
+        ports["Discourse import"] = config["DISCOURSE_IMPORT_PORT"] if config["DISCOURSE_IMPORT_PORT"]
+        ports
       end
 
       def port_conflict_message(customer, conflicts)

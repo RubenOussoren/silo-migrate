@@ -374,7 +374,7 @@ class CLITest < SiloMigrateTest
       assert_includes out.string, "Large XML-converted MariaDB imports on macOS Docker Desktop"
       assert_includes error.message, "Unsafe MariaDB InnoDB settings"
       assert_includes error.message, "silo-migrate regenerate acme"
-      assert_includes error.message, "silo-migrate replace-dump acme initial --yes"
+      assert_includes error.message, "silo-migrate reset-db acme initial --yes"
       assert_includes error.message, "silo-migrate start acme --profile initial-db --wait"
       assert_includes error.message, "silo-migrate import-dump acme initial --file dump.sql"
       refute runtime.operations.any? { |operation| operation.first == :run_with_stdin }
@@ -645,6 +645,7 @@ class CLITest < SiloMigrateTest
       out = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
       cli.run(["init", "acme", "--db-type", "mariadb"])
+      mark_phase_ready(env)
 
       assert_equal 0, cli.run(["schema", "export", "acme"])
 
@@ -660,6 +661,7 @@ class CLITest < SiloMigrateTest
       out = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
       cli.run(["init", "acme", "--db-type", "mariadb"])
+      mark_phase_ready(env)
 
       assert_equal 0, cli.run(["schema", "bundle", "acme"])
 
@@ -686,6 +688,7 @@ class CLITest < SiloMigrateTest
       runtime = SiloMigrate::Runtime::Fake.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: StringIO.new)
       cli.run(["init", "acme", "--db-type", "mariadb", "--final-db-type", "postgres"])
+      mark_phase_ready(env, "final")
       output_dir = File.join(dir, "custom-schema")
 
       assert_equal 0, cli.run(["schema", "bundle", "acme", "--phase", "final", "--output", output_dir])
@@ -703,6 +706,7 @@ class CLITest < SiloMigrateTest
       err = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: err)
       cli.run(["init", "acme", "--db-type", "mariadb"])
+      mark_phase_ready(env)
       runtime.running_containers["acme_initial_mariadb"] = false
 
       assert_equal 1, cli.run(["schema", "bundle", "acme"])
@@ -715,6 +719,7 @@ class CLITest < SiloMigrateTest
       runtime = SiloMigrate::Runtime::Fake.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: StringIO.new)
       cli.run(["init", "acme"])
+      mark_phase_ready(env)
 
       assert_equal 0, cli.run(["run-converter", "acme", "--", "ruby", "converter.rb", "--dry-run"])
 
@@ -727,6 +732,7 @@ class CLITest < SiloMigrateTest
       runtime = SiloMigrate::Runtime::Fake.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: StringIO.new)
       cli.run(["init", "acme"])
+      mark_phase_ready(env)
       create_converter_platform(env, "acme", "vbulletin")
 
       assert_equal 0, cli.run(["run-converter", "acme", "vbulletin"])
@@ -740,6 +746,7 @@ class CLITest < SiloMigrateTest
       runtime = SiloMigrate::Runtime::Fake.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: StringIO.new)
       cli.run(["init", "acme"])
+      mark_phase_ready(env)
       create_converter_platform(env, "acme", "vbulletin")
 
       assert_equal 0, cli.run(["run-converter", "acme", "vbulletin", "--no-reset"])
@@ -754,6 +761,7 @@ class CLITest < SiloMigrateTest
       out = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
       cli.run(["init", "acme", "--db-type", "mariadb", "--password", "topsecret"])
+      mark_phase_ready(env)
       create_converter_platform(env, "acme", "vbulletin")
       settings_defaults = File.join(SiloMigrate::Project.project_path("acme", env), "discourse-converters", "converters", "vbulletin", "settings.yml")
       write(settings_defaults, "database:\n  host: \"127.0.0.1\"\n  port: 3306\n  username: \"root\"\n  password: \"x\"\n  database: \"y\"\n")
@@ -775,6 +783,7 @@ class CLITest < SiloMigrateTest
       out = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
       cli.run(["init", "acme"])
+      mark_phase_ready(env)
       create_converter_platform(env, "acme", "vbulletin")
 
       assert_equal 0, cli.run(["run-converter", "acme", "vbulletin"])
@@ -789,6 +798,7 @@ class CLITest < SiloMigrateTest
       runtime = SiloMigrate::Runtime::Fake.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: StringIO.new)
       cli.run(["init", "acme"])
+      mark_phase_ready(env)
       create_converter_platform(env, "acme", "vbulletin")
 
       assert_equal 0, cli.run(["run-converter", "acme", "vbulletin", "--settings", "/tmp/settings.yml"])
@@ -831,6 +841,7 @@ class CLITest < SiloMigrateTest
       out = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: StringIO.new)
       cli.run(["init", "acme", "--password", "supersecret"])
+      mark_phase_ready(env)
 
       assert_equal 0, cli.run(["run-converter", "acme", "--redacted-logs", "--", "ruby", "converter.rb", "--dry-run"])
 
@@ -858,6 +869,7 @@ class CLITest < SiloMigrateTest
       err = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: err)
       cli.run(["init", "acme"])
+      mark_phase_ready(env)
 
       assert_equal 1, cli.run(["run-converter", "acme", "--redacted-summary"])
 
@@ -1212,6 +1224,7 @@ class CLITest < SiloMigrateTest
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       schema = SiloMigrate::Services::SchemaService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
+      mark_phase_ready(env)
       prompt = FakePrompt.new(["Advanced actions", "Initial dump/database actions", "Generate initial schema bundle"])
 
       SiloMigrate::Interactive.new(project_service: project, import_service: import, schema_service: schema, prompt: prompt, output: out).run("acme")
@@ -1281,7 +1294,7 @@ class CLITest < SiloMigrateTest
         [:rebuild, "acme", "uploads"],
         [:start, "acme", "uploads"]
       ], discourse.calls
-      assert_includes out.string, "output/intermediate.db is missing"
+      assert_includes out.string, "selected converter output DB is missing"
       assert_includes out.string, "Run the converter"
     end
   end
@@ -1402,6 +1415,47 @@ class CLITest < SiloMigrateTest
       assert_includes menu, "Generate final backup"
       refute_includes menu, "Import intermediate.db only"
       refute_includes menu, "Run uploads importer, then import intermediate.db + uploads.sqlite3"
+    end
+  end
+
+  def test_guided_discourse_import_menu_offers_reset_when_not_pristine
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      discourse = FakeDiscourseService.new
+      project.init("acme")
+      SiloMigrate::WorkflowStore.new("acme", env: env).update { |state| state.fetch("discourse")["state"] = "imported" }
+      reset_label = "Reset import instance (destroy + rebuild; converter output and backups preserved)"
+      prompt = FakePrompt.new(["Discourse import container", "y", reset_label, "y"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, discourse_service: discourse, prompt: prompt, output: out).run("acme")
+
+      assert_includes discourse.calls, [:reset_import, "acme", true]
+      menu = prompt.choice_sets.find { |message, _choices| message == "Discourse import container action" }.last
+      assert_includes menu, reset_label
+    end
+  end
+
+  def test_guided_dump_reset_back_returns_to_menu_without_resetting
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      mark_phase_ready(env)
+      dumps_dir = File.join(project.project_path("acme"), "dumps", "initial")
+      write(File.join(dumps_dir, "one.sql"), "-- MySQL dump\n")
+      write(File.join(dumps_dir, "two.sql"), "-- MySQL dump\n")
+      prompt = FakePrompt.new(["Initial dump", "y", "Reset database and import selected dump", "Back"])
+
+      SiloMigrate::Interactive.new(project_service: project, import_service: import, prompt: prompt, output: out).run("acme")
+
+      refute runtime.commands.any? { |entry| entry[0] == :compose && entry[2].include?("rm") }
+      state = SiloMigrate::WorkflowStore.new("acme", env: env).read
+      assert_equal "ready", state.dig("phases", "initial", "state")
     end
   end
 
@@ -1903,6 +1957,7 @@ class CLITest < SiloMigrateTest
       project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
       import = SiloMigrate::Services::ImportService.new(runtime: runtime, env: env, output: out)
       project.init("acme")
+      mark_phase_ready(env)
       converter_dir = File.join(project.project_path("acme"), "discourse-converters")
       FileUtils.mkdir_p(converter_dir)
       write(File.join(converter_dir, "Gemfile"), "source 'https://rubygems.org'\n")
@@ -1942,6 +1997,7 @@ class CLITest < SiloMigrateTest
       findings = SiloMigrate::Services::ConverterFindingsService.new(env: env, output: out)
       fixtures = SiloMigrate::Services::SyntheticFixtureService.new(env: env, output: out)
       project.init("acme")
+      mark_phase_ready(env)
       converter_dir = File.join(project.project_path("acme"), "discourse-converters")
       FileUtils.mkdir_p(converter_dir)
       write(File.join(converter_dir, "Gemfile"), "source 'https://rubygems.org'\n")
@@ -2195,6 +2251,15 @@ class CLITest < SiloMigrateTest
     FileUtils.mkdir_p(File.join(converter_dir, "converters", platform))
   end
 
+  def mark_phase_ready(env, phase = "initial")
+    SiloMigrate::WorkflowStore.new("acme", env: env).update do |state|
+      data = state.fetch("phases").fetch(phase)
+      data["state"] = "ready"
+      data["generation"] = 1
+      data["import"] = { "filename" => "fixture.sql", "imported_at" => Time.now.utc.iso8601 }
+    end
+  end
+
   class FakePrompt
     attr_reader :asked, :selected, :choice_sets
 
@@ -2302,6 +2367,10 @@ class CLITest < SiloMigrateTest
 
     def backup_import(customer)
       @calls << [:backup_import, customer]
+    end
+
+    def reset_import(customer, yes: false)
+      @calls << [:reset_import, customer, yes]
     end
 
     def status(customer, role:)

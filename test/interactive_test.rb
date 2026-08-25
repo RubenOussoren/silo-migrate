@@ -37,7 +37,11 @@ class InteractiveTest < SiloMigrateTest
 
   def test_first_run_prompts_for_base_path_and_persists_it
     Dir.mktmpdir do |dir|
-      env = { "SILO_MIGRATE_USER_CONFIG" => File.join(dir, "user-config.env") }
+      env = {
+        "SILO_MIGRATE_USER_CONFIG" => File.join(dir, "user-config.env"),
+        "SILO_MIGRATE_IGNORE_LEGACY_DEFAULT" => "1",
+        "SILO_MIGRATE_SKIP_PORT_CHECK" => "1"
+      }
       chosen = File.join(dir, "my-projects")
       project, import = build_services(env)
       out = StringIO.new
@@ -224,7 +228,7 @@ class InteractiveTest < SiloMigrateTest
       main_menu = prompt.choice_sets.find { |message, _choices| message == "Migration workflow" }.last
       assert_includes main_menu, "Discourse uploads container"
       assert_includes main_menu, "Discourse import container"
-      assert_includes out.string, "Discourse handoff: ready"
+      assert_includes out.string, "[Uploads handoff] ready"
     end
   end
 

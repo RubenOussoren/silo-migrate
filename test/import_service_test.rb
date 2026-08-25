@@ -160,7 +160,7 @@ class ImportServiceTest < SiloMigrateTest
     )
     summary = diagnostic.summary.join("\n")
     assert_includes summary, "Duplicate entry"
-    assert_includes summary, "silo-migrate replace-dump acme initial --yes"
+    assert_includes summary, "silo-migrate reset-db acme initial --yes"
     assert_includes summary, "Reported SQL line: 1"
   end
 
@@ -176,7 +176,7 @@ class ImportServiceTest < SiloMigrateTest
 
     assert_includes summary, "Row size too large"
     assert_includes summary, "regenerate it with the current converter"
-    assert_includes summary, "silo-migrate replace-dump intel-delta initial --yes"
+    assert_includes summary, "silo-migrate reset-db intel-delta initial --yes"
   end
 
   def test_failure_diagnostics_for_eperm_during_commit_explains_bulk_insert_duplicates
@@ -238,7 +238,7 @@ class ImportServiceTest < SiloMigrateTest
       db_type: "postgres", customer: "acme", phase: "initial"
     ).summary.join("\n")
     assert_includes summary, "Duplicate key"
-    assert_includes summary, "replace-dump acme initial"
+    assert_includes summary, "reset-db acme initial"
   end
 
   def test_postgres_plpgsql_context_line_numbers_do_not_trigger_statement_scan
@@ -249,6 +249,6 @@ class ImportServiceTest < SiloMigrateTest
       db_type: "postgres", customer: "acme", phase: "initial"
     ).summary.join("\n")
     refute_includes summary, "Reported SQL line"
-    assert_includes summary, "replace-dump acme initial"
+    assert_includes summary, "reset-db acme initial"
   end
 end

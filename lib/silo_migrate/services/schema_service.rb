@@ -18,6 +18,10 @@ module SiloMigrate
 
       def bundle(customer, phase: "initial", output_dir: nil)
         config = Project.load_config(customer, @env)
+        phase_state = WorkflowStore.new(customer, env: @env, runtime: @runtime).read.dig("phases", phase, "state")
+        unless %w[ready untracked].include?(phase_state)
+          raise UsageError, "Cannot export schema from #{phase} database while it is #{phase_state}; import it or reconcile it first."
+        end
         db_type, db_name, password = database_config(customer, phase, config)
         container_name = "#{customer}_#{phase}_#{db_type}"
         raise UsageError, "Container #{container_name} is not running. Start it first." unless @runtime.container_running?(container_name)
@@ -38,6 +42,15 @@ module SiloMigrate
         write_json(output_dir, "indexes.json", indexes)
         write_json(output_dir, "summary.json", summary)
         write_artifact(output_dir, "migration_notes.md", migration_notes(summary))
+
+        WorkflowStore.new(customer, env: @env, runtime: @runtime).update do |state|
+          phase_state = state.fetch("phases").fetch(phase)
+          phase_state["schema_bundle"] = {
+            "generation" => phase_state["generation"],
+            "path" => Pathname.new(output_dir).relative_path_from(Pathname.new(Project.project_path(customer, @env))).to_s,
+            "generated_at" => Time.now.utc.iso8601
+          }
+        end
 
         @output.puts "[OK] Schema bundle exported: #{output_dir}"
         output_dir

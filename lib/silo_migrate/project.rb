@@ -33,6 +33,9 @@ module SiloMigrate
       configured = UserConfig.load(env)["SILO_MIGRATE_BASE_PATH"]
       return configured if configured && !configured.empty?
 
+      # Tests set SILO_MIGRATE_IGNORE_LEGACY_DEFAULT so results do not depend
+      # on whether the machine running them has a real legacy base directory.
+      return nil if env["SILO_MIGRATE_IGNORE_LEGACY_DEFAULT"] == "1"
       return DEFAULT_BASE_PATH if Dir.exist?(DEFAULT_BASE_PATH) && File.writable?(DEFAULT_BASE_PATH)
 
       nil
@@ -93,6 +96,8 @@ module SiloMigrate
       temp = Tempfile.new([File.basename(path), ".tmp"], File.dirname(path), encoding: "utf-8")
       begin
         temp.write(content)
+        temp.flush
+        temp.fsync
         temp.close
         File.rename(temp.path, path)
       ensure

@@ -99,7 +99,7 @@ module SiloMigrate
           "exit_status" => result&.status,
           "sources" => {
             "process_output" => process_output_summary(stdout, stderr, redactor),
-            "intermediate_db" => intermediate_db_summary(project_path, redactor)
+            "intermediate_db" => intermediate_db_summary(project_path, redactor, customer)
           },
           "contains_raw_rows" => false,
           "dev_ai_visibility" => "safe",
@@ -132,8 +132,8 @@ module SiloMigrate
         entries
       end
 
-      def intermediate_db_summary(project_path, redactor)
-        db_path = File.join(project_path, "output", "intermediate.db")
+      def intermediate_db_summary(project_path, redactor, customer)
+        db_path = ConverterOutput.new(customer, env: @env).selected_path
         summary = {
           "available" => File.exist?(db_path),
           "path" => redactor.redact(db_path),

@@ -3,6 +3,8 @@
 require "set"
 require "rbconfig"
 require "zlib"
+require "json"
+require "time"
 
 module SiloMigrate
   module Services
@@ -59,41 +61,146 @@ module SiloMigrate
         )
         preflight.run unless options[:skip_preflight]
 
-        needs_collation_fix = collation_fix_needed?(db_type, dump_path, options)
-        cmd = @runtime.exec_import_command(container_name, db_type, db_name, password, max_packet: max_packet, disable_keys: fast)
-        start_time = Time.now
-        @output.puts "Importing into #{container_name}..."
-        reporter = ImportProgressReporter.new(
-          @output,
-          file_size: File.size(dump_path),
-          compressed: DumpTools.gzip_file?(dump_path),
-          interval: options.fetch(:progress_interval, 2)
-        )
-        custom_progress_callback = options[:progress_callback]
-        report_progress = options.fetch(:report_progress, custom_progress_callback.nil?)
-        progress_callback = import_progress_callback(custom_progress_callback, reporter, report_progress)
-        reporter.start if report_progress
-        result = stream_dump_to_runtime(cmd, dump_path, needs_collation_fix, excluded_tables(options[:exclude_tables]), progress_callback)
-        elapsed = Time.now - start_time
-        raise UsageError, failure_message(result, dump_path, customer: customer, phase: phase, db_type: db_type) unless result.success?
+        store = WorkflowStore.new(customer, env: @env, runtime: @runtime)
+        # The lock is held only for state transitions, never while dump bytes
+        # stream: the persisted "importing" state (with a live PID) is what
+        # blocks concurrent imports, so status/dashboard reads stay responsive.
+        store.with_lock do |state|
+          store.reconcile_state!(state)
+          phase_state = store.phase(state, phase)
+          guard_import_state!(customer, phase, phase_state)
+          count = store.user_table_count(phase)
+          if count.nil?
+            phase_state["state"] = "unknown"
+            store.write_locked(state)
+            raise UsageError, "Could not verify that the #{phase} database is empty. Start it and retry, or reset it with: silo-migrate reset-db #{customer} #{phase} --yes"
+          end
+          if count.positive?
+            phase_state["state"] = "untracked"
+            phase_state["user_table_count"] = count
+            phase_state["probed_at"] = Time.now.utc.iso8601
+            store.write_locked(state)
+            raise UsageError, "The #{phase} database contains #{count} user table(s) and cannot be imported over. Reset it first: silo-migrate reset-db #{customer} #{phase} --yes"
+          end
 
-        reporter.finish(elapsed) if report_progress
-        @output.puts "\n[OK] Dump imported successfully"
-        @output.puts "     File: #{File.basename(dump_path)}"
-        @output.puts "     Size: #{DumpTools.format_size(File.size(dump_path))}"
-        @output.puts "     Time elapsed: #{DumpTools.format_elapsed(elapsed)}"
+          phase_state["state"] = "importing"
+          phase_state["import_started_at"] = Time.now.utc.iso8601
+          phase_state["import_pid"] = Process.pid
+          phase_state["pending_import"] = store.dump_identity(dump_path).merge("options" => persisted_options(options))
+          store.write_locked(state)
+        end
+
+        begin
+          needs_collation_fix = collation_fix_needed?(db_type, dump_path, options)
+          cmd = @runtime.exec_import_command(container_name, db_type, db_name, password, max_packet: max_packet, disable_keys: fast)
+          start_time = Time.now
+          @output.puts "Importing into #{container_name}..."
+          reporter = ImportProgressReporter.new(
+            @output,
+            file_size: File.size(dump_path),
+            compressed: DumpTools.gzip_file?(dump_path),
+            interval: options.fetch(:progress_interval, 2)
+          )
+          custom_progress_callback = options[:progress_callback]
+          report_progress = options.fetch(:report_progress, custom_progress_callback.nil?)
+          progress_callback = import_progress_callback(custom_progress_callback, reporter, report_progress)
+          reporter.start if report_progress
+          result = stream_dump_to_runtime(cmd, dump_path, needs_collation_fix, excluded_tables(options[:exclude_tables]), progress_callback)
+          elapsed = Time.now - start_time
+          raise UsageError, failure_message(result, dump_path, customer: customer, phase: phase, db_type: db_type) unless result.success?
+
+          imported_at = Time.now.utc.iso8601
+          store.with_lock do |state|
+            phase_state = store.phase(state, phase)
+            pending = phase_state.delete("pending_import") || store.dump_identity(dump_path).merge("options" => persisted_options(options))
+            phase_state["generation"] = phase_state["generation"].to_i + 1
+            phase_state["state"] = "ready"
+            phase_state["import"] = pending.merge("imported_at" => imported_at)
+            phase_state.delete("import_started_at")
+            phase_state.delete("import_pid")
+            phase_state.delete("user_table_count")
+            store.write_locked(state)
+            write_legacy_marker(customer, phase, phase_state["import"])
+          end
+          reporter.finish(elapsed) if report_progress
+          @output.puts "\n[OK] Dump imported successfully"
+          @output.puts "     File: #{File.basename(dump_path)}"
+          @output.puts "     Size: #{DumpTools.format_size(File.size(dump_path))}"
+          @output.puts "     Time elapsed: #{DumpTools.format_elapsed(elapsed)}"
+        rescue StandardError
+          store.with_lock do |state|
+            phase_state = store.phase(state, phase)
+            if phase_state["state"] == "importing"
+              phase_state["state"] = "dirty"
+              phase_state["failed_at"] = Time.now.utc.iso8601
+              phase_state.delete("import_pid")
+              store.write_locked(state)
+            end
+          end
+          raise
+        end
       end
 
       def replace_dump(customer, phase, yes: false)
         Project.load_config(customer, @env)
-        raise UsageError, "Replacing a dump resets database container data. Re-run with --yes to confirm." unless yes
+        raise UsageError, "Resetting a database deletes its container data and archives dependent artifacts. Re-run with --yes to confirm." unless yes
 
-        @runtime.compose(customer, ["--profile", "#{phase}-db", "stop"])
-        @runtime.compose(customer, ["--profile", "#{phase}-db", "rm", "-f", "-v"])
-        @output.puts "[OK] Database reset complete"
+        store = WorkflowStore.new(customer, env: @env, runtime: @runtime)
+        store.with_lock do |state|
+          store.reconcile_state!(state)
+          if store.phase(state, phase)["state"] == "importing"
+            raise UsageError, "An import into the #{phase} database is currently running; wait for it to finish (or fail) before resetting."
+          end
+
+          stop = @runtime.compose(customer, ["--profile", "#{phase}-db", "stop"])
+          remove = @runtime.compose(customer, ["--profile", "#{phase}-db", "rm", "-f", "-v"])
+          raise UsageError, "Database reset failed; nothing was archived and workflow state was not cleared." unless stop.success? && remove.success?
+
+          Services::HistoryService.new(env: @env, output: @output).archive_for_phase(customer, phase, state: state)
+          data = store.phase(state, phase)
+          reset_generation = data["generation"].to_i
+          data.replace("generation" => reset_generation + 1, "state" => "empty", "import" => nil, "schema_bundle" => nil, "reset_at" => Time.now.utc.iso8601)
+          lineage = state.dig("converter", "output_lineage")
+          if lineage && lineage["phase"] == phase && lineage["generation"].to_i == reset_generation
+            state.fetch("converter")["output_lineage"] = nil
+            state.fetch("discourse")["state"] = "stale" unless state.dig("discourse", "state") == "pristine"
+          end
+          clear_legacy_markers(customer, phase)
+          store.write_locked(state)
+        end
+        @output.puts "[OK] #{phase.capitalize} database reset complete; staged dumps were preserved"
       end
 
       private
+
+      def guard_import_state!(customer, phase, phase_state)
+        return if phase_state["state"] == "empty"
+
+        detail = if phase_state["state"] == "ready" && phase_state["import"]
+                   " (loaded #{phase_state.dig('import', 'filename')} at #{phase_state.dig('import', 'imported_at')})"
+                 elsif phase_state["state"] == "untracked" && phase_state["user_table_count"]
+                   " (contains #{phase_state['user_table_count']} user table(s) without import provenance)"
+                 else
+                   ""
+                 end
+        raise UsageError, "The #{phase} database is #{phase_state['state']}#{detail}; imports are blocked and no dump data was sent. Reset it first: silo-migrate reset-db #{customer} #{phase} --yes"
+      end
+
+      def persisted_options(options)
+        allowed = %i[exclude_tables max_packet fast turbo fix_collations skip_validation trust_dump]
+        options.select { |key, _| allowed.include?(key) }.transform_keys(&:to_s)
+      end
+
+      def write_legacy_marker(customer, phase, import)
+        path = File.join(Project.project_path(customer, @env), "dumps", phase, ".imported.json")
+        Project.atomic_write(path, JSON.pretty_generate({ "file" => import["filename"], "imported_at" => import["imported_at"], "sha256" => import["sha256"], "options" => import["options"] }) + "\n")
+      end
+
+      def clear_legacy_markers(customer, phase)
+        project = Project.project_path(customer, @env)
+        FileUtils.rm_f(File.join(project, "dumps", phase, ".imported.json"))
+        FileUtils.rm_f(File.join(project, "output", "#{phase}-imported.txt"))
+      end
 
       def verify_gzip_integrity!(dump_path, print_validation)
         return unless DumpTools.gzip_file?(dump_path)
@@ -421,7 +528,7 @@ module SiloMigrate
             Regenerate compose with safer DB settings:
               silo-migrate regenerate #{@customer}
             Reset the #{@phase} DB container so the new settings apply:
-              silo-migrate replace-dump #{@customer} #{@phase} --yes
+              silo-migrate reset-db #{@customer} #{@phase} --yes
             Start the DB again:
               silo-migrate start #{@customer} --profile #{@phase}-db --wait
             Retry the import:
@@ -551,7 +658,7 @@ module SiloMigrate
 
           [
             "Recovery (reset the #{@phase} database and retry):",
-            "  silo-migrate replace-dump #{@customer} #{@phase} --yes",
+            "  silo-migrate reset-db #{@customer} #{@phase} --yes",
             "  silo-migrate start #{@customer} --profile #{@phase}-db --wait",
             "  silo-migrate import-dump #{@customer} #{@phase} --file #{File.basename(@path)}"
           ]

@@ -256,6 +256,7 @@ bin/silo-migrate start acme --profile initial-db --wait
 bin/silo-migrate import-dump acme initial
 bin/silo-migrate schema bundle acme
 bin/silo-migrate setup-converter acme --bundle-install
+bin/silo-migrate converter source acme initial
 bin/silo-migrate run-converter acme --redacted-logs
 bin/silo-migrate findings generate acme
 bin/silo-migrate fixtures generate acme
@@ -271,6 +272,7 @@ bin/silo-migrate stage-dump acme final /path/to/final.sql.gz
 bin/silo-migrate start acme --profile final-db --wait
 bin/silo-migrate import-dump acme final
 bin/silo-migrate schema bundle acme --phase final
+bin/silo-migrate converter source acme final   # explicit cutover switch
 ```
 
 For the optional Discourse handoff containers:
@@ -290,14 +292,21 @@ bin/silo-migrate discourse prepare-deps acme --role import
 bin/silo-migrate discourse restore-import acme --backup /path/to/backup.tar.gz
 bin/silo-migrate discourse import acme
 bin/silo-migrate discourse backup-import acme
+# Before another restore/import against the scratch import instance:
+bin/silo-migrate discourse reset-import acme --yes
 ```
 
 ## Guided Workflow
 
-Guided mode is the primary operator experience. It shows project location,
-configured databases, dump counts, schema-bundle status, and container status
-before prompting for the next workflow. The main menu stays intentionally
-coarse-grained so it does not repeat the steps that a workflow already performs.
+Guided mode is a persistent dashboard. It refreshes after every action and shows
+stateful cards, one recommended next action, alternatives, and blocked actions
+with recovery reasons. It exits only through `Quit`.
+
+The durable, credential-free `.silo-migrate/workflow.json` tracks each database
+as `empty`, `importing`, `ready`, `dirty`, `untracked`, or `unknown`; the active
+converter source and selected output database; lineage; and the Discourse import
+state. A live table-count check is made before any dump bytes are sent. A loaded,
+dirty, untracked, or unknown database cannot be imported over.
 
 Main workflows:
 
@@ -309,18 +318,13 @@ Main workflows:
 - **Converter setup** — clone or verify `discourse-converters`, recover from
   SSH/passphrase issues, and optionally build/start the converter container and
   run `bundle install`.
-- **Discourse uploads container** — configure Discourse container files when
-  selected, rebuild/start a vanilla Discourse uploads container, then stop with
-  the converter next step until `output/intermediate.db` exists. Once converter
-  output exists, guided mode prepares uploads-container dependencies and runs
-  the upload importer.
+- **Discourse uploads container** — configure or start the container only when
+  needed, then consume the selected SQLite converter output.
 - **Discourse import container** — configure Discourse container files when
-  selected, rebuild/start a vanilla Discourse import container, then show an
-  explicit action menu. Restore, backup, and status are available immediately;
-  import actions appear once `output/intermediate.db` exists. Import actions
-  prepare import dependencies immediately before running `generic_bulk.rb`, and
-  the uploads+import action bootstraps the uploads container and runs the
-  uploads importer first.
+  selected, start it only when needed, then show an explicit action menu. Restore
+  is allowed only while pristine; one generic import is allowed while pristine
+  or restored. Repeat operations require a confirmed reset, available as
+  `discourse reset-import` or the guided menu's "Reset import instance" action.
 
 Typical flow:
 
@@ -392,7 +396,8 @@ Profiles are `initial-db`, `final-db`, `converter`, and `all`.
 ```bash
 bin/silo-migrate stage-dump acme initial /path/to/dump.sql.gz
 bin/silo-migrate import-dump acme initial
-bin/silo-migrate replace-dump acme initial --yes
+bin/silo-migrate reset-db acme initial --yes
+bin/silo-migrate history list acme
 bin/silo-migrate analyze-dump /path/to/dump.sql.gz
 bin/silo-migrate preprocess-dump /path/to/dump.sql.gz -o /path/to/fixed.sql.gz
 bin/silo-migrate convert-xml /path/to/xml_dumps -c acme --phase initial --compress
@@ -415,7 +420,20 @@ bin/silo-migrate import-dump acme initial --no-fix-collations
 ```
 
 `import-dump` streams dump content into the database container. Table exclusion
-filters matching table DDL/DML while streaming.
+filters matching table DDL/DML while streaming. It is a whole-database operation:
+repeat imports are rejected before streaming. `reset-db` archives lineage-based
+schema, converter output, handoff markers, findings, and fixtures under
+`history/<timestamp>-<reason>/`, while preserving staged dumps and final backups.
+
+Converter runs use the persisted source (`initial` by default). Use `converter
+source CUSTOMER final` for cutover, or `run-converter ... --phase final` for a
+one-run override. `converter output-db CUSTOMER [RELATIVE_PATH]` manages the
+SQLite file selected beneath `output/`; a sole valid candidate is discovered
+automatically, and traversal or symlink escapes are rejected. Platform
+shortcuts and the default `converter.rb` run require a ready source database
+and record output lineage; arbitrary commands passed after `--` (for example
+`run-converter acme -- bundle install`) run ungated and are not treated as
+conversion runs.
 
 XML conversion is for mysqldump XML exports, not arbitrary nested XML. It
 streams each `.xml`/`.xml.gz` file with a SAX parser, so a directory of table

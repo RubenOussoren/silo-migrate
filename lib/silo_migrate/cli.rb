@@ -7,7 +7,7 @@ require "set"
 module SiloMigrate
   class CLI
     COMMANDS = %w[
-      interactive go init list status cleanup start stop regenerate import-dump replace-dump
+      interactive go init list status cleanup start stop regenerate import-dump reset-db replace-dump history
       analyze-dump preprocess-dump convert-xml convert-json stage-dump setup-converter add-final-db
       run-converter converter discourse schema findings fixtures ai trusted doctor self-update uninstall help
     ].freeze
@@ -65,8 +65,18 @@ module SiloMigrate
           --trust-dump               alias for --skip-validation
       HELP
       "replace-dump" => <<~HELP,
-        Usage: silo-migrate replace-dump CUSTOMER PHASE --yes
-        Stops the phase DB container and removes its volume (reset before re-import).
+        Usage: silo-migrate reset-db CUSTOMER PHASE --yes
+               silo-migrate replace-dump CUSTOMER PHASE --yes   (compatibility alias)
+        Archives lineage-dependent artifacts, removes the phase database data,
+        clears legacy markers, and preserves staged dumps and final backups.
+      HELP
+      "reset-db" => <<~HELP,
+        Usage: silo-migrate reset-db CUSTOMER PHASE --yes
+        Reset a phase database and archive derived artifacts under history/.
+      HELP
+      "history" => <<~HELP,
+        Usage: silo-migrate history list CUSTOMER
+               silo-migrate history delete CUSTOMER ENTRY --yes
       HELP
       "analyze-dump" => <<~HELP,
         Usage: silo-migrate analyze-dump DUMP_FILE [options]
@@ -167,6 +177,12 @@ module SiloMigrate
           --no-reset           omit --reset from the platform shortcut
           --redacted-logs      write redacted log + summary artifacts afterwards
           --redacted-summary   alias for --redacted-logs
+          --phase PHASE        one-run source override (initial|final); does not
+                               change the persisted converter source
+
+        Platform shortcuts and the no-argument default run require a ready
+        source database and record output lineage. Commands passed after '--'
+        run ungated and are not treated as conversion runs.
 
         Examples:
           silo-migrate run-converter acme vbulletin
@@ -174,8 +190,9 @@ module SiloMigrate
       HELP
       "converter" => <<~HELP,
         Usage: silo-migrate converter summary CUSTOMER
-        Generates redacted converter log/summary artifacts from output/intermediate.db
-        without re-running the converter.
+               silo-migrate converter source CUSTOMER [initial|final]
+               silo-migrate converter output-db CUSTOMER [RELATIVE_PATH]
+        Manage the persisted source phase and selected SQLite output database.
       HELP
       "discourse" => <<~HELP,
         Usage: silo-migrate discourse install-launcher [options]
@@ -189,10 +206,12 @@ module SiloMigrate
                silo-migrate discourse restore-import CUSTOMER --backup PATH
                silo-migrate discourse import CUSTOMER [--no-uploads-db]
                silo-migrate discourse backup-import CUSTOMER
+               silo-migrate discourse reset-import CUSTOMER --yes
 
-        setup/rebuild/start/prepare-deps and restore-import can run before
-        output/intermediate.db exists. run-uploads and import consume converter
-        output and require output/intermediate.db. If output/uploads.sqlite3
+        Restore is allowed only on a pristine import instance. One generic
+        import is allowed on pristine or restored; reset-import is required
+        before repeating either operation. run-uploads and import consume the
+        selected converter output database. If output/uploads.sqlite3
         exists it is passed to generic_bulk.rb too; --no-uploads-db skips it
         explicitly.
 
@@ -314,7 +333,8 @@ module SiloMigrate
       when "stop" then stop(argv)
       when "regenerate" then regenerate(argv)
       when "import-dump" then import_dump(argv)
-      when "replace-dump" then replace_dump(argv)
+      when "reset-db", "replace-dump" then replace_dump(argv)
+      when "history" then history(argv)
       when "analyze-dump" then analyze_dump(argv)
       when "preprocess-dump" then preprocess_dump(argv)
       when "convert-xml" then convert_xml(argv)
@@ -373,7 +393,9 @@ module SiloMigrate
           stop CUSTOMER                Stop Docker Compose services
           regenerate CUSTOMER          Regenerate docker-compose.yml
           import-dump CUSTOMER PHASE   Import SQL dump into a database
-          replace-dump CUSTOMER PHASE  Reset database container data
+          reset-db CUSTOMER PHASE      Reset DB and archive lineage-dependent artifacts
+          replace-dump CUSTOMER PHASE  Compatibility alias for reset-db
+          history list CUSTOMER        List retained workflow archives
           analyze-dump DUMP_FILE       Analyze SQL dump tables and source type
           preprocess-dump DUMP_FILE    Fix generated-column INSERT values
           convert-xml SOURCE           Convert mysqldump XML to SQL
@@ -383,7 +405,9 @@ module SiloMigrate
                                      Use --allow-ssh-prompt for passphrase-protected SSH keys
           add-final-db CUSTOMER        Add final database configuration
           run-converter CUSTOMER [TYPE] Run converter TYPE shortcut or container command after --
-          converter summary CUSTOMER   Generate redacted converter summary from existing output
+          converter summary CUSTOMER   Generate redacted converter summary from selected output
+          converter source CUSTOMER    Inspect/change active source phase
+          converter output-db CUSTOMER Inspect/change selected SQLite output
           discourse setup CUSTOMER     Configure two discourse_docker handoff containers
           discourse import CUSTOMER    Run final generic_bulk import in the import container
           schema export CUSTOMER       Export source/final DB schema
@@ -428,9 +452,20 @@ module SiloMigrate
 
     def converter(argv)
       subcommand = required_arg(argv, "SUBCOMMAND")
-      raise UsageError, "Unknown converter command: #{subcommand}. Did you mean 'converter summary'?" unless subcommand == "summary"
-
-      @project_service.generate_converter_summary(required_arg(argv, "CUSTOMER"))
+      case subcommand
+      when "summary"
+        @project_service.generate_converter_summary(required_arg(argv, "CUSTOMER"))
+      when "source"
+        customer = required_arg(argv, "CUSTOMER")
+        phase = argv.shift
+        raise UsageError, "Invalid converter source: #{phase}" if phase && !%w[initial final].include?(phase)
+        @project_service.converter_source(customer, phase)
+      when "output-db"
+        customer = required_arg(argv, "CUSTOMER")
+        @project_service.converter_output_db(customer, argv.shift)
+      else
+        raise UsageError, "Unknown converter command: #{subcommand}. Use summary, source, or output-db."
+      end
     end
 
     def discourse(argv)
@@ -457,6 +492,10 @@ module SiloMigrate
         @discourse_service.import(required_arg(argv, "CUSTOMER"), **options)
       when "backup-import"
         @discourse_service.backup_import(required_arg(argv, "CUSTOMER"))
+      when "reset-import"
+        options = { yes: false }
+        OptionParser.new { |opts| opts.on("-y", "--yes") { options[:yes] = true } }.parse!(argv)
+        @discourse_service.reset_import(required_arg(argv, "CUSTOMER"), **options)
       else
         raise UsageError, "Unknown discourse command: #{subcommand}"
       end
@@ -625,6 +664,22 @@ module SiloMigrate
       @import_service.replace_dump(customer, phase, **options)
     end
 
+    def history(argv)
+      subcommand = required_arg(argv, "SUBCOMMAND")
+      service = Services::HistoryService.new(env: @env, output: @output)
+      case subcommand
+      when "list"
+        service.list(required_arg(argv, "CUSTOMER"))
+      when "delete"
+        options = { yes: false }
+        OptionParser.new { |opts| opts.on("-y", "--yes") { options[:yes] = true } }.parse!(argv)
+        customer = required_arg(argv, "CUSTOMER")
+        service.delete(customer, required_arg(argv, "ENTRY"), **options)
+      else
+        raise UsageError, "Unknown history command: #{subcommand}. Use list or delete."
+      end
+    end
+
     def analyze_dump(argv)
       options = { large_threshold: 100, full: false }
       OptionParser.new do |opts|
@@ -777,6 +832,7 @@ module SiloMigrate
         opts.on("--redacted-summary") { options[:redacted_logs] = true }
         opts.on("--no-reset") { options[:reset] = false }
         opts.on("--settings PATH") { |value| options[:settings] = value }
+        opts.on("--phase PHASE") { |value| options[:phase] = validate_phase(value) }
       end
 
       separator_index = argv.index("--")
@@ -784,21 +840,22 @@ module SiloMigrate
         option_argv = argv[0...separator_index]
         command = argv[(separator_index + 1)..] || []
         parser.parse!(option_argv)
-        @project_service.run_converter(customer, command: command, redacted_logs: options[:redacted_logs])
+        @project_service.run_converter(customer, command: command, redacted_logs: options[:redacted_logs], phase: options[:phase], track: false)
         return
       end
 
       parser.parse!(argv)
       case argv.length
       when 0
-        @project_service.run_converter(customer, command: [], redacted_logs: options[:redacted_logs])
+        @project_service.run_converter(customer, command: [], redacted_logs: options[:redacted_logs], phase: options[:phase])
       when 1
         @project_service.run_converter_platform(
           customer,
           argv.first,
           reset: options[:reset],
           settings: options[:settings],
-          redacted_logs: options[:redacted_logs]
+          redacted_logs: options[:redacted_logs],
+          phase: options[:phase]
         )
       else
         raise UsageError, "Custom converter commands must be passed after '--', for example: silo-migrate run-converter #{customer} -- #{argv.join(' ')}"

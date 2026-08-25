@@ -63,7 +63,7 @@ Key wiring facts:
   hostname, internal port, and credentials merged in — and passes it via
   `--settings`. Without this, converter defaults point at `localhost` and cannot
   reach the database from inside the container.
-- **Everything is rebuildable**: `replace-dump` wipes a database volume so you
+- **Everything is rebuildable**: `reset-db` archives derivatives and wipes one database volume so you
   can re-import; `cleanup` removes the whole project (it refuses to delete the
   directory if containers could not be stopped, unless you pass `--force`).
 
@@ -96,8 +96,8 @@ Key wiring facts:
 - **It does not modify `discourse-converters`.** The converter repo is cloned
   and orchestrated as-is; converter bugs are fixed upstream, aided by the
   findings/fixtures artifacts this tool produces.
-- **No incremental imports.** A dump is restored whole; to retry you reset the
-  database (`replace-dump`) and import again.
+- **No incremental imports.** A dump is restored whole. Every import performs a
+  live empty-database check; retry only after `reset-db CUSTOMER PHASE --yes`.
 - **Docker is the only active runtime.** The Silo/Incus runtime is a Phase-4
   placeholder behind the same contract; Podman is best-effort, untested.
 - **Real customer data never becomes a fixture.** Fixtures are shape-only and
@@ -106,8 +106,8 @@ Key wiring facts:
 
 ## Happy path — interactive mode
 
-Run `bin/silo-migrate` (or `bin/silo-migrate acme`). The guided mode shows a
-small set of workflow-level choices instead of every individual substep:
+Run `bin/silo-migrate` (or `bin/silo-migrate acme`). Guided mode is a persistent,
+state-aware dashboard with a recommendation and blocked-action reasons. It shows:
 `Initial dump`, `Final dump`, `Converter setup`, `Discourse uploads container`,
 and `Discourse import container`. Each workflow previews what it will do, then
 chains the existing setup/start/import/bundle steps with explicit back/cancel
@@ -208,7 +208,10 @@ Useful variations:
 bin/silo-migrate help import-dump                      # every flag, per command
 bin/silo-migrate analyze-dump dump.sql.gz              # what's in this dump?
 bin/silo-migrate run-converter acme -- ./convert --from vbulletin --settings /converter-settings/vbulletin.yml
-bin/silo-migrate replace-dump acme initial --yes       # reset DB, then re-import
+bin/silo-migrate reset-db acme initial --yes           # archive derivatives, reset DB
+bin/silo-migrate history list acme                     # inspect retained archives
+bin/silo-migrate converter source acme final           # persist cutover source
+bin/silo-migrate converter output-db acme output/custom.db
 bin/silo-migrate converter summary acme                # re-summarize without re-running
 ```
 
@@ -223,7 +226,7 @@ flowchart TD
     C -- "JSON export" --> E2[convert-json] --> D
     D --> F["start --profile initial-db --wait"]
     F --> G[import-dump]
-    G -- "fails" --> R["diagnostics + recovery:<br/>replace-dump → start --wait → import-dump"] --> G
+    G -- "fails" --> R["diagnostics + recovery:<br/>reset-db → start --wait → import-dump"] --> G
     G --> H[schema bundle]
     H --> I[setup-converter]
     I --> J["run-converter TYPE --redacted-logs<br/>(generated converter-settings/TYPE.yml)"]
@@ -271,14 +274,14 @@ later). Everything under `safe-artifacts/` has been redacted or synthesized.
 | Symptom | Do this |
 |---------|---------|
 | Anything feels broken | `bin/silo-migrate doctor` |
-| Import failed mid-way | Read the diagnostics block — it names the error and prints the exact `replace-dump` / `start --wait` / `import-dump` recovery commands |
+| Import failed mid-way | The phase is `dirty`; run `reset-db CUSTOMER PHASE --yes`, then start and import again |
 | "gzip integrity check failed" | The dump is truncated — re-transfer it (don't bypass unless you're certain) |
 | "Malformed JSON in FILE … appears to be truncated" | The JSON export was cut off. Re-export it for the full data; meanwhile `--recover-truncated` (or the guided-mode prompt) keeps the complete records and reports recovered counts, or skip the file with `-X FILE` |
 | Paginated JSON export imports only one page | The file may be NDJSON. `convert-json` auto-detects seekable NDJSON; pass `--ndjson` explicitly for `.json.gz` NDJSON or when you want to force one JSON document per line |
 | JSON tables/columns look unexpected | Conventions: nested objects flatten (`avatar.url` → `avatar_url`); arrays become `<table>_<path>` child tables joined via `_parent_id` (natural key) or `_parent_sid`; deep/mixed shapes land in `*_json` TEXT columns. See "JSON-to-SQL Conversion Design" in the workspace ARCHITECTURE.md |
 | Converter can't reach the DB | Use the platform shortcut so settings are generated; if compose was regenerated, recreate the container: `start CUSTOMER --profile converter` |
-| Port already in use | Interactive mode offers a free port; or `init`/`add-final-db` with an explicit `--port` |
+| Port already in use | Default ports auto-advance to the next free port (the chosen port is printed); an explicit `--port` fails fast with a free-port suggestion |
 | Huge dump is slow on a Mac | Expected (Docker Desktop fsync); the preflight warns. Prefer a Linux host for multi-GB imports |
-| Want a clean slate | `replace-dump CUSTOMER PHASE --yes` (one DB) or `cleanup CUSTOMER --yes` (everything — **push converter work first**, the clone lives inside the project dir) |
+| Want a clean slate | `reset-db CUSTOMER PHASE --yes` (one DB, derived artifacts archived) or `cleanup CUSTOMER --yes` (everything — **push converter work first**, the clone lives inside the project dir) |
 | `safe-artifacts/` shows in `git status` | Re-run `ai refresh CUSTOMER` (it rewrites the `.git/info/exclude` block) |
 | `git pull` conflicts with `AGENTS.md` | Upstream added its own — delete the generated file, pull, re-run `ai refresh` (it falls back to `safe-artifacts/AGENTS.md`) |

@@ -37,13 +37,22 @@ module SiloMigrate
 
       project_path = @project_service.project_path(customer)
       unless File.exist?(File.join(project_path, "config.env"))
-        return create_project_and_continue(customer, confirm: !create_requested)
+        create_project_and_continue(customer, confirm: !create_requested)
+        return unless File.exist?(File.join(project_path, "config.env"))
       end
 
       loop do
-        show_project_summary(customer)
-        action = select_next_action(customer)
-        break if run_action(customer, action) != BACK
+        begin
+          show_project_summary(customer)
+          action = select_next_action(customer)
+          break if run_action(customer, action) == :quit
+        rescue KeyError
+          raise unless @external_prompt
+
+          # Scripted prompts used by embedding callers signal that their input
+          # sequence is exhausted by returning an unmapped value.
+          break
+        end
       end
     end
 
@@ -136,10 +145,19 @@ module SiloMigrate
       db_type = select("Initial database type", DATABASE_TYPES.keys.to_h { |key| [key, key] }, allow_back: true)
       return BACK if db_type == BACK
 
-      initial_port = ask_optional_integer("Initial port (blank for default)")
-      return BACK if initial_port == BACK
+      loop do
+        initial_port = ask_optional_integer("Initial port (blank for default)")
+        return BACK if initial_port == BACK
 
-      @project_service.init(customer, compact_options(db_type: db_type, initial_port: initial_port))
+        begin
+          return @project_service.init(customer, compact_options(db_type: db_type, initial_port: initial_port))
+        rescue UsageError => e
+          raise unless e.message.match?(/port/i)
+
+          @output.puts "[WARN] #{e.message}"
+          @output.puts "Choose another port."
+        end
+      end
     end
 
     def show_project_summary(customer)
@@ -155,9 +173,24 @@ module SiloMigrate
       @output.puts "Initial DB: #{config['INITIAL_DB_TYPE'] || 'not set'} on port #{config['INITIAL_PORT'] || 'not set'}"
       @output.puts "Final DB: #{config['FINAL_DB_TYPE']} on port #{config['FINAL_PORT']}" if config["FINAL_DB_TYPE"]
       @output.puts "Dumps: #{initial_dumps.length} initial, #{final_dumps.length} final"
-      @output.puts "Imports: #{import_status(customer)}"
+      state = workflow_state(customer)
+      @output.puts "\nWorkflow cards:"
+      %w[initial final].each do |phase|
+        data = state.dig("phases", phase)
+        loaded = data["import"] ? " — #{data.dig('import', 'filename')} at #{data.dig('import', 'imported_at')}" : ""
+        @output.puts "  [#{phase.capitalize} DB] #{data['state']} (generation #{data['generation']})#{loaded}"
+      end
+      @output.puts "  [Converter] source=#{state.dig('converter', 'active_source')} output=#{state.dig('converter', 'output_db')}"
+      @output.puts "  [Selected output DB] #{selected_output_status(customer)}"
+      @output.puts "  [Uploads handoff] #{discourse_handoff_status(customer)}"
+      @output.puts "  [Discourse import] #{state.dig('discourse', 'state')}"
+      recommendation, blocked = dashboard_guidance(customer, state)
+      @output.puts "\nRecommended next action: #{recommendation}"
+      unless blocked.empty?
+        @output.puts "Blocked actions:"
+        blocked.each { |line| @output.puts "  - #{line}" }
+      end
       @output.puts "Schema bundle: #{schema_bundle_status(customer)}"
-      @output.puts "Discourse handoff: #{discourse_handoff_status(customer)}" if intermediate_db_present?(customer)
       @output.puts "\nContainer status:"
       @output.puts @project_service.container_status(customer) if @project_service.respond_to?(:container_status)
     end
@@ -187,7 +220,9 @@ module SiloMigrate
       when :discourse_import then discourse_import_workflow(customer)
       when :status then @project_service.status(customer)
       when :advanced then run_advanced_action(customer)
-      when :quit then @output.puts "No changes made."
+      when :quit
+        @output.puts "No changes made. Leaving guided mode."
+        :quit
       end
     end
 
@@ -248,15 +283,17 @@ module SiloMigrate
         [
           "Setup phase: write/update stock Discourse container files and uploads_importer.yml.",
           "Bootstrap phase: rebuild/start a vanilla Discourse uploads container.",
-          "Upload importer phase: prepare dependencies and run only after output/intermediate.db exists."
+          "Upload importer phase: prepare dependencies and run only after the selected converter output exists."
         ]
       )
       return BACK unless confirm?("Continue with Discourse uploads container workflow?", default: true)
 
-      @discourse_service.setup(customer)
-      @discourse_service.rebuild(customer, role: "uploads")
-      @discourse_service.start(customer, role: "uploads")
-      return unless discourse_intermediate_db_ready?(customer, next_step: "Run the converter to create output/intermediate.db, then rerun this workflow or run 'silo-migrate discourse run-uploads #{customer}'.")
+      was_configured = @discourse_service.configured?(customer)
+      @discourse_service.setup(customer) unless was_configured
+      @discourse_service.rebuild(customer, role: "uploads") unless was_configured
+      details = @discourse_service.status_details(customer)
+      @discourse_service.start(customer, role: "uploads") unless details[:uploads_container] == "running"
+      return unless discourse_intermediate_db_ready?(customer, next_step: "Run the converter to create the selected output DB, then rerun this workflow or run 'silo-migrate discourse run-uploads #{customer}'.")
 
       @discourse_service.prepare_deps(customer, role: "uploads")
       @discourse_service.run_uploads(customer)
@@ -280,9 +317,11 @@ module SiloMigrate
       )
       return BACK unless confirm?("Continue with Discourse import container workflow?", default: true)
 
-      @discourse_service.setup(customer)
-      @discourse_service.rebuild(customer, role: "import")
-      @discourse_service.start(customer, role: "import")
+      was_configured = @discourse_service.configured?(customer)
+      @discourse_service.setup(customer) unless was_configured
+      @discourse_service.rebuild(customer, role: "import") unless was_configured
+      details = @discourse_service.status_details(customer)
+      @discourse_service.start(customer, role: "import") unless details[:import_container] == "running"
       run_discourse_import_action_menu(customer)
       show_discourse_manual_commands(customer)
     rescue UsageError => e
@@ -292,6 +331,25 @@ module SiloMigrate
 
     def prompt_dump_flow(customer, phase)
       existing = dump_files(customer, phase)
+      phase_state = workflow_state(customer).dig("phases", phase, "state")
+      stage_only = false
+      if phase_state != "empty"
+        show_existing_dumps(phase, existing) if existing.any?
+        choices = { "Stage another dump (does not change the database)" => :new_dump }
+        choices["Reset database and import selected dump"] = :reset if existing.any?
+        choices["Back"] = BACK
+        choice = select("#{phase.capitalize} database is #{phase_state}; import is blocked until reset", choices)
+        return BACK if choice == BACK
+        if choice == :reset
+          dump = select_dump_for_import(customer, phase)
+          return BACK unless dump
+          return BACK unless confirm?("Reset #{phase} database, archive derived artifacts, and import #{File.basename(dump)}?", default: false)
+          @import_service.replace_dump(customer, phase, yes: true)
+          return offer_start_and_import(customer, phase, dump, confirm_import: false)
+        end
+        stage_only = true
+        existing = []
+      end
       if existing.any?
         show_existing_dumps(phase, existing)
         choice = select(
@@ -356,14 +414,18 @@ module SiloMigrate
                   else
                     @project_service.stage_dump(customer, phase, source)
                   end
+      if stage_only
+        @output.puts "[OK] Dump staged. The loaded database was not changed; use Reset database and import selected dump when ready."
+        return dump_path
+      end
       offer_start_and_import(customer, phase, dump_path)
     end
 
-    def offer_start_and_import(customer, phase, dump_path)
+    def offer_start_and_import(customer, phase, dump_path, confirm_import: true)
       return unless dump_path
 
       show_import_target(phase, dump_path)
-      return unless confirm?("Start #{phase}-db and import #{File.basename(dump_path)} now?", default: true)
+      return if confirm_import && !confirm?("Start #{phase}-db and import #{File.basename(dump_path)} now?", default: true)
 
       return unless start_services_with_recovery(customer, "#{phase}-db", wait_for_health: true)
 
@@ -377,8 +439,10 @@ module SiloMigrate
         @output.puts "[WARN] Import did not complete; reset DB data before retrying this dump."
         return
       end
-      write_import_marker(customer, phase, dump_path)
       generate_schema_bundle(customer, phase)
+      if phase == "final" && confirm?("Make final the active converter source?", default: true)
+        @project_service.converter_source(customer, "final")
+      end
     end
 
     def prompt_import_options(dump_path)
@@ -425,10 +489,19 @@ module SiloMigrate
       db_type = select("Final database type", DATABASE_TYPES.keys.to_h { |key| [key, key] }, allow_back: true)
       return BACK if db_type == BACK
 
-      port = ask_optional_integer("Final port (blank for initial port + 1)")
-      return BACK if port == BACK
+      loop do
+        port = ask_optional_integer("Final port (blank for initial port + 1)")
+        return BACK if port == BACK
 
-      @project_service.add_final_db(customer, compact_options(db_type: db_type, port: port))
+        begin
+          return @project_service.add_final_db(customer, compact_options(db_type: db_type, port: port))
+        rescue UsageError => e
+          raise unless e.message.match?(/port/i)
+
+          @output.puts "[WARN] #{e.message}"
+          @output.puts "Choose another port."
+        end
+      end
     end
 
     def run_advanced_action(customer)
@@ -554,6 +627,7 @@ module SiloMigrate
           "Start converter service" => :start,
           "Stop converter service" => :stop,
           "Run converter command" => :run,
+          "Select converter output database" => :output_db,
           "Generate redacted summary from latest converter logs" => :summary,
           "Generate findings from latest redacted summary" => :findings,
           "Generate synthetic fixtures from latest findings" => :fixtures,
@@ -567,6 +641,7 @@ module SiloMigrate
       when :start then @project_service.start_converter(customer, bundle_install: confirm?("Run bundle install after starting?", default: true), hard_fail: false)
       when :stop then @project_service.stop(customer, profile: "converter", remove: confirm?("Remove stopped containers?", default: false))
       when :run then run_converter(customer)
+      when :output_db then select_converter_output(customer)
       when :summary then generate_converter_summary(customer)
       when :findings then generate_findings(customer)
       when :fixtures then generate_synthetic_fixtures(customer)
@@ -647,6 +722,9 @@ module SiloMigrate
         choices["Import intermediate.db only"] = :import_intermediate
         choices["Run uploads importer, then import intermediate.db + uploads.sqlite3"] = :import_with_uploads
       end
+      unless workflow_state(customer).dig("discourse", "state") == "pristine"
+        choices["Reset import instance (destroy + rebuild; converter output and backups preserved)"] = :reset_import
+      end
       choices["Generate final backup"] = :backup
       choices["Show import container status"] = :status
       choices[done_label] = done_label == BACK_LABEL ? BACK : :done
@@ -680,6 +758,9 @@ module SiloMigrate
         @discourse_service.run_uploads(customer)
         @discourse_service.prepare_deps(customer, role: "import")
         @discourse_service.import(customer, no_uploads_db: false)
+      when :reset_import
+        confirm!("Destroy and rebuild the Discourse import container for #{customer}? All restored/imported data in it is lost (converter output and final backups are preserved).")
+        @discourse_service.reset_import(customer, yes: true)
       when :backup then @discourse_service.backup_import(customer)
       when :status then @discourse_service.status(customer, role: "import")
       end
@@ -730,6 +811,64 @@ module SiloMigrate
       imported = phase_imported?(customer, phase) ? "imported" : "not imported"
       schema = schema_bundle_present?(customer, phase) ? "schema bundle present" : "schema bundle missing"
       "#{phase.capitalize} dump: #{dumps.length} staged, #{imported}, #{schema}"
+    end
+
+    def workflow_state(customer)
+      WorkflowStore.new(customer, env: env_for_project).read
+    end
+
+    def selected_output_status(customer)
+      path = ConverterOutput.new(customer, env: env_for_project).selected_path
+      relative = Pathname.new(path).relative_path_from(Pathname.new(@project_service.project_path(customer))).to_s
+      File.file?(path) ? "#{relative} (present)" : "#{relative} (missing)"
+    rescue UsageError => e
+      "unknown (#{e.message.lines.first.strip})"
+    end
+
+    def dashboard_guidance(customer, state)
+      initial = state.dig("phases", "initial", "state")
+      final = state.dig("phases", "final", "state")
+      source = state.dig("converter", "active_source")
+      source_state = state.dig("phases", source, "state")
+      output = ConverterOutput.new(customer, env: env_for_project).selected_path
+      recommendation = if initial == "empty"
+                         "stage and import the initial dump"
+                       elsif initial == "importing"
+                         "wait for the running initial import to finish"
+                       elsif %w[dirty unknown].include?(initial)
+                         "reset the initial database"
+                       elsif !File.file?(output)
+                         if %w[ready untracked].include?(source_state)
+                           "run the converter from #{source}"
+                         elsif source_state == "empty"
+                           "stage and import the #{source} dump (the active converter source)"
+                         elsif source_state == "importing"
+                           "wait for the running #{source} import to finish"
+                         else
+                           "reset the #{source} database (the active converter source is #{source_state})"
+                         end
+                       elsif final == "empty"
+                         "stage the final dump when cutover data is available"
+                       elsif state.dig("discourse", "state") == "pristine"
+                         "run the Discourse handoff import"
+                       else
+                         "review status or create the final backup"
+                       end
+      blocked = []
+      %w[initial final].each do |phase|
+        value = state.dig("phases", phase, "state")
+        next if value == "empty"
+
+        blocked << if value == "importing"
+                     "Import #{phase}: an import is already running"
+                   else
+                     "Import #{phase}: database is #{value}; reset-db required"
+                   end
+      end
+      blocked << "Run converter: #{source} source is #{source_state}" unless %w[ready untracked].include?(source_state)
+      discourse = state.dig("discourse", "state")
+      blocked << "Restore/import Discourse: instance is #{discourse}; reset-import required" unless %w[pristine restored].include?(discourse)
+      [recommendation, blocked]
     end
 
     def final_database_status(customer)
@@ -822,7 +961,7 @@ module SiloMigrate
     def discourse_intermediate_db_ready?(customer, next_step:)
       return true if @discourse_service.status_details(customer)[:intermediate_db]
 
-      @output.puts "[WARN] output/intermediate.db is missing; the Discourse container is bootstrapped, but there is no converter output to import yet."
+      @output.puts "[WARN] The selected converter output DB is missing; the Discourse container is bootstrapped, but there is no output to import yet."
       @output.puts "Next step: #{next_step}"
       show_discourse_manual_commands(customer)
       false
@@ -831,7 +970,7 @@ module SiloMigrate
     def ensure_discourse_intermediate_db!(customer)
       return if @discourse_service.status_details(customer)[:intermediate_db]
 
-      raise UsageError, "output/intermediate.db is missing; run the converter before running import actions."
+      raise UsageError, "The selected converter output DB is missing; run the converter before running import actions."
     end
 
     def start_converter_if_requested(customer)
@@ -907,7 +1046,9 @@ module SiloMigrate
       command_text = ask("Converter command (blank for bundle exec ruby converter.rb)").to_s.strip
       command = command_text.empty? ? [] : command_text.split
       begin
-        @project_service.run_converter(customer, command: command)
+        # Custom commands run untracked (maintenance); the blank default is a
+        # real conversion run and stays gated + lineage-tracked.
+        @project_service.run_converter(customer, command: command, track: command.empty?)
       rescue UsageError => e
         @output.puts "[WARN] #{e.message}"
         @output.puts "Recovery commands:"
@@ -926,6 +1067,24 @@ module SiloMigrate
       generate_findings(customer) if confirm?("Generate structured findings from this summary?", default: true)
     rescue UsageError => e
       @output.puts "[WARN] #{e.message}"
+    end
+
+    def select_converter_output(customer)
+      resolver = ConverterOutput.new(customer, env: env_for_project)
+      candidates = resolver.discover_candidates
+      if candidates.empty?
+        @output.puts "[WARN] No valid SQLite databases were found beneath output/."
+        return
+      end
+      choices = candidates.to_h do |path|
+        relative = Pathname.new(path).relative_path_from(Pathname.new(@project_service.project_path(customer))).to_s
+        [relative, path]
+      end
+      selected = select("Select converter output database", choices, allow_back: true)
+      return BACK if selected == BACK
+
+      resolver.select!(selected)
+      @output.puts "[OK] Selected converter output: #{Pathname.new(selected).relative_path_from(Pathname.new(@project_service.project_path(customer)))}"
     end
 
     def generate_findings(customer)
@@ -1606,18 +1765,6 @@ module SiloMigrate
       false
     end
 
-    def write_import_marker(customer, phase, dump_path)
-      config = Project.load_config(customer, env_for_project)
-      marker = {
-        file: File.basename(dump_path),
-        size: File.size(dump_path),
-        imported_at: Time.now.iso8601,
-        db_type: phase == "final" ? config["FINAL_DB_TYPE"] : config["INITIAL_DB_TYPE"],
-        port: phase == "final" ? config["FINAL_PORT"] : config["INITIAL_PORT"]
-      }
-      Project.atomic_write(import_marker_path(customer, phase), JSON.pretty_generate(marker) + "\n")
-    end
-
     def clear_import_marker(customer, phase)
       FileUtils.rm_f(import_marker_path(customer, phase))
     end
@@ -1651,7 +1798,7 @@ module SiloMigrate
     end
 
     def intermediate_db_present?(customer)
-      File.exist?(File.join(@project_service.project_path(customer), "output", "intermediate.db"))
+      File.exist?(ConverterOutput.new(customer, env: env_for_project).selected_path)
     end
 
     def discourse_handoff_status(customer)

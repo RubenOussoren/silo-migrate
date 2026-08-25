@@ -2,6 +2,7 @@
 
 require "fileutils"
 require "rbconfig"
+require "set"
 require "shellwords"
 require "time"
 require "yaml"
@@ -39,7 +40,9 @@ module SiloMigrate
         config = Project.load_config(customer, @env)
         Project.ensure_project_dirs(customer, @env)
 
+        explicit_keys = (existing_discourse_config(config).keys + stringify_config(options).keys).to_set
         discourse_config = default_config(customer).merge(existing_discourse_config(config)).merge(stringify_config(options))
+        validate_service_ports!(config, discourse_config, explicit_keys: explicit_keys)
         validate_discourse_docker_path!(discourse_config.fetch("DISCOURSE_DOCKER_PATH"))
         Project.save_config(customer, config.merge(discourse_config), @env)
         ensure_discourse_dirs(customer, discourse_config)
@@ -128,8 +131,9 @@ module SiloMigrate
       end
 
       def run_uploads(customer)
-        ensure_file!(intermediate_db_path(customer), "Run the converter first to create output/intermediate.db.")
+        ensure_file!(intermediate_db_path(customer), "Run the converter first to create the selected converter output database.")
         setup(customer) unless discourse_configured?(customer)
+        write_uploads_importer_config(customer, discourse_config(customer))
 
         container = container_name(customer, "uploads")
         command = [
@@ -147,46 +151,112 @@ module SiloMigrate
         setup(customer) unless discourse_configured?(customer)
         raise UsageError, "Backup not found: #{backup}" unless File.exist?(backup)
 
-        name = container_name(customer, "import")
-        backup_basename = File.basename(backup)
-        backup_dir = "/var/www/discourse/public/backups/default"
-        copy_command = ["docker", "cp", backup, "#{name}:#{backup_dir}/#{backup_basename}"]
-        log_command_notice("Copying Discourse backup into #{name}...", copy_command)
-        copy = @runtime.run(copy_command, timeout: BACKUP_TIMEOUT)
-        raise UsageError, "Could not copy backup into #{name}" unless copy.success?
+        store = WorkflowStore.new(customer, env: @env, runtime: @runtime)
+        state = store.read
+        discourse_state = state.dig("discourse", "state")
+        unless discourse_state == "pristine"
+          raise UsageError, "Discourse import instance is #{discourse_state}; restore is blocked. Reset it first: silo-migrate discourse reset-import #{customer} --yes"
+        end
+        store.update { |current| current.fetch("discourse")["state"] = "dirty" }
 
-        restore_command = ["docker", "exec", name, "su", "discourse", "-c", "DISCOURSE_ENABLE_RESTORE=true bundle exec script/discourse restore #{backup_basename}"]
-        log_command_notice("Restoring Discourse backup in #{name}...", restore_command)
-        restore = @runtime.run(restore_command, timeout: BACKUP_TIMEOUT)
-        raise UsageError, "Backup restore failed in #{name}" unless restore.success?
+        begin
+          name = container_name(customer, "import")
+          backup_basename = File.basename(backup)
+          backup_dir = "/var/www/discourse/public/backups/default"
+          copy_command = ["docker", "cp", backup, "#{name}:#{backup_dir}/#{backup_basename}"]
+          log_command_notice("Copying Discourse backup into #{name}...", copy_command)
+          copy = @runtime.run(copy_command, timeout: BACKUP_TIMEOUT)
+          raise UsageError, "Could not copy backup into #{name}" unless copy.success?
 
-        marker = File.join(Project.project_path(customer, @env), "output", "discourse-import-restored.txt")
-        Project.atomic_write(marker, "#{Time.now.utc.iso8601} #{backup_basename}\n")
-        @output.puts "[OK] Backup restored into #{name}"
+          restore_command = ["docker", "exec", name, "su", "discourse", "-c", "DISCOURSE_ENABLE_RESTORE=true bundle exec script/discourse restore #{backup_basename}"]
+          log_command_notice("Restoring Discourse backup in #{name}...", restore_command)
+          restore = @runtime.run(restore_command, timeout: BACKUP_TIMEOUT)
+          raise UsageError, "Backup restore failed in #{name}" unless restore.success?
+
+          restored_at = Time.now.utc.iso8601
+          marker = File.join(Project.project_path(customer, @env), "output", "discourse-import-restored.txt")
+          Project.atomic_write(marker, "#{restored_at} #{backup_basename}\n")
+          store.update do |current|
+            current.fetch("discourse").merge!("state" => "restored", "restored_at" => restored_at, "backup" => backup_basename)
+          end
+          @output.puts "[OK] Backup restored into #{name}"
+        rescue StandardError
+          store.update { |current| current.fetch("discourse")["state"] = "dirty" }
+          raise
+        end
       end
 
       def import(customer, no_uploads_db: false)
         setup(customer) unless discourse_configured?(customer)
-        ensure_file!(intermediate_db_path(customer), "Run the converter first to create output/intermediate.db.")
+        ensure_file!(intermediate_db_path(customer), "Run the converter first to create the selected converter output database.")
+        store = WorkflowStore.new(customer, env: @env, runtime: @runtime)
+        workflow = store.read
+        current_state = workflow.dig("discourse", "state")
+        unless %w[pristine restored].include?(current_state)
+          raise UsageError, "Discourse import instance is #{current_state}; repeat import is blocked. Reset it first: silo-migrate discourse reset-import #{customer} --yes"
+        end
+        store.update { |current| current.fetch("discourse")["state"] = "dirty" }
         use_uploads_db = !no_uploads_db && File.exist?(uploads_db_path(customer))
 
         guest_root = guest_root(customer)
-        command = "IMPORT=1 bundle exec ruby script/bulk_import/generic_bulk.rb #{guest_root}/output/intermediate.db"
+        command = "IMPORT=1 bundle exec ruby script/bulk_import/generic_bulk.rb #{guest_output_db_path(customer)}"
         command << " #{guest_root}/output/uploads.sqlite3" if use_uploads_db
         if !use_uploads_db && no_uploads_db
-          @output.puts "[WARN] Skipping uploads.sqlite3; importing with intermediate.db only."
+          @output.puts "[WARN] Skipping uploads.sqlite3; importing with the selected converter output only."
         elsif !use_uploads_db
-          @output.puts "[WARN] uploads.sqlite3 not found; importing with intermediate.db only."
+          @output.puts "[WARN] uploads.sqlite3 not found; importing with the selected converter output only."
         end
         container = container_name(customer, "import")
         docker_command = ["docker", "exec", container, "su", "discourse", "-c", command]
         log_command_notice("Running Discourse generic import in #{container}...", docker_command)
-        result = @runtime.run(docker_command, timeout: IMPORT_TIMEOUT)
-        raise UsageError, "Generic bulk import failed" unless result.success?
+        begin
+          result = @runtime.run(docker_command, timeout: IMPORT_TIMEOUT)
+          raise UsageError, "Generic bulk import failed" unless result.success?
 
-        marker = File.join(Project.project_path(customer, @env), "output", "discourse-import-complete.txt")
-        Project.atomic_write(marker, "#{Time.now.utc.iso8601}\n")
-        @output.puts "[OK] Generic bulk import completed"
+          imported_at = Time.now.utc.iso8601
+          marker = File.join(Project.project_path(customer, @env), "output", "discourse-import-complete.txt")
+          Project.atomic_write(marker, "#{imported_at}\n")
+          store.update do |current|
+            current.fetch("discourse").merge!(
+              "state" => "imported", "imported_at" => imported_at,
+              "output_lineage" => current.dig("converter", "output_lineage")
+            )
+          end
+          @output.puts "[OK] Generic bulk import completed"
+        rescue StandardError
+          store.update { |current| current.fetch("discourse")["state"] = "dirty" }
+          raise
+        end
+      end
+
+      def reset_import(customer, yes: false)
+        raise UsageError, "Resetting the Discourse import instance is destructive. Re-run with --yes." unless yes
+
+        config = discourse_config(customer)
+        validate_discourse_docker_path!(config.fetch("DISCOURSE_DOCKER_PATH"))
+        name = container_name(customer, "import", config)
+        store = WorkflowStore.new(customer, env: @env, runtime: @runtime)
+        store.update { |state| state.fetch("discourse")["state"] = "dirty" }
+        result = @runtime.run(["./launcher", "destroy", name], chdir: config.fetch("DISCOURSE_DOCKER_PATH"), capture: true, timeout: REBUILD_TIMEOUT)
+        raise UsageError, "Could not destroy Discourse import container #{name}" unless result.success?
+
+        shared_root_path = File.join(config.fetch("DISCOURSE_DOCKER_PATH"), "shared")
+        FileUtils.mkdir_p(shared_root_path)
+        shared_root = File.realpath(shared_root_path)
+        shared = File.join(shared_root, name)
+        unless File.basename(shared) == name && File.expand_path(shared).start_with?("#{shared_root}#{File::SEPARATOR}")
+          raise UsageError, "Refusing to reset unexpected Discourse shared directory: #{shared}"
+        end
+        FileUtils.rm_rf(shared)
+        FileUtils.mkdir_p(shared)
+        project = Project.project_path(customer, @env)
+        FileUtils.rm_f(File.join(project, "output", "discourse-import-restored.txt"))
+        FileUtils.rm_f(File.join(project, "output", "discourse-import-complete.txt"))
+        run_launcher(customer, "rebuild", name, role: "import", timeout: REBUILD_TIMEOUT)
+        store.update do |state|
+          state["discourse"] = WorkflowStore.new(customer, env: @env).default_state.fetch("discourse")
+        end
+        @output.puts "[OK] Discourse import instance reset to pristine; converter output and final backups were preserved"
       end
 
       def backup_import(customer)
@@ -218,7 +288,8 @@ module SiloMigrate
       def status_details(customer)
         project_path = Project.project_path(customer, @env)
         {
-          intermediate_db: File.exist?(File.join(project_path, "output", "intermediate.db")),
+          intermediate_db: File.exist?(intermediate_db_path(customer)),
+          selected_output_db: intermediate_db_path(customer),
           uploads_db: File.exist?(File.join(project_path, "output", "uploads.sqlite3")),
           uploads_container: container_state(customer, "uploads"),
           import_container: container_state(customer, "import"),
@@ -234,6 +305,39 @@ module SiloMigrate
       end
 
       private
+
+      def validate_service_ports!(project_config, discourse_config, explicit_keys: Set.new)
+        validator = PortValidator.new(env: @env)
+        used = {}
+        used["initial database"] = project_config["INITIAL_PORT"] if project_config["INITIAL_PORT"]
+        used["final database"] = project_config["FINAL_PORT"] if project_config["FINAL_PORT"]
+        uploads = resolve_service_port(
+          validator, discourse_config, "DISCOURSE_UPLOADS_PORT",
+          label: "Discourse uploads", used: used,
+          explicit: explicit_keys.include?("DISCOURSE_UPLOADS_PORT"),
+          allow_occupied: project_config["DISCOURSE_UPLOADS_PORT"].to_s == discourse_config.fetch("DISCOURSE_UPLOADS_PORT").to_s
+        )
+        used["Discourse uploads"] = uploads
+        import_port = resolve_service_port(
+          validator, discourse_config, "DISCOURSE_IMPORT_PORT",
+          label: "Discourse import", used: used,
+          explicit: explicit_keys.include?("DISCOURSE_IMPORT_PORT"),
+          allow_occupied: project_config["DISCOURSE_IMPORT_PORT"].to_s == discourse_config.fetch("DISCOURSE_IMPORT_PORT").to_s
+        )
+        discourse_config["DISCOURSE_UPLOADS_PORT"] = uploads.to_s
+        discourse_config["DISCOURSE_IMPORT_PORT"] = import_port.to_s
+      end
+
+      # Explicitly configured ports fail fast when unusable; default ports
+      # silently advance to the next free one.
+      def resolve_service_port(validator, discourse_config, key, label:, used:, explicit:, allow_occupied:)
+        value = discourse_config.fetch(key)
+        return validator.validate!(value, label: label, used: used, allow_occupied: allow_occupied) if explicit
+
+        chosen = validator.next_free(value, avoid: used.values)
+        @output.puts "[OK] #{label} default port #{value} is in use; selected free port #{chosen}" if chosen.to_s != value.to_s
+        chosen
+      end
 
       def default_config(customer)
         {
@@ -358,7 +462,7 @@ module SiloMigrate
       def write_uploads_importer_config(customer, config)
         guest_root = config.fetch("DISCOURSE_IMPORT_GUEST_ROOT")
         content = {
-          "source_db_path" => "#{guest_root}/output/intermediate.db",
+          "source_db_path" => guest_output_db_path(customer, config: config),
           "output_db_path" => "#{guest_root}/output/uploads.sqlite3",
           "root_paths" => ["#{guest_root}/uploads"],
           "download_cache_path" => "#{guest_root}/shared/downloaded_files",
@@ -501,8 +605,15 @@ module SiloMigrate
         discourse_config(customer).fetch("DISCOURSE_IMPORT_GUEST_ROOT")
       end
 
+      def guest_output_db_path(customer, config: nil)
+        config ||= discourse_config(customer)
+        host = intermediate_db_path(customer)
+        relative = Pathname.new(host).relative_path_from(Pathname.new(Project.project_path(customer, @env))).to_s
+        "#{config.fetch('DISCOURSE_IMPORT_GUEST_ROOT')}/#{relative}"
+      end
+
       def intermediate_db_path(customer)
-        File.join(Project.project_path(customer, @env), "output", "intermediate.db")
+        ConverterOutput.new(customer, env: @env, runtime: @runtime).selected_path
       end
 
       def uploads_db_path(customer)
