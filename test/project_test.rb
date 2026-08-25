@@ -79,7 +79,47 @@ class ProjectTest < SiloMigrateTest
     end
   end
 
-  def test_cleanup_preserves_project_when_discourse_launcher_is_invalid
+  class NoContainersRuntime < SiloMigrate::Runtime::Fake
+    def run(cmd, **kwargs)
+      super
+      return SiloMigrate::Runtime::CommandResult.new(success?: false, stdout: "", stderr: "No such container", status: 1) if cmd[0, 3] == %w[docker container inspect]
+
+      SiloMigrate::Runtime::CommandResult.new(success?: true, stdout: "", stderr: "", status: 0)
+    end
+  end
+
+  class ForceRemoveFailsRuntime < SiloMigrate::Runtime::Fake
+    def run(cmd, **kwargs)
+      super
+      return SiloMigrate::Runtime::CommandResult.new(success?: false, stdout: "", stderr: "rm failed", status: 1) if cmd[0, 3] == ["docker", "rm", "-f"]
+
+      SiloMigrate::Runtime::CommandResult.new(success?: true, stdout: "", stderr: "", status: 0)
+    end
+  end
+
+  def test_cleanup_succeeds_when_discourse_config_exists_but_containers_were_never_created
+    with_tmp_base do |dir, env|
+      runtime = NoContainersRuntime.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      path = project.project_path("acme")
+      config = SiloMigrate::Project.load_config("acme", env).merge(
+        "DISCOURSE_DOCKER_PATH" => fake_discourse_docker(dir),
+        "DISCOURSE_UPLOADS_CONTAINER" => "acme-uploads",
+        "DISCOURSE_IMPORT_CONTAINER" => "acme-import"
+      )
+      SiloMigrate::Project.save_config("acme", config, env)
+
+      project.cleanup("acme", yes: true)
+
+      refute Dir.exist?(path)
+      refute runtime.commands.any? { |entry| entry[0] == :run && entry[1][0, 2] == ["./launcher", "destroy"] }
+      assert_includes out.string, "No Discourse handoff containers to remove"
+    end
+  end
+
+  def test_cleanup_force_removes_container_when_launcher_config_is_missing
     with_tmp_base do |dir, env|
       runtime = SiloMigrate::Runtime::Fake.new
       out = StringIO.new
@@ -93,8 +133,32 @@ class ProjectTest < SiloMigrateTest
       )
       SiloMigrate::Project.save_config("acme", config, env)
 
+      project.cleanup("acme", yes: true)
+
+      refute Dir.exist?(path)
+      assert runtime.commands.any? { |entry| entry[0] == :run && entry[1] == %w[docker rm -f acme-uploads] }
+      assert runtime.commands.any? { |entry| entry[0] == :run && entry[1] == %w[docker rm -f acme-import] }
+      assert_includes out.string, "has no launcher config; removing the container directly"
+      assert_includes out.string, "Discourse handoff containers destroyed"
+    end
+  end
+
+  def test_cleanup_preserves_project_when_direct_container_removal_fails
+    with_tmp_base do |dir, env|
+      runtime = ForceRemoveFailsRuntime.new
+      out = StringIO.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: out)
+      project.init("acme")
+      path = project.project_path("acme")
+      config = SiloMigrate::Project.load_config("acme", env).merge(
+        "DISCOURSE_DOCKER_PATH" => File.join(dir, "missing-discourse"),
+        "DISCOURSE_UPLOADS_CONTAINER" => "acme-uploads",
+        "DISCOURSE_IMPORT_CONTAINER" => "acme-import"
+      )
+      SiloMigrate::Project.save_config("acme", config, env)
+
       error = assert_raises(SiloMigrate::UsageError) { project.cleanup("acme", yes: true) }
-      assert_includes error.message, "Discourse Docker launcher"
+      assert_includes error.message, "rm failed"
       assert_includes error.message, "NOT deleted"
       assert Dir.exist?(path)
 

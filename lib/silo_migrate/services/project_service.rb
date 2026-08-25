@@ -548,30 +548,45 @@ module SiloMigrate
         buffer.truncated? ? "[earlier output truncated]\n#{text}" : text
       end
 
+      # Destroy only what actually exists: config keys alone do not prove the
+      # launcher containers were ever created (a failed `discourse setup` can
+      # leave config behind), and `./launcher destroy` always errors when the
+      # container yml is missing.
       def cleanup_discourse_handoff(customer, config, project_path, force:)
         return unless discourse_handoff_configured?(config)
 
         docker_path = config["DISCOURSE_DOCKER_PATH"].to_s
-        unless valid_discourse_launcher?(docker_path)
-          handle_discourse_cleanup_failure(customer, project_path, "Discourse Docker launcher is not installed or invalid at #{docker_path.empty? ? '(not set)' : docker_path}.", force: force)
-          return
-        end
-
+        launcher_usable = valid_discourse_launcher?(docker_path)
         containers = [
           config["DISCOURSE_UPLOADS_CONTAINER"] || "#{customer}-uploads",
           config["DISCOURSE_IMPORT_CONTAINER"] || "#{customer}-import"
         ].uniq
         failures = []
+        destroyed = []
         containers.each do |container|
-          result = @runtime.run(["./launcher", "destroy", container], chdir: docker_path, capture: true)
-          failures << "#{container}: #{command_failure_detail(result)}" unless result.success?
+          if launcher_usable && File.exist?(File.join(File.expand_path(docker_path), "containers", "#{container}.yml"))
+            result = @runtime.run(["./launcher", "destroy", container], chdir: docker_path, capture: true)
+            failures << "#{container}: #{command_failure_detail(result)}" unless result.success?
+            destroyed << container if result.success?
+          elsif docker_container_exists?(container)
+            @output.puts "[WARN] #{container} has no launcher config; removing the container directly."
+            result = @runtime.run(["docker", "rm", "-f", container], capture: true)
+            failures << "#{container}: #{command_failure_detail(result)}" unless result.success?
+            destroyed << container if result.success?
+          end
         end
 
-        if failures.empty?
+        if failures.any?
+          handle_discourse_cleanup_failure(customer, project_path, failures.join("; "), force: force)
+        elsif destroyed.any?
           @output.puts "[OK] Discourse handoff containers destroyed"
         else
-          handle_discourse_cleanup_failure(customer, project_path, failures.join("; "), force: force)
+          @output.puts "[OK] No Discourse handoff containers to remove"
         end
+      end
+
+      def docker_container_exists?(name)
+        @runtime.run(["docker", "container", "inspect", name], capture: true).success?
       end
 
       def discourse_handoff_configured?(config)

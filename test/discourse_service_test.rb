@@ -18,6 +18,20 @@ class DiscourseServiceTest < SiloMigrateTest
     path
   end
 
+  def test_failed_setup_persists_no_discourse_config
+    with_tmp_base do |dir, env|
+      project, service, = build_service(env)
+      project.init("acme")
+      docker_path = fake_discourse_docker(dir)
+      write(File.join(docker_path, "containers"), "not a directory")
+
+      assert_raises(StandardError) { service.setup("acme", docker_path: docker_path) }
+
+      config = SiloMigrate::Project.load_config("acme", env)
+      assert_empty config.keys.select { |key| key.start_with?("DISCOURSE_") }
+    end
+  end
+
   def test_setup_generates_two_container_yml_files_with_distinct_ports_and_mounts
     with_tmp_base do |dir, env|
       project, service, = build_service(env)

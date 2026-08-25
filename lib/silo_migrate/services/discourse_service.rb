@@ -44,11 +44,14 @@ module SiloMigrate
         discourse_config = default_config(customer).merge(existing_discourse_config(config)).merge(stringify_config(options))
         validate_service_ports!(config, discourse_config, explicit_keys: explicit_keys)
         validate_discourse_docker_path!(discourse_config.fetch("DISCOURSE_DOCKER_PATH"))
-        Project.save_config(customer, config.merge(discourse_config), @env)
         ensure_discourse_dirs(customer, discourse_config)
         write_container_yml(customer, "uploads", discourse_config)
         write_container_yml(customer, "import", discourse_config)
         write_uploads_importer_config(customer, discourse_config)
+        # Persist config only after the launcher/container artifacts exist, so
+        # a failed setup cannot leave config claiming containers that were
+        # never created.
+        Project.save_config(customer, config.merge(discourse_config), @env)
 
         @output.puts "[OK] Discourse containers configured:"
         @output.puts "  uploads: #{discourse_config.fetch('DISCOURSE_UPLOADS_CONTAINER')} on 127.0.0.1:#{discourse_config.fetch('DISCOURSE_UPLOADS_PORT')}"
