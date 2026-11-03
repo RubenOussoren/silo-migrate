@@ -64,6 +64,101 @@ class CLITest < SiloMigrateTest
     assert_includes out.string, "Does not remove migration projects"
   end
 
+  def test_trusted_release_requires_explicit_text_and_resolves_workspace_relative_paths
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      root = project.project_path("acme")
+      write(File.join(root, "trusted", "findings", "finding-private.yml"), {
+        "id" => "finding-private",
+        "dev_visibility" => "trusted_only",
+        "message" => "private-sentinel"
+      }.to_yaml)
+      out = StringIO.new
+      err = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: err)
+      assert_equal 1, cli.run(["trusted", "redact", "acme", "trusted/findings/finding-private.yml", "--notes", "private-sentinel"])
+      assert_includes err.string, "--released-message"
+      refute_includes err.string, "private-sentinel"
+      assert_empty Dir[File.join(root, "findings", "*.yml")]
+
+      assert_equal 0, cli.run(["trusted", "redact", "acme", "trusted/findings/finding-private.yml", "--notes", "private-sentinel", "--released-message", "Reviewed synthetic summary"])
+      content = File.read(Dir[File.join(root, "findings", "*.yml")].fetch(0))
+      assert_equal "Reviewed synthetic summary", YAML.safe_load(content).fetch("message")
+      refute_includes content, "private-sentinel"
+      refute_includes out.string, "private-sentinel"
+      assert_equal 1, cli.run(["trusted", "review", "acme", "../other/private-sentinel.yml", "--released-message", "Reviewed"])
+      refute_includes err.string, "private-sentinel"
+    end
+  end
+
+  def test_trusted_review_cli_publishes_only_explicit_release_text
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      root = project.project_path("acme")
+      write(File.join(root, "findings", "finding-private.yml"), {
+        "id" => "finding-private",
+        "dev_visibility" => "restricted",
+        "message" => "private-sentinel"
+      }.to_yaml)
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: StringIO.new)
+      assert_equal 0, cli.run(["trusted", "review", "acme", "findings/finding-private.yml", "--released-message", "Reviewed summary"])
+      reviewed = Dir[File.join(root, "findings", "finding-*-reviewed.yml")].fetch(0)
+      assert_equal "Reviewed summary", YAML.safe_load(File.read(reviewed)).fetch("message")
+    end
+  end
+
+  def test_trusted_release_rejects_unquoted_extra_arguments_and_option_like_text
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      root = project.project_path("acme")
+      write(File.join(root, "findings", "finding-private.yml"), {
+        "id" => "finding-private", "dev_visibility" => "restricted"
+      }.to_yaml)
+      error = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: error)
+      %w[review redact].each do |command|
+        assert_equal 1, cli.run(["trusted", command, "acme", "findings/finding-private.yml", "--released-message", "Reviewed", "private-sentinel"])
+        assert_equal 1, cli.run(["trusted", command, "acme", "findings/finding-private.yml", "--released-message", "--notes", "private-sentinel"])
+      end
+      assert_equal 1, cli.run(["trusted", "review", "acme", "findings/finding-private.yml", "--decision", "reject", "--released-message", "private-sentinel"])
+      refute_includes error.string, "private-sentinel"
+      assert_empty Dir[File.join(root, "findings", "finding-*-reviewed.yml")]
+      assert_empty Dir[File.join(root, "findings", "finding-*-redacted.yml")]
+      assert_empty Dir[File.join(root, "trusted", "audit", "*.json")]
+    end
+  end
+
+  def test_trusted_option_errors_and_invalid_byte_tokens_do_not_echo_private_values
+    with_tmp_base do |_dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      root = project.project_path("acme")
+      write(File.join(root, "findings", "finding-private.yml"), {
+        "id" => "finding-private", "dev_visibility" => "restricted"
+      }.to_yaml)
+      %w[review redact].each do |command|
+        invalid = "private-sentinel\xFF".b.force_encoding("UTF-8")
+        [["--nots=private-sentinel"], ["--notes=#{invalid}"], ["--notes", invalid], ["--released-message=#{invalid}"]].each do |tokens|
+          out = StringIO.new
+          err = StringIO.new
+          cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: out, error: err)
+          assert_equal 1, cli.run(["trusted", command, "acme", "findings/finding-private.yml", *tokens])
+          refute_includes err.string, "private-sentinel"
+          assert_empty out.string
+        end
+      end
+      assert_empty Dir[File.join(root, "trusted", "audit", "*.json")]
+      assert_empty Dir[File.join(root, "findings", "finding-*-reviewed.yml")]
+    end
+  end
+
   def test_self_update_command_uses_install_service
     Dir.mktmpdir do |dir|
       source_root = File.join(dir, "source")

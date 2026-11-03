@@ -266,8 +266,8 @@ module SiloMigrate
       HELP
       "trusted" => <<~HELP,
         Usage: silo-migrate trusted inspect CUSTOMER [--phase PHASE] [--reason TEXT] [--as-finding] [--message TEXT] -- COMMAND...
-               silo-migrate trusted review CUSTOMER FINDING [--decision safe|rejected] [--reviewer NAME] [--notes TEXT]
-               silo-migrate trusted redact CUSTOMER FINDING [--reviewer NAME] [--notes TEXT]
+               silo-migrate trusted review CUSTOMER FINDING [--decision safe|reject] [--reviewer NAME] [--notes TEXT] [--released-message TEXT]
+               silo-migrate trusted redact CUSTOMER FINDING [--reviewer NAME] [--notes TEXT] --released-message TEXT
                silo-migrate trusted session CUSTOMER [--provider bedrock] [--runtime silo] [--reason TEXT] [--session-id ID]
 
         Example inspection:
@@ -276,7 +276,11 @@ module SiloMigrate
 
         --as-finding also writes a trusted_only finding stub (no raw output embedded)
         so the conclusion can later flow to the safe zone via:
-          silo-migrate trusted redact acme trusted/findings/finding-inspect-....yml --notes "safe summary"
+          silo-migrate trusted redact acme trusted/findings/finding-inspect-....yml --released-message "reviewed summary"
+
+        FINDING is workspace-relative or absolute within findings/ or trusted/findings/.
+        Safe decisions require explicitly reviewed --released-message text. --notes and
+        reviewer identity stay in the private audit; source payloads/shapes are not copied.
       HELP
       "doctor" => <<~HELP,
         Usage: silo-migrate doctor
@@ -950,25 +954,35 @@ module SiloMigrate
 
     def trusted_review(argv)
       customer = required_arg(argv, "CUSTOMER")
-      finding = required_existing_path(required_arg(argv, "FINDING"))
+      finding = required_arg(argv, "FINDING")
       options = { decision: "safe" }
       OptionParser.new do |opts|
         opts.on("--decision DECISION") { |value| options[:decision] = value }
         opts.on("--reviewer NAME") { |value| options[:reviewer] = value }
         opts.on("--notes TEXT") { |value| options[:notes] = value }
+        opts.on("--released-message TEXT") { |value| options[:released_message] = value }
       end.parse!(argv)
+      raise UsageError, "Unexpected trusted review arguments; quote release text as one argument." unless argv.empty?
+
       @trusted_service.review(customer, finding, **options)
+    rescue OptionParser::ParseError, ArgumentError, EncodingError
+      raise UsageError, "Invalid trusted review options.", cause: nil
     end
 
     def trusted_redact(argv)
       customer = required_arg(argv, "CUSTOMER")
-      finding = required_existing_path(required_arg(argv, "FINDING"))
+      finding = required_arg(argv, "FINDING")
       options = {}
       OptionParser.new do |opts|
         opts.on("--reviewer NAME") { |value| options[:reviewer] = value }
         opts.on("--notes TEXT") { |value| options[:notes] = value }
+        opts.on("--released-message TEXT") { |value| options[:released_message] = value }
       end.parse!(argv)
+      raise UsageError, "Unexpected trusted redact arguments; quote release text as one argument." unless argv.empty?
+
       @trusted_service.redact(customer, finding, **options)
+    rescue OptionParser::ParseError, ArgumentError, EncodingError
+      raise UsageError, "Invalid trusted redact options.", cause: nil
     end
 
     def trusted_session(argv)

@@ -559,9 +559,9 @@ shape metadata.
 
 ```bash
 bin/silo-migrate trusted inspect acme --phase initial --reason "Check one source edge case" -- COMMAND...
-bin/silo-migrate trusted review acme findings/finding-20260601-120000-001.yml --decision safe --reviewer alice
+bin/silo-migrate trusted review acme findings/finding-20260601-120000-001.yml --decision safe --reviewer alice --released-message "Reviewed synthetic finding"
 bin/silo-migrate trusted review acme findings/finding-20260601-120000-001.yml --decision reject --reviewer alice
-bin/silo-migrate trusted redact acme trusted/findings/finding-20260601-120000-001.yml --reviewer alice
+bin/silo-migrate trusted redact acme trusted/findings/finding-20260601-120000-001.yml --reviewer alice --released-message "Reviewed synthetic finding"
 bin/silo-migrate trusted session acme --provider bedrock --runtime silo --reason "Inspect one approved raw-data edge case"
 ```
 
@@ -570,11 +570,53 @@ are written only under `trusted/inspections/`; normal command output shows the
 artifact and audit paths, not the raw values. Audit records are written under
 `trusted/audit/`.
 
-`trusted review` can approve or reject `restricted` findings. A safe approval
-writes a separate reviewed finding under `findings/` that normal fixture
-generation can consume. `trusted_only` findings cannot be approved directly;
-use `trusted redact` to write a safe derivative with raw message/exception
-content removed.
+`trusted review` can approve or reject `restricted` findings. `trusted_only`
+findings cannot be approved directly; use `trusted redact`. Both safe decisions
+require a quoted `--released-message TEXT`: the engineer must review that exact text for
+release. `--notes` is private audit context, not released text. A flag is not an
+automatic redactor or proof that the text is safe. Text must have valid encoding,
+contain no NUL, not start with `--`, and be 1-4096 bytes. Extra positional
+arguments are rejected rather than silently truncating an unquoted summary.
+Reject decisions must not include release text. Private metadata must be
+validly encoded text without NUL; parser/encoding failures are not echoed.
+
+`FINDING` is relative to the selected customer workspace (not the current
+working directory), or an absolute path inside its `findings/` or
+`trusted/findings/`. Review/redaction reject symlink components, non-regular
+files, hard-linked input files, invalid IDs and unknown visibility values.
+Output and audit directories must also be non-symlink paths inside that workspace.
+These checks assume operator-owned directories and do not protect against a
+hostile concurrent filesystem writer; runtime isolation is still required.
+
+Each approval creates an opaque, unique finding ID under `findings/`, with a
+fixed field projection and only the explicitly released message. It does not
+copy source messages, IDs, paths, unknown fields, nested shapes, reviewer
+identity or notes. Private audits retain source provenance, reviewer identity,
+notes and the intended derivative reference. Audit file contents are written and
+fsynced before derivative writes; an audit entry alone is not proof publication
+succeeded. Parent directories are not fsynced: crash/power-loss durability across
+the two directories is not established.
+
+New review audits and derivatives use mode 0600 staging files. Only after a
+complete write, flush, fsync and close is a staging file atomically linked into
+its final name, without replacing any existing entry. Write/flush/fsync/close or
+link failures clean up staging files in `ensure`; a completed audit is retained
+if the derivative fails. If staging removal itself fails, the command explicitly
+distinguishes a written private audit (derivative not published) from a
+published derivative; it does not claim cleanup succeeded. A second close error
+while handling a write error does not mask that original failure when staging
+removal succeeds. A post-write status-output failure likewise reports that artifacts
+were written. Inspect the private workspace before retrying either case, since
+retrying can create a second derivative. Temporary staging files are not matched
+by the finding-publication globs. This is not crash recovery or a full artifact
+release transaction.
+
+Reviewed derivatives have no `observed_shape`; fixture generation will skip
+them rather than silently release source keys or values. Providing reviewed
+synthetic fixtures needs a separately designed release path. This finding-only
+hardening does not fix automatic schema/log/fixture publication elsewhere, bind
+approval to artifact digests, authenticate the reviewer or establish OS isolation.
+Do not treat the existing safe-artifacts flow as a verified customer-data boundary.
 
 `trusted session` is Linux/Silo-only and sets up a Trusted Data AI session for
 Claude Bedrock mode. It writes a Silo config snippet under `trusted/silo/`, takes
@@ -690,7 +732,7 @@ bin/silo-migrate trusted inspect acme --reason "check malformed users" --as-find
   mysql -u root -e "SELECT ... FROM users WHERE ..."
 # review trusted/inspections/... yourself (optionally via a Bedrock chat, manually)
 bin/silo-migrate trusted redact acme /path/to/trusted/findings/finding-inspect-....yml \
-  --notes "safe summary of the conclusion"
+  --notes "private review context" --released-message "reviewed synthetic conclusion"
 bin/silo-migrate ai refresh acme   # safe derivative now visible in safe-artifacts/
 ```
 

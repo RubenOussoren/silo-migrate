@@ -75,8 +75,8 @@ Implemented:
   - Restricted/trusted findings require review or redaction before normal Dev AI use.
 - Initial Phase 3 trusted workflow commands:
   - `silo-migrate trusted inspect CUSTOMER --phase PHASE --reason REASON -- COMMAND...` writes raw output only under `trusted/inspections/` and records an audit event under `trusted/audit/`.
-  - `silo-migrate trusted review CUSTOMER FINDING --decision safe|reject` reviews restricted findings and can write a safe derivative.
-  - `silo-migrate trusted redact CUSTOMER FINDING` writes a safe derivative for trusted-only findings with raw message/exception content removed.
+  - `silo-migrate trusted review CUSTOMER FINDING --decision safe --released-message TEXT` creates a fixed-projection derivative using only explicitly reviewed release text; `--decision reject` writes a private audit only.
+  - `silo-migrate trusted redact CUSTOMER FINDING --released-message TEXT` uses the same fixed projection for trusted-only findings. Source fields, shapes, IDs and private review notes are never copied into the derivative. See the README for confinement, staging, failure semantics and remaining release-gate limits.
 - Initial Phase 4 agent-boundary commands:
   - `silo-migrate ai prepare CUSTOMER` and `ai refresh CUSTOMER` write the locally git-ignored `safe-artifacts/` directory inside the project's `discourse-converters` clone (schema bundles, redacted logs, safe findings, synthetic fixtures, `allowed-commands.json`) plus generated `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json`, and `.silo/normal-dev-ai.yml` beside the code. Converter code itself is never copied or touched.
   - Safe AI workspaces exclude `dumps/`, `trusted/`, `output/intermediate.db`, credentials, raw logs, restricted findings, and trusted-only findings.
