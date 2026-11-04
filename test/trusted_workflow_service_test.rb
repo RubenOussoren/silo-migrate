@@ -136,6 +136,7 @@ class TrustedWorkflowServiceTest < SiloMigrateTest
       config = YAML.safe_load(File.read(artifacts.fetch(:config_path)))
       audit = JSON.parse(File.read(artifacts.fetch(:audit_path)))
       assert_equal "trusted-data-ai", config.fetch("kind")
+      assert_equal ["trusted redact", "release prepare", "engineer reviews exact snapshot", "release approve", "release publish"], config.fetch("safe_handoff")
       assert_equal "bedrock", config.fetch("provider")
       assert_equal "claude", config.dig("agent", "name")
       assert_equal "bedrock", config.dig("agent", "mode")

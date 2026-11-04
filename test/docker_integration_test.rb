@@ -50,13 +50,13 @@ class DockerIntegrationTest < SiloMigrateTest
         assert_operator summary.fetch("table_count"), :>=, 1
         assert_includes out.string, "fixture converter ran"
 
-        # Prepare safe-artifacts BEFORE the redacted run so the run also
-        # exercises the auto-refresh hook end to end.
+        # Explicit publication is approval-gated; producer hooks never release
+        # even schema-only, redacted or synthetic artifacts automatically.
         assert_cli_success cli, err, out, ["ai", "prepare", customer]
         clone = File.join(project_path, "discourse-converters")
         safe_artifacts = File.join(clone, "safe-artifacts")
         assert Dir.exist?(safe_artifacts), "expected safe-artifacts inside the converter clone"
-        assert_includes File.read(File.join(clone, ".git", "info", "exclude")), "/safe-artifacts/"
+        assert_equal "*\n", File.read(File.join(safe_artifacts, ".gitignore"))
 
         # Phase 2 loop: platform run with generated in-network settings,
         # real intermediate.db, then the full redaction/findings pipeline.
@@ -72,24 +72,23 @@ class DockerIntegrationTest < SiloMigrateTest
         assert_equal true, run_summary.dig("sources", "intermediate_db", "available")
         assert_operator run_summary.dig("sources", "intermediate_db", "log_entry_count"), :>=, 1
 
-        # Auto-refresh mirrored the redacted summary into safe-artifacts.
-        assert File.exist?(File.join(safe_artifacts, "findings", "redacted-logs", "latest.summary.json")),
-               "redacted run should auto-refresh safe-artifacts"
+        refute File.exist?(File.join(safe_artifacts, "findings", "redacted-logs", "latest.summary.json")),
+               "redacted run must not implicitly release a summary"
 
         assert_cli_success cli, err, out, ["converter", "summary", customer]
         assert_cli_success cli, err, out, ["findings", "generate", customer]
         assert_cli_success cli, err, out, ["fixtures", "generate", customer]
 
-        assert(Dir[File.join(safe_artifacts, "findings", "finding-*.yml")].any?, "findings should be mirrored into safe-artifacts")
-        assert(Dir[File.join(safe_artifacts, "synthetic-fixtures", "*.yml")].any?, "fixtures should be mirrored into safe-artifacts")
+        assert_empty JSON.parse(File.read(File.join(safe_artifacts, "manifest.json"))).fetch("artifacts")
+        assert_empty Dir[File.join(safe_artifacts, "findings", "finding-*.yml")]
+        assert_empty Dir[File.join(safe_artifacts, "synthetic-fixtures", "*.yml")]
 
         # Redaction sweep: safe-artifacts and the generated root files must not
         # contain raw values or credentials (the clone itself legitimately
         # contains the fixture converter's dummy settings, so it is not swept).
         assert_redaction_holds(safe_artifacts, %w[alice e2e_secret_pw_123], label: "safe-artifacts")
         [File.join(clone, "AGENTS.md"), File.join(clone, "CLAUDE.md"), File.join(clone, ".claude", "settings.json"), File.join(clone, ".silo", "normal-dev-ai.yml")].each do |file|
-          assert File.exist?(file), "expected generated #{File.basename(file)}"
-          %w[alice e2e_secret_pw_123].each { |sentinel| refute_includes File.read(file), sentinel }
+          refute File.exist?(file), "no customer-identifying root instructions should be generated"
         end
         assert_redaction_holds(File.join(project_path, "findings"), %w[alice e2e_secret_pw_123], label: "findings artifacts")
         refute Dir.exist?(File.join(safe_artifacts, "converter-settings")), "generated settings must not reach safe-artifacts"

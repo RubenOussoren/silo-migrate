@@ -74,7 +74,7 @@ class WorkflowStateTest < SiloMigrateTest
 
   def test_reset_archives_lineage_artifacts_but_preserves_inputs_and_backups
     with_tmp_base do |_dir, env|
-      project, importer, runtime, dump, = build_project(env)
+      project, importer, runtime, dump, output = build_project(env)
       importer.import_dump("acme", "initial", file: "dump.sql", report_progress: false)
       root = project.project_path("acme")
       sqlite = write(File.join(root, "output", "custom.db"), "SQLite format 3\0payload", mode: "wb")
@@ -91,6 +91,7 @@ class WorkflowStateTest < SiloMigrateTest
       end
 
       importer.replace_dump("acme", "initial", yes: true)
+      assert_includes output.string, "Source reset does not revoke approved snapshots"
 
       assert File.exist?(dump)
       assert File.exist?(backup)

@@ -20,7 +20,7 @@ module SiloMigrate
           paths.concat([
             state.dig("converter", "output_db"), "output/uploads.sqlite3",
             "output/discourse-import-restored.txt", "output/discourse-import-complete.txt",
-            "findings", "fixtures", "synthetic-fixtures", File.join("discourse-converters", "safe-artifacts")
+            "findings", "fixtures", "synthetic-fixtures"
           ])
         end
         archive(customer, paths.compact, reason: reason, metadata: { "phase" => phase, "generation" => generation })

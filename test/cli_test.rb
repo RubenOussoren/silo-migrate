@@ -696,25 +696,26 @@ class CLITest < SiloMigrateTest
       assert_equal 0, cli.run(["ai", "prepare", "acme"])
 
       clone = File.join(project_path, "discourse-converters")
-      assert File.exist?(File.join(clone, "AGENTS.md"))
-      assert File.exist?(File.join(clone, "safe-artifacts", "schema", "initial", "summary.json"))
-      assert File.exist?(File.join(clone, "safe-artifacts", "manifest.json"))
-      assert_includes out.string, "Safe artifacts prepared"
+      refute File.exist?(File.join(clone, "AGENTS.md"))
+      refute File.exist?(File.join(clone, "safe-artifacts", "schema", "initial", "summary.json"))
+      manifest = JSON.parse(File.read(File.join(clone, "safe-artifacts", "manifest.json")))
+      assert_empty manifest.fetch("artifacts")
+      assert_includes out.string, '"state":"published"'
     end
   end
 
-  def test_ai_prepare_without_converter_clone_fails_with_setup_hint
+  def test_ai_prepare_without_converter_clone_fails_with_fixed_error
     with_tmp_base do |_dir, env|
       err = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: StringIO.new, error: err)
       cli.run(["init", "acme"])
 
       assert_equal 1, cli.run(["ai", "prepare", "acme"])
-      assert_includes err.string, "setup-converter"
+      assert_includes err.string, "RELEASE_PATH_MISSING"
     end
   end
 
-  def test_findings_generate_auto_refreshes_safe_artifacts
+  def test_findings_generate_does_not_publish_without_approval
     with_tmp_base do |_dir, env|
       out = StringIO.new
       cli = SiloMigrate::CLI.new(runtime: SiloMigrate::Runtime::Fake.new, env: env, output: out, error: StringIO.new)
@@ -725,12 +726,13 @@ class CLITest < SiloMigrateTest
 
       assert_equal 0, cli.run(["ai", "prepare", "acme"])
       safe = File.join(project_path, "discourse-converters", "safe-artifacts")
-      stale = write(File.join(safe, "findings", "finding-stale.yml"), "id: finding-stale\ndev_visibility: safe\n")
+      before = File.read(File.join(safe, "manifest.json"))
 
       assert_equal 0, cli.run(["findings", "generate", "acme"])
 
-      refute File.exist?(stale), "auto-refresh should have rebuilt safe-artifacts"
-      assert(Dir[File.join(safe, "findings", "finding-*.yml")].any?, "fresh findings should be mirrored into safe-artifacts")
+      assert_equal before, File.read(File.join(safe, "manifest.json"))
+      assert_empty Dir[File.join(safe, "findings", "finding-*.yml")]
+      assert_empty JSON.parse(before).fetch("artifacts")
     end
   end
 

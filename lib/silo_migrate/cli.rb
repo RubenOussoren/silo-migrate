@@ -9,7 +9,7 @@ module SiloMigrate
     COMMANDS = %w[
       interactive go init list status cleanup start stop regenerate import-dump reset-db replace-dump history
       analyze-dump preprocess-dump convert-xml convert-json stage-dump setup-converter add-final-db
-      run-converter converter discourse schema findings fixtures ai trusted doctor self-update uninstall help
+      run-converter converter discourse schema findings fixtures ai release trusted doctor self-update uninstall help
     ].freeze
 
     COMMAND_HELP = {
@@ -243,7 +243,7 @@ module SiloMigrate
       "schema" => <<~HELP,
         Usage: silo-migrate schema export CUSTOMER [--phase PHASE] [-o DIR]
                silo-migrate schema bundle CUSTOMER [--phase PHASE] [-o DIR]
-        export writes raw schema SQL; bundle writes the AI-safe metadata bundle
+        export writes raw schema SQL; bundle writes a private candidate metadata bundle
         (schema.sql, tables/columns/indexes JSON, summary, migration notes).
       HELP
       "findings" => <<~HELP,
@@ -257,12 +257,21 @@ module SiloMigrate
       "ai" => <<~HELP,
         Usage: silo-migrate ai prepare CUSTOMER
                silo-migrate ai refresh CUSTOMER
-        Writes/refreshes the locally git-ignored safe-artifacts/ directory inside
-        the project's discourse-converters clone (schema bundles, redacted logs,
-        safe findings, synthetic fixtures) plus agent instruction files.
-        Never raw data or credentials; never touches converter code - the Dev AI
-        works directly in the clone and commits/pushes normally. Redacted-log,
-        findings, and fixture generation auto-refresh safe-artifacts afterwards.
+        Explicitly publish only approved immutable artifact snapshots. No implicit
+        release based on schema-only/redaction/safe labels; no automatic refresh.
+        Output contains fixed states and opaque references only.
+      HELP
+      "release" => <<~HELP,
+        Usage: silo-migrate release prepare CUSTOMER SOURCE --class schema|log|summary|finding|fixture
+               silo-migrate release approve CUSTOMER ID --sha256 DIGEST --bytes N --reviewed --reviewer NAME [--notes TEXT]
+               silo-migrate release publish CUSTOMER [ID ...]
+               silo-migrate release revoke CUSTOMER ID
+               silo-migrate release status CUSTOMER [ID]
+        Engineer-operated only. Review exact private snapshot bytes at
+        .silo-migrate/releases/snapshots/ID.bin before approving their digest/size.
+        SOURCE must be within schema/, findings/ or synthetic-fixtures/ in the
+        selected workspace. No raw contents/paths/review notes enter status output.
+        Approval is operator attestation, not caller authentication or redaction.
       HELP
       "trusted" => <<~HELP,
         Usage: silo-migrate trusted inspect CUSTOMER [--phase PHASE] [--reason TEXT] [--as-finding] [--message TEXT] -- COMMAND...
@@ -313,6 +322,7 @@ module SiloMigrate
       @findings_service = Services::ConverterFindingsService.new(env: env, output: output)
       @fixture_service = Services::SyntheticFixtureService.new(env: env, output: output)
       @ai_workspace_service = Services::AIWorkspaceService.new(env: env, output: output)
+      @release_service = Services::ArtifactReleaseService.new(env: env, output: output)
       @trusted_service = Services::TrustedWorkflowService.new(runtime: runtime, env: env, output: output)
       @discourse_service = Services::DiscourseService.new(runtime: runtime, env: env, output: output)
     end
@@ -353,6 +363,7 @@ module SiloMigrate
       when "findings" then findings(argv)
       when "fixtures" then fixtures(argv)
       when "ai" then ai(argv)
+      when "release" then release(argv)
       when "trusted" then trusted(argv)
       when "doctor" then return doctor
       when "self-update" then return self_update
@@ -415,11 +426,12 @@ module SiloMigrate
           discourse setup CUSTOMER     Configure two discourse_docker handoff containers
           discourse import CUSTOMER    Run final generic_bulk import in the import container
           schema export CUSTOMER       Export source/final DB schema
-          schema bundle CUSTOMER       Export AI-safe schema metadata bundle
+          schema bundle CUSTOMER       Export private schema metadata candidates
           findings generate CUSTOMER   Generate structured findings from a redacted summary
           fixtures generate CUSTOMER   Generate shape-only synthetic fixtures from findings
-          ai prepare CUSTOMER          Write safe-artifacts/ into the converter clone
-          ai refresh CUSTOMER          Refresh safe-artifacts/ (never touches converter code)
+          ai prepare CUSTOMER          Publish approved snapshots only (never implicit approval)
+          ai refresh CUSTOMER          Publish approved snapshots only (never converter code)
+          release                      Prepare, approve, publish, revoke or inspect release status
           trusted inspect CUSTOMER     Run audited trusted-only inspection command after --
           trusted review CUSTOMER FILE Approve/reject a restricted finding
           trusted redact CUSTOMER FILE Write a safe redacted derivative
@@ -911,9 +923,50 @@ module SiloMigrate
 
     def ai(argv)
       subcommand = required_arg(argv, "SUBCOMMAND")
-      raise UsageError, "Unknown ai command: #{subcommand}" unless %w[prepare refresh].include?(subcommand)
+      raise UsageError, "RELEASE_OPTIONS_INVALID" unless %w[prepare refresh].include?(subcommand)
 
-      @ai_workspace_service.prepare(required_arg(argv, "CUSTOMER"))
+      customer = required_arg(argv, "CUSTOMER")
+      raise UsageError, "RELEASE_OPTIONS_INVALID" unless argv.empty?
+
+      @ai_workspace_service.prepare(customer)
+    end
+
+    def release(argv)
+      subcommand = required_arg(argv, "SUBCOMMAND")
+      customer = required_arg(argv, "CUSTOMER")
+      case subcommand
+      when "prepare"
+        source = required_arg(argv, "SOURCE")
+        options = {}
+        OptionParser.new { |opts| opts.on("--class CLASS") { |value| options[:artifact_class] = value } }.parse!(argv)
+        raise UsageError, "RELEASE_OPTIONS_INVALID" unless argv.empty? && options.key?(:artifact_class)
+
+        @release_service.prepare(customer, source: source, **options)
+      when "approve"
+        id = required_arg(argv, "ID")
+        options = { reviewed: false }
+        OptionParser.new do |opts|
+          opts.on("--sha256 DIGEST") { |value| options[:sha256] = value }
+          opts.on("--bytes N") { |value| options[:bytes] = Integer(value, 10) }
+          opts.on("--reviewed") { options[:reviewed] = true }
+          opts.on("--reviewer NAME") { |value| options[:reviewer] = value }
+          opts.on("--notes TEXT") { |value| options[:notes] = value }
+        end.parse!(argv)
+        raise UsageError, "RELEASE_OPTIONS_INVALID" unless argv.empty? && options.key?(:sha256) && options.key?(:bytes)
+
+        @release_service.approve(customer, id: id, **options)
+      when "publish"
+        @release_service.publish(customer, ids: argv.empty? ? nil : argv)
+      when "revoke", "status"
+        id = argv.shift
+        raise UsageError, "RELEASE_OPTIONS_INVALID" unless argv.empty? && (subcommand == "status" || id)
+
+        subcommand == "revoke" ? @release_service.revoke(customer, id: id) : @release_service.status(customer, id: id)
+      else
+        raise UsageError, "RELEASE_OPTIONS_INVALID"
+      end
+    rescue OptionParser::ParseError, ArgumentError, EncodingError
+      raise UsageError, "RELEASE_OPTIONS_INVALID", cause: nil
     end
 
     def trusted(argv)

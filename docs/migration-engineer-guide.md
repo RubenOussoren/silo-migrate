@@ -4,8 +4,9 @@ A practical overview of what the tool does, what it deliberately does not do, an
 the two ways to drive it (guided interactive mode and standalone commands).
 For internals and design rationale, see [`ARCHITECTURE.md`](../ARCHITECTURE.md).
 
-> **One-page visual:** [`migration-overview.svg`](migration-overview.svg) shows the
-> whole system at a glance (open it in a browser; it renders on GitHub too).
+> **Historical visual:** [`migration-overview.svg`](migration-overview.svg)
+> predates exact-byte release approval. Do not use its artifact/data-safety
+> arrows as current operating guidance; the approval diagrams below supersede them.
 
 ![silo-migrate overview](migration-overview.svg)
 
@@ -16,8 +17,9 @@ intermediate database, using **throwaway Docker containers** as the workbench.
 You point it at a dump; it provisions a source database container, restores the
 dump into it, runs the matching `discourse-converters` converter against that
 database over a private Docker network, and collects the converter's output
-(`output/intermediate.db`) plus AI-safe artifacts (schema bundles, redacted
-logs, findings, synthetic fixtures).
+(`output/intermediate.db`) plus private candidate artifacts (schema bundles,
+redacted logs, findings and synthetic fixtures). Only separately reviewed exact
+snapshots can enter the generated development context.
 
 It can also configure scratch Discourse uploads/import containers for the final
 handoff: the uploads container produces `output/uploads.sqlite3`, and the import
@@ -49,7 +51,9 @@ flowchart LR
     CLI -- "run-converter TYPE<br/>+ generated --settings" --> CONV
     CONV -- "reads source data<br/>(container DNS, e.g. acme_initial_mariadb:3306)" --> IDB
     CONV -- writes --> OUT[("output/intermediate.db")]
-    OUT -- "redacted summary → findings →<br/>fixtures → ai prepare" --> SAFE["Safe AI artifacts<br/>(no raw data, no credentials)"]
+    OUT -- "private summary → findings → fixtures" --> SNAP["Private snapshot"]
+    SNAP --> REVIEW["Engineer reviews exact bytes<br/>and attests digest + size"]
+    REVIEW -- "guarded publish" --> SAFE["Approved snapshot bytes only<br/>(approval is not automatic redaction)"]
     OUT -. "guided Discourse uploads/import<br/>container workflows" .-> DISC[("Discourse")]
 ```
 
@@ -63,8 +67,9 @@ Key wiring facts:
   hostname, internal port, and credentials merged in — and passes it via
   `--settings`. Without this, converter defaults point at `localhost` and cannot
   reach the database from inside the container.
-- **Everything is rebuildable**: `reset-db` archives derivatives and wipes one database volume so you
-  can re-import; `cleanup` removes the whole project (it refuses to delete the
+- **Everything is rebuildable**: `reset-db` archives private source derivatives and wipes one database volume so you
+  can re-import; it does not archive/withdraw/revoke the separate approved view,
+  and prints a reminder to review releases and explicitly revoke obsolete snapshots; `cleanup` removes the whole project (it refuses to delete the
   directory if containers could not be stopped, unless you pass `--force`).
 
 ## What the tool CAN do
@@ -78,8 +83,8 @@ Key wiring facts:
 | Import | Streamed restore (constant memory, progress + ETA), waits for container health, MySQL-8-collation auto-fix on MariaDB, table exclusion, `--fast`/`--turbo` modes, per-error diagnostics with exact recovery commands |
 | Converter | Clones/builds `discourse-converters` in its own container; platform shortcut (`run-converter acme vbulletin`) with auto-generated in-network settings, or any custom command after `--` |
 | Discourse handoff | Configures two scratch Discourse containers (`uploads` and `import`), prepares role-specific dependencies, runs the uploads importer, restores a backup to the import container, runs `generic_bulk.rb`, and copies out a final backup |
-| Artifacts | Schema bundles (`schema bundle`), redacted converter logs/summaries, structured findings, shape-only synthetic fixtures, `safe-artifacts/` in the converter clone (`ai prepare`, auto-refreshed by the generators) |
-| Data safety | Raw dumps, live DBs, `intermediate.db`, and generated credentials never reach AI workspaces or logs; restricted data goes through the audited `trusted ...` workflow |
+| Artifacts | Schema bundles (`schema bundle`), redacted converter logs/summaries, structured findings, shape-only synthetic fixtures, approval-gated snapshot publication in `safe-artifacts/` (`release prepare/approve/publish/revoke`; no producer auto-refresh) |
+| Data safety | Exact-byte engineer approval gates the generated context view; labels/redaction are not approval. Caller authentication, OS/provider isolation and legacy inspect/session error-path hardening remain separate requirements |
 
 ## What the tool CANNOT do (by design)
 
@@ -176,10 +181,15 @@ bin/silo-migrate schema bundle acme
 bin/silo-migrate setup-converter acme --bundle-install
 bin/silo-migrate run-converter acme vbulletin --redacted-logs
 
-# 6. derive the safe artifacts for converter development
+# 6. produce private candidates, then review exact snapshots before publishing
 bin/silo-migrate findings generate acme
 bin/silo-migrate fixtures generate acme
-bin/silo-migrate ai prepare acme
+bin/silo-migrate release prepare acme schema/initial/summary.json --class summary
+# Privately inspect .silo-migrate/releases/snapshots/ARTIFACT_ID.bin.
+# Replace placeholders with its actual ID, digest and byte count, then attest:
+bin/silo-migrate release approve acme ARTIFACT_ID --sha256 DIGEST --bytes BYTE_COUNT --reviewed --reviewer engineer
+bin/silo-migrate release publish acme ARTIFACT_ID
+# ai prepare/refresh are guarded publication aliases, never implicit approvals.
 
 # 7. optional Discourse handoff containers
 # one-time Linux launcher checkout setup; skip if /var/discourse already exists
@@ -230,44 +240,61 @@ flowchart TD
     G --> H[schema bundle]
     H --> I[setup-converter]
     I --> J["run-converter TYPE --redacted-logs<br/>(generated converter-settings/TYPE.yml)"]
-    J -- "fails" --> J2["converter summary → findings<br/>(debug with safe artifacts, fix upstream)"] --> J
+    J -- "fails" --> J2["converter summary → findings<br/>(investigate privately, approve snapshot context, fix upstream)"] --> J
     J --> K[("output/intermediate.db")]
-    K --> L[findings generate → fixtures generate → ai prepare]
+    K --> L[private candidates → snapshot → engineer approval → publish]
     K --> M["Discourse uploads/import<br/>handoff containers"]
 ```
 
 ## Data-safety zones (what AI tooling may see)
 
-Converter **code** is not customer data — it lives in exactly one place, the
-project's `discourse-converters` git clone, where the Dev AI edits, commits,
-and pushes normally. Only **data artifacts** are zone-separated: `ai prepare`
-writes a locally git-ignored `safe-artifacts/` directory *inside* the clone,
-and redacted-log/findings/fixture generation refreshes it automatically.
+Keep the converter checkout clean: source code and synthetic tests only, never
+raw dumps, generated settings, customer decisions or data-bearing logs. A path,
+model preference, generated instruction or read-only convention is not an OS
+sandbox. The currently generated view does not configure Silo/Claude mounts,
+credentials, network policy or provider isolation.
+
+All schema, logs, summaries, findings and synthetic fixtures are **private
+candidates**. Neither `safe`, metadata-only, regex redaction nor a previous
+manifest authorizes publication. `release prepare` snapshots bounded exact bytes
+privately; the engineer inspects those contents and approves the ID, digest and
+byte count with `--reviewed`. Only approved snapshots can be published. SHA-256
+proves byte identity, not that the bytes are safe. Do not send private snapshots
+to coding providers for a safety judgment.
 
 ```mermaid
 flowchart LR
-    subgraph RAW["Migration runtime zone — raw customer data"]
-        dumps["dumps/*"] ~~~ dbs["DB containers"] ~~~ idb["output/intermediate.db"] ~~~ creds["config.env · converter-settings/"]
-    end
-    subgraph TRUSTED["Trusted Data zone — audited, analysis-only"]
-        ti["trusted inspect --as-finding<br/>→ human review (Bedrock chat, manually)<br/>→ trusted redact"]
-    end
-    subgraph CLONE["discourse-converters clone — the Dev AI works here"]
-        code["converter code (real .git,<br/>commit/push normally)"]
-        subgraph SAFEZ["safe-artifacts/ (generated, git-ignored)"]
-            sb["schema bundles"] ~~~ rl["redacted logs"] ~~~ sf["safe findings"] ~~~ fx["fixtures"]
-        end
-    end
-    RAW -- "redaction + shape-only extraction<br/>(auto-refresh)" --> SAFEZ
-    RAW -- "explicit, logged, reviewed" --> TRUSTED
-    TRUSTED -- "safe derivatives land in findings/,<br/>mirrored on next refresh" --> SAFEZ
+    RAW[Private artifacts] --> SNAP[Private bounded immutable snapshot]
+    SNAP --> HUMAN[Engineer reviews exact contents and attests digest/size]
+    HUMAN --> PUB[Guarded publication of approved bytes only]
+    PUB --> VIEW[Opaque artifacts + fixed templates in safe-artifacts]
+    REVOKE[Terminal revocation] --> REMOVE[Remove current view; cannot retract history]
 ```
 
-Rule of thumb: anything under `dumps/`, `output/`, `trusted/`,
-`converter-settings/`, `config.env`, or inside a container is raw-zone — the
-generated `AGENTS.md` and `.claude/settings.json` deny rules keep agents away
-from those `../` paths (a soft boundary on macOS; Silo mounts make it hard
-later). Everything under `safe-artifacts/` has been redacted or synthesized.
+`ai prepare/refresh` explicitly publish approved snapshots; producer hooks no
+longer refresh anything. Without approvals the view is empty. Fixed instructions
+are generated only inside `safe-artifacts/`; there are no new root `AGENTS.md`,
+`.claude` deny settings, Silo snippets or Git exclude rewrites. Original names,
+customer identity, reviewer and notes do not enter generated metadata.
+
+Revocation records the terminal decision before inspecting/withdrawing a corrupt
+or interrupted view. Status also withdraws stale/legacy context under absent or
+blocked state. If cleanup/storage fails, the command fails and reports blocked
+state, not successful revocation. Source resets do not revoke independent
+snapshots: explicitly revoke a snapshot when its context is no longer intended.
+Publication views are no longer moved into workflow history outside the release
+lock. Private source/history/snapshot retention is not data deletion or recall.
+
+Legacy root files generated by earlier versions may contain customer identifiers
+and stale instructions/deny rules. They are not rewritten automatically: the
+engineer must review/retire them privately before exposing a checkout. Existing
+operator-owned/upstream files are preserved. Never assume a root instruction or
+`safe-artifacts/` path itself makes data safe.
+
+See the README's engineer-reviewed publication contract for limits, failure
+recovery, retained snapshots and filesystem assumptions. This synthetic local
+slice does not approve customer use; known inspect/session raw-byte and parser
+privacy risks and runtime/provider isolation must be addressed first.
 
 ## Quick troubleshooting
 
@@ -282,6 +309,6 @@ later). Everything under `safe-artifacts/` has been redacted or synthesized.
 | Converter can't reach the DB | Use the platform shortcut so settings are generated; if compose was regenerated, recreate the container: `start CUSTOMER --profile converter` |
 | Port already in use | Default ports auto-advance to the next free port (the chosen port is printed); an explicit `--port` fails fast with a free-port suggestion |
 | Huge dump is slow on a Mac | Expected (Docker Desktop fsync); the preflight warns. Prefer a Linux host for multi-GB imports |
-| Want a clean slate | `reset-db CUSTOMER PHASE --yes` (one DB, derived artifacts archived) or `cleanup CUSTOMER --yes` (everything — **push converter work first**, the clone lives inside the project dir) |
-| `safe-artifacts/` shows in `git status` | Re-run `ai refresh CUSTOMER` (it rewrites the `.git/info/exclude` block) |
-| `git pull` conflicts with `AGENTS.md` | Upstream added its own — delete the generated file, pull, re-run `ai refresh` (it falls back to `safe-artifacts/AGENTS.md`) |
+| Want a clean slate | `reset-db CUSTOMER PHASE --yes` (one DB, private source derivatives archived; approved view/snapshots require explicit revocation) or `cleanup CUSTOMER --yes` (everything — **push converter work first**, the clone lives inside the project dir) |
+| `safe-artifacts/` shows in `git status` | Its own generated `.gitignore` ignores new contents. Investigate previously tracked files privately; publication no longer rewrites Git excludes |
+| Legacy root `AGENTS.md` / Claude or Silo snippets | Review/retire stale generated files privately; new fixed instructions live only inside the view. Do not overwrite upstream/operator files or infer isolation from old deny rules |

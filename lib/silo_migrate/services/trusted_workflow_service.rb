@@ -373,9 +373,10 @@ module SiloMigrate
           ],
           "safe_handoff" => [
             "trusted redact",
-            "safe findings",
-            "synthetic fixtures",
-            "ai refresh"
+            "release prepare",
+            "engineer reviews exact snapshot",
+            "release approve",
+            "release publish"
           ]
         }
         Project.atomic_write(path, config.to_yaml)

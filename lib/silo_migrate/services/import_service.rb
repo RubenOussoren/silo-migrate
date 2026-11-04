@@ -169,6 +169,7 @@ module SiloMigrate
           store.write_locked(state)
         end
         @output.puts "[OK] #{phase.capitalize} database reset complete; staged dumps were preserved"
+        @output.puts "[NOTE] Source reset does not revoke approved snapshots or withdraw published context. Review releases and explicitly revoke obsolete snapshots."
       end
 
       private
