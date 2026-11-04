@@ -9,10 +9,11 @@ module SiloMigrate
     COMMANDS = %w[
       interactive go init list status cleanup start stop regenerate import-dump reset-db replace-dump history
       analyze-dump preprocess-dump convert-xml convert-json stage-dump setup-converter add-final-db
-      run-converter converter discourse schema findings fixtures ai release trusted doctor self-update uninstall help
+      run-converter converter discourse schema findings fixtures ai release trusted named doctor self-update uninstall help
     ].freeze
 
     COMMAND_HELP = {
+      "named" => NamedCLI::HELP,
       "interactive" => <<~HELP,
         Usage: silo-migrate interactive [CUSTOMER]   (alias: go)
 
@@ -333,6 +334,9 @@ module SiloMigrate
 
     def run(argv)
       argv = argv.dup
+      if argv.first == "named"
+        return NamedCLI.new(env: @env, output: @output, error: @error).run(argv.drop(1))
+      end
       return run_interactive(nil) if argv.empty?
       return help(0) if argv.first == "--help" || argv.first == "-h"
       return version if argv.first == "--version" || argv.first == "-v"
@@ -404,6 +408,7 @@ module SiloMigrate
           doctor                       Check Ruby, Docker, git, and base path setup
           self-update                  Pull updates and refresh global shims
           uninstall                    Remove global shims and managed checkout
+          named                        File-only named registry and validate-inputs (release disabled)
           init CUSTOMER                Initialize a migration project
           list                         List migration projects
           status CUSTOMER              Show project and container status

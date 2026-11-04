@@ -34,6 +34,16 @@ practical end-to-end overview (capabilities, limits, happy paths, diagrams).
   restricted finding review, safe redacted derivatives, and Linux/Silo Bedrock
   session setup.
 
+## Named file-only foundation (synthetic-only)
+
+`named` is an opt-in fresh-workspace mode for named source/dataset/input identities
+and a durable `validate-inputs` plan/run. It does not provision databases, parse
+SQL, run converters or publish artifacts. Named and legacy modes cannot be mixed;
+release commands are explicitly disabled in named mode. See
+[Named workspaces](docs/named-workspaces.md) for the shared application contract,
+CLI, locking, recovery and retained limitations. This is not migration rehearsal
+or customer-use acceptance.
+
 ## Installation
 
 Requirements:

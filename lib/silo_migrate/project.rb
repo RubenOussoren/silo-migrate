@@ -46,7 +46,9 @@ module SiloMigrate
     end
 
     def project_path(customer, env = ENV)
-      File.join(base_path(env), customer)
+      path = File.join(base_path(env), customer)
+      NamedWorkspaceMode.reject_legacy_path!(path)
+      path
     end
 
     def config_path(customer, env = ENV)

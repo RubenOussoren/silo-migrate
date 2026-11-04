@@ -18,6 +18,7 @@ module SiloMigrate
 
     def initialize(customer, env: ENV, runtime: nil)
       @customer = Project.validate_customer_name!(customer)
+      Project.project_path(@customer, env) # Never create legacy state in named mode.
       @env = env
       @runtime = runtime
     end

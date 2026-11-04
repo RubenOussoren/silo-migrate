@@ -29,6 +29,10 @@ module SiloMigrate
       unless customer.is_a?(String) && CUSTOMER_NAME_PATTERN.match?(customer)
         raise ReleaseError, "RELEASE_WORKSPACE_INVALID"
       end
+      candidate = File.join(Project.base_path(env), customer)
+      if NamedWorkspaceMode.named_path?(candidate)
+        raise ReleaseError, "RELEASE_NAMED_MODE_UNSUPPORTED", cause: nil
+      end
       @nominal_path = File.expand_path(Project.project_path(customer, env))
       raise ReleaseError, "RELEASE_WORKSPACE_INVALID" if File.symlink?(@nominal_path)
 

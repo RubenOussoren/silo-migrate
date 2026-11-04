@@ -25,6 +25,7 @@ module SiloMigrate
 
       def init(customer, options = {})
         customer = Project.validate_customer_name!(customer)
+        Project.project_path(customer, @env) # Refuse named mode before port probes or writes.
         db_type = options[:db_type] || "mariadb"
         initial_port = validate_new_port!(options[:initial_port] || DATABASE_TYPES.fetch(db_type)[:default_port], label: "Initial database", explicit: !options[:initial_port].nil?)
         db_name = options[:db_name] || "#{customer}_initial_db"
@@ -154,7 +155,13 @@ module SiloMigrate
         base = Project.base_path(@env)
         return [] unless Dir.exist?(base)
 
-        Dir.children(base).select { |entry| File.exist?(File.join(base, entry, "config.env")) }.sort
+        Dir.children(base).select do |entry|
+          path = File.join(base, entry)
+          next false unless File.exist?(File.join(path, "config.env"))
+
+          NamedWorkspaceMode.reject_legacy_path!(path)
+          true
+        end.sort
       end
 
       def project_path(customer)
