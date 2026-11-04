@@ -108,14 +108,17 @@ module SiloMigrate
         @docker_desktop_result
       end
 
-      def run(cmd, chdir: nil, capture: false, timeout: nil, stdin_data: nil, separate_process_group: true)
+      def run(cmd, chdir: nil, capture: false, timeout: nil, stdin_data: nil, separate_process_group: true, binary: false)
+        raise UsageError, "Binary capture requires captured execution." if binary && !capture
+
         @operations << [:run, cmd, chdir, capture, timeout, stdin_data&.bytesize, separate_process_group]
         @last_run_options = {
           chdir: chdir,
           capture: capture,
           timeout: timeout,
           stdin_data_bytes: stdin_data&.bytesize,
-          separate_process_group: separate_process_group
+          separate_process_group: separate_process_group,
+          binary: binary
         }
         @commands << [:run, cmd, chdir, capture, timeout, stdin_data&.bytesize]
         if cmd[0, 3] == ["git", "clone", "-b"]

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "digest"
 require "fileutils"
 require "json"
 require "rbconfig"
@@ -12,6 +13,13 @@ module SiloMigrate
   module Services
     class TrustedWorkflowService
       ARTIFACT_VERSION = 1
+      PRIVATE_ARTIFACT_VERSION = 2
+      class OperationError < UsageError; end
+      PRIVATE_ERROR_CODES = %w[
+        TRUSTED_WORKSPACE_INVALID TRUSTED_INSPECT_INPUT_INVALID TRUSTED_INSPECT_COMMAND_FAILED
+        TRUSTED_SESSION_INPUT_INVALID TRUSTED_SESSION_PLATFORM_UNSUPPORTED
+        TRUSTED_SESSION_SNAPSHOT_FAILED TRUSTED_SESSION_LAUNCH_FAILED
+      ].freeze
       FINDING_ID_PATTERN = /\Afinding-[a-zA-Z0-9_-]{1,128}\z/
       FINDING_ROOTS = ["findings", "trusted/findings"].freeze
 
@@ -21,54 +29,58 @@ module SiloMigrate
         @output = output
       end
 
-      def inspect(customer, phase: "initial", reason:, command:, as_finding: false, message: nil, timestamp: Time.now.utc)
-        Project.load_config(customer, @env)
-        raise UsageError, "Trusted inspection requires --reason." if reason.to_s.strip.empty?
+      def inspect(customer, phase: "initial", reason: nil, command: [], as_finding: false, message: nil, timestamp: Time.now.utc)
+        private_operation("INSPECT") do
+          unless %w[initial final].include?(phase) && [true, false].include?(as_finding) &&
+                 private_reason?(reason) && command.is_a?(Array) && !command.empty? &&
+                 command.first.is_a?(String) && !command.first.empty? &&
+                 command.all? { |arg| arg.is_a?(String) && !arg.b.include?("\0") } &&
+                 (message.nil? || message.is_a?(String))
+            raise OperationError, "TRUSTED_INSPECT_INPUT_INVALID"
+          end
+          project_path = private_project_path(customer)
+          actor = byte_envelope(default_reviewer)
+          id = SecureRandom.hex(16)
+          confined_review_path(project_path, "trusted/inspections/inspection-#{id}.json", create_parents: true)
+          confined_review_path(project_path, "trusted/audit/trusted-inspect-#{id}.json", create_parents: true)
+          confined_review_path(project_path, "trusted/findings/finding-inspect-#{id}.yml", create_parents: true) if as_finding
+          intent_path = write_private_json(project_path, "trusted/audit/trusted-inspect-request-#{id}.json", {
+            "artifact_version" => PRIVATE_ARTIFACT_VERSION, "generated_at" => timestamp.utc.iso8601,
+            "event" => "trusted_inspect", "actor" => actor,
+            "details" => { "phase" => phase, "reason" => byte_envelope(reason),
+              "command" => command.map { |arg| byte_envelope(arg) }, "status" => "requested",
+              "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY }
+          })
+          result = @runtime.run(command, capture: true, binary: true, timeout: nil)
+          fields = private_result(result)
+          inspection_path = write_private_json(project_path, "trusted/inspections/inspection-#{id}.json", {
+            "artifact_version" => PRIVATE_ARTIFACT_VERSION,
+            "generated_at" => timestamp.utc.iso8601,
+            "customer" => customer, "phase" => phase,
+            "reason" => byte_envelope(reason), "command" => command.map { |arg| byte_envelope(arg) },
+            "message" => message.nil? ? nil : byte_envelope(message),
+            "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY, "contains_raw_rows" => true
+          }.merge(fields))
+          finding_path = write_inspection_finding(project_path, inspection_path, phase, id, timestamp) if as_finding
+          audit_path = write_private_json(project_path, "trusted/audit/trusted-inspect-#{id}.json", {
+            "artifact_version" => PRIVATE_ARTIFACT_VERSION, "generated_at" => timestamp.utc.iso8601,
+            "event" => "trusted_inspect", "actor" => actor,
+            "details" => {
+              "phase" => phase, "reason" => byte_envelope(reason),
+              "command" => command.map { |arg| byte_envelope(arg) },
+              "success" => fields.fetch("success"), "exit_status" => fields.fetch("exit_status"),
+              "artifact" => source_label(inspection_path, project_path),
+              "finding" => finding_path ? source_label(finding_path, project_path) : nil,
+              "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY, "redaction_review" => "not_reviewed"
+            }
+          })
+          raise OperationError, "TRUSTED_INSPECT_COMMAND_FAILED" unless fields.fetch("success")
 
-        command = Array(command).reject(&:empty?)
-        raise UsageError, "Trusted inspection command must be passed after '--'." if command.empty?
-
-        project_path = Project.project_path(customer, @env)
-        stamp = timestamp.utc.strftime("%Y%m%d-%H%M%S")
-        result = @runtime.run(command, capture: true, timeout: nil)
-        inspection_path = File.join(project_path, "trusted", "inspections", "inspection-#{stamp}.json")
-        inspection = {
-          "artifact_version" => ARTIFACT_VERSION,
-          "generated_at" => timestamp.utc.iso8601,
-          "customer" => customer,
-          "phase" => phase,
-          "reason" => reason,
-          "command" => command,
-          "success" => result.success?,
-          "exit_status" => result.status,
-          "stdout" => result.stdout,
-          "stderr" => result.stderr,
-          "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY,
-          "contains_raw_rows" => true
-        }
-        Project.atomic_write(inspection_path, JSON.pretty_generate(inspection) + "\n")
-
-        finding_path = write_inspection_finding(customer, project_path, inspection_path, phase, reason, message, stamp, timestamp) if as_finding
-
-        audit_path = write_audit(
-          customer,
-          "trusted_inspect",
-          timestamp,
-          "phase" => phase,
-          "reason" => reason,
-          "command" => command,
-          "success" => result.success?,
-          "exit_status" => result.status,
-          "artifact" => source_label(inspection_path, project_path),
-          "finding" => finding_path ? source_label(finding_path, project_path) : nil,
-          "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY,
-          "redaction_review" => "not_reviewed"
-        )
-
-        @output.puts "[OK] Trusted inspection artifact: #{inspection_path}"
-        @output.puts "[OK] Trusted finding stub: #{finding_path}" if finding_path
-        @output.puts "[OK] Trusted audit: #{audit_path}"
-        { inspection_path: inspection_path, finding_path: finding_path, audit_path: audit_path, result: result }
+          @output.puts "[OK] Trusted inspection artifact: inspection-#{id}"
+          @output.puts "[OK] Trusted finding stub: finding-inspect-#{id}" if finding_path
+          @output.puts "[OK] Trusted inspection audit: trusted-inspect-#{id}"
+          { inspection_path: inspection_path, finding_path: finding_path, audit_path: audit_path, intent_path: intent_path }
+        end
       end
 
       def review(customer, finding_path, decision: "safe", reviewer: default_reviewer, notes: nil, released_message: nil, timestamp: Time.now.utc)
@@ -79,66 +91,122 @@ module SiloMigrate
         review_finding(customer, finding_path, decision: "safe", reviewer: reviewer, notes: notes, timestamp: timestamp, redact: true, released_message: released_message)
       end
 
-      def session(customer, provider: "bedrock", runtime: "silo", reason:, session_id: nil, timestamp: Time.now.utc)
-        Project.load_config(customer, @env)
-        provider = provider.to_s.strip.downcase
-        runtime = runtime.to_s.strip.downcase
-        raise UsageError, "Trusted sessions currently support --provider bedrock only." unless provider == "bedrock"
-        raise UsageError, "Trusted sessions currently support --runtime silo only." unless runtime == "silo"
-        raise UsageError, "Trusted session requires --reason." if reason.to_s.strip.empty?
-        raise UsageError, trusted_session_platform_error unless linux_host?
+      def session(customer, provider: "bedrock", runtime: "silo", reason: nil, session_id: nil, timestamp: Time.now.utc)
+        private_operation("SESSION") do
+          unless provider.is_a?(String) && provider.b.strip.downcase == "bedrock" &&
+                 runtime.is_a?(String) && runtime.b.strip.downcase == "silo" && private_reason?(reason)
+            raise OperationError, "TRUSTED_SESSION_INPUT_INVALID"
+          end
+          raise OperationError, "TRUSTED_SESSION_PLATFORM_UNSUPPORTED" unless linux_host?
 
-        project_path = Project.project_path(customer, @env)
-        session_id = normalize_session_id(session_id, timestamp)
-        config_path = write_trusted_silo_config(customer, project_path, provider, runtime, reason, session_id, timestamp)
-        audit_path = write_audit(
-          customer,
-          "trusted_session",
-          timestamp,
-          "provider" => provider,
-          "runtime" => runtime,
-          "reason" => reason,
-          "session_id" => session_id,
-          "config" => source_label(config_path, project_path),
-          "raw_mount_policy" => "trusted_data_ai_only",
-          "snapshot" => "before_agent_launch",
-          "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY
-        )
+          project_path = private_project_path(customer)
+          actor = byte_envelope(default_reviewer)
+          id = SecureRandom.hex(16)
+          session_id = normalize_session_id(session_id, id)
+          config_path = write_trusted_silo_config(customer, project_path, session_id, timestamp, id)
+          audit_path = write_private_json(project_path, "trusted/audit/trusted-session-#{id}.json", {
+            "artifact_version" => PRIVATE_ARTIFACT_VERSION, "generated_at" => timestamp.utc.iso8601,
+            "event" => "trusted_session", "actor" => actor,
+            "details" => {
+              "provider" => "bedrock", "runtime" => "silo", "reason" => byte_envelope(reason),
+              "session_id" => session_id, "config" => source_label(config_path, project_path),
+              "snapshot" => "before_agent_launch", "status" => "requested",
+              "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY
+            }
+          })
+          confined_review_path(project_path, "trusted/session-results/session-#{id}-snapshot.json", create_parents: true)
+          snapshot = @runtime.run(["silo", "snapshot", "create", "--config", config_path, "--message", "trusted-data-ai #{id}"], capture: true, binary: true, timeout: nil)
+          snapshot_path = write_private_result(project_path, id, "snapshot", snapshot, timestamp)
+          raise OperationError, "TRUSTED_SESSION_SNAPSHOT_FAILED" unless snapshot.success?
 
-        snapshot_result = @runtime.run(["silo", "snapshot", "create", "--config", config_path, "--message", "trusted-data-ai #{customer} #{session_id}"], capture: true, timeout: nil)
-        raise UsageError, "Silo snapshot failed before trusted session launch." unless snapshot_result.success?
+          # Attached execution bypasses the privacy boundary through inherited
+          # stdout/stderr. Legacy session launch is now captured, never streamed.
+          launch = @runtime.run(["silo", "agent", "claude", "--config", config_path], capture: true, binary: true, timeout: nil)
+          launch_path = write_private_result(project_path, id, "launch", launch, timestamp)
+          raise OperationError, "TRUSTED_SESSION_LAUNCH_FAILED" unless launch.success?
 
-        launch_result = @runtime.run(["silo", "agent", "claude", "--config", config_path], capture: false, timeout: nil)
-        raise UsageError, "Trusted Silo agent session failed to launch." unless launch_result.success?
-
-        @output.puts "[OK] Trusted Data AI config: #{config_path}"
-        @output.puts "[OK] Trusted audit: #{audit_path}"
-        { config_path: config_path, audit_path: audit_path, session_id: session_id }
+          @output.puts "[OK] Trusted session artifacts written: session-#{id}"
+          { config_path: config_path, audit_path: audit_path, session_id: session_id,
+            snapshot_path: snapshot_path, launch_path: launch_path }
+        end
       end
 
       private
 
-      # Writes a trusted_only finding stub that REFERENCES the inspection but
-      # omits command output. Reasons/messages can still be sensitive and stay
-      # private until the operator explicitly supplies release text.
-      def write_inspection_finding(customer, project_path, inspection_path, phase, reason, message, stamp, timestamp)
-        path = File.join(project_path, "trusted", "findings", "finding-inspect-#{stamp}.yml")
+      def private_operation(kind)
+        yield
+      rescue OperationError => error
+        code = PRIVATE_ERROR_CODES.include?(error.message) ? error.message : "TRUSTED_#{kind}_FAILED"
+        raise OperationError, code, cause: nil
+      rescue StandardError, ScriptError
+        raise OperationError, "TRUSTED_#{kind}_FAILED", cause: nil
+      end
+
+      def private_reason?(reason)
+        reason.is_a?(String) && !reason.b.strip.empty?
+      end
+
+      def byte_envelope(value)
+        raise TypeError unless value.is_a?(String)
+
+        bytes = value.b
+        { "encoding" => "base64", "original_encoding" => value.encoding.name,
+          "bytes" => bytes.bytesize, "sha256" => Digest::SHA256.hexdigest(bytes),
+          "data" => [bytes].pack("m0") }
+      end
+
+      def private_result(result)
+        success = result.success?
+        status = result.status
+        raise TypeError unless [true, false, nil].include?(success) && (status.nil? || status.is_a?(Integer))
+
+        { "success" => success == true, "exit_status" => status,
+          "stdout" => result.stdout.nil? ? nil : byte_envelope(result.stdout),
+          "stderr" => result.stderr.nil? ? nil : byte_envelope(result.stderr) }
+      end
+
+      def private_project_path(customer)
+        unless customer.is_a?(String) && CUSTOMER_NAME_PATTERN.match?(customer)
+          raise OperationError, "TRUSTED_WORKSPACE_INVALID"
+        end
+        path = Project.project_path(customer, @env)
+        raise OperationError, "TRUSTED_WORKSPACE_INVALID" if File.symlink?(path)
+
+        root = File.realpath(path)
+        # Existence/identity anchor only: arbitrary inspection does not require
+        # loading private database credentials or validating database settings.
+        confined_review_path(root, "config.env")
+        root
+      rescue StandardError
+        raise OperationError, "TRUSTED_WORKSPACE_INVALID", cause: nil
+      end
+
+      def write_private_json(project_path, relative, value)
+        path = confined_review_path(project_path, relative, create_parents: true)
+        write_review_artifact(path, JSON.pretty_generate(value) + "\n", kind: :audit)
+        path
+      end
+
+      def write_private_result(project_path, id, stage, result, timestamp)
+        write_private_json(project_path, "trusted/session-results/session-#{id}-#{stage}.json", {
+          "artifact_version" => PRIVATE_ARTIFACT_VERSION, "generated_at" => timestamp.utc.iso8601,
+          "operation_id" => id, "stage" => stage, "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY,
+          "contains_raw_rows" => true
+        }.merge(private_result(result)))
+      end
+
+      def write_inspection_finding(project_path, inspection_path, phase, id, timestamp)
+        path = confined_review_path(project_path, "trusted/findings/finding-inspect-#{id}.yml", create_parents: true)
         finding = {
-          "artifact_version" => ARTIFACT_VERSION,
-          "id" => "finding-inspect-#{stamp}",
-          "generated_at" => timestamp.utc.iso8601,
-          "source" => source_label(inspection_path, project_path),
-          "failure" => "trusted_inspection",
-          "severity" => "warning",
-          "phase" => phase,
-          "message" => (message.to_s.strip.empty? ? reason : message),
-          "exception_class" => nil,
-          "observed_shape" => nil,
-          "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY,
-          "contains_raw_rows" => false,
-          "recommended_next_step" => "Review the referenced inspection in the trusted zone, then run 'silo-migrate trusted redact #{customer} #{source_label(path, project_path)}' and supply explicitly reviewed release text in --released-message. Keep private review context in --notes."
+          "artifact_version" => ARTIFACT_VERSION, "id" => "finding-inspect-#{id}",
+          "generated_at" => timestamp.utc.iso8601, "source" => source_label(inspection_path, project_path),
+          "failure" => "trusted_inspection", "severity" => "warning", "phase" => phase,
+          "message" => "Review the private byte-preserving inspection record.",
+          "exception_class" => nil, "observed_shape" => nil,
+          "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY, "contains_raw_rows" => false,
+          "recommended_next_step" => "Produce a separately reviewed derivative; exact-byte snapshot approval is still required before publication."
         }
-        Project.atomic_write(path, finding.to_yaml)
+        write_review_artifact(path, finding.to_yaml, kind: :audit)
         path
       end
 
@@ -325,70 +393,34 @@ module SiloMigrate
         raise UsageError, "Malformed finding: invalid YAML.", cause: nil
       end
 
-      def write_audit(customer, event, timestamp, details)
-        project_path = Project.project_path(customer, @env)
-        path = File.join(project_path, "trusted", "audit", "#{event}-#{timestamp.utc.strftime('%Y%m%d-%H%M%S')}.json")
-        audit = {
-          "artifact_version" => ARTIFACT_VERSION,
-          "generated_at" => timestamp.utc.iso8601,
-          "customer" => customer,
-          "event" => event,
-          "actor" => default_reviewer,
-          "details" => details.compact
-        }
-        Project.atomic_write(path, JSON.pretty_generate(audit) + "\n")
-        path
-      end
-
-      def write_trusted_silo_config(customer, project_path, provider, runtime, reason, session_id, timestamp)
-        path = File.join(project_path, "trusted", "silo", "trusted-data-ai-#{session_id}.yml")
+      def write_trusted_silo_config(customer, project_path, session_id, timestamp, id)
+        path = confined_review_path(project_path, "trusted/silo/trusted-data-ai-#{id}.yml", create_parents: true)
         config = {
-          "artifact_version" => ARTIFACT_VERSION,
-          "kind" => "trusted-data-ai",
-          "customer" => customer,
-          "generated_at" => timestamp.utc.iso8601,
-          "provider" => provider,
-          "runtime" => runtime,
-          "reason" => reason,
-          "session_id" => session_id,
-          "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY,
-          "agent" => {
-            "name" => "claude",
-            "mode" => "bedrock"
-          },
-          "snapshots" => {
-            "before_agent_launch" => true
-          },
-          "audit" => {
-            "directory" => File.join(project_path, "trusted", "audit")
-          },
-          "mounts" => [
-            {
-              "source" => project_path,
-              "target" => "/workspace/#{customer}",
-              "access" => "read_write",
-              "classification" => "raw_customer_project",
-              "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY
-            }
-          ],
-          "safe_handoff" => [
-            "trusted redact",
-            "release prepare",
-            "engineer reviews exact snapshot",
-            "release approve",
-            "release publish"
-          ]
+          "artifact_version" => ARTIFACT_VERSION, "kind" => "trusted-data-ai",
+          "customer" => customer, "generated_at" => timestamp.utc.iso8601,
+          "provider" => "bedrock", "runtime" => "silo",
+          "reason" => "Operator justification is recorded in the private audit.",
+          "session_id" => session_id, "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY,
+          "agent" => { "name" => "claude", "mode" => "bedrock" },
+          "snapshots" => { "before_agent_launch" => true },
+          "audit" => { "directory" => File.join(project_path, "trusted", "audit") },
+          "mounts" => [{ "source" => project_path, "target" => "/workspace/#{customer}",
+            "access" => "read_write", "classification" => "raw_customer_project",
+            "dev_visibility" => VisibilityPolicy::TRUSTED_ONLY }],
+          "safe_handoff" => ["trusted redact", "release prepare", "engineer reviews exact snapshot", "release approve", "release publish"]
         }
-        Project.atomic_write(path, config.to_yaml)
+        write_review_artifact(path, config.to_yaml, kind: :audit)
         path
       end
 
-      def normalize_session_id(session_id, timestamp)
-        value = session_id.to_s.strip
-        value = "session-#{timestamp.utc.strftime('%Y%m%d-%H%M%S')}" if value.empty?
-        raise UsageError, "Invalid trusted session id: #{session_id}. Use letters, numbers, '.', '_' or '-'." unless value.match?(/\A[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\z/)
+      def normalize_session_id(session_id, id)
+        return "session-#{id}" if session_id.nil? || session_id == ""
+        unless session_id.is_a?(String) && session_id.valid_encoding? &&
+               session_id.match?(/\A[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\z/)
+          raise OperationError, "TRUSTED_SESSION_INPUT_INVALID"
+        end
 
-        value
+        session_id
       end
 
       def linux_host?
@@ -396,10 +428,6 @@ module SiloMigrate
         return false if @env["SILO_MIGRATE_FORCE_NON_LINUX"] == "1"
 
         RbConfig::CONFIG.fetch("host_os").include?("linux")
-      end
-
-      def trusted_session_platform_error
-        "trusted session requires a Linux/Silo host. On macOS, use Docker plus 'silo-migrate ai prepare' for Normal Dev AI, or run this command on a Linux/Silo host for Bedrock raw-data access."
       end
 
       def normalize_decision(decision)

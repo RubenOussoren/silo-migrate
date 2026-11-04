@@ -678,7 +678,7 @@ class CLITest < SiloMigrateTest
 
       project_path = SiloMigrate::Project.project_path("acme", env)
       assert_equal 1, Dir[File.join(project_path, "trusted", "inspections", "*.json")].length
-      assert_equal 1, Dir[File.join(project_path, "trusted", "audit", "*.json")].length
+      assert_equal 2, Dir[File.join(project_path, "trusted", "audit", "*.json")].length
       assert_includes out.string, "Trusted inspection artifact"
       refute_includes out.string, "raw-value"
     end

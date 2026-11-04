@@ -293,8 +293,14 @@ operator-owned/upstream files are preserved. Never assume a root instruction or
 
 See the README's engineer-reviewed publication contract for limits, failure
 recovery, retained snapshots and filesystem assumptions. This synthetic local
-slice does not approve customer use; known inspect/session raw-byte and parser
-privacy risks and runtime/provider isolation must be addressed first.
+slice does not approve customer use. Inspect/session now preserve available
+stdout/stderr as private version-2 base64 byte envelopes and use fixed cause-free
+parser/runtime/serialization errors, with mocked-only verification. Legacy session
+launch is captured with binary pipes and stdin closed, never terminal-attached;
+it is not an interactive session, and real Silo compatibility is unverified.
+Requested inspection/session audits are intent, not a run ledger or completion proof. Runtime/provider
+isolation, credential/data policy and capture/resource limits still require
+separate acceptance. See the README for the versioned format and failure limits.
 
 ## Quick troubleshooting
 

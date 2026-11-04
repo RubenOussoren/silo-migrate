@@ -565,13 +565,73 @@ bin/silo-migrate trusted inspect acme --phase initial --reason "Check one source
 bin/silo-migrate trusted review acme findings/finding-20260601-120000-001.yml --decision safe --reviewer alice --released-message "Reviewed synthetic finding"
 bin/silo-migrate trusted review acme findings/finding-20260601-120000-001.yml --decision reject --reviewer alice
 bin/silo-migrate trusted redact acme trusted/findings/finding-20260601-120000-001.yml --reviewer alice --released-message "Reviewed synthetic finding"
-bin/silo-migrate trusted session acme --provider bedrock --runtime silo --reason "Inspect one approved raw-data edge case"
+bin/silo-migrate trusted session acme --provider bedrock --runtime silo --reason "Synthetic legacy non-interactive launch request"
 ```
 
-`trusted inspect` is for narrow, audited data-touching checks. Raw stdout/stderr
-are written only under `trusted/inspections/`; normal command output shows the
-artifact and audit paths, not the raw values. Audit records are written under
-`trusted/audit/`.
+`trusted inspect` is an engineer-operated, data-bearing command surface, not a
+clean-agent tool or a sandbox. The privacy-hardening slice is tested only with
+synthetic bytes and mocked execution; it does not authorize customer inspections.
+
+Private inspection JSON now uses `artifact_version: 2`. Stdout/stderr, command
+arguments, reason, optional message and audit actor are byte envelopes:
+`encoding: base64`, `original_encoding`, byte count, SHA-256 and base64 `data`.
+All available returned bytes (including invalid text encoding, NUL and empty
+output) are preserved, not scrubbed or transcoded. A null stdout/stderr field
+means capture was unavailable, distinct from an envelope containing zero bytes. Native Ruby pack/unpack is used; no extra
+gem is needed. Base64 is **not redaction**. These records remain private under
+`trusted/inspections/` and `trusted/audit/`, outside the publication source roots.
+Never paste them into a coding-provider conversation or public diagnostics.
+CLI option parsing uses a binary view of argument bytes to avoid invalid-text
+regex failures; the envelope encoding label can therefore be `ASCII-8BIT` for
+CLI metadata. Raw bytes, not that informational Ruby label, are authoritative.
+
+New directories use 0700 and files 0600, with confined non-symlink paths and
+atomic non-overwriting staging writes. Random invocation IDs replace timestamp-
+only names. Success output contains generated opaque references, never workspace
+paths, customer identity, reason, query arguments or result bytes. Operator-only
+service return values still contain private artifact paths, but no raw runtime
+result object; they are not a coding-tool response contract.
+
+`--as-finding` writes a fixed-message `trusted_only` stub referencing the private
+record. The supplied `--message` is retained in that record's byte envelope,
+not interpolated into the YAML stub. An empty command name or NUL command argv is
+rejected before execution; intentional empty argument values are retained.
+A `requested` intent audit (write-once by this command, not tamper-proof) is written before the command, so runtime
+or result-write failure does not erase the request trace. A separate result
+audit is written only when result storage succeeds; neither is a run ledger.
+A nonzero or signal-killed inspection result is preserved privately, then reported as fixed
+`TRUSTED_INSPECT_COMMAND_FAILED`, not successful execution. Nested help/version/completion built-ins and abbreviated private flags are
+refused rather than allowing OptionParser to print through global streams or
+exit successfully. Use top-level `trusted --help` for static help. Literal metadata
+that resembles a reserved completion token can use `--reason=VALUE`.
+Parser/input errors, raised runtime/adapter exceptions and
+storage/serialization/output errors return fixed
+`TRUSTED_*` messages with sensitive exception causes suppressed. A storage or
+output failure can happen after execution or after some private records were
+written: inspect private storage before retrying; there is no exactly-once run
+ledger or automatic retry/recovery in this slice. No available result bytes can
+be guaranteed persisted if a reader fails, storage fails or the process dies.
+Failures intentionally print a fixed code only, without even an opaque record
+reference. Correlating failed concurrent requests therefore requires private
+operator inspection; durable run IDs/ledger handling is a later slice.
+Repeated `--reason` options retain only the last value. A session config can be
+left privately orphaned if the following intent write fails; execution does not
+start. These are not full request-accounting or crash-recovery guarantees.
+
+Version-1 inspection JSON used plain text and timestamp names; it is not rewritten.
+Existing consumers must explicitly handle version 2. For a private local review,
+`record.fetch("stdout")&.fetch("data")&.unpack1("m0")` recovers available exact bytes; do not
+print decoded customer bytes into shared logs or send them to coding providers.
+Trusted calls request opt-in `capture: true, binary: true`: the Docker adapter
+sets pipe binary mode before reads (independent of text encoding defaults) and
+suppresses reader-thread exception reports so errors propagate to the fixed
+boundary instead of printing privately valued tracebacks. Other callers retain
+the previous text-capture default. Alternate adapters must support this contract;
+there is no fallback to attached/text execution. Workspace preflight checks a
+confined regular `config.env` existence anchor, not its database settings; missing
+or unsafe workspaces return `TRUSTED_WORKSPACE_INVALID` before execution.
+Capture still buffers output in memory; bounded streaming/query limits and real
+runtime isolation are separate requirements before customer use.
 
 `trusted review` can approve or reject `restricted` findings. `trusted_only`
 findings cannot be approved directly; use `trusted redact`. Both safe decisions
@@ -619,15 +679,31 @@ them rather than silently release source keys or values. Providing reviewed
 synthetic fixtures needs a separately designed release path. This finding-only
 hardening alone is not publication approval. The snapshot release flow below
 binds a separate approval to exact bytes before publication. Neither command
-family authenticates the reviewer or establishes OS isolation. Inspect/session
-raw-byte serialization and parser-error privacy hardening is still required
-before customer-data use; these commands are not clean-agent privileged tools.
+family authenticates the reviewer or establishes OS isolation. The byte/error
+privacy boundary is synthetically tested as described above; actual runtime,
+provider, credential and data-policy acceptance is still required before
+customer-data use. These commands are not clean-agent privileged tools.
 
-`trusted session` is Linux/Silo-only and sets up a Trusted Data AI session for
-Claude Bedrock mode. It writes a Silo config snippet under `trusted/silo/`, takes
-a pre-launch snapshot through Silo, and records audit metadata under
-`trusted/audit/`. On macOS it fails with guidance to use the Docker/local safe
-workflow or run the trusted session command on a Linux/Silo host.
+`trusted session` retains the legacy Linux/Silo/Bedrock command wiring, not an
+approved work-node/Frontier analyst route. Both snapshot and launch calls now
+use captured execution; launch output is **not attached/streamed to the terminal**.
+Each available stage result is preserved as a private version-2 byte-envelope
+JSON record under `trusted/session-results/`. No real session, provider or Silo compatibility has been tested. With the Docker
+adapter, stdin is closed and stdout/stderr are pipes: this is non-interactive
+and **cannot provide an interactive customer session**. A separate reviewed
+broker/runtime design is needed, not a switch back to unsafe terminal attachment. The service cannot contain a runtime implementation that ignores its
+capture contract or writes to unrelated channels, and capture is not OS isolation.
+
+The requested-session audit is written before execution, explicitly marked
+`requested`; it is not proof the snapshot or launch completed. A failed snapshot
+stops launch; a failed launch or runtime/encoding/storage error produces only a
+fixed cause-free message, with no captured output echoed. Available nonzero or
+signal-killed stage output is retained privately. A raised runtime exception before a result returns
+may leave only the intent audit. User-supplied session IDs and raw justification
+stay private; filenames/success references use unrelated generated IDs. The Silo
+config contains a fixed reference to the audit instead of raw justification.
+Unsupported platform/provider/runtime/options are refused without echoing values.
+No provider settings are changed and no session is launched by ordinary publication.
 
 ### Engineer-reviewed artifact publication
 

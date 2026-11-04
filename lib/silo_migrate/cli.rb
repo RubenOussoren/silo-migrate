@@ -283,8 +283,12 @@ module SiloMigrate
           silo-migrate trusted inspect acme --phase initial --reason "check edge case" -- \\
             mysql -u root -e "SELECT COUNT(*) FROM users"
 
-        --as-finding also writes a trusted_only finding stub (no raw output embedded)
-        so the conclusion can later flow to the safe zone via:
+        Inspection JSON v2 preserves raw bytes in private base64 envelopes (not
+        redaction). Console references are opaque; session subprocess output is
+        captured privately with stdin closed, not an interactive session. Runtime integration is
+        unverified; these are engineer-only commands, not clean-agent tools.
+        --as-finding writes a fixed-message trusted_only stub; --message stays in
+        the private inspection record. A conclusion can later be reviewed via:
           silo-migrate trusted redact acme trusted/findings/finding-inspect-....yml --released-message "reviewed summary"
 
         FINDING is workspace-relative or absolute within findings/ or trusted/findings/.
@@ -435,7 +439,7 @@ module SiloMigrate
           trusted inspect CUSTOMER     Run audited trusted-only inspection command after --
           trusted review CUSTOMER FILE Approve/reject a restricted finding
           trusted redact CUSTOMER FILE Write a safe redacted derivative
-          trusted session CUSTOMER     Launch a Linux/Silo Bedrock trusted data AI session
+          trusted session CUSTOMER     Non-interactive captured legacy Linux/Silo request
 
         Run 'silo-migrate help <command>' (or '<command> --help') for flags and examples.
       HELP
@@ -970,39 +974,39 @@ module SiloMigrate
     end
 
     def trusted(argv)
-      subcommand = required_arg(argv, "SUBCOMMAND")
+      subcommand = argv.shift
       case subcommand
       when "inspect" then trusted_inspect(argv)
       when "review" then trusted_review(argv)
       when "redact" then trusted_redact(argv)
       when "session" then trusted_session(argv)
       else
-        raise UsageError, "Unknown trusted command: #{subcommand}"
+        raise UsageError, "TRUSTED_OPTIONS_INVALID", cause: nil
       end
     end
 
     def trusted_inspect(argv)
-      customer = required_arg(argv, "CUSTOMER")
-      options = { phase: "initial", as_finding: false }
-      parser = OptionParser.new do |opts|
-        opts.on("--phase PHASE") { |value| options[:phase] = validate_phase(value) }
-        opts.on("--reason TEXT") { |value| options[:reason] = value }
-        opts.on("--as-finding") { options[:as_finding] = true }
-        opts.on("--message TEXT") { |value| options[:message] = value }
-      end
-      separator_index = argv.index("--")
-      raise UsageError, "Trusted inspection command must be passed after '--'." unless separator_index
+      begin
+        customer = required_arg(argv, "CUSTOMER")
+        options = { phase: "initial", as_finding: false }
+        parser = OptionParser.new do |opts|
+          opts.on("--phase PHASE") { |value| options[:phase] = value }
+          opts.on("--reason TEXT") { |value| options[:reason] = value }
+          opts.on("--as-finding") { options[:as_finding] = true }
+          opts.on("--message TEXT") { |value| options[:message] = value }
+        end
+        separator = argv.index("--")
+        raise UsageError unless separator
 
-      parser.parse!(argv[0...separator_index])
-      command = argv[(separator_index + 1)..] || []
-      @trusted_service.inspect(
-        customer,
-        phase: options[:phase],
-        reason: options[:reason],
-        command: command,
-        as_finding: options[:as_finding],
-        message: options[:message]
-      )
+        option_args = argv[0...separator].map { |arg| arg.b }
+        parse_private_options(parser, option_args)
+        raise UsageError unless option_args.empty?
+
+        command = argv[(separator + 1)..] || []
+      rescue StandardError
+        raise UsageError, "TRUSTED_INSPECT_OPTIONS_INVALID", cause: nil
+      end
+      @trusted_service.inspect(customer, command: command, **options)
     end
 
     def trusted_review(argv)
@@ -1039,15 +1043,34 @@ module SiloMigrate
     end
 
     def trusted_session(argv)
-      customer = required_arg(argv, "CUSTOMER")
-      options = { provider: "bedrock", runtime: "silo" }
-      OptionParser.new do |opts|
-        opts.on("--provider PROVIDER") { |value| options[:provider] = value }
-        opts.on("--runtime RUNTIME") { |value| options[:runtime] = value }
-        opts.on("--reason TEXT") { |value| options[:reason] = value }
-        opts.on("--session-id ID") { |value| options[:session_id] = value }
-      end.parse!(argv)
+      begin
+        customer = required_arg(argv, "CUSTOMER")
+        argv = argv.map { |arg| arg.b }
+        options = { provider: "bedrock", runtime: "silo" }
+        parser = OptionParser.new do |opts|
+          opts.on("--provider PROVIDER") { |value| options[:provider] = value }
+          opts.on("--runtime RUNTIME") { |value| options[:runtime] = value }
+          opts.on("--reason TEXT") { |value| options[:reason] = value }
+          opts.on("--session-id ID") { |value| options[:session_id] = value }
+        end
+        parse_private_options(parser, argv)
+        raise UsageError unless argv.empty?
+      rescue StandardError
+        raise UsageError, "TRUSTED_SESSION_OPTIONS_INVALID", cause: nil
+      end
       @trusted_service.session(customer, **options)
+    end
+
+    def parse_private_options(parser, args)
+      parser.require_exact = true
+      parser.on("-h", "--help") { raise UsageError }
+      parser.on("-v", "--version") { raise UsageError }
+      # OptionParser's completion switches print via global streams and exit.
+      # Reserve their standalone tokens; literal metadata can use --reason=VALUE.
+      if args.any? { |arg| arg.start_with?("--") && arg.split("=", 2).first.include?("completion") }
+        raise UsageError
+      end
+      parser.parse!(args)
     end
 
     def required_arg(argv, name)

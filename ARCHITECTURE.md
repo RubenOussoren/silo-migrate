@@ -20,6 +20,22 @@ The AI/Silo/trusted-data architecture in this document should shape interfaces a
 
 ## Current Rebuild Status
 
+### Current trusted inspect/session privacy boundary
+
+Available inspection/session output bytes are stored privately in version-2
+JSON base64 envelopes with byte counts/digests and informational encoding labels.
+Reasons, command argv and other data-bearing inspection metadata use the same
+byte-preserving representation. Fixed-message finding stubs never copy raw
+justification. Private paths/bytes and sensitive exception causes are not echoed
+by inspect/session handlers. Session subprocess calls are captured rather than
+attached; requested audits are not completion proof or a durable run ledger.
+Capture uses opt-in binary pipes with stdin closed; this is non-interactive,
+not an interactive session. Requested inspection audits precede execution;
+signal-killed results retain available bytes with failure status. Only synthetic
+fixtures/mocked execution were tested. Real Silo compatibility, provider,
+resource-limit and runtime-isolation behavior remains unverified. This does not
+change the artifact-publication gate or authorize customer sessions.
+
 ### Current publication contract (supersedes historical Phase 2/4 descriptions)
 
 `release prepare` creates a private bounded snapshot; the engineer reviews its
@@ -91,13 +107,13 @@ Implemented:
   - Fixture generation consumes only `safe` findings.
   - Restricted/trusted findings require review or redaction before normal Dev AI use.
 - Initial Phase 3 trusted workflow commands:
-  - `silo-migrate trusted inspect CUSTOMER --phase PHASE --reason REASON -- COMMAND...` writes raw output only under `trusted/inspections/` and records an audit event under `trusted/audit/`.
+  - `silo-migrate trusted inspect CUSTOMER --phase PHASE --reason REASON -- COMMAND...` preserves raw bytes as private version-2 envelopes under `trusted/inspections/` with private audit references; console messages contain opaque IDs only.
   - `silo-migrate trusted review CUSTOMER FINDING --decision safe --released-message TEXT` creates a fixed-projection derivative using only explicitly reviewed release text; `--decision reject` writes a private audit only.
   - `silo-migrate trusted redact CUSTOMER FINDING --released-message TEXT` uses the same fixed projection for trusted-only findings. Source fields, shapes, IDs and private review notes are never copied into the derivative. See the README for confinement, staging, failure semantics and remaining release-gate limits.
 - Initial Phase 4 agent-boundary commands:
   - `silo-migrate ai prepare CUSTOMER` and `ai refresh CUSTOMER` explicitly publish only approved snapshots into the generated `safe-artifacts/` view. Fixed instructions stay inside the view; no customer-identifying root/configuration files are generated. Converter code itself is never copied or touched.
   - Safe AI workspaces exclude `dumps/`, `trusted/`, `output/intermediate.db`, credentials, raw logs, restricted findings, and trusted-only findings.
-  - `silo-migrate trusted session CUSTOMER --provider bedrock --runtime silo --reason REASON` is Linux/Silo-only and writes a Trusted Data AI Silo config plus audit metadata before snapshot and launch commands.
+  - `silo-migrate trusted session CUSTOMER --provider bedrock --runtime silo --reason REASON` is Linux/Silo-only and writes a Trusted Data AI Silo config plus audit metadata before captured non-interactive snapshot and launch commands (stdin closed; real compatibility unverified).
 - Guided mode shows project path, configured databases, dump counts, schema bundle status, Discourse handoff status, and container status before prompting.
 - Guided import paths detect dump format/source type, analyze large-table suggestions, allow table exclusions, detect port conflicts before Docker start, and wait for DB health before import.
 - Guided import paths automatically generate the schema bundle for the imported phase after a successful import; bundle failures are warnings and do not invalidate the import.
@@ -292,7 +308,7 @@ Migration CLI on Linux
 Approved raw-data inspection (future, analysis-only)
   -> trusted session --provider bedrock --runtime silo
   -> Silo snapshot
-  -> Trusted Data AI Session mounting raw project data
+  -> future interactive trusted broker (not the current captured legacy command)
   -> trusted redact / candidate findings / fixtures
   -> release prepare -> engineer exact-byte approval -> release publish
 ```
@@ -521,8 +537,8 @@ Required:
 
 Current implemented handoff:
 
-- `silo-migrate trusted session CUSTOMER --provider bedrock --runtime silo --reason REASON` writes a Trusted Data AI Silo config under `trusted/silo/`, records audit metadata under `trusted/audit/`, requests a Silo snapshot, and launches Claude Bedrock mode through Silo.
-- On macOS, this command fails with guidance to use Docker plus safe Normal Dev AI workspaces locally, or to run the trusted session on a Linux/Silo host.
+- Legacy `trusted session` writes private config/intent metadata, then requests captured snapshot/launch calls and records available stage bytes privately. No terminal attachment or output streaming is allowed by this handler; unsupported platforms receive a fixed message.
+- This wiring has mocked-only verification. It is not proof of live Silo/TTY compatibility, approved provider policy or private runtime isolation; real sessions require separate scope and acceptance.
 
 ## Converter Development Flow
 
@@ -937,7 +953,7 @@ Goal: formalize the Bedrock/customer-data path.
 - Implemented initial slice: safe-only fixture generation.
 - Implemented initial slice: audited trusted-only inspection command.
 - Implemented initial slice: restricted finding review and trusted-only redaction hooks.
-- Implemented initial slice: Linux/Silo Bedrock trusted session setup with config generation, snapshot command construction, and audit metadata.
+- Implemented initial slice: Linux/Silo Bedrock trusted session setup with config generation, non-interactive captured snapshot/launch construction, and audit metadata; no real session compatibility verified.
 - Still future: broader policy/config integration and production hardening of Bedrock session launch behavior.
 
 ### Phase 4: Agent Runtime and Data Boundary
@@ -948,7 +964,7 @@ Goal: support safe Normal Dev AI and trusted Bedrock raw-data workflows without 
 - Current: fixed instructions inside the approved view only; historical root
   instructions, deny settings, Silo snippets and automatic refresh are retired.
   Existing operator files are preserved and require private legacy review.
-- Implemented initial slice: `trusted session CUSTOMER --provider bedrock --runtime silo --reason REASON` is Linux/Silo-only and generates Trusted Data AI config, audit metadata, snapshot intent, and launch command construction.
+- Implemented initial slice: `trusted session CUSTOMER --provider bedrock --runtime silo --reason REASON` is Linux/Silo-only and generates Trusted Data AI config, audit metadata, snapshot intent, and non-interactive captured launch construction with stdin closed; it is not an interactive session.
 - Keep Docker as the default migration runtime on macOS and Linux.
 - Keep Silo optional and Linux-only for agent isolation.
 - Defer full `Runtime::Silo` database/container replacement until the agent-session model is validated.

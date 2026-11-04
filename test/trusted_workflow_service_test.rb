@@ -23,9 +23,11 @@ class TrustedWorkflowServiceTest < SiloMigrateTest
       audit = JSON.parse(File.read(artifacts.fetch(:audit_path)))
       assert_equal "trusted_only", inspection.fetch("dev_visibility")
       assert_equal true, inspection.fetch("contains_raw_rows")
-      assert_equal %w[echo customer@example.test], inspection.fetch("command")
+      assert_equal 2, inspection.fetch("artifact_version")
+      assert_equal %w[echo customer@example.test], inspection.fetch("command").map { |value| value.fetch("data").unpack1("m0") }
+      refute artifacts.key?(:result)
       assert_equal "trusted_inspect", audit.fetch("event")
-      assert_equal "trusted/inspections/inspection-20260601-130000.json", audit.dig("details", "artifact")
+      assert_equal "trusted/inspections/#{File.basename(artifacts.fetch(:inspection_path))}", audit.dig("details", "artifact")
       refute_includes out.string, "customer@example.test"
     end
   end
@@ -111,8 +113,8 @@ class TrustedWorkflowServiceTest < SiloMigrateTest
         )
       end
 
-      assert_includes error.message, "Linux/Silo host"
-      assert_includes error.message, "ai prepare"
+      assert_equal "TRUSTED_SESSION_PLATFORM_UNSUPPORTED", error.message
+      assert_nil error.cause
     end
   end
 
@@ -172,7 +174,7 @@ class TrustedWorkflowServiceTest < SiloMigrateTest
       )
 
       finding_path = artifacts.fetch(:finding_path)
-      assert_includes finding_path, File.join("trusted", "findings", "finding-inspect-20260601-130000.yml")
+      assert_match(%r{/trusted/findings/finding-inspect-[0-9a-f]{32}\.yml\z}, finding_path)
       content = File.read(finding_path)
       refute_includes content, "raw-value-sentinel"
       refute_includes content, "real@customer.test"
@@ -180,11 +182,13 @@ class TrustedWorkflowServiceTest < SiloMigrateTest
       finding = YAML.safe_load(content)
       assert_equal "trusted_only", finding.fetch("dev_visibility")
       assert_equal "trusted_inspection", finding.fetch("failure")
-      assert_equal "Some users rows have malformed encoding", finding.fetch("message")
-      assert_includes finding.fetch("source"), "trusted/inspections/inspection-20260601-130000.json"
+      assert_equal "Review the private byte-preserving inspection record.", finding.fetch("message")
+      assert_equal "trusted/inspections/#{File.basename(artifacts.fetch(:inspection_path))}", finding.fetch("source")
+      inspection = JSON.parse(File.read(artifacts.fetch(:inspection_path)))
+      assert_equal "Some users rows have malformed encoding", inspection.fetch("message").fetch("data").unpack1("m0")
 
       audit = JSON.parse(File.read(artifacts.fetch(:audit_path)))
-      assert_includes audit.dig("details", "finding"), "finding-inspect-20260601-130000.yml"
+      assert_equal "trusted/findings/#{File.basename(finding_path)}", audit.dig("details", "finding")
     end
   end
 
@@ -565,8 +569,9 @@ class TrustedWorkflowServiceTest < SiloMigrateTest
       env["SILO_MIGRATE_BASE_PATH"] = alias_base
       service = SiloMigrate::Services::TrustedWorkflowService.new(runtime: runtime, env: env, output: StringIO.new)
       inspection = service.inspect("acme", reason: "Synthetic check", command: %w[echo synthetic], as_finding: true)
-      assert inspection.fetch(:finding_path).start_with?(alias_base + File::SEPARATOR)
-      result = service.redact("acme", inspection.fetch(:finding_path), released_message: "Reviewed summary")
+      assert inspection.fetch(:finding_path).start_with?(canonical_root + File::SEPARATOR)
+      alias_finding_path = File.join(alias_base, "acme", "trusted", "findings", File.basename(inspection.fetch(:finding_path)))
+      result = service.redact("acme", alias_finding_path, released_message: "Reviewed summary")
       assert_equal File.join(canonical_root, "findings"), File.dirname(result.fetch(:reviewed_path))
       assert_equal "Reviewed summary", YAML.safe_load(File.read(result.fetch(:reviewed_path))).fetch("message")
       File.symlink(File.join(canonical_root, "trusted", "findings"), File.join(canonical_root, "findings", "linked"))

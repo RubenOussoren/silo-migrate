@@ -153,14 +153,16 @@ module SiloMigrate
         true
       end
 
-      def run(cmd, chdir: nil, capture: false, timeout: nil, stdin_data: nil, separate_process_group: true)
+      def run(cmd, chdir: nil, capture: false, timeout: nil, stdin_data: nil, separate_process_group: true, binary: false)
+        raise UsageError, "Binary capture requires captured execution." if binary && !capture
+
         cmd = normalize_command(cmd)
         process_options = {}
         process_options[:chdir] = chdir if chdir
         process_options[:pgroup] = true if separate_process_group
 
         if capture || stdin_data
-          run_captured(cmd, process_options, timeout, stdin_data, separate_process_group)
+          run_captured(cmd, process_options, timeout, stdin_data, separate_process_group, binary: binary)
         else
           run_attached(cmd, process_options, timeout, separate_process_group)
         end
@@ -304,7 +306,7 @@ module SiloMigrate
         CommandResult.new(success?: false, stdout: "", stderr: timeout_message(cmd, timeout), status: nil)
       end
 
-      def run_captured(cmd, process_options, timeout, stdin_data, separate_process_group)
+      def run_captured(cmd, process_options, timeout, stdin_data, separate_process_group, binary: false)
         stdout = +""
         stderr = +""
         status = nil
@@ -312,8 +314,16 @@ module SiloMigrate
 
         Open3.popen3(*cmd, **process_options) do |stdin, out, err, wait_thr|
           pid = wait_thr.pid
-          stdout_thread = Thread.new { out.read.to_s }
-          stderr_thread = Thread.new { err.read.to_s }
+          out.binmode if binary
+          err.binmode if binary
+          stdout_thread = Thread.new do
+            Thread.current.report_on_exception = false if binary
+            out.read.to_s
+          end
+          stderr_thread = Thread.new do
+            Thread.current.report_on_exception = false if binary
+            err.read.to_s
+          end
           captured_exchange(stdin, wait_thr, stdout_thread, stderr_thread, stdin_data, timeout) do |captured_stdout, captured_stderr, captured_status|
             stdout = captured_stdout
             stderr = captured_stderr
