@@ -9,7 +9,7 @@ agents_md: "false"
 search: false
 max_turns: 12
 tools:
-  enabled: []
+  enabled: [update_plan]
   custom:
     - name: analyst_run_evidence
       description: "Read the private failure record and bounded logs of one run."

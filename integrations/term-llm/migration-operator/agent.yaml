@@ -5,7 +5,7 @@ agents_md: "false"
 search: false
 max_turns: 40
 tools:
-  enabled: []
+  enabled: [update_plan]
   custom:
     - name: migration_status
       description: "Show safe status for a migration workspace: plans, runs, instances, capabilities."
