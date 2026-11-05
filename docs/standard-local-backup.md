@@ -1,6 +1,8 @@
-# Standard local backup: current CLI slice
+# Standard local backup: launcher-based CLI slice
 
-This is a documented target workflow, not runtime authorization or proof that a Discourse image is ready. No runtime/container/download/install/build action is included here.
+For the runtime-tested path, see [Standard local migration workbench](standard-workbench.md). It uses a frozen prebuilt image and has run end to end on synthetic data.
+
+This page describes the older `discourse_docker` launcher route through `silo-migrate discourse`. It has only been tested with fake runtimes, and it needs a launcher role built from the same application revision as the checks below. No runtime/container/download/install/build action is included here.
 
 ## Same-destination import-role path
 
@@ -36,18 +38,18 @@ Guided workflow's existing backup action does not supply the required explicit f
 
 Distinct other-converter, new-converter, delta-import, multi-source, and native-merge paths remain distinct; this workflow does not replace them or globally remove settings. Hosted review restore, production restore, DNS/traffic changes, and operational acceptance remain human handoffs.
 
-As of the planning workspace's source-only `LOCAL-MIGRATION-BACKUP-REUSE-ASSESSMENT-20261105.md` assessment, launcher/templates/base/image digests, final immutable runtime recipe/image and dependency closure, and runtime readiness evidence are unknown or missing. Static cache presence is not a ready image. Use only fresh, independent writable scratch copies in the existing project mounts; never mount accepted inputs/caches writable or hardlink SQLite inputs into scratch. Frozen dependencies and runtime must be prepared separately. Do not infer automation, readiness, or execution authorization from these CLI examples.
+For this launcher route, launcher/templates/base digests and a matching final image remain unpinned. Static cache presence is not a ready image. Use only fresh, independent writable scratch copies in the existing project mounts; never mount accepted inputs/caches writable or hardlink SQLite inputs into scratch. Frozen dependencies and runtime must be prepared separately. Do not infer automation, readiness, or execution authorization from these CLI examples.
 
 No customer/private data or runtime actions are authorized by this document.
 
 ## Offline checks and remaining runtime gates
 
 The standard-only contract requires Discourse app revision
-`0801565a151df0c7fd15cc8e1b87485f1c738c3e`, Ruby `4.0.7`, Bundler `4.0.23`,
+`3158c7503a59d0952c84cc8c032790e80167bf38`, Ruby `4.0.9`, Bundler `4.0.23`,
 and app lock SHA256
-`ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8`
-(read from the retained pinned source). These are not launcher/base/final-image
-pins. Dependency checks do not install, resolve, update platforms or rewrite locks.
+`bacaa276aebc56385bf28c9fefbc6224e494e0361bd734933b4a20427e0f87d2`
+(read from the prebuilt image; see `runtime/prebuilt-discourse/runtime-lock.json`).
+These are not launcher/base/final-image pins. Dependency checks do not install, resolve, update platforms or rewrite locks.
 Tiny generated settings (one worker, DB pool5, shared buffers128MB, connections20)
 are a preparation profile, not verified resource sizing or a runtime approval.
 Loopback ports, disabled email/Sidekiq and LocalStore checks are not network

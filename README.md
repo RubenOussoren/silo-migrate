@@ -34,6 +34,16 @@ practical end-to-end overview (capabilities, limits, happy paths, diagrams).
   restricted finding review, safe redacted derivatives, and Linux/Silo Bedrock
   session setup.
 
+## Standard local migration workbench (synthetic-only)
+
+`silo-migrate standard` takes one full source snapshot through conversion, a
+sandbox baseline, uploads, generic import and a full backup, then proves that
+backup by restoring it into a fresh local instance. It keeps durable plans,
+approvals and run state, and a narrow term-llm adapter offers the same operations
+conversationally. See [Standard local migration workbench](docs/standard-workbench.md).
+This is not customer-data acceptance, and hosted restore and cutover stay with the
+engineer.
+
 ## Named file-only foundation (synthetic-only)
 
 `named` is an opt-in fresh-workspace mode for named source/dataset/input identities
