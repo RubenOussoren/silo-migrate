@@ -34,8 +34,8 @@ class DiscourseFakeRuntime < SiloMigrate::Runtime::Fake
     text = cmd.join(" ")
     return command_result(false) if @fail_on && text.include?(@fail_on)
 
-    if cmd[-2, 2] == ["rev-parse", "HEAD"]
-      return command_result(true, "#{SiloMigrate::Services::DiscourseService::STANDARD_DISCOURSE_REVISION}\n")
+    if cmd.last == "/var/www/discourse/config/git-utils-overrides.json"
+      return command_result(true, JSON.generate("git_version" => SiloMigrate::Services::DiscourseService::STANDARD_DISCOURSE_REVISION))
     elsif text.include?("SILO_ALLOW_RESTORE")
       return command_result(true, "SILO_ALLOW_RESTORE=#{@restore_allowed}\n")
     elsif text.include?("script/discourse enable_restore")

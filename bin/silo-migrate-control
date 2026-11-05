@@ -1,0 +1,41 @@
+#!/bin/sh
+# Runs silo-migrate in its pinned control-plane container, because this host has
+# no Ruby toolchain and installing one on the host is out of scope. This is the
+# trusted control plane, not a coding runtime: it holds the Docker socket and must
+# not be mounted into agent or converter containers.
+set -eu
+
+self=$(readlink -f "$0")
+repo=$(cd "$(dirname "$self")/.." && pwd -P)
+project=${SILO_CONTROL_PROJECT:-$(cd "$repo/../.." && pwd -P)}
+gems=${SILO_CONTROL_GEMS:-$project/.runtime-cache/gems}
+base=${SILO_MIGRATE_BASE_PATH:-$project/.runtime-cache/mvp-workspaces}
+image=${SILO_CONTROL_IMAGE:-sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b8310d84949240}
+docker_group=$(stat -c %g /var/run/docker.sock)
+mkdir -p -m 700 "$base"
+
+mode="--rm -i"
+name=""
+if [ "${1:-}" = "--detach" ]; then
+  shift
+  name="silo-control-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+  mode="--rm -d --name $name"
+fi
+
+# shellcheck disable=SC2086
+exec docker run $mode --pull=never --restart no --network host --read-only \
+  --user "$(id -u):$(id -g)" --group-add "$docker_group" --cap-drop ALL \
+  --security-opt no-new-privileges --cpus 0.25 --memory 512m --memory-swap 512m --pids-limit 256 \
+  --log-opt max-size=1m --tmpfs /tmp:rw,exec,size=256m,mode=1777 \
+  --mount "type=bind,src=$project,dst=$project,readonly" \
+  --mount "type=bind,src=$base,dst=$base" \
+  --mount "type=bind,src=$gems,dst=/gems,readonly" \
+  --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+  --mount type=bind,src=/usr/bin/docker,dst=/usr/local/bin/docker,readonly \
+  -e HOME=/tmp -e USER=silo -e TMPDIR=/tmp -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 \
+  -e GEM_HOME=/gems -e GEM_PATH=/gems:/gems/ruby/3.3.0 -e BUNDLE_PATH=/gems \
+  -e BUNDLE_FROZEN=true -e BUNDLE_APP_CONFIG=/tmp/bundle-config -e BUNDLE_AUTO_INSTALL=false \
+  -e BUNDLE_DISABLE_VERSION_CHECK=true -e RUBYOPT=-W0 \
+  -e SILO_MIGRATE_BASE_PATH="$base" -e SILO_MIGRATE_USER_CONFIG=/tmp/user-config.env \
+  -e GIT_CONFIG_NOSYSTEM=1 -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+  -w "$repo" "$image" bundle _2.6.9_ exec ruby bin/silo-migrate "$@"

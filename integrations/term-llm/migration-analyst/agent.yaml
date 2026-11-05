@@ -1,0 +1,38 @@
+name: migration-analyst
+description: Trusted private investigator for one migration run. Frontier only. Proposes findings; cannot release them.
+provider: cdck_frontier
+model: CDCK/MoM
+allowed_models:
+  - cdck_frontier:CDCK/MoM
+workspace: none
+agents_md: "false"
+search: false
+max_turns: 12
+tools:
+  enabled: []
+  custom:
+    - name: analyst_run_evidence
+      description: "Read the private failure record and bounded logs of one run."
+      script: scripts/analyst_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          run_id: {type: string}
+        required: [workspace, run_id]
+        additionalProperties: false
+    - name: analyst_propose_finding
+      description: "Propose a finding privately for engineer review. This does not release it to coding work."
+      script: scripts/analyst_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          run_id: {type: string}
+          text: {type: string, description: "Cause, evidence, and a suggested synthetic reproduction with no source values"}
+        required: [workspace, run_id, text]
+        additionalProperties: false

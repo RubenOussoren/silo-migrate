@@ -15,13 +15,18 @@ require "set"
 require "shellwords"
 require "time"
 require "yaml"
+require_relative "discourse_archive"
 
 module SiloMigrate
   module Services
     class DiscourseService
+      include DiscourseArchive
+
       ROLES = %w[uploads import].freeze
-      STANDARD_DISCOURSE_REVISION = "0801565a151df0c7fd15cc8e1b87485f1c738c3e"
-      STANDARD_LOCK_SHA256 = "ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8"
+      STANDARD_DISCOURSE_REVISION = "3158c7503a59d0952c84cc8c032790e80167bf38"
+      STANDARD_LOCK_SHA256 = "bacaa276aebc56385bf28c9fefbc6224e494e0361bd734933b4a20427e0f87d2"
+      STANDARD_RUBY_VERSION = "4.0.9"
+      STANDARD_BUNDLER_VERSION = "4.0.23"
       ROLE_BOTH = "both"
       DEFAULT_DOCKER_PATH = "/var/discourse"
       DEFAULT_DOCKER_REPO = "https://github.com/discourse/discourse_docker.git"
@@ -36,7 +41,6 @@ module SiloMigrate
       IMPORT_TIMEOUT = nil
       REBUILD_TIMEOUT = nil
       BACKUP_TIMEOUT = nil
-      STANDARD_IMPORT_LOG_LIMIT = 65_536
 
       attr_reader :env
 
@@ -628,7 +632,7 @@ module SiloMigrate
         if standard_local?(config)
           content["site_settings"] = {
             "authorized_extensions" => "txt", "max_attachment_size_kb" => 1024,
-            "max_image_size_kb" => 1024, "max_image_megapixels" => 1,
+            "max_image_size_kb" => 1024, "max_image_megapixels" => 5,
             "secure_uploads" => false, "s3_enable_access_control_tags" => false,
             "enable_s3_uploads" => false, "multisite" => false
           }
@@ -700,12 +704,10 @@ module SiloMigrate
       end
 
       def assert_clean_import_report!(result)
-        text = result.stdout.to_s
-        unless text.bytesize <= STANDARD_IMPORT_LOG_LIMIT && result.stderr.to_s.empty? &&
-               text.match?(/^Done! \(\d+ minutes\)$/) &&
-               !text.match?(/Import issues \(|\bERROR:|\b[1-9]\d* (?:errors|skipped)\b/i)
+        unless result.stderr.to_s.empty?
           raise UsageError, "Standard import report is incomplete or contains errors/skips; destination remains dirty"
         end
+        assert_clean_import_output!(result.stdout)
       end
 
       def restore_enabled?(container)
@@ -724,14 +726,16 @@ module SiloMigrate
       end
 
       def assert_standard_runtime!(container)
-        revision = @runtime.run(["docker", "exec", container, "git", "-C", "/var/www/discourse", "rev-parse", "HEAD"], capture: true, timeout: 30)
-        unless revision.success? && revision.stdout.to_s.strip == STANDARD_DISCOURSE_REVISION
+        # Prebuilt images carry no .git; upstream records the revision here instead.
+        revision = @runtime.run(["docker", "exec", container, "cat", "/var/www/discourse/config/git-utils-overrides.json"], capture: true, timeout: 30)
+        recorded = revision.success? ? (JSON.parse(revision.stdout.to_s)["git_version"] rescue nil) : nil
+        unless recorded == STANDARD_DISCOURSE_REVISION
           raise UsageError, "Standard local runtime must use the exact approved Discourse app revision"
         end
         code = <<~RUBY
           require "bundler"
           require "digest"
-          abort "Ruby/Bundler mismatch" unless RUBY_VERSION == "4.0.7" && Bundler::VERSION == "4.0.23"
+          abort "Ruby/Bundler mismatch" unless RUBY_VERSION == "#{STANDARD_RUBY_VERSION}" && Bundler::VERSION == "#{STANDARD_BUNDLER_VERSION}"
           abort "App lock mismatch" unless Digest::SHA256.file("Gemfile.lock").hexdigest == "#{STANDARD_LOCK_SHA256}"
         RUBY
         versions = @runtime.run(discourse_command(container, ["ruby", "-e", code]), timeout: 30)
@@ -784,89 +788,6 @@ module SiloMigrate
         raise UsageError, "Cannot validate local upload inputs: #{error.class}"
       ensure
         db&.close
-      end
-
-      def ensure_single_link_db!(path)
-        raise UsageError, "Use an independent scratch DB copy, not a hardlink" unless File.stat(path).nlink == 1
-      end
-
-      def validate_processing_db!(path)
-        raise UsageError, "SQLite3 is required to validate the processing database" unless defined?(SQLite3::Database)
-        ensure_file!(path, "Upload processing database is required; use --no-uploads-db only for an intentional no-upload migration.")
-        ensure_single_link_db!(path)
-        raise UsageError, "Processing database must be closed/checkpointed" if %w[-wal -shm].any? { |suffix| File.exist?("#{path}#{suffix}") }
-        db = SQLite3::Database.new(path, readonly: true)
-        bad = db.get_first_value("SELECT COUNT(*) FROM uploads WHERE upload IS NULL OR markdown IS NULL OR skip_reason IS NOT NULL OR skip_details IS NOT NULL")
-        raise UsageError, "Upload processing contains errors or skips" unless bad == 0
-        raise UsageError, "Processing database failed integrity check" unless db.get_first_value("PRAGMA quick_check") == "ok"
-      rescue StandardError => error
-        raise if error.is_a?(UsageError)
-        raise UsageError, "Invalid upload processing database: #{error.class}"
-      ensure
-        db&.close
-      end
-
-      def validate_upload_member!(member)
-        unless member.is_a?(String) && member.start_with?("uploads/") &&
-               member.split("/").none? { |part| part.empty? || %w[. ..].include?(part) } && !member.match?(/[\x00-\x1f\\]/)
-          raise UsageError, "Expected an exact safe uploads/ archive member"
-        end
-      end
-
-      def validate_full_archive!(path, required_uploads)
-        raise UsageError, "Empty full backup" unless File.size(path).positive?
-        members = {}
-        upload_hashes = {}
-        Zlib::GzipReader.open(path) do |gzip|
-          Gem::Package::TarReader.new(gzip) do |tar|
-            tar.each do |entry|
-              name = entry.full_name.delete_suffix("/")
-              if name.empty? || name.start_with?("/") || name.split("/").any? { |part| part.empty? || %w[. ..].include?(part) } || name.match?(/[\x00-\x1f\\]/) || members.key?(name)
-                raise UsageError, "Unsafe or duplicate backup archive member"
-              end
-              if entry.file?
-                members[name] = entry.header.size
-                if name == "dump.sql.gz"
-                  dump = Zlib::GzipReader.new(entry)
-                  dump_bytes = 0
-                  until dump.eof?
-                    dump_bytes += dump.read(64 * 1024).bytesize
-                  end
-                  dump.finish
-                  raise UsageError, "Empty database dump" if dump_bytes.zero?
-                else
-                  digest = Digest::SHA256.new
-                  read_bytes = 0
-                  until entry.eof?
-                    chunk = entry.read(64 * 1024)
-                    raise UsageError, "Truncated backup member" if chunk.nil? || chunk.empty?
-                    digest.update(chunk)
-                    read_bytes += chunk.bytesize
-                  end
-                  raise UsageError, "Truncated backup member" unless read_bytes == entry.header.size
-                  upload_hashes[name] = digest.hexdigest if name.start_with?("uploads/")
-                end
-              elsif entry.header.typeflag == "1" && members[entry.header.linkname].to_i.positive?
-                members[name] = members.fetch(entry.header.linkname)
-                upload_hashes[name] = upload_hashes[entry.header.linkname] if name.start_with?("uploads/")
-              elsif entry.directory?
-                next
-              else
-                raise UsageError, "Unsupported backup archive member (including PAX/links)"
-              end
-            end
-          end
-          gzip.read(64 * 1024) until gzip.eof? # Force gzip trailer/CRC verification.
-        end
-        unless members["dump.sql.gz"].to_i.positive? && members.any? { |name, bytes| name.start_with?("uploads/") && bytes.positive? }
-          raise UsageError, "Backup must contain a DB dump and local uploads, not SQL-only"
-        end
-        unless required_uploads.all? { |name| members[name].to_i.positive? }
-          raise UsageError, "Backup is missing required sandbox/source upload bytes"
-        end
-        { "sizes" => members, "upload_sha256" => upload_hashes }
-      rescue Zlib::Error, Gem::Package::TarInvalidError, EOFError => error
-        raise UsageError, "Invalid full backup archive: #{error.class}"
       end
 
       def validate_discourse_docker_path!(path)

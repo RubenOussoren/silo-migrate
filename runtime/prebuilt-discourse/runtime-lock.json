@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "recipe": "standard-local-prebuilt-v1",
+  "provenance": {
+    "route": "https://github.com/featheredtoast/discourse-docker-compose",
+    "route_commit": "6c0336ed11d7e1fa02cdf555025e0bfc4b0a7645",
+    "stock_index_tag": "docker.io/discourse/discourse:2026.11.0-latest",
+    "stock_index_digest": "sha256:6c8d2a5f7632713bfca7269d70fcd8b87ae6b27eb1723638102caa4a066d4ba8"
+  },
+  "images": {
+    "web": {
+      "id": "sha256:e00b7aaed590e55f912e2c2fa0687a3c2fba334e986918fb433d5d7ff917a818",
+      "derived_from": "docker.io/discourse/discourse@sha256:f847da87e77b0506eae2167d75f0cce500cf174fde7127b60e33baaafeab65ec",
+      "dockerfile_sha256": "87f40d8f98f6c906a33e36269d1eac6d5272f93f951dac9bfa433d1d1f95bea2",
+      "tag": "silo-migrate/discourse-migration:3158c750-overlay1"
+    },
+    "db": { "id": "sha256:893b46aab58e3562442a4763088b214959b9916f32c800069c31b2e72c003f2f", "ref": "docker.io/discourse/postgres@sha256:893b46aab58e3562442a4763088b214959b9916f32c800069c31b2e72c003f2f" },
+    "redis": { "id": "sha256:a6dd428750118c2c2c67d3f555faef0aa15a2b71198b40e1cb3b9229b1cf3094", "ref": "docker.io/library/redis@sha256:a6dd428750118c2c2c67d3f555faef0aa15a2b71198b40e1cb3b9229b1cf3094" },
+    "converter": { "id": "sha256:3f43fd0d7287251667f992a04628b5d5e4f70e6fd2d29b9d4bb0e83b51f358b8", "ref": "migration-architecture/converter-test:ruby3313-trixie-candidate-20261104-01" },
+    "source_db": { "id": "sha256:d9fc02976678d4236145299c40dc267051681b33489c994f0ec4a097ce4a9521", "ref": "mariadb@sha256:d9fc02976678d4236145299c40dc267051681b33489c994f0ec4a097ce4a9521" }
+  },
+  "app": {
+    "revision": "3158c7503a59d0952c84cc8c032790e80167bf38",
+    "version": "2026.11.0-latest",
+    "ruby": "4.0.9",
+    "bundler": "4.0.23",
+    "gemfile_lock_sha256": "bacaa276aebc56385bf28c9fefbc6224e494e0361bd734933b4a20427e0f87d2",
+    "required_extensions": ["hstore", "pg_trgm", "unaccent", "vector"],
+    "postgres_major": "18",
+    "redis_major": "7"
+  },
+  "limits": {
+    "aggregate_cpus": 4.0,
+    "aggregate_memory_mib": 8192,
+    "storage_new_gib": 40,
+    "host_free_min_gib": 8,
+    "ports": [18080, 18089],
+    "stack": {
+      "web": { "cpus": 1.0, "memory_mib": 2560, "pids": 512 },
+      "db": { "cpus": 0.5, "memory_mib": 768, "pids": 128 },
+      "redis": { "cpus": 0.25, "memory_mib": 256, "pids": 64 },
+      "proxy": { "cpus": 0.1, "memory_mib": 64, "pids": 32 }
+    },
+    "conversion": {
+      "db": { "cpus": 0.5, "memory_mib": 768, "pids": 128 },
+      "converter": { "cpus": 1.0, "memory_mib": 1024, "pids": 128 }
+    }
+  }
+}

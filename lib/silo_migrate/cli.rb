@@ -14,6 +14,7 @@ module SiloMigrate
 
     COMMAND_HELP = {
       "named" => NamedCLI::HELP,
+      "standard" => StandardCLI::HELP,
       "interactive" => <<~HELP,
         Usage: silo-migrate interactive [CUSTOMER]   (alias: go)
 
@@ -346,6 +347,9 @@ module SiloMigrate
       argv = argv.dup
       if argv.first == "named"
         return NamedCLI.new(env: @env, output: @output, error: @error).run(argv.drop(1))
+      end
+      if argv.first == "standard"
+        return StandardCLI.new(env: @env, output: @output, error: @error).run(argv.drop(1))
       end
       return run_interactive(nil) if argv.empty?
       return help(0) if argv.first == "--help" || argv.first == "-h"
