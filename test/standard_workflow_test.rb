@@ -5,10 +5,12 @@ require 'silo_migrate/services/standard_workflow_service'
 
 # Scripted command results only; no subprocess, Docker socket or host port use.
 class StandardScriptedRuntime < SiloMigrate::Runtime::Fake
-  attr_accessor :high_usage, :ownership, :images_match, :import_failure
+  attr_accessor :high_usage, :ownership, :images_match, :import_failure, :sweep_resources
   def run(cmd, **options)
     result = super
-    stdout = if cmd.first == 'df'
+    stdout = if cmd.first == 'docker' && cmd.include?('ls') && cmd.include?('--filter')
+      (sweep_resources || {}).fetch(cmd[1], []).join("\n")
+    elsif cmd.first == 'df'
       "Avail\n107374182400\n"
     elsif cmd[0, 2] == %w[docker ps]
       high_usage ? "recorded-id\n" : ''
@@ -29,7 +31,7 @@ end
 # Shared synthetic fixture for the other new standard tests. All writes stay in
 # with_tmp_base, including the code identity tree (never the read-only checkout).
 module StandardTestWorkspace
-  def with_standard
+  def with_standard(inputs: nil)
     with_tmp_base do |dir, env|
       @env = env
       @named = SiloMigrate::Services::NamedWorkspaceService.new(env: env)
@@ -38,8 +40,8 @@ module StandardTestWorkspace
       source = @named.add_source('synthetic', platform: 'synthetic')[:source_id]
       @dataset = @named.add_dataset('synthetic', source_id: source)[:dataset_id]
       @paths = {}
-      %w[source-sql converter-settings expected].each do |type|
-        @paths[type] = add_standard_input(type, "synthetic #{type}")
+      (inputs || %w[source-sql converter-settings expected].to_h { |type| [type, "synthetic #{type}"] }).each do |type, bytes|
+        @paths[type] = add_standard_input(type, bytes, name: type == 'upload' ? 'uploads/source.txt' : type)
       end
       @code_root = File.join(dir, 'code')
       FileUtils.mkdir_p(File.join(@code_root, 'runtime'))
@@ -55,8 +57,8 @@ module StandardTestWorkspace
     end
   end
 
-  def add_standard_input(type, bytes, name: type)
-    relative = "inputs/#{name}"
+  def add_standard_input(type, bytes, name: type, input_root: 'dataset')
+    relative = "inputs/#{input_root}/#{name}"
     path = write(File.join(@root, relative), bytes)
     @named.add_input('synthetic', dataset_id: @dataset, path: relative, sha256: Digest::SHA256.hexdigest(bytes), bytes: bytes.bytesize, type: type)
     path
@@ -83,7 +85,7 @@ module StandardTestWorkspace
   end
 
   def claim(plan = approve)
-    @service.send(:claim_plan!, plan[:plan_id])
+    @service.claim(plan_id: plan[:plan_id]).fetch(:run_id)
   end
 
   def attach_instance(run_id, state: 'dirty')
@@ -181,7 +183,7 @@ class StandardWorkflowTest < SiloMigrateTest
       @service.store.with_op_lock do
         standard_error('STANDARD_BUSY') { new_standard.run_plan(plan_id: plan[:plan_id]) }
         standard_error('STANDARD_BUSY') { new_standard.recover(run_id: run_id) }
-        assert_equal 'running', new_standard.show_run(run_id)[:status]
+        assert_equal 'claimed', new_standard.show_run(run_id)[:status]
         assert new_standard.status[:executor_active]
       end
     end
@@ -191,6 +193,7 @@ class StandardWorkflowTest < SiloMigrateTest
     with_standard do
       run_id = claim
       name = attach_instance(run_id, state: 'ready')
+      @service.store.update { |state| state['runs'][run_id]['status'] = 'running' }
       reopened = new_standard
       assert_equal 'abandoned', reopened.show_run(run_id)[:status]
       assert_includes reopened.show_run(run_id)[:recovery], 'run recover'
@@ -207,6 +210,7 @@ class StandardWorkflowTest < SiloMigrateTest
     with_standard do
       first = claim
       attach_instance(first)
+      @service.recover(run_id: first)
       second = approve
       standard_error('STANDARD_DIRTY_INSTANCE') { @service.run_plan(plan_id: second[:plan_id]) }
     end
@@ -295,6 +299,163 @@ class StandardWorkflowTest < SiloMigrateTest
       assert_equal 'removed', new_standard.store.load['instances'][name]['state']
       assert_equal 'retain exact evidence', File.binread(retained)
       assert new_standard.store.load['runs'].key?(run_id)
+    end
+  end
+
+  def test_claimed_and_running_runs_block_new_claims
+    with_standard do
+      first = claim
+      assert_equal 'claimed', new_standard.show_run(first)[:status]
+      refute new_standard.show_run(first).key?(:recovery)
+      second = approve
+      standard_error('STANDARD_BUSY') { new_standard.claim(plan_id: second[:plan_id]) }
+      @service.store.update { |state| state['runs'][first]['status'] = 'running' }
+      standard_error('STANDARD_BUSY') { new_standard.claim(plan_id: second[:plan_id]) }
+    end
+  end
+
+  def test_claim_can_be_recovered_but_execute_requires_claimed_state
+    with_standard do
+      run_id = claim
+      assert_equal 'interrupted', new_standard.recover(run_id: run_id)[:status]
+      standard_error('STANDARD_TRANSITION_INVALID') { new_standard.execute(run_id: run_id) }
+      next_run = claim
+      assert_equal 'failed', new_standard.execute(run_id: next_run)[:status]
+      standard_error('STANDARD_TRANSITION_INVALID') { new_standard.execute(run_id: next_run) }
+    end
+  end
+
+  def test_unregistered_upload_dotfile_is_refused_before_conversion
+    with_standard do
+      plan = approve
+      write(File.join(@root, 'inputs/dataset/uploads/.hidden'), 'unregistered private bytes')
+      @runtime.images_match = true
+      result = @service.run_plan(plan_id: plan[:plan_id])
+      assert_equal 'failed', result[:status]
+      assert_equal 'preflight', result[:stage]
+      assert_equal 'STANDARD_INPUT_CHANGED', result[:failure]['code']
+      assert_equal 'pending', result[:stages]['convert']
+    end
+  end
+
+  def test_registered_inputs_must_have_one_dataset_root
+    with_standard do
+      relative = 'inputs/other/extra'
+      bytes = 'registered but wrong root'
+      write(File.join(@root, relative), bytes)
+      @named.add_input('synthetic', dataset_id: @dataset, path: relative, sha256: Digest::SHA256.hexdigest(bytes), bytes: bytes.bytesize, type: 'binary')
+      @runtime.images_match = true
+      run = @service.run_plan(plan_id: approve[:plan_id])
+      assert_equal 'failed', run[:status]
+      assert_equal 'STANDARD_INPUTS_INCOMPLETE', JSON.parse(File.read(@service.store.run_dir(run[:run_id], 'private', 'failure.json')))['code']
+      assert_equal 'pending', run[:stages]['convert']
+      assert_equal 'STANDARD_INPUTS_INCOMPLETE', run[:failure]['code']
+    end
+  end
+
+  def test_later_stages_read_only_preflight_snapshot
+    with_standard do
+      # A separate valid expected input makes expected_for exercise the same
+      # path used by verify_site and verify_restore, not just a copy helper.
+      expected = { 'users' => [], 'categories' => [], 'topics' => [], 'posts' => [], 'counts' => {} }
+      # Re-register a fresh dataset; never mutate a registered input before planning.
+      source = @named.add_source('synthetic', platform: 'synthetic')[:source_id]
+      @dataset = @named.add_dataset('synthetic', source_id: source)[:dataset_id]
+      add_standard_input('source-sql', 'original SQL', name: 'source.sql', input_root: 'snapshot')
+      add_standard_input('converter-settings', 'original settings', name: 'settings.yml', input_root: 'snapshot')
+      add_standard_input('expected', JSON.generate(expected), name: 'expected.json', input_root: 'snapshot')
+      add_standard_input('upload', 'original attachment', name: 'uploads/one.txt', input_root: 'snapshot')
+      @runtime.images_match = true
+      run_id = claim
+      @service.send(:stage_preflight, run_id)
+      inputs = @service.send(:run_inputs, run_id)
+      assert_equal 4, inputs.size
+      inputs.each do |input|
+        path = @service.send(:input_path, run_id, input)
+        assert path.start_with?(@service.store.run_dir(run_id, 'work') + '/')
+        assert_equal input['sha256'], Digest::SHA256.file(path).hexdigest
+        assert_equal 0o400, File.stat(path).mode & 0o777
+      end
+      source_root = File.join(@root, 'inputs/snapshot')
+      File.write(File.join(source_root, 'expected.json'), '{"changed":true}')
+      File.write(File.join(source_root, 'uploads/one.txt'), 'changed attachment')
+      actual, shas, bytes = @service.send(:expected_for, run_id)
+      assert_equal expected, actual
+      assert_equal [Digest::SHA256.hexdigest('original attachment')], shas
+      assert_equal ['original attachment'], bytes.values
+      tree = @service.send(:input_tree, run_id, inputs, 'upload', 'uploads')
+      assert_equal 'original attachment', File.binread(File.join(tree, 'one.txt'))
+    end
+  end
+
+  def test_status_and_plan_show_do_not_contend_with_named_lock_or_report_false_stale
+    with_standard do
+      plan = approve
+      ready = Queue.new
+      release = Queue.new
+      holder = Thread.new do
+        @service.store.named.with_lock { ready << true; release.pop }
+      end
+      ready.pop
+      begin
+        require 'timeout'
+        Timeout.timeout(2) do
+          assert_equal 'approved', new_standard.show_plan(plan[:plan_id])[:status]
+          assert_equal 'approved', new_standard.status[:plans].find { |p| p[:plan_id] == plan[:plan_id] }[:status]
+        end
+      ensure
+        release << true
+        holder.value
+      end
+    end
+  end
+
+  def test_host_lock_blocks_second_workspace_execution
+    with_standard do
+      @named.init('second')
+      source = @named.add_source('second', platform: 'synthetic')[:source_id]
+      dataset = @named.add_dataset('second', source_id: source)[:dataset_id]
+      %w[source-sql converter-settings expected].each do |type|
+        relative = "inputs/dataset/#{type}"
+        write(File.join(@env.fetch('SILO_MIGRATE_BASE_PATH'), 'second', relative), type)
+        @named.add_input('second', dataset_id: dataset, path: relative, sha256: Digest::SHA256.hexdigest(type), bytes: type.bytesize, type: type)
+      end
+      second = SiloMigrate::Services::StandardWorkflowService.new('second', env: @env, runtime: @runtime, code_root: @code_root,
+        port_probe: ->(_) { true }, disk_free: -> { 100 * 1024**3 })
+      config = @service.store.load.fetch('config')
+      second.init(converter_worktree: config['converter_worktree'], converter_revision: config['converter_revision'], site_settings: config['site_settings'])
+      plan = second.propose_plan(dataset_id: dataset)
+      second.approve_plan(plan_id: plan[:plan_id], sha256: plan[:digest], reviewer: 'engineer')
+      run_id = second.claim(plan_id: plan[:plan_id])[:run_id]
+      @service.store.with_host_lock do
+        standard_error('STANDARD_BUSY') { second.execute(run_id: run_id) }
+        assert_equal 'claimed', second.show_run(run_id)[:status]
+      end
+      assert_equal 'failed', second.execute(run_id: run_id)[:status]
+    end
+  end
+
+  def test_reset_sweeps_orphans_using_exact_run_label_for_every_resource_kind
+    with_standard do
+      run_id = claim
+      @service.recover(run_id: run_id)
+      @runtime.sweep_resources = { 'container' => ['orphan-container-id'], 'network' => ['orphan-network-id'], 'volume' => ['orphan-volume-name'] }
+      assert_equal 'reset', @service.reset_run(run_id: run_id, yes: true)[:status]
+      commands = @runtime.commands.map { |op| op[1] }
+      %w[container network volume].each do |kind|
+        listing = commands.select { |cmd| cmd[0, 3] == ['docker', kind, 'ls'] }
+        assert_equal 1, listing.size
+        index = listing.first.index('--filter')
+        refute_nil index
+        assert_equal "label=silo-migrate.run=#{run_id}", listing.first[index + 1]
+      end
+      assert_equal [
+        ['docker', 'container', 'rm', '--force', '--volumes', 'orphan-container-id'],
+        ['docker', 'network', 'rm', 'orphan-network-id'],
+        ['docker', 'volume', 'rm', 'orphan-volume-name']
+      ], commands.select { |cmd| cmd.include?('rm') }
+      assert_equal 'interrupted', new_standard.show_run(run_id)[:status]
+      assert_equal 'consumed', new_standard.show_plan(@service.store.load['runs'][run_id]['plan_id'])[:status]
     end
   end
 

@@ -90,4 +90,30 @@ class StandardCLITest < SiloMigrateTest
       end
     end
   end
+  def test_agent_claim_then_execute_returns_structured_state_and_failed_exit
+    with_standard do
+      plan = approve
+      out = StringIO.new
+      err = StringIO.new
+      cli = SiloMigrate::StandardCLI.new(env: @env, output: out, error: err)
+      cli.stub(:service, new_standard) do
+        assert_equal 0, cli.run(['agent', 'run-claim', 'synthetic', plan[:plan_id]])
+        claimed = JSON.parse(out.string)
+        assert_equal 'claimed', claimed.fetch('status')
+        assert_match(/\Arun-[0-9a-f]{32}\z/, claimed.fetch('run_id'))
+        assert_equal plan[:plan_id], claimed.fetch('plan_id')
+        assert_empty err.string
+        assert_equal 'claimed', new_standard.show_run(claimed['run_id'])[:status]
+        out.truncate(0)
+        out.rewind
+        assert_equal 1, cli.run(['agent', 'run-execute', 'synthetic', claimed['run_id']])
+        run = JSON.parse(out.string)
+        assert_equal claimed['run_id'], run.fetch('run_id')
+        assert_equal 'failed', run.fetch('status')
+        assert_equal 'STANDARD_RUNTIME_MISMATCH', run.fetch('failure').fetch('code')
+        assert_empty err.string
+      end
+    end
+  end
+
 end

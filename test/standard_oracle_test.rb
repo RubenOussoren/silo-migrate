@@ -7,18 +7,21 @@ class StandardOracleTest < SiloMigrateTest
 
   def setup
     @site = {
-      'users' => [{ 'id' => 1, 'username' => 'alice', 'email' => 'alice@example.test' }],
-      'topics' => [{ 'id' => 2, 'title' => 'Topic', 'posts_count' => 1 }],
-      'posts' => [{ 'id' => 3, 'raw' => 'Post body', 'cooked' => '<p>Post body <a href="http://old.test/body">link</a></p>' }],
-      'uploads' => [{ 'id' => 4, 'sha1' => 'abc', 'file_sha256' => 'a' * 64, 'local_path_present' => true, 'post_references' => [3] }],
-      'categories' => [{ 'id' => 5, 'name' => 'General', 'slug' => 'general' }],
+      'users' => [{ 'id' => 1, 'username' => 'alice', 'email' => 'alice@example.test', 'import_id' => '1' }],
+      'topics' => [{ 'id' => 2, 'title' => 'Topic', 'posts_count' => 1, 'import_id' => '2', 'category_import_id' => '5', 'user' => 'alice', 'created_at' => '2026-01-01T00:00:00Z' }],
+      'posts' => [{ 'id' => 3, 'raw' => 'Post body', 'cooked' => '<p>Post body <a class="attachment" href="http://old.test/body">file.txt</a> (12 Bytes)</p>', 'import_id' => '3', 'topic_import_id' => '2', 'user' => 'alice', 'post_number' => 1, 'created_at' => '2026-01-01T00:00:00Z' }],
+      'uploads' => [{ 'id' => 4, 'sha1' => 'abc', 'file_sha256' => 'a' * 64, 'local_path_present' => true, 'post_references' => [3], 'original_filename' => 'file.txt', 'filesize' => 12 }],
+      'categories' => [{ 'id' => 5, 'name' => 'General', 'slug' => 'general', 'import_id' => '5', 'parent_import_id' => nil }],
       'groups' => [{ 'name' => 'staff', 'users' => ['alice'] }], 'settings' => { 'title' => 'Forum' },
       'custom_fields' => %w[user topic post category].to_h { |kind| ["#{kind}_import_ids", [1]] },
       'versions' => { 'discourse' => '1', 'git' => 'revision', 'ruby' => '3' },
       'runtime' => { 'store_local' => true, 's3' => false, 'disable_emails' => 'yes', 'extensions' => ['vector'], 'pg_version' => '16.1', 'redis_version' => '7.1' }
     }
-    @expected = { 'users' => [{ 'username' => 'alice', 'email' => 'alice@example.test' }], 'categories' => [{ 'slug' => 'general' }],
-      'topics' => [{ 'topic_id' => 2, 'topic_subject' => 'Topic' }], 'posts' => [{ 'post_id' => 3, 'raw' => 'Post body' }],
+    @expected = { 'users' => [{ 'user_id' => 1, 'username' => 'alice', 'email' => 'alice@example.test' }],
+      'categories' => [{ 'category_id' => 5, 'slug' => 'general', 'parent_category_id' => nil }],
+      'topics' => [{ 'topic_id' => 2, 'topic_subject' => 'Topic', 'category_id' => 5, 'user_id' => 1, 'created_at' => '2026-01-01T00:00:00Z' }],
+      'posts' => [{ 'post_id' => 3, 'raw' => 'Post body', 'topic_id' => 2, 'post_number' => 1, 'user_id' => 1, 'created_at' => '2026-01-01T00:00:00Z' }],
+      'attachment' => { 'attachment_id' => 6, 'post_id' => 3, 'file_name' => 'file.txt', 'bytes' => 12 },
       'counts' => %w[users topics posts categories].to_h { |kind| [kind, 1] } }
     @lock = { 'app' => { 'version' => '1', 'revision' => 'revision', 'ruby' => '3', 'required_extensions' => ['vector'], 'postgres_major' => 16, 'redis_major' => 7 } }
   end
@@ -28,7 +31,7 @@ class StandardOracleTest < SiloMigrateTest
   end
 
   def imported(site)
-    Oracle.imported_failures(@expected, site, attachment_sha256s: ['a' * 64])
+    Oracle.imported_failures(@expected, site, attachment_sha256s: ['a' * 64], baseline: { 'users' => [], 'topics' => [], 'posts' => [] })
   end
 
   def test_passing_cases
@@ -69,18 +72,21 @@ class StandardOracleTest < SiloMigrateTest
     define_method("test_imported_#{kind}_missing") do
       changed = copy
       changed[kind].clear
-      refute_empty imported(changed)
+      expected_label = { 'users' => 'imported-user-missing:1', 'categories' => 'imported-category-missing:5', 'topics' => 'imported-topic-missing:2', 'posts' => 'imported-post-missing:3', 'uploads' => "attachment-missing:#{'a' * 12}" }.fetch(kind)
+      assert_includes imported(changed), expected_label
     end
   end
 
   def test_imported_email_attachment_and_mapping_failures
     changed = copy
     changed['users'][0]['email'] = 'other@example.test'
-    assert_includes imported(changed), 'imported-user-email-mismatch:alice'
-    %w[users topics posts categories].zip(%w[user topic post category]).each do |kind, field|
+    assert_includes imported(changed), 'imported-user-email-mismatch:1'
+    { 'users' => 'user', 'topics' => 'topic', 'posts' => 'post', 'categories' => 'category' }.each do |kind, singular|
       changed = copy
-      changed['custom_fields']["#{field}_import_ids"] = []
-      assert_includes imported(changed), "import-mapping-count-mismatch:#{kind}:0!=1"
+      changed[kind][0]['import_id'] = '999'
+      failures = imported(changed)
+      assert_includes failures, "imported-#{singular}-unexpected:999"
+      assert_includes failures, "imported-#{singular}-missing:#{@site[kind][0]['import_id']}"
     end
     changed = copy
     changed['uploads'][0]['post_references'] = []
@@ -99,7 +105,7 @@ class StandardOracleTest < SiloMigrateTest
   end
 
   { 'extensions' => [[], 'extension-missing:vector'], 'pg_version' => ['15.1', 'postgres-mismatch'], 'redis_version' => ['6.1', 'redis-mismatch'],
-    'store_local' => [false, 'store-not-local'], 's3' => [true, 'store-not-local'], 'disable_emails' => ['no', 'email-not-disabled'] }.each do |field, (value, code)|
+    'store_local' => [false, 'store-not-local'], 's3' => [true, 'store-not-local'], 'disable_emails' => ['no', 'email-not-disabled'], 'allow_restore' => [true, 'restore-left-enabled'] }.each do |field, (value, code)|
     define_method("test_runtime_#{field}_mismatch") do
       changed = copy
       changed['runtime'][field] = value
@@ -117,6 +123,59 @@ class StandardOracleTest < SiloMigrateTest
       changed = copy
       changed[kind] = kind == 'settings' || kind == 'custom_fields' ? {} : []
       refute_empty Oracle.restored_failures(@site, changed, base_url_map: map), kind
+    end
+  end
+
+  { 'users' => { 'username' => 'username', 'email' => 'email' },
+    'categories' => { 'slug' => 'slug', 'parent_import_id' => 'parent' },
+    'topics' => { 'title' => 'title', 'category_import_id' => 'category', 'user' => 'user', 'created_at' => 'created' },
+    'posts' => { 'topic_import_id' => 'topic', 'post_number' => 'number', 'user' => 'user', 'created_at' => 'created', 'cooked' => 'text' }
+  }.each do |kind, fields|
+    fields.each do |field, label|
+      define_method("test_imported_#{kind}_#{label}_mismatch") do
+        changed = copy
+        changed[kind][0][field] = 'wrong'
+        singular = { 'users' => 'user', 'categories' => 'category', 'topics' => 'topic', 'posts' => 'post' }.fetch(kind)
+        assert_includes imported(changed), "imported-#{singular}-#{label}-mismatch:#{@site[kind][0]['import_id']}"
+      end
+    end
+  end
+
+  { 'users' => 'user', 'categories' => 'category', 'topics' => 'topic', 'posts' => 'post' }.each do |kind, label|
+    define_method("test_extra_import_id_in_#{kind}_is_unexpected") do
+      changed = copy
+      changed[kind] << changed[kind][0].merge('id' => 999, 'import_id' => '999')
+      assert_includes imported(changed), "imported-#{label}-unexpected:999"
+      refute imported(changed).any? { |failure| failure.start_with?("imported-#{label}-missing:") }
+    end
+  end
+
+  def test_swapped_attachment_fails_even_when_still_referenced
+    changed = copy
+    changed['uploads'][0]['post_references'] = [999]
+    assert_includes imported(changed), 'attachment-wrong-post:6'
+    refute_includes imported(changed), "attachment-unreferenced:#{'a' * 12}"
+  end
+
+  def test_attachment_record_identity_required
+    changed = copy
+    changed['uploads'][0]['original_filename'] = 'wrong.txt'
+    assert_includes imported(changed), 'attachment-record-missing:6'
+  end
+
+  def test_full_text_equality_rejects_appended_and_truncated_text
+    ['<p>Post body plus unwanted tail</p>', '<p>Post</p>'].each do |cooked|
+      changed = copy
+      changed['posts'][0]['cooked'] = cooked
+      assert_includes imported(changed), 'imported-post-text-mismatch:3'
+    end
+  end
+
+  %w[users topics posts].each do |kind|
+    define_method("test_extra_#{kind}_without_import_id_fails_total") do
+      changed = copy
+      changed[kind] << { 'id' => 999 }
+      assert_includes imported(changed), "site-#{kind}-total-mismatch:2!=1"
     end
   end
 

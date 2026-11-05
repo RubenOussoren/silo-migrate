@@ -29,11 +29,14 @@ class StandardToolAdapterTest(unittest.TestCase):
 import json, os, sys
 with open(os.environ['ARGV_RECORD'], 'a') as out:
     out.write(json.dumps(sys.argv[1:]) + '\\n')
-marker = os.environ['ARGV_RECORD'] + '.started'
-if sys.argv[1] == '--detach' and os.environ.get('CLAIMS_PLAN', '1') == '1':
-    open(marker, 'w').close()
-if os.path.exists(marker):
-    print(json.dumps({'version': 1, 'status': 'consumed', 'run_id': 'run-' + 'b' * 32}))
+if 'run-claim' in sys.argv:
+    refusal = os.environ.get('CLAIM_REFUSAL')
+    if refusal:
+        print('Error: ' + refusal, file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({'version': 1, 'status': 'claimed', 'run_id': os.environ.get('CLAIM_RUN_ID', 'run-' + 'b' * 32)}))
+elif 'run-execute' in sys.argv:
+    sys.exit(int(os.environ.get('EXECUTE_EXIT', '0')))
 else:
     print(json.dumps({'version': 1, 'status': os.environ.get('PLAN_STATUS', 'approved')}))
 ''')
@@ -43,9 +46,9 @@ else:
         self.ids = {name: name.removesuffix('_id') + '-' + 'a' * 32
                     for name in ('dataset_id', 'plan_id', 'run_id', 'finding_id')}
 
-    def call(self, tool, args, status='approved', claims=True):
+    def call(self, tool, args, status='approved', **overrides):
         env = dict(self.env, TERM_LLM_TOOL_NAME=tool, PLAN_STATUS=status,
-                   CLAIMS_PLAN='1' if claims else '0', SILO_TOOL_START_WAIT='1')
+                   **overrides)
         result = subprocess.run([sys.executable, '-I', '-B', str(SCRIPT)],
                                 input=json.dumps(args), capture_output=True, text=True,
                                 env=env, timeout=10)
@@ -83,13 +86,35 @@ else:
         self.assertEqual({'version': 1, 'plan_id': self.ids['plan_id'], 'run_id': 'run-' + 'b' * 32, 'status': 'started'}, result)
         self.assertEqual([
             ['standard', 'agent', 'plan-show', 'synthetic', self.ids['plan_id']],
-            ['--detach', 'standard', 'agent', 'run-request', 'synthetic', self.ids['plan_id']],
-            ['standard', 'agent', 'plan-show', 'synthetic', self.ids['plan_id']],
+            ['standard', 'agent', 'run-claim', 'synthetic', self.ids['plan_id']],
+            ['--detach', 'standard', 'agent', 'run-execute', 'synthetic', 'run-' + 'b' * 32],
         ], self.calls())
 
-    def test_run_request_reports_when_the_background_process_never_claims_the_plan(self):
-        result = self.call('migration_run_request', {'workspace': 'synthetic', 'plan_id': self.ids['plan_id']}, claims=False)
+    def test_claim_refusal_returns_fixed_code_without_detaching(self):
+        for code in ('STANDARD_BUSY', 'STANDARD_CAPACITY', 'STANDARD_STALE_PLAN'):
+            with self.subTest(code=code):
+                self.record.unlink(missing_ok=True)
+                result = self.call('migration_run_request', {'workspace': 'synthetic', 'plan_id': self.ids['plan_id']}, CLAIM_REFUSAL=code)
+                self.assertEqual(code, result['error'])
+                self.assertEqual([
+                    ['standard', 'agent', 'plan-show', 'synthetic', self.ids['plan_id']],
+                    ['standard', 'agent', 'run-claim', 'synthetic', self.ids['plan_id']],
+                ], self.calls())
+
+    def test_detach_failure_reports_not_started_without_polling(self):
+        result = self.call('migration_run_request', {'workspace': 'synthetic', 'plan_id': self.ids['plan_id']}, EXECUTE_EXIT='1')
         self.assertEqual('STANDARD_RUN_NOT_STARTED', result['error'])
+        self.assertEqual(3, len(self.calls()))
+        self.assertEqual(['--detach', 'standard', 'agent', 'run-execute', 'synthetic', 'run-' + 'b' * 32], self.calls()[-1])
+
+    def test_malformed_claim_id_cannot_be_executed(self):
+        for value in ('run-wrong', '--help', 'run-' + 'b' * 32 + ';echo bad'):
+            with self.subTest(value=value):
+                self.record.unlink(missing_ok=True)
+                result = self.call('migration_run_request', {'workspace': 'synthetic', 'plan_id': self.ids['plan_id']}, CLAIM_RUN_ID=value)
+                self.assertEqual('STANDARD_OPERATION_FAILED', result['error'])
+                self.assertEqual(2, len(self.calls()))
+                self.assertEqual('run-claim', self.calls()[-1][2])
 
     def test_nonapproved_plan_never_invokes_run_request(self):
         for status in ('proposed', 'stale', 'consumed', 'rejected', 'running'):

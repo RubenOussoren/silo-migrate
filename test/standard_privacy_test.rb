@@ -56,13 +56,33 @@ class StandardPrivacyTest < SiloMigrateTest
       findings.release(finding_id: finding_id, released_text: derivative, sha256: Digest::SHA256.hexdigest(derivative), reviewer: 'engineer')
       # Every supported agent command, including a consumed run request.
       [['status', 'synthetic'], ['plan-propose', 'synthetic', '--dataset', @dataset], ['plan-show', 'synthetic', plan[:plan_id]],
-       ['run-request', 'synthetic', plan[:plan_id]], ['run-show', 'synthetic', run_id], ['findings', 'synthetic'], ['finding-show', 'synthetic', finding_id]].each do |args|
+       ['run-request', 'synthetic', plan[:plan_id]], ['run-claim', 'synthetic', plan[:plan_id]], ['run-execute', 'synthetic', run_id], ['run-show', 'synthetic', run_id], ['findings', 'synthetic'], ['finding-show', 'synthetic', finding_id]].each do |args|
         code, out, err = cli('agent', *args)
-        assert_equal(args.first == 'run-request' ? 1 : 0, code)
+        assert_equal(%w[run-request run-claim run-execute].include?(args.first) ? 1 : 0, code)
         assert_private_free out
         assert_private_free err
         JSON.parse(out) unless out.empty?
       end
+    end
+  end
+
+  def test_successful_agent_claim_and_execution_responses_are_private_free
+    with_standard do
+      add_standard_input('binary', MARKER, name: MARKER)
+      plan = approve
+      code, out, err = cli('agent', 'run-claim', 'synthetic', plan[:plan_id])
+      assert_equal 0, code
+      assert_empty err
+      assert_private_free out
+      claimed = JSON.parse(out)
+      assert_equal 'claimed', claimed.fetch('status')
+      plant_private_material(claimed.fetch('run_id'))
+      code, out, err = cli('agent', 'run-execute', 'synthetic', claimed.fetch('run_id'))
+      assert_equal 1, code
+      assert_empty err
+      assert_private_free out
+      assert_equal 'failed', JSON.parse(out).fetch('status')
+      assert_equal 'STANDARD_RUNTIME_MISMATCH', JSON.parse(out).fetch('failure').fetch('code')
     end
   end
 
@@ -117,7 +137,7 @@ class StandardPrivacyTest < SiloMigrateTest
         assert_equal "Error: STANDARD_ARGUMENTS_INVALID\n", err
       end
       [['status', 'synthetic'], ['plan-propose', 'synthetic', '--dataset', @dataset], ['plan-show', 'synthetic', 'plan-' + 'a' * 32],
-       ['run-request', 'synthetic', 'plan-' + 'a' * 32], ['run-show', 'synthetic', 'run-' + 'a' * 32],
+       ['run-request', 'synthetic', 'plan-' + 'a' * 32], ['run-claim', 'synthetic', 'plan-' + 'a' * 32], ['run-execute', 'synthetic', 'run-' + 'a' * 32], ['run-show', 'synthetic', 'run-' + 'a' * 32],
        ['findings', 'synthetic'], ['finding-show', 'synthetic', 'finding-' + 'a' * 32]].each do |args|
         code, out, err = cli('agent', *args, 'extra')
         assert_equal 1, code

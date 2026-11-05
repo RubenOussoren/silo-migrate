@@ -45,6 +45,9 @@ module SiloMigrate
       }.freeze
 
       RECOVERY = {
+        "STANDARD_INPUTS_INCOMPLETE" => "The dataset's registered inputs are incomplete or span more than one input directory. Register a corrected dataset, then re-plan.",
+        "STANDARD_STACK_FAILED" => "A local instance could not start. Inspect private evidence, reset this run, then re-plan.",
+        "STANDARD_RUNNER_FAILED" => "A helper script failed inside an instance. Inspect private evidence, reset this run, then re-plan.",
         "STANDARD_INPUT_CHANGED" => "An input changed. Do not edit inputs: register a new dataset, then propose and approve a new plan.",
         "STANDARD_COLLISION" => "Source records collide with the baseline. Decide policy, change the fixture or baseline, then re-plan.",
         "STANDARD_RUNTIME_MISMATCH" => "Runtime identity differs from the frozen lock. Rebuild or update the lock deliberately; do not bypass the check.",
