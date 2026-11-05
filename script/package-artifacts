@@ -1,0 +1,181 @@
+#!/usr/bin/env -S python3 -I
+"""Allowlisted offline runtime packages. Run with python3 -I."""
+import argparse
+import datetime
+import fnmatch
+import gzip
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import subprocess
+import tarfile
+
+SPEC = importlib.util.spec_from_file_location("image_identity", Path(__file__).with_name("image_identity.py"))
+IDENTITY = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(IDENTITY)
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def safe_name(name):
+    return bool(name and name not in (".", "./") and not name.startswith("/") and ".." not in PurePosixPath(name).parts
+                and "\\" not in name and not any(c.isspace() for c in name))
+
+
+def profile_read(path):
+    profile = json.loads(Path(path).read_text())
+    assert profile.get("version") == 1, "unsupported profile version"
+    assert isinstance(profile.get("images"), dict) and "control" in profile["images"], "missing images/control"
+    for role, image in profile["images"].items():
+        assert re.fullmatch(r"[a-z][a-z0-9_]*", role), "invalid role"
+        assert image["source"] in ("package", "public-digest"), "invalid source"
+        assert re.fullmatch(r"sha256:[a-f0-9]{64}", image["content_id"]), "invalid content id"
+        assert image["ref"] and not image["ref"].startswith("-"), "invalid ref"
+        if image["source"] == "public-digest":
+            assert re.search(r"@sha256:[a-f0-9]{64}$", image["ref"]), "public images must be digest pinned"
+    return profile
+
+
+def verify(directory, profile_path=None):
+    root = Path(directory)
+    assert root.is_dir() and not root.is_symlink(), "package must be a real directory"
+    files = set()
+    dirs = set()
+    for path in root.rglob("*"):
+        assert not path.is_symlink(), "package symlink refused"
+        if path.is_dir():
+            dirs.add(path.relative_to(root).as_posix())
+        else:
+            assert path.is_file(), "special file refused"
+            files.add(path.relative_to(root).as_posix())
+    sums = {}
+    for line in (root / "SHA256SUMS").read_text().splitlines():
+        match = re.fullmatch(r"([a-f0-9]{64})  (.+)", line)
+        assert match and safe_name(match[2]) and match[2] not in sums, "invalid checksum list"
+        sums[match[2]] = match[1]
+    assert files == set(sums) | {"SHA256SUMS"}, "unlisted or missing file"
+    for name, digest in sums.items():
+        assert sha(root / name) == digest, "package checksum mismatch"
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["format_version"] == 1, "unsupported package version"
+    assert manifest["profile"]["file"] == "profile.json", "invalid profile path"
+    assert sha(root / "profile.json") == manifest["profile"]["sha256"], "profile checksum mismatch"
+    if profile_path:
+        assert sha(profile_path) == manifest["profile"]["sha256"], "release profile mismatch"
+    profile = profile_read(root / "profile.json")
+    assert manifest["profile"]["name"] == profile["recipe"], "profile name mismatch"
+    expected = {"manifest.json", "profile.json", "gems.tar.gz", "site_settings.yml"}
+    roles = set()
+    for image in manifest["images"]:
+        role = image["role"]
+        assert role not in roles and role in profile["images"], "duplicate/unknown image role"
+        roles.add(role)
+        for key in ("ref", "source", "content_id"):
+            assert image[key] == profile["images"][role][key], "manifest/profile mismatch"
+        name = "images/" + role + ".tar.gz"
+        assert image["file"] == name, "invalid image path"
+        assert sha(root / name) == image["sha256"] and (root / name).stat().st_size == image["bytes"], "image mismatch"
+        expected.add(name)
+    assert all(i["source"] != "package" or r in roles for r, i in profile["images"].items()), "missing packaged role"
+    assert sums.keys() == expected, "unexpected package payload"
+    assert dirs <= {"images"}, "unlisted directory"
+    for key, filename in (("gems", "gems.tar.gz"), ("site_settings", "site_settings.yml")):
+        assert manifest[key]["file"] == filename and sha(root / filename) == manifest[key]["sha256"], "cache checksum mismatch"
+    with tarfile.open(root / "gems.tar.gz", "r:gz") as archive:
+        members = archive.getmembers()
+        assert len({m.name.rstrip("/") for m in members}) == len(members), "duplicate gem member"
+        for member in members:
+            assert safe_name(member.name) and (member.isfile() or member.isdir()), "unsafe gem archive member"
+            assert not credential(member.name), "credential-like gem archive member"
+        assert sum(m.isfile() for m in members) == manifest["gems"]["file_count"], "gem count mismatch"
+    return manifest
+
+
+def credential(name):
+    return any(fnmatch.fnmatch(part.lower(), pattern) for part in PurePosixPath(name).parts
+               for pattern in ("*.pem", "*.key", ".netrc", "credentials*", "*token*"))
+
+
+def package(args):
+    profile = profile_read(args.profile)
+    gems = Path(args.gems)
+    assert gems.is_dir() and not gems.is_symlink(), "gems must be a real directory"
+    paths = sorted(gems.rglob("*"))
+    for path in paths:
+        assert safe_name(path.relative_to(gems).as_posix()), "unsafe gem name"
+        assert not credential(path.relative_to(gems).as_posix()), "credential-like gem name refused"
+        assert not path.is_symlink() and (path.is_dir() or path.is_file()), "gem link/special file refused"
+    site = Path(args.site_settings)
+    assert site.name == "site_settings.yml" and site.is_file() and not site.is_symlink(), "expected site_settings.yml"
+    out = Path(args.output)
+    out.mkdir(mode=0o750)  # Intentionally refuses existing destinations.
+    (out / "images").mkdir()
+    shutil.copyfile(args.profile, out / "profile.json")
+    shutil.copyfile(site, out / "site_settings.yml")
+    manifest = {"format_version": 1, "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "profile": {"name": profile["recipe"], "file": "profile.json", "sha256": sha(args.profile)}, "images": []}
+    for role, image in profile["images"].items():
+        if image["source"] != "package" and not args.include_public:
+            continue
+        inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", image["ref"]], stderr=subprocess.DEVNULL))
+        assert IDENTITY.content_id(inspected) == image["content_id"], "image content mismatch"
+        filename = "images/" + role + ".tar.gz"
+        with open(out / filename, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as compressed:
+            proc = subprocess.Popen(["docker", "image", "save", "--platform", "linux/amd64", image["ref"]], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            shutil.copyfileobj(proc.stdout, compressed)
+            proc.stdout.close()
+            assert proc.wait() == 0, "docker save failed"
+        manifest["images"].append(dict(image, role=role, file=filename, sha256=sha(out / filename), bytes=(out / filename).stat().st_size))
+    with open(out / "gems.tar.gz", "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as gz, tarfile.open(fileobj=gz, mode="w") as archive:
+        for path in paths:
+            info = archive.gettarinfo(str(path), path.relative_to(gems).as_posix())
+            info.uid = info.gid = info.mtime = 0
+            info.uname = info.gname = ""
+            info.pax_headers = {}
+            if path.is_file():
+                with path.open("rb") as stream:
+                    archive.addfile(info, stream)
+            else:
+                archive.addfile(info)
+    manifest["gems"] = {"file": "gems.tar.gz", "sha256": sha(out / "gems.tar.gz"), "file_count": sum(p.is_file() for p in paths)}
+    manifest["site_settings"] = {"file": "site_settings.yml", "sha256": sha(out / "site_settings.yml")}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    files = sorted(p for p in out.rglob("*") if p.is_file())
+    (out / "SHA256SUMS").write_text("".join(sha(p) + "  " + p.relative_to(out).as_posix() + "\n" for p in files))
+    verify(out)
+    print("ARTIFACTS_OK " + sha(out / "manifest.json"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    build = sub.add_parser("build")
+    for key in ("profile", "gems", "site-settings", "output"):
+        build.add_argument("--" + key, required=True)
+    build.add_argument("--include-public", action="store_true")
+    check = sub.add_parser("verify")
+    check.add_argument("directory")
+    check.add_argument("--profile")
+    args = parser.parse_args()
+    if args.command == "verify":
+        verify(args.directory, args.profile)
+        print("ARTIFACTS_OK " + sha(Path(args.directory) / "manifest.json"))
+    else:
+        package(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, AssertionError, tarfile.TarError, subprocess.SubprocessError):
+        raise SystemExit("ARTIFACTS_INVALID: check allowlist, profile and checksums; no payload loaded")
