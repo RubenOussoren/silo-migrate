@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 WORKSPACE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 PATTERNS = {
@@ -83,8 +84,19 @@ def main():
             started = run(["run-request", workspace, plan_id], detach=True)
             if started.returncode != 0:
                 return fail("STANDARD_OPERATION_FAILED")
-            print(json.dumps({"version": 1, "plan_id": plan_id, "status": "requested"}))
-            return 0
+            # The background process claims the plan before any mutation. A refusal
+            # such as a capacity check ends it with the plan still approved.
+            deadline = time.monotonic() + float(os.environ.get("SILO_TOOL_START_WAIT", "30"))
+            while True:
+                shown = run(["plan-show", workspace, plan_id])
+                if shown.returncode == 0:
+                    plan = json.loads(shown.stdout)
+                    if plan.get("status") == "consumed":
+                        print(json.dumps({"version": 1, "plan_id": plan_id, "run_id": plan.get("run_id"), "status": "started"}))
+                        return 0
+                if time.monotonic() >= deadline:
+                    return fail("STANDARD_RUN_NOT_STARTED")
+                time.sleep(1)
         if tool == "migration_run_show":
             return emit(run(["run-show", workspace, argument(args, "run_id")]))
         if tool == "migration_findings":

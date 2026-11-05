@@ -29,7 +29,13 @@ class StandardToolAdapterTest(unittest.TestCase):
 import json, os, sys
 with open(os.environ['ARGV_RECORD'], 'a') as out:
     out.write(json.dumps(sys.argv[1:]) + '\\n')
-print(json.dumps({'version': 1, 'status': os.environ.get('PLAN_STATUS', 'approved')}))
+marker = os.environ['ARGV_RECORD'] + '.started'
+if sys.argv[1] == '--detach' and os.environ.get('CLAIMS_PLAN', '1') == '1':
+    open(marker, 'w').close()
+if os.path.exists(marker):
+    print(json.dumps({'version': 1, 'status': 'consumed', 'run_id': 'run-' + 'b' * 32}))
+else:
+    print(json.dumps({'version': 1, 'status': os.environ.get('PLAN_STATUS', 'approved')}))
 ''')
         self.control.chmod(0o700)
         self.env = dict(os.environ, SILO_CONTROL=str(self.control), ARGV_RECORD=str(self.record),
@@ -37,8 +43,9 @@ print(json.dumps({'version': 1, 'status': os.environ.get('PLAN_STATUS', 'approve
         self.ids = {name: name.removesuffix('_id') + '-' + 'a' * 32
                     for name in ('dataset_id', 'plan_id', 'run_id', 'finding_id')}
 
-    def call(self, tool, args, status='approved'):
-        env = dict(self.env, TERM_LLM_TOOL_NAME=tool, PLAN_STATUS=status)
+    def call(self, tool, args, status='approved', claims=True):
+        env = dict(self.env, TERM_LLM_TOOL_NAME=tool, PLAN_STATUS=status,
+                   CLAIMS_PLAN='1' if claims else '0', SILO_TOOL_START_WAIT='1')
         result = subprocess.run([sys.executable, '-I', '-B', str(SCRIPT)],
                                 input=json.dumps(args), capture_output=True, text=True,
                                 env=env, timeout=10)
@@ -73,11 +80,16 @@ print(json.dumps({'version': 1, 'status': os.environ.get('PLAN_STATUS', 'approve
 
     def test_run_request_prechecks_then_detaches_exact_argv(self):
         result = self.call('migration_run_request', {'workspace': 'synthetic', 'plan_id': self.ids['plan_id']})
-        self.assertEqual({'version': 1, 'plan_id': self.ids['plan_id'], 'status': 'requested'}, result)
+        self.assertEqual({'version': 1, 'plan_id': self.ids['plan_id'], 'run_id': 'run-' + 'b' * 32, 'status': 'started'}, result)
         self.assertEqual([
             ['standard', 'agent', 'plan-show', 'synthetic', self.ids['plan_id']],
             ['--detach', 'standard', 'agent', 'run-request', 'synthetic', self.ids['plan_id']],
+            ['standard', 'agent', 'plan-show', 'synthetic', self.ids['plan_id']],
         ], self.calls())
+
+    def test_run_request_reports_when_the_background_process_never_claims_the_plan(self):
+        result = self.call('migration_run_request', {'workspace': 'synthetic', 'plan_id': self.ids['plan_id']}, claims=False)
+        self.assertEqual('STANDARD_RUN_NOT_STARTED', result['error'])
 
     def test_nonapproved_plan_never_invokes_run_request(self):
         for status in ('proposed', 'stale', 'consumed', 'rejected', 'running'):
