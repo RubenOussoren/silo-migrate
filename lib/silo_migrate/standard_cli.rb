@@ -33,8 +33,9 @@ module SiloMigrate
         finding release WORKSPACE FINDING_ID --file PATH --sha256 DIGEST --reviewer NAME [--reproduction PATH --reproduction-sha256 DIGEST]
         finding reject WORKSPACE FINDING_ID --reviewer NAME
 
-      Trusted analyst path (private synthetic/customer investigation session only):
-        finding propose WORKSPACE --run RUN_ID --file PATH [--kind finding|reproduction]
+      Trusted analyst path (separate private investigation session only):
+        analyst evidence WORKSPACE RUN_ID
+        finding propose WORKSPACE --run RUN_ID --file PATH|- [--kind finding|reproduction]
 
       Conversational adapter (safe projections only):
         agent status WORKSPACE
@@ -101,6 +102,7 @@ module SiloMigrate
       when "baseline" then baseline(args)
       when "run" then run_group(args)
       when "finding" then finding(args)
+      when "analyst" then analyst(args)
       when "agent" then agent(args)
       else invalid!
       end
@@ -194,6 +196,14 @@ module SiloMigrate
       end
     end
 
+    def analyst(args)
+      expect!(args.shift, "evidence")
+      workspace = positional!(args)
+      run_id = positional!(args)
+      no_more!(args)
+      findings(workspace).private_evidence(run_id)
+    end
+
     # The complete adapter surface. Nothing here approves, resets or releases.
     def agent(args)
       action = args.shift
@@ -243,6 +253,11 @@ module SiloMigrate
     end
 
     def read_bounded(path)
+      if path == "-"
+        text = $stdin.read(Services::StandardFindingsService::MAX_BYTES + 1).to_s
+        invalid! if text.bytesize > Services::StandardFindingsService::MAX_BYTES
+        return text
+      end
       invalid! unless File.file?(path) && !File.symlink?(path) && File.size(path) <= Services::StandardFindingsService::MAX_BYTES
       File.read(path)
     end
@@ -253,7 +268,7 @@ module SiloMigrate
         option = args.shift
         invalid! unless allowed.include?(option) && !result.key?(option)
         value = args.shift
-        invalid! if value.nil? || value.start_with?("-")
+        invalid! if value.nil? || (value.start_with?("-") && !(value == "-" && option == "--file"))
         result[option] = value
       end
       invalid! unless (allowed - optional - result.keys).empty?

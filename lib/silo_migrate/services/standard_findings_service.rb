@@ -17,6 +17,7 @@ module SiloMigrate
     class StandardFindingsService
       MAX_BYTES = 256 * 1024
       KINDS = %w[finding reproduction].freeze
+      EVIDENCE_TAIL_BYTES = 16 * 1024
 
       def initialize(workspace, env: ENV)
         @store = StandardStore.new(workspace, env: env)
@@ -35,6 +36,27 @@ module SiloMigrate
                                           "proposal_sha256" => Digest::SHA256.hexdigest(text), "release" => nil }
         end
         { version: 1, finding_id: id, status: "proposed" }
+      end
+
+      # Trusted analyst path only. Bounded read of one run's private evidence. Never
+      # reachable from `standard agent`; do not expose it to a coding session.
+      def private_evidence(run_id)
+        run = @store.load.fetch("runs")[run_id]
+        raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
+
+        read_tail = lambda do |path|
+          bytes = File.size(path)
+          File.open(path, "rb") do |file|
+            file.seek([bytes - EVIDENCE_TAIL_BYTES, 0].max)
+            file.read.force_encoding("UTF-8").scrub
+          end
+        end
+        directory = @store.run_dir(run_id)
+        failure = File.join(directory, "private", "failure.json")
+        evidence = Dir[File.join(directory, "evidence", "*.failures.json")].sort.to_h { |path| [File.basename(path), read_tail.call(path)] }
+        logs = Dir[File.join(directory, "logs", "*.log")].sort.to_h { |path| [File.basename(path), read_tail.call(path)] }
+        { version: 1, run_id: run_id, status: run["status"], stage: run["stage"], failure: File.file?(failure) ? JSON.parse(File.read(failure)) : nil,
+          assertion_failures: evidence, logs: logs }
       end
 
       # Engineer path: the private proposal, plus exact-digest gated release.

@@ -116,6 +116,8 @@ module SiloMigrate
 
         inputs = dataset_inputs(named, dataset_id)
         require_input_types!(inputs)
+        raise StandardWorkflowError, "STANDARD_INPUT_CHANGED" unless inputs_unchanged?(inputs)
+
         baseline_decision = baseline_decision(state, baseline)
         ports = select_ports(state, ports)
         plan_id = @store.new_id("plan")
@@ -306,6 +308,15 @@ module SiloMigrate
         named.fetch("inputs").values.select { |input| input["dataset_id"] == dataset_id }.sort_by { |input| input["path"] }
       end
 
+      # Stat identity against what was registered: size, inode, mtime and ctime. The
+      # full content hash is checked again in the preflight stage.
+      def inputs_unchanged?(inputs)
+        @store.named.with_lock { |store| inputs.each { |input| store.verify_input_identity(input) } }
+        true
+      rescue NamedError
+        false
+      end
+
       def require_input_types!(inputs)
         types = inputs.map { |input| input["type"] }
         %w[source-sql converter-settings expected].each do |type|
@@ -351,7 +362,9 @@ module SiloMigrate
         ids = body.fetch("input_binding").map { |input| input["id"] }
         return "inputs" unless ids.all? { |id| named.fetch("inputs").key?(id) }
         return "inputs" unless @store.named.input_binding(named, ids) == body.fetch("input_stat_binding")
-        return "dataset" unless dataset_inputs(named, body.fetch("dataset_id")).map { |input| input["id"] }.sort == ids.sort
+        current = dataset_inputs(named, body.fetch("dataset_id"))
+        return "dataset" unless current.map { |input| input["id"] }.sort == ids.sort
+        return "inputs" unless inputs_unchanged?(current)
         return "code" unless code_identity == body.fetch("code_identity")
         return "runtime" unless Digest::SHA256.hexdigest(JSON.generate(lock)) == body.fetch("runtime_lock_sha256")
         return "converter" unless state.dig("config", "converter_revision") == body.fetch("converter_revision")
