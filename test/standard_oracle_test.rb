@@ -20,9 +20,9 @@ class StandardOracleTest < SiloMigrateTest
     @expected = { 'users' => [{ 'user_id' => 1, 'username' => 'alice', 'email' => 'alice@example.test' }],
       'categories' => [{ 'category_id' => 5, 'slug' => 'general', 'parent_category_id' => nil }],
       'topics' => [{ 'topic_id' => 2, 'topic_subject' => 'Topic', 'category_id' => 5, 'user_id' => 1, 'created_at' => '2026-01-01T00:00:00Z' }],
-      'posts' => [{ 'post_id' => 3, 'raw' => 'Post body', 'topic_id' => 2, 'post_number' => 1, 'user_id' => 1, 'created_at' => '2026-01-01T00:00:00Z' }],
-      'attachment' => { 'attachment_id' => 6, 'post_id' => 3, 'file_name' => 'file.txt', 'bytes' => 12 },
-      'counts' => %w[users topics posts categories].to_h { |kind| [kind, 1] } }
+      'posts' => [{ 'post_id' => 3, 'raw' => 'Post body', 'topic_id' => 2, 'post_number' => 1, 'user_id' => 1, 'created_at' => '2026-01-01T00:00:00Z',
+        'attachments' => [{ 'attachment_id' => 6, 'file_name' => 'file.txt', 'bytes' => 12 }] }],
+      'counts' => %w[users topics posts categories attachments].to_h { |kind| [kind, 1] } }
     @lock = { 'app' => { 'version' => '1', 'revision' => 'revision', 'ruby' => '3', 'required_extensions' => ['vector'], 'postgres_major' => 16, 'redis_major' => 7 } }
   end
 
@@ -31,7 +31,7 @@ class StandardOracleTest < SiloMigrateTest
   end
 
   def imported(site)
-    Oracle.imported_failures(@expected, site, attachment_sha256s: ['a' * 64], baseline: { 'users' => [], 'topics' => [], 'posts' => [] })
+    Oracle.imported_failures(@expected, site, attachment_sha256s: ['a' * 64], baseline: { 'users' => [], 'topics' => [], 'posts' => [], 'categories' => [] })
   end
 
   def test_passing_cases
@@ -171,12 +171,66 @@ class StandardOracleTest < SiloMigrateTest
     end
   end
 
-  %w[users topics posts].each do |kind|
+  %w[users topics posts categories].each do |kind|
     define_method("test_extra_#{kind}_without_import_id_fails_total") do
       changed = copy
       changed[kind] << { 'id' => 999 }
       assert_includes imported(changed), "site-#{kind}-total-mismatch:2!=1"
     end
+  end
+
+  { 'users' => 'user', 'categories' => 'category', 'topics' => 'topic', 'posts' => 'post' }.each do |kind, label|
+    define_method("test_duplicate_import_ids_in_#{kind}_fail") do
+      changed = copy
+      changed[kind] << changed[kind][0].merge('id' => 999)
+      assert_includes imported(changed), "imported-#{label}-duplicate:#{@site[kind][0]['import_id']}"
+      assert_includes imported(changed), "site-#{kind}-total-mismatch:2!=1"
+    end
+  end
+
+  def add_reply(expected_id, site_id, number, target_id, reply_number)
+    @expected['posts'] << @expected['posts'][0].merge('post_id' => expected_id, 'post_number' => number, 'reply_to_post_id' => target_id, 'attachments' => [])
+    @site['posts'] << @site['posts'][0].merge('id' => site_id, 'import_id' => expected_id.to_s, 'post_number' => number, 'reply_to_post_number' => reply_number)
+    @expected['counts']['posts'] += 1
+  end
+
+  def test_reply_to_first_post_has_no_stored_target_but_later_targets_must_match
+    add_reply(7, 70, 2, 3, nil)
+    assert_empty imported(copy)
+    changed = copy
+    changed['posts'][1]['reply_to_post_number'] = 1
+    assert_includes imported(changed), 'imported-post-reply-mismatch:7'
+    add_reply(8, 80, 3, 7, 2)
+    assert_empty imported(copy)
+    [nil, 1, 3].each do |wrong|
+      changed = copy
+      changed['posts'][2]['reply_to_post_number'] = wrong
+      assert_includes imported(changed), 'imported-post-reply-mismatch:8'
+    end
+  end
+
+  def test_every_declared_attachment_is_checked_against_its_own_post
+    add_reply(7, 70, 2, 3, nil)
+    @expected['posts'][1]['attachments'] = [{ 'attachment_id' => 9, 'file_name' => 'second.txt', 'bytes' => 5 }]
+    @expected['counts']['attachments'] = 2
+    @site['uploads'] << @site['uploads'][0].merge('id' => 99, 'original_filename' => 'second.txt', 'filesize' => 5, 'file_sha256' => 'b' * 64, 'post_references' => [70])
+    assert_empty imported(copy)
+    changed = copy
+    changed['uploads'][0]['post_references'] = [70]
+    changed['uploads'][1]['post_references'] = [3]
+    assert_includes imported(changed), 'attachment-wrong-post:6'
+    assert_includes imported(changed), 'attachment-wrong-post:9'
+    changed['uploads'].delete_at(1)
+    assert_includes imported(changed), 'attachment-record-missing:9'
+  end
+
+  def test_incomplete_attachment_declarations_fail_even_with_legacy_attachment_field
+    @expected['attachment'] = @expected['posts'][0]['attachments'][0].merge('post_id' => 3)
+    @expected['posts'][0]['attachments'] = []
+    assert_includes imported(copy), 'attachment-expectation-incomplete:0!=1'
+    @expected['counts']['attachments'] = 0
+    @expected['posts'][0]['attachments'] = [@expected['attachment']]
+    assert_includes imported(copy), 'attachment-expectation-incomplete:1!=0'
   end
 
   def test_each_collision_kind_case_insensitive

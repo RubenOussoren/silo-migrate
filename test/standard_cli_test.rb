@@ -70,9 +70,9 @@ class StandardCLITest < SiloMigrateTest
     end
   end
 
-  def test_failed_run_start_and_agent_request_emit_json_and_exit_one
+  def test_failed_run_start_and_execute_emit_json_and_exit_one
     with_standard do
-      [%w[run start], %w[agent run-request]].each do |prefix|
+      [%w[run start], %w[agent run-execute]].each do |prefix|
         plan = approve
         # Services created by CLI use real port probes; inject a service whose
         # probes, disk measurements and runtime are all deterministic fakes.
@@ -80,7 +80,8 @@ class StandardCLITest < SiloMigrateTest
         err = StringIO.new
         cli = SiloMigrate::StandardCLI.new(env: @env, output: out, error: err)
         cli.stub(:service, new_standard) do
-          assert_equal 1, cli.run(prefix + ['synthetic', plan[:plan_id]])
+          identifier = prefix == %w[run start] ? plan[:plan_id] : claim(plan)
+          assert_equal 1, cli.run(prefix + ['synthetic', identifier])
         end
         assert_empty err.string
         result = JSON.parse(out.string)
@@ -90,6 +91,18 @@ class StandardCLITest < SiloMigrateTest
       end
     end
   end
+  def test_removed_agent_run_request_is_refused_without_consuming_plan
+    with_standard do
+      plan = approve
+      code, out, err = invoke(['agent', 'run-request', 'synthetic', plan[:plan_id]])
+      assert_equal 1, code
+      assert_empty out
+      assert_equal "Error: STANDARD_ARGUMENTS_INVALID\n", err
+      assert_equal 'approved', @service.show_plan(plan[:plan_id])[:status]
+      assert_empty @service.store.load['runs']
+    end
+  end
+
   def test_agent_claim_then_execute_returns_structured_state_and_failed_exit
     with_standard do
       plan = approve

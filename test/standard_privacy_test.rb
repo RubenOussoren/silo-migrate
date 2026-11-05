@@ -54,13 +54,14 @@ class StandardPrivacyTest < SiloMigrateTest
       finding_id = findings.propose(run_id: run_id, text: MARKER)[:finding_id]
       derivative = "Reviewed synthetic finding.\n"
       findings.release(finding_id: finding_id, released_text: derivative, sha256: Digest::SHA256.hexdigest(derivative), reviewer: 'engineer')
-      # Every supported agent command, including a consumed run request.
+      # All supported agent commands, plus refusal of the removed run-request verb.
       [['status', 'synthetic'], ['plan-propose', 'synthetic', '--dataset', @dataset], ['plan-show', 'synthetic', plan[:plan_id]],
        ['run-request', 'synthetic', plan[:plan_id]], ['run-claim', 'synthetic', plan[:plan_id]], ['run-execute', 'synthetic', run_id], ['run-show', 'synthetic', run_id], ['findings', 'synthetic'], ['finding-show', 'synthetic', finding_id]].each do |args|
         code, out, err = cli('agent', *args)
         assert_equal(%w[run-request run-claim run-execute].include?(args.first) ? 1 : 0, code)
         assert_private_free out
         assert_private_free err
+        assert_equal "Error: STANDARD_ARGUMENTS_INVALID\n", err if args.first == 'run-request'
         JSON.parse(out) unless out.empty?
       end
     end
@@ -130,7 +131,7 @@ class StandardPrivacyTest < SiloMigrateTest
 
   def test_agent_grammar_rejects_privileged_commands_and_every_extra_argument
     with_standard do
-      %w[approve reset release private-paths recover review].each do |verb|
+      %w[approve reset release private-paths recover review run-request].each do |verb|
         code, out, err = cli('agent', verb, 'synthetic')
         assert_equal 1, code, verb
         assert_empty out

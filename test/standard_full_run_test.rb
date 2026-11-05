@@ -10,15 +10,15 @@ class StandardCompleteRuntime < StandardScriptedRuntime
   SANDBOX = SiloMigrate::Services::StandardWorkflowService::SANDBOX_ATTACHMENT
   SOURCE = "Synthetic source attachment.\n"
   DATE = '2026-01-01T00:00:00Z'
-  attr_accessor :service, :fail_stage, :occupied_kind, :stage_hook
+  attr_accessor :service, :fail_stage, :occupied_kind, :stage_hook, :restore_runtime_failure
   attr_reader :observations, :http_requests, :backups
 
   def self.expected
     { 'users' => [{ 'user_id' => 1, 'username' => 'alice', 'email' => 'alice@example.test' }],
       'categories' => [{ 'category_id' => 2, 'slug' => 'imported', 'parent_category_id' => nil }],
       'topics' => [{ 'topic_id' => 3, 'topic_subject' => 'Imported topic', 'category_id' => 2, 'user_id' => 1, 'created_at' => DATE }],
-      'posts' => [{ 'post_id' => 4, 'raw' => '<p>Complete source body.</p>', 'topic_id' => 3, 'post_number' => 1, 'user_id' => 1, 'created_at' => DATE }],
-      'attachment' => { 'attachment_id' => 5, 'post_id' => 4, 'file_name' => 'source.txt', 'bytes' => SOURCE.bytesize },
+      'posts' => [{ 'post_id' => 4, 'raw' => '<p>Complete source body.</p>', 'topic_id' => 3, 'post_number' => 1, 'user_id' => 1, 'created_at' => DATE,
+        'attachments' => [{ 'attachment_id' => 5, 'file_name' => 'source.txt', 'bytes' => SOURCE.bytesize }] }],
       'counts' => { 'users' => 1, 'categories' => 1, 'topics' => 1, 'posts' => 1, 'attachments' => 1 } }
   end
 
@@ -97,6 +97,10 @@ class StandardCompleteRuntime < StandardScriptedRuntime
     site['runtime'] = { 'base_url' => web.include?('-restore-') ? 'http://localhost' : 'http://127.0.0.1',
       'store_local' => true, 's3' => false, 'disable_emails' => 'yes', 'extensions' => app['required_extensions'],
       'pg_version' => "#{app['postgres_major']}.1", 'redis_version' => "#{app['redis_major']}.1", 'allow_restore' => false }
+    if stage == 'verify_restore'
+      site['runtime']['allow_restore'] = true if restore_runtime_failure == 'allow_restore'
+      site['versions']['git'] = 'wrong-restored-revision' if restore_runtime_failure == 'revision'
+    end
     if fail_stage == stage && %w[verify_site verify_restore].include?(stage)
       site['posts'].last['cooked'] = '<p>Wrong visible text.</p>'
     end
@@ -237,7 +241,7 @@ class StandardFullRunTest < SiloMigrateTest
       'expected' => JSON.generate(StandardCompleteRuntime.expected), 'upload' => StandardCompleteRuntime::SOURCE }
     with_standard(inputs: inputs) do
       @runtime = StandardCompleteRuntime.new
-      @service = SiloMigrate::Services::StandardWorkflowService.new('synthetic', env: @env, runtime: @runtime, code_root: @code_root,
+      @service = SiloMigrate::Services::StandardWorkflowService.new('synthetic', env: @env, runtime: @runtime, code_root: @code_root, execute_lock_wait: 0,
         http: @runtime.method(:http), port_probe: ->(_) { true }, disk_free: -> { 100 * 1024**3 }, sleeper: ->(_) {})
       @runtime.service = @service
       yield
@@ -408,6 +412,48 @@ class StandardFullRunTest < SiloMigrateTest
       manifest = JSON.parse(File.read(@service.store.run_dir(launched[:run_id], 'evidence', 'final.manifest.json')))
       assert_equal accepted[:baseline_id], manifest['lineage']['baseline']['baseline_id']
       assert_equal @service.store.load['accepted_baselines'][accepted[:baseline_id]]['sha256'], manifest['lineage']['baseline_archive']['sha256']
+    end
+  end
+
+  { 'allow_restore' => 'runtime-restore-left-enabled', 'revision' => 'runtime-revision-mismatch' }.each do |field, failure|
+    define_method("test_verify_restore_rejects_#{field}_even_with_matching_durable_content") do
+      with_complete do
+        @runtime.restore_runtime_failure = field
+        result = @service.run_plan(plan_id: approve[:plan_id])
+        assert_equal 'failed', result[:status]
+        assert_equal 'verify_restore', result[:stage]
+        assert_equal 'STANDARD_RESTORE_FAILED', result[:failure]['code']
+        assert_equal 'passed', result[:stages]['restore']
+        assert_equal 'failed', result[:assertions]['restore']['result']
+        failures = JSON.parse(File.read(@service.store.run_dir(result[:run_id], 'evidence', 'restore.failures.json')))
+        assert_includes failures, failure
+        assert_equal 'archive-validated', result.dig(:artifacts, 'final', 'label')
+        refute @service.store.load['runs'][result[:run_id]].key?('restore_proven_at')
+        manifest = JSON.parse(File.read(@service.store.run_dir(result[:run_id], 'evidence', 'final.manifest.json')))
+        assert_equal 'archive-validated', manifest['restore_status']
+      end
+    end
+  end
+
+  %w[fingerprint archive].each do |changed|
+    define_method("test_execute_rechecks_accepted_baseline_#{changed}_after_claim") do
+      with_complete do
+        first = completed_run
+        accepted = @service.accept_baseline(run_id: first[:run_id], reviewer: 'engineer')
+        plan = approve(@service.propose_plan(dataset_id: @dataset, baseline: accepted[:baseline_id]))
+        run_id = claim(plan)
+        record = @service.store.load['accepted_baselines'][accepted[:baseline_id]]
+        path = record.fetch(changed == 'fingerprint' ? 'fingerprint' : 'path')
+        File.chmod(0o600, path)
+        File.binwrite(path, 'changed after claim')
+        result = new_standard.execute(run_id: run_id)
+        assert_equal 'failed', result[:status]
+        assert_equal 'preflight', result[:stage]
+        assert_equal 'STANDARD_STALE_PLAN', result[:failure]['code']
+        assert_equal 'pending', result[:stages]['convert']
+        assert_equal result, new_standard.show_run(run_id)
+        assert_empty result[:artifacts]
+      end
     end
   end
 
