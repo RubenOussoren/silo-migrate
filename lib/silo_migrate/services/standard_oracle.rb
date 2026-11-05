@@ -45,37 +45,66 @@ module SiloMigrate
         failures
       end
 
-      # `expected` is the dataset's registered expected file (synthetic).
+      # `expected` is the dataset's registered expected file (synthetic). Matches by
+      # source import ID in both directions, so an extra or moved record fails as well
+      # as a missing one. Text is the whole post's visible text, not a substring.
       def imported_failures(expected, site, attachment_sha256s:, baseline: nil)
         failures = []
-        baseline_ids = baseline ? baseline.fetch("users").map { |user| user["username"] } : []
-        imported_users = site.fetch("users").reject { |user| baseline_ids.include?(user["username"]) }
-        expected_names = expected.fetch("users").map { |user| user["username"] }.sort
-        failures << "imported-users-mismatch" unless imported_users.map { |user| user["username"] }.sort == expected_names
+        imported = ->(records) { records.select { |record| record["import_id"] } }
+        users = imported.call(site.fetch("users"))
+        categories = imported.call(site.fetch("categories"))
+        topics = imported.call(site.fetch("topics"))
+        posts = imported.call(site.fetch("posts"))
+        usernames = expected.fetch("users").to_h { |user| [user["user_id"].to_s, user["username"]] }
+
+        compare_ids(failures, "user", expected.fetch("users").map { |user| user["user_id"] }, users)
+        compare_ids(failures, "category", expected.fetch("categories").map { |category| category["category_id"] }, categories)
+        compare_ids(failures, "topic", expected.fetch("topics").map { |topic| topic["topic_id"] }, topics)
+        compare_ids(failures, "post", expected.fetch("posts").map { |post| post["post_id"] }, posts)
+
         expected.fetch("users").each do |user|
-          found = imported_users.find { |candidate| candidate["username"] == user["username"] }
-          failures << "imported-user-email-mismatch:#{user['username']}" if found && found["email"] != user["email"]
+          found = users.find { |candidate| candidate["import_id"] == user["user_id"].to_s }
+          next unless found
+
+          failures << "imported-user-username-mismatch:#{user['user_id']}" unless found["username"] == user["username"]
+          failures << "imported-user-email-mismatch:#{user['user_id']}" unless found["email"] == user["email"]
         end
         expected.fetch("categories").each do |category|
-          failures << "imported-category-missing:#{category['slug']}" unless site.fetch("categories").any? { |candidate| candidate["slug"] == category["slug"] }
+          found = categories.find { |candidate| candidate["import_id"] == category["category_id"].to_s }
+          next unless found
+
+          failures << "imported-category-slug-mismatch:#{category['category_id']}" unless found["slug"] == category["slug"]
+          parent = category["parent_category_id"]&.to_s
+          failures << "imported-category-parent-mismatch:#{category['category_id']}" unless found["parent_import_id"] == parent
         end
-        titles = site.fetch("topics").map { |topic| topic["title"] }
         expected.fetch("topics").each do |topic|
-          failures << "imported-topic-missing:#{topic['topic_id']}" unless titles.include?(topic["topic_subject"])
+          found = topics.find { |candidate| candidate["import_id"] == topic["topic_id"].to_s }
+          next unless found
+
+          failures << "imported-topic-title-mismatch:#{topic['topic_id']}" unless found["title"] == topic["topic_subject"]
+          failures << "imported-topic-category-mismatch:#{topic['topic_id']}" unless found["category_import_id"] == topic["category_id"].to_s
+          failures << "imported-topic-user-mismatch:#{topic['topic_id']}" unless found["user"] == usernames[topic["user_id"].to_s]
+          failures << "imported-topic-created-mismatch:#{topic['topic_id']}" unless found["created_at"] == topic["created_at"]
         end
-        # Source bodies are HTML; destination raw bodies are Markdown. Compare
-        # rendered text instead, retaining the entire expected body as evidence.
-        texts = site.fetch("posts").map { |post| visible_text(post["cooked"]) }
         expected.fetch("posts").each do |post|
-          fragment = visible_text(post["raw"])
-          failures << "imported-post-missing:#{post['post_id']}" unless !fragment.empty? && texts.any? { |text| text.include?(fragment) }
+          found = posts.find { |candidate| candidate["import_id"] == post["post_id"].to_s }
+          next unless found
+
+          failures << "imported-post-topic-mismatch:#{post['post_id']}" unless found["topic_import_id"] == post["topic_id"].to_s
+          failures << "imported-post-number-mismatch:#{post['post_id']}" unless found["post_number"] == post["post_number"]
+          failures << "imported-post-user-mismatch:#{post['post_id']}" unless found["user"] == usernames[post["user_id"].to_s]
+          failures << "imported-post-created-mismatch:#{post['post_id']}" unless found["created_at"] == post["created_at"]
+          text = visible_text(post["raw"])
+          failures << "imported-post-text-mismatch:#{post['post_id']}" unless !text.empty? && text == post_visible_text(found["cooked"])
         end
-        counts = site.fetch("custom_fields")
-        { "users" => "user_import_ids", "topics" => "topic_import_ids", "posts" => "post_import_ids", "categories" => "category_import_ids" }.each do |kind, field|
-          expected_count = expected.fetch("counts").fetch(kind)
-          actual = counts.fetch(field).size
-          failures << "import-mapping-count-mismatch:#{kind}:#{actual}!=#{expected_count}" unless actual == expected_count
+
+        if baseline
+          { "topics" => "topics", "posts" => "posts", "users" => "users" }.each do |kind, key|
+            total = baseline.fetch(key).size + expected.fetch("counts").fetch(kind)
+            failures << "site-#{kind}-total-mismatch:#{site.fetch(key).size}!=#{total}" unless site.fetch(key).size == total
+          end
         end
+
         attachment_sha256s.each do |sha|
           upload = site.fetch("uploads").find { |candidate| candidate["file_sha256"] == sha }
           if upload.nil?
@@ -85,7 +114,23 @@ module SiloMigrate
             failures << "attachment-unreferenced:#{sha[0, 12]}" if upload["post_references"].empty?
           end
         end
+        if (attachment = expected["attachment"])
+          owner = posts.find { |candidate| candidate["import_id"] == attachment["post_id"].to_s }
+          upload = site.fetch("uploads").find { |candidate| candidate["original_filename"] == attachment["file_name"] && candidate["filesize"] == attachment["bytes"] }
+          if upload.nil?
+            failures << "attachment-record-missing:#{attachment['attachment_id']}"
+          elsif owner.nil? || !upload["post_references"].include?(owner["id"])
+            failures << "attachment-wrong-post:#{attachment['attachment_id']}"
+          end
+        end
         failures
+      end
+
+      def compare_ids(failures, label, expected_ids, records)
+        expected_ids = expected_ids.map(&:to_s).sort
+        actual = records.map { |record| record["import_id"].to_s }.sort
+        (expected_ids - actual).each { |id| failures << "imported-#{label}-missing:#{id}" }
+        (actual - expected_ids).each { |id| failures << "imported-#{label}-unexpected:#{id}" }
       end
 
       def runtime_failures(site, lock)
@@ -100,11 +145,12 @@ module SiloMigrate
         (app.fetch("required_extensions") - runtime.fetch("extensions")).each { |name| failures << "runtime-extension-missing:#{name}" }
         failures << "runtime-postgres-mismatch" unless runtime["pg_version"].to_s.start_with?("#{app.fetch('postgres_major')}.")
         failures << "runtime-redis-mismatch" unless runtime["redis_version"].to_s.start_with?("#{app.fetch('redis_major')}.")
+        failures << "runtime-restore-left-enabled" if runtime["allow_restore"]
         failures
       end
 
-      # Restored site must equal the pre-backup site modulo the deliberate hostname
-      # change. Comparing everything durable, not just the fixture's own records.
+      # Restored site must match the pre-backup site across the facts the fingerprint
+      # collects, modulo the deliberate hostname change.
       def restored_failures(source_site, restored_site, base_url_map:)
         failures = []
         compare_records(failures, "restored-user", source_site["users"], restored_site["users"], "username", BASELINE_USERS)
@@ -142,6 +188,14 @@ module SiloMigrate
 
       def visible_text(html)
         Nokogiri::HTML.fragment(html.to_s).text.gsub(/[[:space:]]+/, " ").strip
+      end
+
+      # A post's own words, without the attachment link and size the importer adds.
+      # The attachment is asserted separately against the post that should own it.
+      def post_visible_text(cooked)
+        fragment = Nokogiri::HTML.fragment(cooked.to_s)
+        fragment.css("a.attachment").each(&:remove)
+        fragment.text.gsub(/\(\s*\d+(?:\.\d+)?\s*(?:Bytes|KB|MB)\s*\)/, "").gsub(/[[:space:]]+/, " ").strip
       end
 
       def normalize(text, base_url_map)

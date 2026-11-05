@@ -44,8 +44,10 @@ module SiloMigrate
       @named.root
     end
 
+    # Lock-free: the registry is replaced atomically, and a status poll must never
+    # contend with a run or a registration.
     def named_state
-      @named.with_lock { |store| store.load }
+      NamedWorkspaceStore.boundary { @named.load }
     end
 
     def ensure_ready!(create: false)
@@ -89,23 +91,23 @@ module SiloMigrate
     end
 
     # A persisted "running" with this lock free means its process has gone away.
-    def with_op_lock
+    def with_op_lock(&block)
       FileUtils.mkdir_p(@root, mode: 0o700)
-      File.open(op_lock_path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |lock|
-        raise StandardWorkflowError, "STANDARD_BUSY" unless lock.flock(File::LOCK_EX | File::LOCK_NB)
-        begin
-          yield
-        ensure
-          lock.flock(File::LOCK_UN)
-        end
-      end
+      exclusive(op_lock_path, &block)
     end
 
+    # The envelope is host-wide, so only one workspace may execute at a time.
+    def with_host_lock(&block)
+      exclusive(File.join(File.dirname(@named.root), ".silo-standard-execution.lock"), &block)
+    end
+
+    # A shared probe only overlaps a real holder's exclusive lock; a brief collision
+    # with another probe is absorbed by the short retry in `exclusive`.
     def op_lock_held?
       return false unless File.exist?(op_lock_path)
 
-      File.open(op_lock_path, File::RDWR | File::NOFOLLOW) do |lock|
-        got = lock.flock(File::LOCK_EX | File::LOCK_NB)
+      File.open(op_lock_path, File::RDONLY | File::NOFOLLOW) do |lock|
+        got = lock.flock(File::LOCK_SH | File::LOCK_NB)
         lock.flock(File::LOCK_UN) if got
         !got
       end
@@ -142,6 +144,26 @@ module SiloMigrate
     end
 
     private
+
+    LOCK_RETRIES = 5
+    LOCK_RETRY_SECONDS = 0.2
+
+    def exclusive(path)
+      File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |lock|
+        attempts = 0
+        until lock.flock(File::LOCK_EX | File::LOCK_NB)
+          attempts += 1
+          raise StandardWorkflowError, "STANDARD_BUSY" if attempts > LOCK_RETRIES
+
+          sleep LOCK_RETRY_SECONDS
+        end
+        begin
+          yield
+        ensure
+          lock.flock(File::LOCK_UN)
+        end
+      end
+    end
 
     def state_path
       File.join(@root, "state.json")

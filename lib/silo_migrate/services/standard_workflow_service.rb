@@ -48,16 +48,19 @@ module SiloMigrate
         "STANDARD_INPUT_CHANGED" => "An input changed. Do not edit inputs: register a new dataset, then propose and approve a new plan.",
         "STANDARD_COLLISION" => "Source records collide with the baseline. Decide policy, change the fixture or baseline, then re-plan.",
         "STANDARD_RUNTIME_MISMATCH" => "Runtime identity differs from the frozen lock. Rebuild or update the lock deliberately; do not bypass the check.",
-        "STANDARD_CONVERSION_FAILED" => "Conversion failed. Inspect private evidence, then re-plan; containers were removed.",
+        "STANDARD_CONVERSION_FAILED" => "Conversion failed. Inspect private evidence, reset this run, then re-plan.",
         "STANDARD_UPLOADS_FAILED" => "Upload processing failed; the instance is dirty. Run the reset for this run, investigate privately, then re-plan.",
         "STANDARD_IMPORT_FAILED" => "Import failed; the instance is dirty. Run the reset for this run, investigate privately, then re-plan.",
         "STANDARD_VERIFY_FAILED" => "Assertions failed. Keep the instance for private inspection, then reset and re-plan with a fixed revision.",
         "STANDARD_BACKUP_FAILED" => "Backup failed and its name is consumed. Reset, then re-plan with a new run.",
         "STANDARD_RESTORE_FAILED" => "Restore or restore validation failed. The source backup is retained; reset and re-plan after investigation.",
+        "STANDARD_CAPACITY" => "Host capacity or disk headroom was too low to continue. Reset an earlier run's retained instances or free disk, reset this run, then re-plan.",
         "STANDARD_INTERRUPTED" => "The executing process ended. The instance state is unknown: reset this run, then re-plan.",
         "STANDARD_INTERNAL" => "An unexpected failure occurred. Inspect private evidence, reset this run, then re-plan."
       }.freeze
 
+      MAX_PLANS = 128
+      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
       attr_reader :store
@@ -94,7 +97,7 @@ module SiloMigrate
 
       # Identity of the code that will execute. Any source edit invalidates approval.
       def code_identity
-        files = Dir.glob(%w[lib/**/*.rb bin/silo-migrate runtime/prebuilt-discourse/*], base: @code_root).select { |rel| File.file?(File.join(@code_root, rel)) }.sort
+        files = Dir.glob(%w[lib/**/*.rb bin/silo-migrate bin/silo-migrate-control Gemfile.lock silo-migrate.gemspec runtime/prebuilt-discourse/*], base: @code_root).select { |rel| File.file?(File.join(@code_root, rel)) }.sort
         digest = Digest::SHA256.new
         files.each do |rel|
           digest.update(rel)
@@ -109,6 +112,8 @@ module SiloMigrate
 
       def propose_plan(dataset_id:, baseline: "seed", ports: nil)
         state = @store.load
+        raise StandardWorkflowError, "STANDARD_SIZE_LIMIT" if state.fetch("plans").size >= MAX_PLANS
+
         named = @store.named_state
         dataset = named.fetch("datasets")[dataset_id]
         raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless dataset
@@ -181,6 +186,10 @@ module SiloMigrate
 
       # Baseline only: an accepted pre-import archive is what a launch run restores.
       def accept_baseline(run_id:, reviewer:)
+        unless reviewer.is_a?(String) && reviewer.match?(/\A[[:print:]]{1,120}\z/)
+          raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID"
+        end
+
         @store.update do |state|
           run = state.fetch("runs")[run_id]
           raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
@@ -190,7 +199,11 @@ module SiloMigrate
           end
 
           baseline_id = "baseline-#{artifact.fetch('sha256')[0, 16]}"
-          state.fetch("accepted_baselines")[baseline_id] = artifact.merge("id" => baseline_id, "run_id" => run_id, "reviewer" => reviewer, "accepted_at" => now, "fingerprint" => run.dig("artifacts", "baseline_fingerprint"))
+          fingerprint = run.dig("artifacts", "baseline_fingerprint")
+          state.fetch("accepted_baselines")[baseline_id] = artifact.merge(
+            "id" => baseline_id, "run_id" => run_id, "reviewer" => reviewer, "accepted_at" => now,
+            "fingerprint" => fingerprint, "fingerprint_sha256" => Digest::SHA256.file(fingerprint).hexdigest
+          )
           { version: 1, baseline_id: baseline_id, status: "accepted" }
         end
       end
@@ -198,10 +211,34 @@ module SiloMigrate
       # -- execution ----------------------------------------------------------
 
       def run_plan(plan_id:)
+        @store.with_host_lock do
+          @store.with_op_lock do
+            run_id = claim_plan!(plan_id)
+            execute_stages(run_id)
+            public_run(@store.load.fetch("runs").fetch(run_id), held: true)
+          end
+        end
+      end
+
+      # Foreground half of a background start: refusals are returned to the caller.
+      # Nothing has been mutated yet, so an unexecuted claim is safely recoverable.
+      def claim(plan_id:)
         @store.with_op_lock do
           run_id = claim_plan!(plan_id)
-          execute_stages(run_id)
-          public_run(@store.load.fetch("runs").fetch(run_id), held: true)
+          { version: 1, plan_id: plan_id, run_id: run_id, status: "claimed" }
+        end
+      end
+
+      def execute(run_id:)
+        @store.with_host_lock do
+          @store.with_op_lock do
+            run = @store.load.fetch("runs")[run_id]
+            raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
+            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless run["status"] == "claimed"
+
+            execute_stages(run_id)
+            public_run(@store.load.fetch("runs").fetch(run_id), held: true)
+          end
         end
       end
 
@@ -211,7 +248,7 @@ module SiloMigrate
           @store.update do |state|
             run = state.fetch("runs")[run_id]
             raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
-            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless run["status"] == "running"
+            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless %w[claimed running].include?(run["status"])
 
             run["status"] = "interrupted"
             run["failure"] = { "stage" => run["stage"], "code" => "STANDARD_INTERRUPTED", "recovery" => RECOVERY.fetch("STANDARD_INTERRUPTED") }
@@ -231,7 +268,7 @@ module SiloMigrate
           state = @store.load
           run = state.fetch("runs")[run_id]
           raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
-          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" if run["status"] == "running"
+          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" if %w[claimed running].include?(run["status"])
 
           removed = []
           run.fetch("instances", {}).each_value do |name|
@@ -243,8 +280,27 @@ module SiloMigrate
             @store.update { |current| current.fetch("instances")[name] = stack.record }
             removed << name
           end
+          sweep_run_resources(run_id)
           { version: 1, run_id: run_id, status: "reset", removed: removed }
         end
+      end
+
+      # Catches what a recorded instance can't: conversion containers and anything
+      # left by a creation that died partway. Selected by this run's exact label.
+      def sweep_run_resources(run_id)
+        label = "label=silo-migrate.run=#{run_id}"
+        problems = []
+        [[%w[container ls -a --no-trunc --format {{.ID}}], %w[container rm --force --volumes]],
+         [%w[network ls --no-trunc --format {{.ID}}], %w[network rm]],
+         [%w[volume ls --format {{.Name}}], %w[volume rm]]].each do |list, remove|
+          listed = @runtime.run(["docker", *list.first(list.index("--format") || list.size), "--filter", label, *list.drop(list.index("--format") || list.size)], capture: true, timeout: 30)
+          raise StandardWorkflowError.new("STANDARD_CLEANUP_FAILED", list.first) unless listed.success?
+
+          listed.stdout.to_s.split.each do |identity|
+            problems << remove.first unless @runtime.run(["docker", *remove, identity], capture: true, timeout: 120).success?
+          end
+        end
+        raise StandardWorkflowError.new("STANDARD_CLEANUP_FAILED", problems.uniq.join(",")) unless problems.empty?
       end
 
       # -- read-only views ----------------------------------------------------
@@ -310,7 +366,7 @@ module SiloMigrate
       # Stat identity against what was registered: size, inode, mtime and ctime. The
       # full content hash is checked again in the preflight stage.
       def inputs_unchanged?(inputs)
-        @store.named.with_lock { |store| inputs.each { |input| store.verify_input_identity(input) } }
+        inputs.each { |input| @store.named.verify_input_identity(input) }
         true
       rescue NamedError
         false
@@ -372,7 +428,7 @@ module SiloMigrate
         baseline = body.fetch("baseline")
         if baseline["mode"] == "restore"
           accepted = state.fetch("accepted_baselines")[baseline["baseline_id"]]
-          return "baseline" unless accepted && accepted["sha256"] == baseline["sha256"] && File.file?(accepted.fetch("path")) && Digest::SHA256.file(accepted.fetch("path")).hexdigest == baseline["sha256"]
+          return "baseline" unless accepted && accepted["sha256"] == baseline["sha256"] && File.file?(accepted.fetch("path")) && Digest::SHA256.file(accepted.fetch("path")).hexdigest == baseline["sha256"] && Digest::SHA256.file(accepted.fetch("fingerprint")).hexdigest == accepted["fingerprint_sha256"]
         end
         nil
       rescue NamedError, Errno::ENOENT
@@ -403,6 +459,8 @@ module SiloMigrate
           outputs = plan.dig("body", "outputs").values.compact
           raise StandardWorkflowError, "STANDARD_OUTPUT_CONSUMED" unless (outputs & state.fetch("consumed_outputs")).empty?
 
+          raise StandardWorkflowError, "STANDARD_BUSY" if state.fetch("runs").values.any? { |run| %w[claimed running].include?(run["status"]) }
+
           dirty = state.fetch("instances").values.select { |record| %w[creating dirty].include?(record["state"]) }
           raise StandardWorkflowError.new("STANDARD_DIRTY_INSTANCE", "reset the earlier run first") unless dirty.empty?
 
@@ -411,7 +469,7 @@ module SiloMigrate
           plan["status"] = "consumed"
           plan["run_id"] = run_id
           state.fetch("runs")[run_id] = {
-            "id" => run_id, "plan_id" => plan_id, "dataset_id" => plan.dig("body", "dataset_id"), "status" => "running",
+            "id" => run_id, "plan_id" => plan_id, "dataset_id" => plan.dig("body", "dataset_id"), "status" => "claimed",
             "stage" => nil, "stages" => STAGES.to_h { |stage| [stage, { "status" => "pending" }] },
             "started_at" => now, "finished_at" => nil, "failure" => nil,
             "instances" => {}, "artifacts" => {}, "results" => {}, "assertions" => {}
@@ -420,8 +478,9 @@ module SiloMigrate
         run_id
       end
 
-      # Measured admission against the aggregate envelope: docker enforces each
-      # limit, this refuses a new run that would exceed the sum.
+      # Admission against the aggregate envelope, counting containers that exist now.
+      # Docker enforces each limit; the host lock stops a second workspace starting
+      # while this one is between containers.
       def admission!(_state)
         stack = lock.dig("limits", "stack")
         needed_cpus = stack.values.sum { |limit| limit["cpus"] } * 2
@@ -449,16 +508,24 @@ module SiloMigrate
         [rows.sum(&:first) / 1e9, rows.sum(&:last) / (1024 * 1024)]
       end
 
+      def guard_disk!
+        minimum = lock.dig("limits", "host_free_min_gib") * 1024**3
+        raise StandardWorkflowError.new("STANDARD_CAPACITY", "host disk headroom") if @disk_free.call < minimum
+      end
+
       def host_disk_free_bytes
         result = @runtime.run(["df", "-B1", "--output=avail", @store.workspace_root], capture: true, timeout: 15)
         result.stdout.to_s.lines.last.to_i
       end
 
       def execute_stages(run_id)
+        @store.update { |state| state.fetch("runs").fetch(run_id)["status"] = "running" }
         STAGES.each do |stage|
           stage_method = "stage_#{stage}"
           begin_stage(run_id, stage)
           begin
+            guard_disk!
+            admission!(nil) if stage == STAGES.first
             send(stage_method, run_id)
             finish_stage(run_id, stage, "passed")
           rescue StandardWorkflowError => error
@@ -549,39 +616,86 @@ module SiloMigrate
 
       # -- stages -------------------------------------------------------------
 
+      # Everything later stages consume comes from this run-owned copy of exactly the
+      # plan's bound bytes. A new or edited file in the workspace can't reach a stage.
       def stage_preflight(run_id)
         body = plan_for(run_id).fetch("body")
         named = @store.named_state
-        inputs = dataset_inputs(named, body.fetch("dataset_id"))
-        @store.named.with_lock do |store|
-          inputs.each do |input|
-            store.inspect_input(input.fetch("path").unpack1("m0"), sha256: input["sha256"], bytes: input["bytes"], expected: input["identity"])
-            store.verify_input_identity(input)
-          end
-        end
         lock.fetch("images").each do |role, image|
           inspected = @runtime.run(["docker", "image", "inspect", "--format", "{{.Id}}", image.fetch("id")], capture: true, timeout: 30)
           unless inspected.success? && inspected.stdout.to_s.strip == image.fetch("id")
             raise StandardWorkflowError.new("STANDARD_RUNTIME_MISMATCH", role)
           end
         end
-        record_results(run_id, input_count: inputs.size, input_bytes: inputs.sum { |input| input["bytes"] })
+        manifest = materialize_inputs(run_id, body, named)
+        @store.write_private(@store.run_dir(run_id, "work", "inputs.json"), JSON.pretty_generate(manifest) + "\n")
+        snapshot_helpers(run_id)
+        snapshot_site_settings(run_id, body)
+        record_results(run_id, input_count: manifest.size, input_bytes: manifest.sum { |input| input["bytes"] })
       rescue NamedError => error
         raise StandardWorkflowError.new("STANDARD_INPUT_CHANGED", error.message)
       end
 
-      def input_path(input)
-        File.join(@store.workspace_root, input.fetch("path").unpack1("m0"))
+      def materialize_inputs(run_id, body, named)
+        bound = body.fetch("input_binding").map { |binding| [named.fetch("inputs").fetch(binding.fetch("id")), binding] }
+        roots = bound.map { |input, _| input.fetch("path").unpack1("m0").split("/").first(2).join("/") }.uniq
+        raise StandardWorkflowError.new("STANDARD_INPUTS_INCOMPLETE", "layout") unless roots.size == 1
+
+        root = File.join(@store.workspace_root, roots.first)
+        registered = bound.map { |input, _| File.join(@store.workspace_root, input.fetch("path").unpack1("m0")) }
+        on_disk = Dir.glob("**/*", File::FNM_DOTMATCH, base: root).map { |rel| File.join(root, rel) }.reject { |path| File.basename(path) == "." || (File.directory?(path) && !File.symlink?(path)) }
+        unless (on_disk - registered).empty?
+          raise StandardWorkflowError.new("STANDARD_INPUT_CHANGED", "unregistered file present")
+        end
+
+        bound.map do |input, binding|
+          relative = input.fetch("path").unpack1("m0")
+          source = File.join(@store.workspace_root, relative)
+          @store.named.verify_input_identity(input)
+          bytes = File.binread(source)
+          unless Digest::SHA256.hexdigest(bytes) == binding.fetch("sha256") && bytes.bytesize == binding.fetch("bytes")
+            raise StandardWorkflowError.new("STANDARD_INPUT_CHANGED", "content differs from plan")
+          end
+
+          target = @store.run_dir(run_id, "work", relative)
+          FileUtils.mkdir_p(File.dirname(target), mode: 0o700)
+          File.open(target, File::WRONLY | File::CREAT | File::EXCL, 0o400) { |file| file.binmode; file.write(bytes) }
+          binding.slice("id", "type", "sha256", "bytes").merge("relative" => relative)
+        end
+      end
+
+      def snapshot_helpers(run_id)
+        target = @store.run_dir(run_id, "work", "helpers")
+        FileUtils.mkdir_p(target, mode: 0o700)
+        HELPERS.each { |helper| FileUtils.cp(File.join(helper_dir, helper), File.join(target, helper)) }
+      end
+
+      def snapshot_site_settings(run_id, body)
+        source = @store.load.dig("config", "site_settings")
+        unless Digest::SHA256.file(source).hexdigest == body.fetch("site_settings_sha256")
+          raise StandardWorkflowError.new("STANDARD_RUNTIME_MISMATCH", "site settings cache")
+        end
+
+        FileUtils.cp(source, @store.run_dir(run_id, "work", "site_settings.yml"))
+      end
+
+      def run_inputs(run_id)
+        JSON.parse(File.read(@store.run_dir(run_id, "work", "inputs.json")))
+      end
+
+      def input_path(run_id, input)
+        @store.run_dir(run_id, "work", input.fetch("relative"))
       end
 
       def typed_input(inputs, type)
-        inputs.find { |input| input["type"] == type } or raise StandardWorkflowError, "STANDARD_INPUTS_INCOMPLETE"
+        matches = inputs.select { |input| input["type"] == type }
+        raise StandardWorkflowError, "STANDARD_INPUTS_INCOMPLETE" unless matches.size == 1
+
+        matches.first
       end
 
       def stage_convert(run_id)
-        body = plan_for(run_id).fetch("body")
-        named = @store.named_state
-        inputs = dataset_inputs(named, body.fetch("dataset_id"))
+        inputs = run_inputs(run_id)
         config = @store.load.fetch("config")
         work = @store.run_dir(run_id, "work")
         code = File.join(work, "code")
@@ -589,10 +703,10 @@ module SiloMigrate
         secrets = @store.run_dir(run_id, "private", "converter")
         [code, output, secrets].each { |dir| FileUtils.mkdir_p(dir, mode: 0o700) }
 
-        materialize_converter(config, code)
+        materialize_converter(run_id, config, code)
         root_password = SecureRandom.hex(32)
         converter_password = SecureRandom.hex(32)
-        settings = File.read(input_path(typed_input(inputs, "converter-settings")))
+        settings = File.read(input_path(run_id, typed_input(inputs, "converter-settings")))
         { "  host: synthetic-source" => "  host: 127.0.0.1",
           "  password: \"\"" => "  password: \"#{converter_password}\"",
           "  sql_layout_override: inline_community_database" => "  sql_layout_override: null" }.each do |from, to|
@@ -610,25 +724,25 @@ module SiloMigrate
         SQL
 
         sql = typed_input(inputs, "source-sql")
-        uploads_dir = input_tree(inputs, "upload", "uploads")
-        mappings_dir = input_tree(inputs, "mapping", "mappings")
+        uploads_dir = input_tree(run_id, inputs, "upload", "uploads")
+        mappings_dir = input_tree(run_id, inputs, "mapping", "mappings")
         short = run_id.delete_prefix("run-")[0, 8]
         db_name = "silomig-#{short}-source-db"
         converter_name = "silomig-#{short}-converter"
         limits = lock.dig("limits", "conversion")
         common = ["--pull=never", "--restart", "no", "--read-only", "--user", "#{Process.uid}:#{Process.gid}", "--cap-drop", "ALL",
                   "--security-opt", "no-new-privileges", "--log-driver", "local", "--log-opt", "max-size=1m",
-                  "--label", "silo-migrate.managed=true", "--label", "silo-migrate.instance=#{short}-conversion"]
+                  "--label", "silo-migrate.managed=true", "--label", "silo-migrate.instance=#{short}-conversion", "--label", "silo-migrate.run=#{run_id}"]
         tmpfs_opts = "rw,uid=#{Process.uid},gid=#{Process.gid},mode=0700"
         created = []
         begin
           db_id = checked(run_id, "conversion-db-start", ["docker", "run", "-d", *common, "--name", db_name, "--network", "none",
-            "--cpus", limits.dig("db", "cpus").to_s, "--memory", "#{limits.dig('db', 'memory_mib')}m", "--pids-limit", limits.dig("db", "pids").to_s,
+            "--cpus", limits.dig("db", "cpus").to_s, "--memory", "#{limits.dig('db', 'memory_mib')}m", "--memory-swap", "#{limits.dig('db', 'memory_mib')}m", "--pids-limit", limits.dig("db", "pids").to_s,
             "--tmpfs", "/var/lib/mysql:#{tmpfs_opts},size=512m", "--tmpfs", "/tmp:#{tmpfs_opts},size=64m", "--tmpfs", "/run/mysqld:#{tmpfs_opts},size=16m",
             "-v", "#{File.join(secrets, 'root-password')}:/run-fixture/root-password:ro",
             "-v", "#{File.join(secrets, 'root.cnf')}:/run-fixture/root.cnf:ro",
             "-v", "#{File.join(secrets, 'bootstrap.sql')}:/run-fixture/bootstrap.sql:ro",
-            "-v", "#{input_path(sql)}:/run-fixture/snapshot.sql:ro",
+            "-v", "#{input_path(run_id, sql)}:/run-fixture/snapshot.sql:ro",
             "-e", "MARIADB_ROOT_PASSWORD_FILE=/run-fixture/root-password", "-e", "MARIADB_ROOT_HOST=localhost",
             lock.dig("images", "source_db", "id"), "mariadbd", "--bind-address=127.0.0.1", "--skip-name-resolve",
             "--innodb-buffer-pool-size=64M", "--innodb-log-file-size=32M", "--max-connections=10"], timeout: 60).stdout.strip
@@ -638,7 +752,7 @@ module SiloMigrate
           checked(run_id, "conversion-db-bootstrap", ["docker", "exec", db_id, "/bin/sh", "-c", "exec #{client} < /run-fixture/bootstrap.sql"], timeout: 60)
           checked(run_id, "conversion-db-load", ["docker", "exec", db_id, "/bin/sh", "-c", "exec #{client} khoros_fixture < /run-fixture/snapshot.sql"], timeout: 120)
           converter_args = ["docker", "run", "-d", *common, "--name", converter_name, "--network", "container:#{db_id}",
-            "--cpus", limits.dig("converter", "cpus").to_s, "--memory", "#{limits.dig('converter', 'memory_mib')}m", "--pids-limit", limits.dig("converter", "pids").to_s,
+            "--cpus", limits.dig("converter", "cpus").to_s, "--memory", "#{limits.dig('converter', 'memory_mib')}m", "--memory-swap", "#{limits.dig('converter', 'memory_mib')}m", "--pids-limit", limits.dig("converter", "pids").to_s,
             "--tmpfs", "/tmp:#{tmpfs_opts},size=128m", "-v", "#{code}:/app:ro", "-v", "#{output}:/app/output",
             "-v", "#{File.join(secrets, 'settings.yml')}:/run-fixture/settings.yml:ro",
             "-e", "HOME=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8", "-w", "/app"]
@@ -654,6 +768,7 @@ module SiloMigrate
 
           assert_conversion_summary!(run_id, convert.stdout.to_s + convert.stderr.to_s)
         ensure
+          # Anything that survives this is removed by the run's reset, via its label.
           created.reverse_each { |id| @runtime.run(["docker", "rm", "--force", "--volumes", id], capture: true, timeout: 60) }
         end
         produced = File.join(output, "intermediate.sqlite")
@@ -665,7 +780,7 @@ module SiloMigrate
         FileUtils.cp(produced, intermediate)
         File.chmod(0o400, intermediate)
         identity = artifact_identity(intermediate)
-        expected = JSON.parse(File.read(input_path(typed_input(inputs, "expected"))))
+        expected = JSON.parse(File.read(input_path(run_id, typed_input(inputs, "expected"))))
         failures = intermediate_failures(intermediate, expected)
         assert_clean!(run_id, "intermediate", failures, "STANDARD_CONVERSION_FAILED")
         @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["intermediate"] = identity }
@@ -701,7 +816,7 @@ module SiloMigrate
 
       # Clean code snapshot of an exact converter revision, plus its site-settings
       # cache. Writes only into this run's new directory.
-      def materialize_converter(config, code)
+      def materialize_converter(run_id, config, code)
         revision = config.fetch("converter_revision")
         worktree = config.fetch("converter_worktree")
         head = @runtime.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture: true, timeout: 30)
@@ -716,20 +831,19 @@ module SiloMigrate
         FileUtils.rm_f(archive)
         cache = File.join(code, "tmp", "requires", "discourse", "config")
         FileUtils.mkdir_p(cache)
-        FileUtils.cp(config.fetch("site_settings"), File.join(cache, "site_settings.yml"))
+        FileUtils.cp(@store.run_dir(run_id, "work", "site_settings.yml"), File.join(cache, "site_settings.yml"))
         FileUtils.mkdir_p(File.join(code, "output"))
       end
 
-      # Registered inputs of one type live under inputs/<dir>/<subdir>/; returns
-      # that exact directory so bind mounts expose only registered files.
-      def input_tree(inputs, type, subdir)
+      # The run-owned directory holding exactly this type's bound inputs.
+      def input_tree(run_id, inputs, type, subdir)
         selected = inputs.select { |input| input["type"] == type }
         return nil if selected.empty?
 
-        roots = selected.map { |input| input.fetch("path").unpack1("m0")[%r{\A(.*?/#{subdir})/}, 1] }.uniq
+        roots = selected.map { |input| input.fetch("relative")[%r{\A(.*?/#{subdir})/}, 1] }.uniq
         raise StandardWorkflowError.new("STANDARD_INPUTS_INCOMPLETE", subdir) unless roots.length == 1 && roots.first
 
-        File.join(@store.workspace_root, roots.first)
+        @store.run_dir(run_id, "work", roots.first)
       end
 
       def wait_source_db(db_id)
@@ -764,17 +878,18 @@ module SiloMigrate
       def create_stack(run_id, role, target)
         name = target.fetch("name")
         db_password = SecureRandom.hex(24)
-        @store.write_private(@store.run_dir(run_id, "private", "#{role}-db-password"), db_password)
+        env_file = @store.run_dir(run_id, "private", "#{role}.env")
+        @store.write_private(env_file, "DB_PASSWORD=#{db_password}\nDISCOURSE_DB_PASSWORD=#{db_password}\n")
         @store.update do |state|
           state.fetch("instances")[name] = { "name" => name, "containers" => {}, "networks" => [], "volumes" => [], "state" => "creating", "role" => role, "run_id" => run_id, "port" => target.fetch("port"), "hostname" => target.fetch("hostname") }
           state.fetch("runs").fetch(run_id).fetch("instances")[role] = name
         end
         stack = PrebuiltStack.new(runtime: @runtime, lock: lock, name: name, record: @store.load.fetch("instances").fetch(name), sleeper: @sleeper)
-        stack.create!(hostname: target.fetch("hostname"), port: target.fetch("port"), db_password: db_password,
+        stack.create!(hostname: target.fetch("hostname"), port: target.fetch("port"), env_file: env_file,
                       labels: { "silo-migrate.run" => run_id, "silo-migrate.role" => role }) do |record|
           @store.update { |state| state.fetch("instances")[name] = record }
         end
-        install_helpers(stack)
+        install_helpers(run_id, stack)
         stack
       end
 
@@ -792,10 +907,8 @@ module SiloMigrate
         File.join(@code_root, "runtime", "prebuilt-discourse")
       end
 
-      def install_helpers(stack)
-        %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb].each do |helper|
-          stack.copy_in(File.join(helper_dir, helper), "/tmp/#{helper}")
-        end
+      def install_helpers(run_id, stack)
+        HELPERS.each { |helper| stack.copy_in(@store.run_dir(run_id, "work", "helpers", helper), "/tmp/#{helper}") }
       end
 
       def fingerprint(stack)
@@ -834,10 +947,10 @@ module SiloMigrate
       def seed_baseline(run_id, stack, body)
         password = SecureRandom.urlsafe_base64(18)
         @store.write_private(@store.run_dir(run_id, "private", "admin-password"), password)
+        secrets = @store.run_dir(run_id, "private", "seed.env")
+        @store.write_private(secrets, "SILO_ADMIN_PASSWORD=#{password}\n")
         sandbox = SANDBOX_ATTACHMENT
-        seeded = stack.rails_runner("/tmp/baseline_seed.rb", env: {
-          "SILO_ADMIN_PASSWORD" => password, "SILO_SANDBOX_ATTACHMENT_B64" => [sandbox].pack("m0")
-        })
+        seeded = stack.rails_runner("/tmp/baseline_seed.rb", env: { "SILO_SANDBOX_ATTACHMENT_B64" => [sandbox].pack("m0") }, env_file: secrets)
         evidence(run_id, "baseline.seed.json", seeded)
         expected = Digest::SHA256.hexdigest(sandbox)
         base_fp = fingerprint(stack)
@@ -863,11 +976,11 @@ module SiloMigrate
       def restore_baseline(run_id, stack, decision)
         accepted = @store.load.fetch("accepted_baselines").fetch(decision.fetch("baseline_id"))
         path = accepted.fetch("path")
-        unless Digest::SHA256.file(path).hexdigest == decision.fetch("sha256")
-          raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "accepted baseline bytes changed")
+        unless Digest::SHA256.file(accepted.fetch("fingerprint")).hexdigest == accepted.fetch("fingerprint_sha256")
+          raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "accepted baseline fingerprint changed")
         end
 
-        restore_archive(run_id, stack, path, "baseline-restore")
+        restore_archive(run_id, stack, path, "baseline-restore", expected_sha256: decision.fetch("sha256"))
         prior_password = @store.run_dir(accepted.fetch("run_id"), "private", "admin-password")
         @store.write_private(@store.run_dir(run_id, "private", "admin-password"), File.read(prior_password)) if File.file?(prior_password)
         accepted_fp = JSON.parse(File.read(accepted.fetch("fingerprint")))
@@ -905,9 +1018,7 @@ module SiloMigrate
       # retained artifact is never handed to them directly.
       def stage_uploads(run_id)
         stack = stack_for(run_id, "review")
-        body = plan_for(run_id).fetch("body")
-        named = @store.named_state
-        inputs = dataset_inputs(named, body.fetch("dataset_id"))
+        inputs = run_inputs(run_id)
         work = @store.run_dir(run_id, "work", "import")
         FileUtils.mkdir_p(work, mode: 0o700)
         scratch = File.join(work, "intermediate.sqlite")
@@ -932,7 +1043,7 @@ module SiloMigrate
 
         stack.copy_in(scratch, "/shared/import/intermediate.sqlite")
         stack.copy_in(config_path, "/shared/import/uploads.yml")
-        tree = input_tree(inputs, "upload", "uploads")
+        tree = input_tree(run_id, inputs, "upload", "uploads")
         if tree
           Dir.children(tree).each { |entry| stack.copy_in(File.join(tree, entry), "/shared/import/files/#{entry}") }
         end
@@ -984,12 +1095,10 @@ module SiloMigrate
       end
 
       def expected_for(run_id)
-        named = @store.named_state
-        inputs = dataset_inputs(named, plan_for(run_id).dig("body", "dataset_id"))
-        expected = JSON.parse(File.read(input_path(typed_input(inputs, "expected"))))
-        attachments = inputs.select { |input| input["type"] == "upload" }.map { |input| input["sha256"] }
-        attachment_bytes = inputs.select { |input| input["type"] == "upload" }.to_h { |input| [input["sha256"], File.binread(input_path(input))] }
-        [expected, attachments, attachment_bytes]
+        inputs = run_inputs(run_id)
+        expected = JSON.parse(File.read(input_path(run_id, typed_input(inputs, "expected"))))
+        uploads = inputs.select { |input| input["type"] == "upload" }
+        [expected, uploads.map { |input| input["sha256"] }, uploads.to_h { |input| [input["sha256"], File.binread(input_path(run_id, input))] }]
       end
 
       def stage_verify_site(run_id)
@@ -1004,7 +1113,13 @@ module SiloMigrate
         failures.concat(http_content_failures(run_id, stack, site, expected, attachments, bytes, state, "review"))
         failures.concat(database_count_failures(stack, base, expected))
         assert_clean!(run_id, "site", failures, "STANDARD_VERIFY_FAILED")
-        record_results(run_id, imported_users: expected.dig("counts", "users"), imported_topics: expected.dig("counts", "topics"), imported_posts: expected.dig("counts", "posts"), imported_attachments: attachments.size)
+        record_results(run_id, **measured_counts(site, attachments))
+      end
+
+      def measured_counts(site, attachments)
+        imported = ->(key) { site.fetch(key).count { |record| record["import_id"] } }
+        { imported_users: imported.call("users"), imported_topics: imported.call("topics"), imported_posts: imported.call("posts"),
+          imported_attachments: site.fetch("uploads").count { |upload| attachments.include?(upload["file_sha256"]) } }
       end
 
       # Real downloads over the published loopback port, compared byte for byte.
@@ -1066,16 +1181,24 @@ module SiloMigrate
         { status: 0, body: error.class.name }
       end
 
+      # Direct SQL, independent of the fingerprint script's ActiveRecord queries.
       def database_count_failures(stack, base, expected)
-        result = stack.db_query("SELECT (SELECT COUNT(*) FROM users WHERE id > 0), (SELECT COUNT(*) FROM topics t JOIN users u ON u.id = t.user_id WHERE u.id > 0 AND t.archetype = 'regular'), (SELECT COUNT(*) FROM uploads WHERE id > 0)")
+        result = stack.db_query(<<~SQL.tr("\n", " "))
+          SELECT (SELECT COUNT(*) FROM users WHERE id > 0),
+                 (SELECT COUNT(*) FROM topics WHERE user_id > 0 AND archetype = 'regular'),
+                 (SELECT COUNT(*) FROM posts p JOIN topics t ON t.id = p.topic_id WHERE p.user_id > 0 AND t.archetype = 'regular'),
+                 (SELECT COUNT(*) FROM uploads WHERE id > 0)
+        SQL
         return ["database-query-failed"] unless result.success?
 
-        users, _topics, uploads = result.stdout.strip.split("|").map(&:to_i)
-        failures = []
-        failures << "database-user-count:#{users}" unless users == base.fetch("users").size + expected.dig("counts", "users")
-        expected_uploads = base.fetch("uploads").size + expected.dig("counts", "attachments")
-        failures << "database-upload-count:#{uploads}" unless uploads == expected_uploads
-        failures
+        users, topics, posts, uploads = result.stdout.strip.split("|").map(&:to_i)
+        counts = expected.fetch("counts")
+        { "user" => [users, base.fetch("users").size + counts.fetch("users")],
+          "topic" => [topics, base.fetch("topics").size + counts.fetch("topics")],
+          "post" => [posts, base.fetch("posts").size + counts.fetch("posts")],
+          "upload" => [uploads, base.fetch("uploads").size + counts.fetch("attachments")] }.filter_map do |kind, (actual, wanted)|
+          "database-#{kind}-count:#{actual}!=#{wanted}" unless actual == wanted
+        end
       end
 
       def archive_member(upload)
@@ -1146,8 +1269,16 @@ module SiloMigrate
             "intermediate" => run.dig("artifacts", "intermediate"), "uploads_db" => run.dig("artifacts", "uploads_db"),
             "code_identity" => plan.dig("body", "code_identity"), "converter_revision" => plan.dig("body", "converter_revision"),
             "app_revision" => plan.dig("body", "app_revision"), "image_ids" => plan.dig("body", "image_ids"),
+            "runtime_lock_sha256" => plan.dig("body", "runtime_lock_sha256"),
+            "site_settings_sha256" => plan.dig("body", "site_settings_sha256"),
             "site_versions" => site["versions"]
           },
+          "carried_state" => [
+            "synthetic sandbox_admin and sandbox_member accounts with a local password",
+            "disable_emails=yes and the baseline's seeded site settings",
+            "backup metadata base URL of the local review hostname; upstream restore remaps it",
+            "posts not yet rebaked can still hold the local hostname in protocol-relative image URLs"
+          ],
           "scope" => "synthetic local rehearsal; hosted restore, plugins and S3 remain engineer handoffs"
         }
       end
@@ -1160,7 +1291,9 @@ module SiloMigrate
         record_results(run_id, review_url: result.fetch("base_url"))
       end
 
-      def restore_archive(run_id, stack, archive, label)
+      def restore_archive(run_id, stack, archive, label, expected_sha256:)
+        raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "archive bytes changed") unless Digest::SHA256.file(archive).hexdigest == expected_sha256
+
         filename = File.basename(archive)
         ensure_dir = stack.web_exec(["sh", "-c", "mkdir -p #{PrebuiltStack::DISCOURSE_ROOT}/public/backups/default && chown -R discourse:discourse #{PrebuiltStack::DISCOURSE_ROOT}/public/backups /shared/backups"], timeout: 30)
         raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "backup dir") unless ensure_dir.success?
@@ -1189,7 +1322,7 @@ module SiloMigrate
         assert_runtime_identity!(run_id, stack, "restore")
         final = @store.load.fetch("runs").fetch(run_id).dig("artifacts", "final")
         set_instance_state(stack, "dirty")
-        restore_archive(run_id, stack, final.fetch("path"), "final-restore")
+        restore_archive(run_id, stack, final.fetch("path"), "final-restore", expected_sha256: final.fetch("sha256"))
         set_instance_state(stack, "restored")
         # Sidekiq and the app reload settings; give the restarted workers a moment.
         wait_restored_web(stack)
@@ -1227,6 +1360,10 @@ module SiloMigrate
         end
         @store.update do |current|
           final = current.fetch("runs").fetch(run_id).fetch("artifacts").fetch("final")
+          unless Digest::SHA256.file(final.fetch("path")).hexdigest == final.fetch("sha256")
+            raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "archive bytes changed")
+          end
+
           final["label"] = "restore-proven"
           current.fetch("runs").fetch(run_id)["restore_proven_at"] = now
         end
@@ -1279,7 +1416,7 @@ module SiloMigrate
         result = {
           version: 1, run_id: run["id"], plan_id: run["plan_id"], dataset_id: run["dataset_id"], status: status,
           stage: run["stage"], stages: run["stages"].transform_values { |entry| entry["status"] },
-          assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments", "review_url", "restore_url"),
+          assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments"),
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
         if status == "abandoned"
@@ -1297,8 +1434,11 @@ module SiloMigrate
         end
       end
 
+      # `state` is the last durable state; `live` is what Docker reports right now.
       def public_instance(record)
-        { name: record["name"], role: record["role"], run_id: record["run_id"], state: record["state"], port: record["port"], url: record["state"] == "removed" ? nil : "http://127.0.0.1:#{record['port']}/" }
+        removed = record["state"] == "removed"
+        live = !removed && PrebuiltStack.new(runtime: @runtime, lock: lock, name: record["name"], record: record).running?
+        { name: record["name"], role: record["role"], run_id: record["run_id"], state: record["state"], live: live, port: record["port"], url: live ? "http://127.0.0.1:#{record['port']}/" : nil }
       end
     end
   end

@@ -36,7 +36,7 @@
     "host_free_min_gib": 8,
     "ports": [18080, 18089],
     "stack": {
-      "web": { "cpus": 1.0, "memory_mib": 2560, "pids": 512 },
+      "web": { "cpus": 0.9, "memory_mib": 2304, "pids": 512 },
       "db": { "cpus": 0.5, "memory_mib": 768, "pids": 128 },
       "redis": { "cpus": 0.25, "memory_mib": 256, "pids": 64 },
       "proxy": { "cpus": 0.1, "memory_mib": 64, "pids": 32 }

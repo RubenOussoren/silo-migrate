@@ -36,7 +36,7 @@ module SiloMigrate
       # Yields after each owned resource is created so the caller can persist the
       # record durably before any fallible next step: every resource stays
       # removable even if this process dies mid-creation.
-      def create!(hostname:, port:, db_password:, labels: {}, &progress)
+      def create!(hostname:, port:, env_file:, labels: {}, &progress)
         limits = @lock.fetch("limits").fetch("stack")
         images = @lock.fetch("images")
         label_args = labels.merge(LABEL_MANAGED => "true", LABEL_INSTANCE => @name)
@@ -48,6 +48,7 @@ module SiloMigrate
 
         internal = "#{@name}-int"
         published = "#{@name}-pub"
+        refuse_existing!(internal, published)
         command!(["docker", "network", "create", "--internal", *label_args, internal], timeout: 30)
         record["networks"] << internal
         progress&.call(record)
@@ -64,7 +65,7 @@ module SiloMigrate
 
         start_container("db", images.fetch("db").fetch("id"), limits.fetch("db"), label_args, [
           "--network", internal, "--network-alias", "db", "--shm-size", "128m",
-          "-v", "#{@name}-pg:/var/lib/postgresql", "-e", "DB_PASSWORD=#{db_password}",
+          "-v", "#{@name}-pg:/var/lib/postgresql", "--env-file", env_file,
           "-e", "DB_SHARED_BUFFERS=128MB", "-e", "DB_WORK_MEM=8MB"
         ], [], &progress)
         wait_for("database") { success?(["docker", "exec", container("db"), "pg_isready", "-U", "postgres"], timeout: 10) }
@@ -76,7 +77,7 @@ module SiloMigrate
         start_container("web", images.fetch("web").fetch("id"), limits.fetch("web"), label_args, [
           "--network", internal, "--network-alias", "web", "--hostname", "#{hostname.tr('.', '-')}-web",
           "--shm-size", "256m", "-v", "#{@name}-shared:/shared",
-          "-e", "DISCOURSE_DB_HOST=db", "-e", "DISCOURSE_DB_PASSWORD=#{db_password}",
+          "-e", "DISCOURSE_DB_HOST=db", "--env-file", env_file,
           "-e", "DISCOURSE_REDIS_HOST=redis", "-e", "DISCOURSE_HOSTNAME=#{hostname}",
           "-e", "DISCOURSE_DEVELOPER_EMAILS=sandbox_admin@example.invalid",
           "-e", "DISCOURSE_SMTP_ADDRESS=smtp.invalid", "-e", "DISCOURSE_SMTP_PORT=25",
@@ -99,10 +100,12 @@ module SiloMigrate
         "#{@name}-#{role}"
       end
 
-      def rails_runner(script_path, env: {}, timeout: 300)
-        exports = env.keys.map { |key| "#{key}=\"$#{key}\"" }
-        inner = ["cd", DISCOURSE_ROOT, "&&", "exec", *BUNDLE_ENV, *exports, "bundle", "exec", "rails", "runner", Shellwords.escape(script_path)].join(" ")
+      # Values reach the script through the exec environment; pass secrets by
+      # env_file so they are not in this process's arguments.
+      def rails_runner(script_path, env: {}, env_file: nil, timeout: 300)
+        inner = ["cd", DISCOURSE_ROOT, "&&", "exec", *BUNDLE_ENV, "bundle", "exec", "rails", "runner", Shellwords.escape(script_path)].join(" ")
         exec_args = env.flat_map { |key, value| ["-e", "#{key}=#{value}"] }
+        exec_args += ["--env-file", env_file] if env_file
         result = @runtime.run(["docker", "exec", *exec_args, container("web"), "su", "discourse", "-c", inner], capture: true, timeout: timeout)
         lines = result.stdout.to_s.lines.grep(/\ASILO_JSON:/)
         unless result.success? && lines.length == 1
@@ -174,10 +177,17 @@ module SiloMigrate
 
       private
 
+      def refuse_existing!(*networks)
+        taken = networks.any? { |network| @runtime.run(["docker", "network", "inspect", network], capture: true, timeout: 20).success? }
+        taken ||= %w[pg redis shared].any? { |volume| @runtime.run(["docker", "volume", "inspect", "#{@name}-#{volume}"], capture: true, timeout: 20).success? }
+        taken ||= ROLES.any? { |role| @runtime.run(["docker", "container", "inspect", container(role)], capture: true, timeout: 20).success? }
+        raise StandardWorkflowError.new("STANDARD_STACK_FAILED", "name already in use") if taken
+      end
+
       def owned?(kind, identity, problems)
         result = @runtime.run(["docker", kind, "inspect", "--format", "{{json .#{kind == 'container' ? 'Config.Labels' : 'Labels'}}}", identity], capture: true, timeout: 20)
         # Already gone (e.g. a partial creation or earlier reset) needs no action.
-        return false if !result.success? && result.stderr.to_s.match?(/no such/i)
+        return false if !result.success? && result.stderr.to_s.match?(/no such|not found/i)
 
         labels = result.success? ? (JSON.parse(result.stdout) rescue nil) : nil
         unless labels.is_a?(Hash) && labels[LABEL_INSTANCE] == @name && labels[LABEL_MANAGED] == "true"

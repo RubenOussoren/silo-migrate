@@ -9,7 +9,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 
 WORKSPACE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 PATTERNS = {
@@ -81,22 +80,19 @@ def main():
             status = json.loads(shown.stdout).get("status")
             if status != "approved":
                 return fail("STANDARD_NOT_APPROVED" if status == "proposed" else "STANDARD_PLAN_NOT_RUNNABLE")
-            started = run(["run-request", workspace, plan_id], detach=True)
-            if started.returncode != 0:
+            # Claim in the foreground so a refusal is reported truthfully; nothing has
+            # changed at that point. Then execute in the background.
+            claimed = run(["run-claim", workspace, plan_id])
+            if claimed.returncode != 0:
+                return emit(claimed)
+            run_id = json.loads(claimed.stdout).get("run_id")
+            if not isinstance(run_id, str) or not PATTERNS["run_id"].match(run_id):
                 return fail("STANDARD_OPERATION_FAILED")
-            # The background process claims the plan before any mutation. A refusal
-            # such as a capacity check ends it with the plan still approved.
-            deadline = time.monotonic() + float(os.environ.get("SILO_TOOL_START_WAIT", "30"))
-            while True:
-                shown = run(["plan-show", workspace, plan_id])
-                if shown.returncode == 0:
-                    plan = json.loads(shown.stdout)
-                    if plan.get("status") == "consumed":
-                        print(json.dumps({"version": 1, "plan_id": plan_id, "run_id": plan.get("run_id"), "status": "started"}))
-                        return 0
-                if time.monotonic() >= deadline:
-                    return fail("STANDARD_RUN_NOT_STARTED")
-                time.sleep(1)
+            started = run(["run-execute", workspace, run_id], detach=True)
+            if started.returncode != 0:
+                return fail("STANDARD_RUN_NOT_STARTED")
+            print(json.dumps({"version": 1, "plan_id": plan_id, "run_id": run_id, "status": "started"}))
+            return 0
         if tool == "migration_run_show":
             return emit(run(["run-show", workspace, argument(args, "run_id")]))
         if tool == "migration_findings":

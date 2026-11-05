@@ -10,16 +10,27 @@ repo=$(cd "$(dirname "$self")/.." && pwd -P)
 project=${SILO_CONTROL_PROJECT:-$(cd "$repo/../.." && pwd -P)}
 gems=${SILO_CONTROL_GEMS:-$project/.runtime-cache/gems}
 base=${SILO_MIGRATE_BASE_PATH:-$project/.runtime-cache/mvp-workspaces}
-image=${SILO_CONTROL_IMAGE:-sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b8310d84949240}
+image=sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b8310d84949240
 docker_group=$(stat -c %g /var/run/docker.sock)
 mkdir -p -m 700 "$base"
 
 mode="--rm -i"
-name=""
 if [ "${1:-}" = "--detach" ]; then
   shift
   name="silo-control-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
   mode="--rm -d --name $name"
+fi
+
+# Claim in the foreground so a refusal is reported, then execute in the background
+# so the run outlives this terminal.
+if [ "${1:-}" = "start-run" ]; then
+  [ $# -eq 3 ] || { echo "Usage: silo-migrate-control start-run WORKSPACE PLAN_ID" >&2; exit 2; }
+  claimed=$("$self" standard run claim "$2" "$3") || exit $?
+  run_id=$(printf '%s' "$claimed" | sed -n 's/.*"run_id":"\(run-[0-9a-f]*\)".*/\1/p')
+  [ -n "$run_id" ] || { echo "Error: STANDARD_OPERATION_FAILED" >&2; exit 1; }
+  "$self" --detach standard run execute "$2" "$run_id" >/dev/null
+  printf '%s\n' "$claimed"
+  exit 0
 fi
 
 # shellcheck disable=SC2086

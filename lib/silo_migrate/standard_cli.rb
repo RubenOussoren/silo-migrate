@@ -25,6 +25,8 @@ module SiloMigrate
         plan approve WORKSPACE PLAN_ID --sha256 DIGEST --reviewer NAME
         baseline accept WORKSPACE RUN_ID --reviewer NAME
         run start WORKSPACE PLAN_ID
+        run claim WORKSPACE PLAN_ID
+        run execute WORKSPACE RUN_ID
         run show WORKSPACE RUN_ID
         run private-paths WORKSPACE RUN_ID
         run recover WORKSPACE RUN_ID
@@ -42,6 +44,8 @@ module SiloMigrate
         agent plan-propose WORKSPACE --dataset ID [--baseline seed|BASELINE_ID]
         agent plan-show WORKSPACE PLAN_ID
         agent run-request WORKSPACE PLAN_ID
+        agent run-claim WORKSPACE PLAN_ID
+        agent run-execute WORKSPACE RUN_ID
         agent run-show WORKSPACE RUN_ID
         agent findings WORKSPACE
         agent finding-show WORKSPACE FINDING_ID
@@ -161,6 +165,8 @@ module SiloMigrate
       identifier = positional!(args)
       case action
       when "start" then no_more!(args); service(workspace).run_plan(plan_id: identifier)
+      when "claim" then no_more!(args); service(workspace).claim(plan_id: identifier)
+      when "execute" then no_more!(args); service(workspace).execute(run_id: identifier)
       when "show" then no_more!(args); service(workspace).show_run(identifier)
       when "private-paths" then no_more!(args); service(workspace).private_paths(identifier)
       when "recover" then no_more!(args); service(workspace).recover(run_id: identifier)
@@ -221,6 +227,14 @@ module SiloMigrate
         plan_id = positional!(args)
         no_more!(args)
         service(workspace).run_plan(plan_id: plan_id)
+      when "run-claim"
+        plan_id = positional!(args)
+        no_more!(args)
+        service(workspace).claim(plan_id: plan_id)
+      when "run-execute"
+        run_id = positional!(args)
+        no_more!(args)
+        service(workspace).execute(run_id: run_id)
       when "run-show"
         run_id = positional!(args)
         no_more!(args)
@@ -235,7 +249,7 @@ module SiloMigrate
     end
 
     def failed_run?(argv, result)
-      request = argv[0, 2] == %w[run start] || argv[0, 2] == %w[agent run-request]
+      request = [%w[run start], %w[run execute], %w[agent run-request], %w[agent run-execute]].include?(argv[0, 2])
       request && result[:status] != "completed"
     end
 
@@ -330,11 +344,11 @@ module SiloMigrate
           File.join(dir, "#{snapshot}.sql") => ["#{root}/source.sql", "source-sql"],
           File.join(dir, "settings.yml") => ["#{root}/settings.yml", "converter-settings"]
         }
-        Dir.glob("**/*", base: File.join(dir, "mappings")).each do |rel|
+        Dir.glob("**/*", File::FNM_DOTMATCH, base: File.join(dir, "mappings")).each do |rel|
           path = File.join(dir, "mappings", rel)
           files[path] = ["#{root}/mappings/#{rel}", "mapping"] if File.file?(path)
         end
-        Dir.glob("**/*", base: File.join(dir, "uploads")).each do |rel|
+        Dir.glob("**/*", File::FNM_DOTMATCH, base: File.join(dir, "uploads")).each do |rel|
           path = File.join(dir, "uploads", rel)
           files[path] = ["#{root}/uploads/#{rel}", "upload"] if File.file?(path)
         end
