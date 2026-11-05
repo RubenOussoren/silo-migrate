@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require_relative "support/discourse_runtime"
 
 class WorkflowStateTest < SiloMigrateTest
   class NonEmptyRuntime < SiloMigrate::Runtime::Fake
@@ -230,7 +231,7 @@ end
 class DiscourseWorkflowStateTest < SiloMigrateTest
   def test_restore_and_import_are_one_shot_until_confirmed_reset
     with_tmp_base do |dir, env|
-      runtime = SiloMigrate::Runtime::Fake.new
+      runtime = DiscourseFakeRuntime.new
       project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
       root = project.init("acme")
       docker_root = File.join(dir, "discourse")

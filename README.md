@@ -290,23 +290,25 @@ bin/silo-migrate converter source acme final   # explicit cutover switch
 For the optional Discourse handoff containers:
 
 ```bash
-# one-time Linux launcher checkout setup; skip if /var/discourse already exists
-bin/silo-migrate discourse install-launcher
+# Example only: first obtain a separately inspected/pinned launcher and runtime.
+# install-launcher defaults to floating main; it is not a pinned runtime recipe.
 
-bin/silo-migrate discourse setup acme
-bin/silo-migrate discourse rebuild acme --role uploads
-bin/silo-migrate discourse start acme --role uploads
-bin/silo-migrate discourse prepare-deps acme --role uploads
-bin/silo-migrate discourse run-uploads acme
+bin/silo-migrate discourse setup acme --standard-local
 bin/silo-migrate discourse rebuild acme --role import
 bin/silo-migrate discourse start acme --role import
 bin/silo-migrate discourse prepare-deps acme --role import
-bin/silo-migrate discourse restore-import acme --backup /path/to/backup.tar.gz
+# Restore the engineer-provided baseline into the pristine import role.
+bin/silo-migrate discourse restore-import acme --backup /path/to/engineer-baseline.tar.gz
+# Capture that baseline under an explicit, distinct local archive identity.
+bin/silo-migrate discourse backup-import acme --filename baseline-before-import.tar.gz
+bin/silo-migrate discourse run-uploads acme --role import
 bin/silo-migrate discourse import acme
-bin/silo-migrate discourse backup-import acme
-# Before another restore/import against the scratch import instance:
-bin/silo-migrate discourse reset-import acme --yes
+bin/silo-migrate discourse backup-import acme --filename final-local-migration.tar.gz \
+  --required-upload uploads/default/original/sandbox.txt \
+  --required-upload uploads/default/original/source.txt
 ```
+
+This is a CLI shape only; see [the standard local backup workflow](docs/standard-local-backup.md) for the returned versioned filename, validation limits, and unknown runtime readiness. Explicit `--filename` is required for each backup; the guided backup action does not supply one. `--standard-local` is an explicit opt-in setup profile. `prepare-deps` verifies the frozen bundle and does not install dependencies.
 
 ## Guided Workflow
 

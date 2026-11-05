@@ -1,9 +1,10 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require_relative "support/discourse_runtime"
 
 class DiscourseServiceTest < SiloMigrateTest
-  def build_service(env, runtime: SiloMigrate::Runtime::Fake.new)
+  def build_service(env, runtime: DiscourseFakeRuntime.new)
     out = StringIO.new
     project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
     service = SiloMigrate::Services::DiscourseService.new(runtime: runtime, env: env, output: out)
@@ -113,44 +114,48 @@ class DiscourseServiceTest < SiloMigrateTest
       service.restore_import("acme", backup: backup)
 
       docker_cp = runtime.commands.find { |command| command[0] == :run && command[1][0, 2] == ["docker", "cp"] }
-      restore = runtime.commands.find { |command| command[0] == :run && command[1].include?("DISCOURSE_ENABLE_RESTORE=true bundle exec script/discourse restore backup.tar.gz") }
+      restore = runtime.commands.find { |command| command[0] == :run && command[1].join(" ").include?("script/discourse restore backup.tar.gz") }
       assert_includes docker_cp[1].last, "acme-import:"
       assert_equal "acme-import", restore[1][2]
       refute runtime.commands.any? { |command| command[0] == :run && command[1].include?("acme-uploads") && command[1].join(" ").include?("restore") }
       assert_includes out.string, "[INFO] Copying Discourse backup into acme-import..."
       assert_includes out.string, "[INFO] Running: docker cp"
       assert_includes out.string, "[INFO] Restoring Discourse backup in acme-import..."
-      assert_includes out.string, "DISCOURSE_ENABLE_RESTORE\\=true"
+      assert runtime.commands.any? { |entry| entry[0] == :run && entry[1].join(" ").include?("script/discourse enable_restore") }
+      refute runtime.restore_allowed
     end
   end
 
-  def test_builds_dependency_upload_import_final_import_and_backup_commands
+  def test_builds_frozen_dependency_same_instance_standard_import_and_exact_backup_commands
     with_tmp_base do |dir, env|
       project, service, runtime, out = build_service(env)
       project.init("acme")
       service.setup("acme", docker_path: fake_discourse_docker(dir))
-      write(File.join(project.project_path("acme"), "output", "intermediate.db"), "sqlite")
-      write(File.join(project.project_path("acme"), "output", "uploads.sqlite3"), "uploads")
+      root = project.project_path("acme")
+      write(File.join(root, "output", "intermediate.db"), "sqlite")
+      runtime.processing_path = File.join(root, "output", "uploads.sqlite3")
 
       service.prepare_deps("acme", role: "both")
-      service.run_uploads("acme")
+      service.run_uploads("acme", role: "import")
       service.import("acme")
-      service.backup_import("acme")
+      archive = service.backup_import("acme", filename: "final-01.tar.gz", required_uploads: ["uploads/default/original/sandbox.txt", "uploads/default/original/source.txt"])
 
-      command_texts = runtime.commands.select { |entry| entry[0] == :run }.map { |entry| entry[1].join(" ") }
-      assert command_texts.any? { |cmd| cmd.include?("acme-uploads su discourse -c bundle config set --local with generic_import && bundle install") }
-      assert command_texts.any? { |cmd| cmd.include?("acme-import su discourse -c bundle config set --local with generic_import && bundle install") }
-      assert command_texts.any? { |cmd| cmd.include?("uploads_importer.rb /migrations/acme/shared/bulk_import_scripts/uploads_importer.yml") }
-      assert command_texts.any? { |cmd| cmd.include?("IMPORT=1 bundle exec ruby script/bulk_import/generic_bulk.rb /migrations/acme/output/intermediate.db /migrations/acme/output/uploads.sqlite3") }
-      assert command_texts.any? { |cmd| cmd.include?("acme-import su discourse -c bundle exec script/discourse backup") }
-      assert_includes out.string, "[INFO] Preparing Discourse uploads dependencies in acme-uploads..."
-      assert_includes out.string, "[INFO] Preparing Discourse import dependencies in acme-import..."
-      assert_includes out.string, "[INFO] Running Discourse uploads importer in acme-uploads..."
-      assert_includes out.string, "uploads_importer.rb"
-      assert_includes out.string, "[INFO] Running Discourse generic import in acme-import..."
-      assert_includes out.string, "generic_bulk.rb"
-      assert_includes out.string, "[INFO] Generating final Discourse backup in acme-import..."
-      assert_includes out.string, "[INFO] Finding latest Discourse backup in acme-import..."
+      commands = runtime.commands.select { |entry| entry[0] == :run }.map { |entry| entry[1] }
+      assert_equal 2, commands.count { |cmd| cmd.last.include?("bundle check") }
+      refute commands.any? { |cmd| cmd.last.include?("bundle install") }
+      upload = commands.find { |cmd| cmd.last.include?("uploads_importer.rb") }
+      assert_equal "acme-import", upload[2]
+      importer = commands.find { |cmd| cmd.last.include?("generic_bulk.rb") }
+      assert_includes importer.last, "env -u IMPORT -u DELTA_IMPORT -u MERGE_IMPORT"
+      assert_includes importer.last, "BUNDLE_WITH\\=generic_import"
+      assert_includes importer.last, "generic_bulk.rb /migrations/acme/output/intermediate.db /migrations/acme/output/uploads.sqlite3"
+      assert_includes File.basename(archive), "final-01-v"
+      manifest = JSON.parse(File.read(File.join(File.dirname(archive), "manifest.json")))
+      assert_equal "archive-validated", manifest.fetch("state")
+      assert_equal Digest::SHA256.file(archive).hexdigest, manifest.dig("archive", "sha256")
+      assert_equal Digest::SHA256.hexdigest("sandbox"), manifest.dig("members", "upload_sha256", "uploads/default/original/sandbox.txt")
+      assert_includes out.string, "not restore-proven"
+      refute commands.any? { |cmd| cmd.join(" ").include?("ls -1t") }
     end
   end
 
@@ -165,18 +170,19 @@ class DiscourseServiceTest < SiloMigrateTest
     end
   end
 
-  def test_final_import_uses_intermediate_db_only_when_uploads_db_is_missing
+  def test_final_import_requires_processing_database_unless_explicitly_omitted
     with_tmp_base do |dir, env|
       project, service, runtime, out = build_service(env)
       project.init("acme")
       service.setup("acme", docker_path: fake_discourse_docker(dir))
       write(File.join(project.project_path("acme"), "output", "intermediate.db"), "sqlite")
-
-      service.import("acme")
+      error = assert_raises(SiloMigrate::UsageError) { service.import("acme") }
+      assert_includes error.message, "Upload processing database is required"
+      refute runtime.commands.any? { |entry| entry[0] == :run && entry[1].join(" ").include?("generic_bulk.rb") }
+      service.import("acme", no_uploads_db: true)
       import_command = runtime.commands.reverse.find { |entry| entry[0] == :run && entry[1].join(" ").include?("generic_bulk.rb") }
-      assert_includes import_command[1].join(" "), "/migrations/acme/output/intermediate.db"
       refute_includes import_command[1].join(" "), "/migrations/acme/output/uploads.sqlite3"
-      assert_includes out.string, "uploads.sqlite3 not found"
+      assert_includes out.string, "Explicitly skipping"
     end
   end
 

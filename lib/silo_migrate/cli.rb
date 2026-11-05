@@ -203,18 +203,27 @@ module SiloMigrate
                silo-migrate discourse stop CUSTOMER [--role uploads|import|both]
                silo-migrate discourse status CUSTOMER [--role uploads|import|both]
                silo-migrate discourse prepare-deps CUSTOMER [--role uploads|import|both]
-               silo-migrate discourse run-uploads CUSTOMER
+               silo-migrate discourse run-uploads CUSTOMER [--role uploads|import]
                silo-migrate discourse restore-import CUSTOMER --backup PATH
                silo-migrate discourse import CUSTOMER [--no-uploads-db]
-               silo-migrate discourse backup-import CUSTOMER
+               silo-migrate discourse backup-import CUSTOMER --filename NAME.tar.gz [--required-upload MEMBER ...]
                silo-migrate discourse reset-import CUSTOMER --yes
 
         Restore is allowed only on a pristine import instance. One generic
         import is allowed on pristine or restored; reset-import is required
-        before repeating either operation. run-uploads and import consume the
-        selected converter output database. If output/uploads.sqlite3
-        exists it is passed to generic_bulk.rb too; --no-uploads-db skips it
-        explicitly.
+        before repeating either operation. The uploader consumes the selected
+        converter output database; uploads.sqlite3 is required by default for import;
+        --no-uploads-db is the explicit skip. run-uploads supports exactly one
+        role (uploads or import); both is not supported. backup-import requires
+        an explicit safe --filename NAME.tar.gz. --filename is a requested basename,
+        not the resulting archive name: upstream appends -v<app-version>-<schema>.tar.gz.
+        Output and manifest are isolated in a new exclusive local directory
+        named for the requested stem. --required-upload may be repeated for exact
+        archive members; for a standard rehearsal supply sandbox and source files.
+        Validation supports the tiny fixture archive only (PAX/extended entries
+        fail closed); the standard-local CPU guard requires Etc.nprocessors=1.
+        Archive validation is not restore proof. prepare-deps verifies the frozen
+        bundle without installing dependencies.
 
         setup writes two discourse_docker container YAML files:
           <customer>-uploads on 127.0.0.1:8080
@@ -240,6 +249,7 @@ module SiloMigrate
           --db-pool N                 Rails DB pool
           --shared-buffers VALUE      Postgres shared buffers
           --max-connections N         Postgres max connections
+          --standard-local           opt in to the tiny local text-fixture profile
       HELP
       "schema" => <<~HELP,
         Usage: silo-migrate schema export CUSTOMER [--phase PHASE] [-o DIR]
@@ -504,7 +514,16 @@ module SiloMigrate
       when "status" then discourse_role_command(argv) { |customer, role| @discourse_service.status(customer, role: role) }
       when "prepare-deps" then discourse_role_command(argv) { |customer, role| @discourse_service.prepare_deps(customer, role: role) }
       when "run-uploads"
-        @discourse_service.run_uploads(required_arg(argv, "CUSTOMER"))
+        options = { role: "uploads" }
+        OptionParser.new do |opts|
+          opts.on("--role ROLE") do |value|
+            role = validate_discourse_role(value)
+            raise UsageError, "Upload processing supports only one role: uploads or import" unless %w[uploads import].include?(role)
+
+            options[:role] = role
+          end
+        end.parse!(argv)
+        @discourse_service.run_uploads(required_arg(argv, "CUSTOMER"), **options)
       when "restore-import"
         options = {}
         OptionParser.new { |opts| opts.on("--backup PATH") { |value| options[:backup] = value } }.parse!(argv)
@@ -516,7 +535,14 @@ module SiloMigrate
         OptionParser.new { |opts| opts.on("--no-uploads-db") { options[:no_uploads_db] = true } }.parse!(argv)
         @discourse_service.import(required_arg(argv, "CUSTOMER"), **options)
       when "backup-import"
-        @discourse_service.backup_import(required_arg(argv, "CUSTOMER"))
+        options = { required_uploads: [] }
+        OptionParser.new do |opts|
+          opts.on("--filename NAME") { |value| options[:filename] = value }
+          opts.on("--required-upload MEMBER") { |value| options[:required_uploads] << value }
+        end.parse!(argv)
+        raise UsageError, "Missing required option: --filename NAME.tar.gz" if options[:filename].to_s.empty?
+
+        @discourse_service.backup_import(required_arg(argv, "CUSTOMER"), **options)
       when "reset-import"
         options = { yes: false }
         OptionParser.new { |opts| opts.on("-y", "--yes") { options[:yes] = true } }.parse!(argv)
@@ -554,6 +580,7 @@ module SiloMigrate
         opts.on("--db-pool N", Integer) { |value| options[:db_pool] = value }
         opts.on("--shared-buffers VALUE") { |value| options[:db_shared_buffers] = value }
         opts.on("--max-connections N", Integer) { |value| options[:db_max_connections] = value }
+        opts.on("--standard-local") { options[:standard_local] = "true" }
       end.parse!(argv)
       @discourse_service.setup(required_arg(argv, "CUSTOMER"), options)
     end

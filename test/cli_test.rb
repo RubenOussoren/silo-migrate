@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require_relative "support/discourse_runtime"
 
 class CLITest < SiloMigrateTest
   def test_help_output
@@ -18,6 +19,8 @@ class CLITest < SiloMigrateTest
     assert_includes out.string, "trusted session"
     assert_includes out.string, "discourse setup"
     assert_includes out.string, "discourse import"
+    assert_includes out.string, "silo-migrate help <command>"
+    assert_includes out.string.gsub(/\s+/, " "), "Show a command's flags and examples"
     assert_includes out.string, "--bundle-install also builds/starts"
     assert_includes out.string, "doctor"
     assert_includes out.string, "self-update"
@@ -25,6 +28,76 @@ class CLITest < SiloMigrateTest
     assert_includes out.string, "converter summary"
     assert_includes out.string, "alias: go"
     assert_includes out.string, "migration-tool = silo-migrate"
+  end
+
+  def test_discourse_run_uploads_routes_import_role_and_rejects_both
+    with_tmp_base do |dir, env|
+      runtime = DiscourseFakeRuntime.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      docker_path = File.join(dir, "discourse")
+      FileUtils.mkdir_p(docker_path)
+      launcher = write(File.join(docker_path, "launcher"), "#!/usr/bin/env bash\n")
+      FileUtils.chmod(0o755, launcher)
+      error = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: error)
+      assert_equal 0, cli.run(["discourse", "setup", "acme", "--docker-path", docker_path])
+      root = SiloMigrate::Project.project_path("acme", env)
+      write(File.join(root, "output", "intermediate.db"), "synthetic sqlite placeholder")
+      runtime.processing_path = File.join(root, "output", "uploads.sqlite3")
+
+      assert_equal 0, cli.run(["discourse", "run-uploads", "acme", "--role", "import"])
+      assert runtime.commands.any? { |entry| entry[0] == :run && entry[1].join(" ").include?("docker exec acme-import") && entry[1].join(" ").include?("uploads_importer.rb") }
+      assert_equal 1, cli.run(["discourse", "run-uploads", "acme", "--role", "both"])
+      assert_includes error.string, "uploads or import"
+    end
+  end
+
+  def test_discourse_backup_cli_requires_filename_and_passes_exact_inventory
+    with_tmp_base do |dir, env|
+      runtime = DiscourseFakeRuntime.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      docker_path = File.join(dir, "discourse")
+      FileUtils.mkdir_p(docker_path)
+      launcher = write(File.join(docker_path, "launcher"), "#!/usr/bin/env bash\n")
+      FileUtils.chmod(0o755, launcher)
+      error = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: error)
+      assert_equal 0, cli.run(["discourse", "setup", "acme", "--docker-path", docker_path])
+
+      assert_equal 1, cli.run(["discourse", "backup-import", "acme"])
+      assert_includes error.string, "--filename"
+      members = ["uploads/default/original/sandbox.txt", "uploads/default/original/source.txt"]
+      assert_equal 0, cli.run(["discourse", "backup-import", "acme", "--filename", "cli-check.tar.gz", *members.flat_map { |member| ["--required-upload", member] }])
+      archive = Dir[File.join(SiloMigrate::Project.project_path("acme", env), "output", "discourse-backups", "cli-check", "*.tar.gz")].fetch(0)
+      assert File.file?(archive)
+      manifest = JSON.parse(File.read(File.join(File.dirname(archive), "manifest.json")))
+      assert_equal members, manifest.fetch("required_uploads")
+      assert_includes runtime.commands.find { |entry| entry[0] == :run && entry[1].join(" ").include?("script/discourse backup") }[1].join(" "), "cli-check.tar.gz"
+    end
+  end
+
+  def test_discourse_standard_local_setup_persists_opt_in_and_import_requires_processing_db
+    with_tmp_base do |dir, env|
+      runtime = SiloMigrate::Runtime::Fake.new
+      project = SiloMigrate::Services::ProjectService.new(runtime: runtime, env: env, output: StringIO.new)
+      project.init("acme")
+      docker_path = File.join(dir, "discourse")
+      FileUtils.mkdir_p(docker_path)
+      launcher = write(File.join(docker_path, "launcher"), "#!/usr/bin/env bash\n")
+      FileUtils.chmod(0o755, launcher)
+      error = StringIO.new
+      cli = SiloMigrate::CLI.new(runtime: runtime, env: env, output: StringIO.new, error: error)
+      assert_equal 0, cli.run(["discourse", "setup", "acme", "--docker-path", docker_path, "--standard-local"])
+      config = SiloMigrate::Project.load_config("acme", env)
+      assert_equal "true", config.fetch("DISCOURSE_STANDARD_LOCAL")
+      root = SiloMigrate::Project.project_path("acme", env)
+      write(File.join(root, "output", "intermediate.db"), "synthetic sqlite placeholder")
+
+      assert_equal 1, cli.run(["discourse", "import", "acme"])
+      assert_match(/processing database|uploads.sqlite3/i, error.string)
+    end
   end
 
   def test_per_command_help
@@ -52,10 +125,17 @@ class CLITest < SiloMigrateTest
     assert_equal 0, cli.run(["trusted", "--help"])
     assert_includes out.string, "mysql -u root -e"
 
+    # Check Discourse flags only in this command's help, not earlier output.
+    out.truncate(0)
+    out.rewind
     assert_equal 0, cli.run(["discourse", "--help"])
     assert_includes out.string, "restore-import"
+    assert_includes out.string, "run-uploads CUSTOMER [--role uploads|import]"
     assert_includes out.string, "--no-uploads-db"
-
+    assert_includes out.string, "--required-upload MEMBER"
+    assert_includes out.string, "--filename NAME.tar.gz"
+    assert_includes out.string, "--standard-local"
+    assert_includes out.string.gsub(/\s+/, " "), "prepare-deps verifies the frozen bundle without installing dependencies."
     assert_equal 0, cli.run(["self-update", "--help"])
     assert_includes out.string, "Pulls the managed Git checkout"
     assert_includes out.string, "Does not run OS package managers or manage Docker"
@@ -332,7 +412,7 @@ class CLITest < SiloMigrateTest
       FileUtils.chmod(0o755, launcher)
       assert_equal 0, cli.run(["discourse", "setup", "acme", "--docker-path", docker_path, "--uploads-port", "18080", "--import-port", "18081"])
       write(File.join(SiloMigrate::Project.project_path("acme", env), "output", "intermediate.db"), "sqlite")
-      assert_equal 0, cli.run(["discourse", "import", "acme"])
+      assert_equal 0, cli.run(["discourse", "import", "acme", "--no-uploads-db"])
 
       assert File.exist?(File.join(docker_path, "containers", "acme-uploads.yml"))
       import_command = runtime.commands.reverse.find { |entry| entry[0] == :run && entry[1].join(" ").include?("generic_bulk.rb") }
