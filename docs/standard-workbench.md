@@ -121,6 +121,18 @@ A rebuild may produce a different image ID, because the discarded build stage us
 
 Each instance's web container sits on an internal Docker network with no route out. Only a small proxy publishes HTTP, on `127.0.0.1` in the range 18080–18089. Containers have CPU, memory and PID limits, bounded logs and no restart policy. Docker enforces each container's limit, and admission refuses a run that would exceed 4 CPUs or 8GiB in total. Storage isn't quota-enforced; admission checks free disk.
 
+## Hands-on check
+
+1. Open the review site and find **Sandbox welcome topic created before migration** next to the imported topics.
+2. Download the attachments from the sandbox topic and an imported topic, and check their text.
+3. Log in as `sandbox_admin` with the password from `standard run private-paths`. Check that the Admin area loads.
+4. Open the restored site and repeat. The same password works, because the accounts came from the backup.
+5. In a new terminal or chat, run `standard status` and see the same state.
+6. Ask the operator agent to approve a plan, and see it refuse.
+7. Touch a registered file under the workspace's `inputs/`, then run `standard plan show` on an approved plan and see `stale`.
+
+Email is disabled and the sites have no route out, so anything involving email won't work there.
+
 ## Limitations
 
 - **Synthetic only.** Customer data needs separately approved isolation that this doesn't provide.
