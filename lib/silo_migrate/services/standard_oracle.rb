@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "nokogiri"
+
 module SiloMigrate
   module Services
     # Independent comparison of site facts against the baseline and the dataset's
@@ -61,10 +63,12 @@ module SiloMigrate
         expected.fetch("topics").each do |topic|
           failures << "imported-topic-missing:#{topic['topic_id']}" unless titles.include?(topic["topic_subject"])
         end
-        raws = site.fetch("posts").map { |post| post["raw"].to_s }
+        # Source bodies are HTML; destination raw bodies are Markdown. Compare
+        # rendered text instead, retaining the entire expected body as evidence.
+        texts = site.fetch("posts").map { |post| visible_text(post["cooked"]) }
         expected.fetch("posts").each do |post|
-          fragment = post["raw"].to_s.gsub(/<[^>]+>/, "").strip
-          failures << "imported-post-missing:#{post['post_id']}" unless !fragment.empty? && raws.any? { |raw| raw.include?(fragment) }
+          fragment = visible_text(post["raw"])
+          failures << "imported-post-missing:#{post['post_id']}" unless !fragment.empty? && texts.any? { |text| text.include?(fragment) }
         end
         counts = site.fetch("custom_fields")
         { "users" => "user_import_ids", "topics" => "topic_import_ids", "posts" => "post_import_ids", "categories" => "category_import_ids" }.each do |kind, field|
@@ -134,6 +138,10 @@ module SiloMigrate
           failures << "collision-category:#{category['slug'] || category['name']}"
         end
         failures
+      end
+
+      def visible_text(html)
+        Nokogiri::HTML.fragment(html.to_s).text.gsub(/[[:space:]]+/, " ").strip
       end
 
       def normalize(text, base_url_map)
