@@ -307,7 +307,7 @@ class StandardFullRunTest < SiloMigrateTest
   end
 
   { 'verify_site' => 'STANDARD_VERIFY_FAILED', 'final_backup' => 'STANDARD_BACKUP_FAILED',
-    'review_url' => 'STANDARD_INTERNAL', 'restore' => 'STANDARD_RESTORE_FAILED', 'verify_restore' => 'STANDARD_RESTORE_FAILED' }.each do |stage, code|
+    'review_url' => 'STANDARD_RUNNER_FAILED', 'restore' => 'STANDARD_RESTORE_FAILED', 'verify_restore' => 'STANDARD_RESTORE_FAILED' }.each do |stage, code|
     define_method("test_#{stage}_failure_never_promotes_final_to_restore_proven") do
       with_complete do
         @runtime.fail_stage = stage
