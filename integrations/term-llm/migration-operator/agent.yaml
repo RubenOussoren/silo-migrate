@@ -44,10 +44,10 @@ tools:
         required: [workspace, plan_id]
         additionalProperties: false
     - name: migration_run_request
-      description: "Request execution of a plan the engineer has already approved. Refused unless approved and current. Starts in the background; poll with migration_status."
+      description: "Request execution of a plan the engineer has already approved. Refused unless approved and current. Starts in the background; poll with migration_run_show."
       script: scripts/standard_tool.py
       call: json
-      timeout_seconds: 60
+      timeout_seconds: 120
       input:
         type: object
         properties:

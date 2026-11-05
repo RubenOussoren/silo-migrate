@@ -66,7 +66,8 @@ module SiloMigrate
 
       MAX_PLANS = 128
       EXECUTE_LOCK_WAIT = 120
-      CLAIM_GRACE_SECONDS = 60
+      # Longer than EXECUTE_LOCK_WAIT, so a queued executor isn't called never-started.
+      CLAIM_GRACE_SECONDS = 180
       HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
@@ -262,7 +263,9 @@ module SiloMigrate
       rescue StandardWorkflowError => error
         raise unless error.code == "STANDARD_BUSY"
 
-        fail_run(run_id, STAGES.first, "STANDARD_BUSY", "execution lock unavailable")
+        # A duplicate request must not fail a run another process is executing.
+        raise unless fail_unstarted_claim(run_id)
+
         public_run(@store.load.fetch("runs").fetch(run_id), held: false)
       end
 
@@ -600,18 +603,33 @@ module SiloMigrate
         end
       end
 
-      def fail_run(run_id, stage, code, detail)
-        @store.write_private(@store.run_dir(run_id, "private", "failure.json"),
-                             JSON.pretty_generate("stage" => stage, "code" => code, "detail" => detail, "at" => now) + "\n")
+      def fail_unstarted_claim(run_id)
+        failed = false
         @store.update do |state|
           run = state.fetch("runs").fetch(run_id)
-          run.fetch("stages")[stage] = run.fetch("stages").fetch(stage).merge("status" => "failed", "finished_at" => now)
-          run["status"] = "failed"
-          run["finished_at"] = now
-          recovery = RECOVERY.fetch(code) { RECOVERY.fetch("STANDARD_INTERNAL") }
-          run["failure"] = { "stage" => stage, "code" => RECOVERY.key?(code) ? code : "STANDARD_INTERNAL", "recovery" => recovery }
-          mark_instances_dirty(state, run)
+          next unless run["status"] == "claimed"
+
+          apply_failure(state, run, STAGES.first, "STANDARD_BUSY", "execution lock unavailable")
+          failed = true
         end
+        failed
+      end
+
+      def fail_run(run_id, stage, code, detail)
+        @store.update do |state|
+          apply_failure(state, state.fetch("runs").fetch(run_id), stage, code, detail)
+        end
+      end
+
+      def apply_failure(state, run, stage, code, detail)
+        @store.write_private(@store.run_dir(run.fetch("id"), "private", "failure.json"),
+                             JSON.pretty_generate("stage" => stage, "code" => code, "detail" => detail, "at" => now) + "\n")
+        run.fetch("stages")[stage] = run.fetch("stages").fetch(stage).merge("status" => "failed", "finished_at" => now)
+        run["status"] = "failed"
+        run["finished_at"] = now
+        recovery = RECOVERY.fetch(code) { RECOVERY.fetch("STANDARD_INTERNAL") }
+        run["failure"] = { "stage" => stage, "code" => RECOVERY.key?(code) ? code : "STANDARD_INTERNAL", "recovery" => recovery }
+        mark_instances_dirty(state, run)
       end
 
       def mark_instances_dirty(state, run)
@@ -1463,7 +1481,7 @@ module SiloMigrate
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
         if status == "not_started"
-          result[:recovery] = "The background process never started this run, so no instance was created. Its plan and output names are used. Run: silo-migrate standard run recover #{@workspace} #{run['id']}, then propose and approve a new plan."
+          result[:recovery] = "No process has started this run, so no instance was created. Its plan and output names are used. Run: silo-migrate standard run recover #{@workspace} #{run['id']}, then propose and approve a new plan."
         end
         if status == "abandoned"
           result[:recovery] = "The executing process is gone. Run: silo-migrate standard run recover #{@workspace} #{run['id']}, then reset and re-plan."

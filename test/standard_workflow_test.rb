@@ -496,6 +496,41 @@ class StandardWorkflowTest < SiloMigrateTest
     end
   end
 
+  def test_duplicate_execute_never_fails_a_run_another_process_is_executing
+    with_standard do
+      run_id = claim
+      @service.store.with_op_lock do
+        # The other process has already moved this run past claimed.
+        @service.store.update { |state| state['runs'][run_id]['status'] = 'running' }
+        contender = new_standard
+        store = contender.store
+        def store.with_op_lock(wait: 0)
+          raise SiloMigrate::StandardWorkflowError, 'STANDARD_BUSY'
+        end
+        standard_error('STANDARD_TRANSITION_INVALID') { contender.execute(run_id: run_id) }
+      end
+      assert_equal 'running', new_standard.store.load['runs'][run_id]['status']
+      assert_nil new_standard.store.load['runs'][run_id]['failure']
+    end
+  end
+
+  def test_execute_busy_while_still_claimed_fails_only_that_claim
+    with_standard do
+      run_id = claim
+      other = new_standard
+      store = other.store
+      def store.with_host_lock(wait: 0)
+        raise SiloMigrate::StandardWorkflowError, 'STANDARD_BUSY'
+      end
+      assert_equal 'STANDARD_BUSY', other.execute(run_id: run_id)[:failure]['code']
+      # Moved on between the busy result and the guarded update: not rewritten.
+      @service.store.update { |state| state['runs'][run_id].merge!('status' => 'running', 'failure' => nil) }
+      refute other.send(:fail_unstarted_claim, run_id)
+      assert_equal 'running', new_standard.store.load['runs'][run_id]['status']
+      assert_nil new_standard.store.load['runs'][run_id]['failure']
+    end
+  end
+
   def test_execute_op_lock_contention_is_a_durable_busy_failure
     with_standard do
       run_id = claim
