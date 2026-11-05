@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-require "base64"
 require "digest"
 require "fileutils"
 require "json"
@@ -837,7 +836,7 @@ module SiloMigrate
         @store.write_private(@store.run_dir(run_id, "private", "admin-password"), password)
         sandbox = SANDBOX_ATTACHMENT
         seeded = stack.rails_runner("/tmp/baseline_seed.rb", env: {
-          "SILO_ADMIN_PASSWORD" => password, "SILO_SANDBOX_ATTACHMENT_B64" => Base64.strict_encode64(sandbox)
+          "SILO_ADMIN_PASSWORD" => password, "SILO_SANDBOX_ATTACHMENT_B64" => [sandbox].pack("m0")
         })
         evidence(run_id, "baseline.seed.json", seeded)
         expected = Digest::SHA256.hexdigest(sandbox)

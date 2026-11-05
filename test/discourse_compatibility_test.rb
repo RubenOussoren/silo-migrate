@@ -310,7 +310,7 @@ class DiscourseCompatibilityTest < SiloMigrateTest
   def test_standard_runtime_pin_mismatch_stays_dirty_without_upload_execution
     with_service(standard: true) do |service, runtime, root, store, source|
       local_source(source, root)
-      runtime.fail_on = "rev-parse HEAD"
+      runtime.fail_on = "git-utils-overrides.json"
       assert_raises(SiloMigrate::UsageError) { service.run_uploads("acme", role: "import") }
       assert_equal "dirty", store.read.dig("discourse", "state")
       refute commands(runtime).any? { |text| text.include?("uploads_importer.rb") }

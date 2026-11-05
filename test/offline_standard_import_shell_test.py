@@ -24,7 +24,11 @@ class StandardImportShellTest(unittest.TestCase):
         match = re.search(r"command\[-1\] = <<~SH\n(.*?)\n        SH", source, re.S)
         self.assertIsNotNone(match, "bounded import shell contract not found")
         self.script = match[1]
-        limit = re.search(r"STANDARD_IMPORT_LOG_LIMIT = ([\d_]+)", source)
+        limit_source = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "lib/silo_migrate/services/discourse_archive.rb"
+        ).read_text()
+        limit = re.search(r"STANDARD_IMPORT_LOG_LIMIT = ([\d_]+)", limit_source)
         self.assertIsNotNone(limit)
         self.limit = int(limit[1].replace("_", ""))
         self.script = self.script.replace(
