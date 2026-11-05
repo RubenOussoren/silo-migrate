@@ -94,12 +94,13 @@ module SiloMigrate
           failures << "imported-post-number-mismatch:#{post['post_id']}" unless found["post_number"] == post["post_number"]
           failures << "imported-post-user-mismatch:#{post['post_id']}" unless found["user"] == usernames[post["user_id"].to_s]
           failures << "imported-post-created-mismatch:#{post['post_id']}" unless found["created_at"] == post["created_at"]
+          failures << "imported-post-reply-mismatch:#{post['post_id']}" if reply_mismatch?(post, found, expected.fetch("posts"))
           text = visible_text(post["raw"])
           failures << "imported-post-text-mismatch:#{post['post_id']}" unless !text.empty? && text == post_visible_text(found["cooked"])
         end
 
         if baseline
-          { "topics" => "topics", "posts" => "posts", "users" => "users" }.each do |kind, key|
+          { "topics" => "topics", "posts" => "posts", "users" => "users", "categories" => "categories" }.each do |kind, key|
             total = baseline.fetch(key).size + expected.fetch("counts").fetch(kind)
             failures << "site-#{kind}-total-mismatch:#{site.fetch(key).size}!=#{total}" unless site.fetch(key).size == total
           end
@@ -114,9 +115,17 @@ module SiloMigrate
             failures << "attachment-unreferenced:#{sha[0, 12]}" if upload["post_references"].empty?
           end
         end
-        if (attachment = expected["attachment"])
-          owner = posts.find { |candidate| candidate["import_id"] == attachment["post_id"].to_s }
-          upload = site.fetch("uploads").find { |candidate| candidate["original_filename"] == attachment["file_name"] && candidate["filesize"] == attachment["bytes"] }
+        # Every attachment the source declares must belong to its declared post.
+        owned = expected.fetch("posts").flat_map do |post|
+          Array(post["attachments"]).map { |attachment| [post["post_id"].to_s, attachment] }
+        end
+        unless owned.size == expected.fetch("counts").fetch("attachments")
+          failures << "attachment-expectation-incomplete:#{owned.size}!=#{expected.fetch('counts').fetch('attachments')}"
+        end
+        owned.each do |post_id, attachment|
+          owner = posts.find { |candidate| candidate["import_id"] == post_id }
+          upload = site.fetch("uploads").find { |candidate| candidate["original_filename"] == attachment["file_name"] && (!owner || candidate["post_references"].include?(owner["id"])) }
+          upload ||= site.fetch("uploads").find { |candidate| candidate["original_filename"] == attachment["file_name"] }
           if upload.nil?
             failures << "attachment-record-missing:#{attachment['attachment_id']}"
           elsif owner.nil? || !upload["post_references"].include?(owner["id"])
@@ -131,6 +140,15 @@ module SiloMigrate
         actual = records.map { |record| record["import_id"].to_s }.sort
         (expected_ids - actual).each { |id| failures << "imported-#{label}-missing:#{id}" }
         (actual - expected_ids).each { |id| failures << "imported-#{label}-unexpected:#{id}" }
+        actual.tally.each { |id, count| failures << "imported-#{label}-duplicate:#{id}" if count > 1 }
+      end
+
+      # A reply to a topic's first post is stored without a target, so only later
+      # targets are compared.
+      def reply_mismatch?(post, found, expected_posts)
+        target = expected_posts.find { |candidate| candidate["post_id"] == post["reply_to_post_id"] }
+        wanted = target && target["post_number"].to_i > 1 ? target["post_number"] : nil
+        found["reply_to_post_number"] != wanted
       end
 
       def runtime_failures(site, lock)
@@ -186,16 +204,30 @@ module SiloMigrate
         failures
       end
 
+      BLOCK_ELEMENTS = "p,div,br,li,ul,ol,h1,h2,h3,h4,h5,h6,blockquote,pre,tr,td,th,hr"
+      SIZE_AFTER_LINK = /\A\s*\(\s*\d+(?:\.\d+)?\s*(?:Bytes?|KB|MB|GB)\s*\)/
+
       def visible_text(html)
-        Nokogiri::HTML.fragment(html.to_s).text.gsub(/[[:space:]]+/, " ").strip
+        fragment_text(Nokogiri::HTML.fragment(html.to_s))
       end
 
-      # A post's own words, without the attachment link and size the importer adds.
-      # The attachment is asserted separately against the post that should own it.
+      # A post's own words, without the attachment links and sizes the importer adds.
+      # Attachments are asserted separately against the post that should own them.
       def post_visible_text(cooked)
         fragment = Nokogiri::HTML.fragment(cooked.to_s)
-        fragment.css("a.attachment").each(&:remove)
-        fragment.text.gsub(/\(\s*\d+(?:\.\d+)?\s*(?:Bytes|KB|MB)\s*\)/, "").gsub(/[[:space:]]+/, " ").strip
+        fragment.css("a.attachment").each do |link|
+          following = link.next_sibling
+          following.content = following.text.sub(SIZE_AFTER_LINK, "") if following&.text?
+          link.remove
+        end
+        fragment_text(fragment)
+      end
+
+      # Same treatment for both sides: block boundaries separate words, whitespace
+      # collapses, and the destination's typographer quotes count as plain quotes.
+      def fragment_text(fragment)
+        fragment.css(BLOCK_ELEMENTS).each { |node| node.add_next_sibling(" ") }
+        fragment.text.tr("\u201C\u201D\u2018\u2019", %q(""''")).gsub(/[[:space:]]+/, " ").strip
       end
 
       def normalize(text, base_url_map)

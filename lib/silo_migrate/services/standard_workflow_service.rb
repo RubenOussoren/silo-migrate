@@ -48,6 +48,8 @@ module SiloMigrate
         "STANDARD_INPUTS_INCOMPLETE" => "The dataset's registered inputs are incomplete or span more than one input directory. Register a corrected dataset, then re-plan.",
         "STANDARD_STACK_FAILED" => "A local instance could not start. Inspect private evidence, reset this run, then re-plan.",
         "STANDARD_RUNNER_FAILED" => "A helper script failed inside an instance. Inspect private evidence, reset this run, then re-plan.",
+        "STANDARD_STALE_PLAN" => "Code, runtime or inputs changed after approval. Reset this run, then propose and approve a new plan.",
+        "STANDARD_BUSY" => "Another run held the execution lock. Reset this run, then re-plan.",
         "STANDARD_INPUT_CHANGED" => "An input changed. Do not edit inputs: register a new dataset, then propose and approve a new plan.",
         "STANDARD_COLLISION" => "Source records collide with the baseline. Decide policy, change the fixture or baseline, then re-plan.",
         "STANDARD_RUNTIME_MISMATCH" => "Runtime identity differs from the frozen lock. Rebuild or update the lock deliberately; do not bypass the check.",
@@ -63,12 +65,14 @@ module SiloMigrate
       }.freeze
 
       MAX_PLANS = 128
+      EXECUTE_LOCK_WAIT = 120
+      CLAIM_GRACE_SECONDS = 60
       HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
       attr_reader :store
 
-      def initialize(workspace, runtime: Runtime::Docker.new, env: ENV, code_root: nil, sleeper: nil, http: nil, port_probe: nil, disk_free: nil)
+      def initialize(workspace, runtime: Runtime::Docker.new, env: ENV, code_root: nil, sleeper: nil, http: nil, port_probe: nil, disk_free: nil, execute_lock_wait: EXECUTE_LOCK_WAIT)
         @workspace = workspace
         @runtime = runtime
         @env = env
@@ -78,6 +82,7 @@ module SiloMigrate
         @http = http || method(:http_fetch)
         @port_probe = port_probe || method(:port_free?)
         @disk_free = disk_free || method(:host_disk_free_bytes)
+        @execute_lock_wait = execute_lock_wait
       end
 
       # -- configuration ------------------------------------------------------
@@ -124,6 +129,9 @@ module SiloMigrate
         inputs = dataset_inputs(named, dataset_id)
         require_input_types!(inputs)
         raise StandardWorkflowError, "STANDARD_INPUT_CHANGED" unless inputs_unchanged?(inputs)
+
+        layout = input_layout_problem(inputs)
+        raise StandardWorkflowError, layout if layout
 
         baseline_decision = baseline_decision(state, baseline)
         ports = select_ports(state, ports)
@@ -226,23 +234,36 @@ module SiloMigrate
       # Foreground half of a background start: refusals are returned to the caller.
       # Nothing has been mutated yet, so an unexecuted claim is safely recoverable.
       def claim(plan_id:)
-        @store.with_op_lock do
-          run_id = claim_plan!(plan_id)
-          { version: 1, plan_id: plan_id, run_id: run_id, status: "claimed" }
+        @store.with_host_lock do
+          @store.with_op_lock do
+            run_id = claim_plan!(plan_id)
+            { version: 1, plan_id: plan_id, run_id: run_id, status: "claimed" }
+          end
         end
       end
 
+      # Waits briefly for the locks, because the caller has already returned. If they
+      # stay held, the claim becomes a durable failure rather than silently stalling.
       def execute(run_id:)
-        @store.with_host_lock do
-          @store.with_op_lock do
-            run = @store.load.fetch("runs")[run_id]
-            raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
-            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless run["status"] == "claimed"
+        run = @store.load.fetch("runs")[run_id]
+        raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
+        raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless run["status"] == "claimed"
+
+        @store.with_host_lock(wait: @execute_lock_wait) do
+          @store.with_op_lock(wait: @execute_lock_wait) do
+            unless @store.load.fetch("runs").fetch(run_id)["status"] == "claimed"
+              raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID"
+            end
 
             execute_stages(run_id)
             public_run(@store.load.fetch("runs").fetch(run_id), held: true)
           end
         end
+      rescue StandardWorkflowError => error
+        raise unless error.code == "STANDARD_BUSY"
+
+        fail_run(run_id, STAGES.first, "STANDARD_BUSY", "execution lock unavailable")
+        public_run(@store.load.fetch("runs").fetch(run_id), held: false)
       end
 
       # Explicit: only an abandoned running run (executor lock free) is marked.
@@ -262,8 +283,9 @@ module SiloMigrate
         end
       end
 
-      # Removes only this run's owned instances, by exact recorded ID. Evidence,
-      # plans and retained backups are preserved. Requires explicit engineer intent.
+      # Removes this run's owned instances by exact recorded ID, then anything else
+      # carrying its exact run label. Evidence, plans and retained backups are
+      # preserved. Requires explicit engineer intent.
       def reset_run(run_id:, yes: false)
         raise StandardWorkflowError, "STANDARD_CONFIRMATION_REQUIRED" unless yes
 
@@ -273,18 +295,21 @@ module SiloMigrate
           raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
           raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" if %w[claimed running].include?(run["status"])
 
-          removed = []
-          run.fetch("instances", {}).each_value do |name|
+          stacks = run.fetch("instances", {}).values.filter_map do |name|
             record = state.fetch("instances")[name]
             next unless record && record["state"] != "removed"
 
             stack = PrebuiltStack.new(runtime: @runtime, lock: lock, name: name, record: record)
             stack.remove!
-            @store.update { |current| current.fetch("instances")[name] = stack.record }
-            removed << name
+            stack
           end
+          # Persist "removed" only after the sweep, so a failed reset stays dirty and
+          # keeps blocking new runs. Retrying is safe: absent resources are skipped.
           sweep_run_resources(run_id)
-          { version: 1, run_id: run_id, status: "reset", removed: removed }
+          @store.update do |current|
+            stacks.each { |stack| current.fetch("instances")[stack.name] = stack.record }
+          end
+          { version: 1, run_id: run_id, status: "reset", removed: stacks.map(&:name) }
         end
       end
 
@@ -375,6 +400,18 @@ module SiloMigrate
         false
       end
 
+      # A dataset owns exactly one inputs/<dir>/ tree, holding only registered files.
+      def input_layout_problem(inputs)
+        paths = inputs.map { |input| input.fetch("path").unpack1("m0") }
+        roots = paths.map { |path| path.split("/").first(2) }.uniq
+        return "STANDARD_INPUTS_INCOMPLETE" unless roots.size == 1 && roots.first.size == 2 && paths.none? { |path| path.split("/").size < 3 }
+
+        root = File.join(@store.workspace_root.b, roots.first.join("/").b)
+        registered = paths.map { |path| File.join(@store.workspace_root.b, path.b) }
+        on_disk = Dir.glob("**/*", File::FNM_DOTMATCH, base: root).map { |rel| File.join(root, rel).b }.reject { |path| File.basename(path) == "." || (File.directory?(path) && !File.symlink?(path)) }
+        (on_disk - registered).empty? ? nil : "STANDARD_INPUT_CHANGED"
+      end
+
       def require_input_types!(inputs)
         types = inputs.map { |input| input["type"] }
         %w[source-sql converter-settings expected].each do |type|
@@ -422,7 +459,7 @@ module SiloMigrate
         return "inputs" unless @store.named.input_binding(named, ids) == body.fetch("input_stat_binding")
         current = dataset_inputs(named, body.fetch("dataset_id"))
         return "dataset" unless current.map { |input| input["id"] }.sort == ids.sort
-        return "inputs" unless inputs_unchanged?(current)
+        return "inputs" unless inputs_unchanged?(current) && input_layout_problem(current).nil?
         return "code" unless code_identity == body.fetch("code_identity")
         return "runtime" unless Digest::SHA256.hexdigest(JSON.generate(lock)) == body.fetch("runtime_lock_sha256")
         return "converter" unless state.dig("config", "converter_revision") == body.fetch("converter_revision")
@@ -622,7 +659,13 @@ module SiloMigrate
       # Everything later stages consume comes from this run-owned copy of exactly the
       # plan's bound bytes. A new or edited file in the workspace can't reach a stage.
       def stage_preflight(run_id)
-        body = plan_for(run_id).fetch("body")
+        plan = plan_for(run_id)
+        body = plan.fetch("body")
+        # Execution can start any time after the claim, so everything approved is
+        # checked again by the process that will actually use it.
+        stale = stale_reason(plan, @store.load)
+        raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
+
         named = @store.named_state
         lock.fetch("images").each do |role, image|
           inspected = @runtime.run(["docker", "image", "inspect", "--format", "{{.Id}}", image.fetch("id")], capture: true, timeout: 30)
@@ -641,18 +684,13 @@ module SiloMigrate
 
       def materialize_inputs(run_id, body, named)
         bound = body.fetch("input_binding").map { |binding| [named.fetch("inputs").fetch(binding.fetch("id")), binding] }
-        roots = bound.map { |input, _| input.fetch("path").unpack1("m0").split("/").first(2).join("/") }.uniq
-        raise StandardWorkflowError.new("STANDARD_INPUTS_INCOMPLETE", "layout") unless roots.size == 1
-
-        root = File.join(@store.workspace_root, roots.first)
-        registered = bound.map { |input, _| File.join(@store.workspace_root, input.fetch("path").unpack1("m0")) }
-        on_disk = Dir.glob("**/*", File::FNM_DOTMATCH, base: root).map { |rel| File.join(root, rel) }.reject { |path| File.basename(path) == "." || (File.directory?(path) && !File.symlink?(path)) }
-        unless (on_disk - registered).empty?
-          raise StandardWorkflowError.new("STANDARD_INPUT_CHANGED", "unregistered file present")
-        end
+        layout = input_layout_problem(bound.map(&:first))
+        raise StandardWorkflowError.new(layout, "input layout") if layout
 
         bound.map do |input, binding|
-          relative = input.fetch("path").unpack1("m0")
+          relative = input.fetch("path").unpack1("m0").force_encoding("UTF-8")
+          raise StandardWorkflowError.new("STANDARD_INPUTS_INCOMPLETE", "path encoding") unless relative.valid_encoding?
+
           source = File.join(@store.workspace_root, relative)
           @store.named.verify_input_identity(input)
           bytes = File.binread(source)
@@ -1351,7 +1389,8 @@ module SiloMigrate
         map = { source.dig("runtime", "base_url") => restored.dig("runtime", "base_url") }
         expected, attachments, bytes = expected_for(run_id)
         base = JSON.parse(File.read(@store.run_dir(run_id, "evidence", "baseline.fingerprint.json")))
-        failures = StandardOracle.restored_failures(source, restored, base_url_map: map)
+        failures = StandardOracle.runtime_failures(restored, lock)
+        failures.concat(StandardOracle.restored_failures(source, restored, base_url_map: map))
         failures.concat(StandardOracle.imported_failures(expected, restored, attachment_sha256s: attachments, baseline: base))
         failures.concat(http_content_failures(run_id, stack, restored, expected, attachments, bytes, state, "restore"))
         failures.concat(database_count_failures(stack, base, expected))
@@ -1416,12 +1455,16 @@ module SiloMigrate
       def public_run(run, held: false)
         status = run["status"]
         status = "abandoned" if status == "running" && !held
+        status = "not_started" if status == "claimed" && !held && Time.now - Time.parse(run["started_at"]) > CLAIM_GRACE_SECONDS
         result = {
           version: 1, run_id: run["id"], plan_id: run["plan_id"], dataset_id: run["dataset_id"], status: status,
           stage: run["stage"], stages: run["stages"].transform_values { |entry| entry["status"] },
           assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments"),
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
+        if status == "not_started"
+          result[:recovery] = "The background process never started this run, so no instance was created. Its plan and output names are used. Run: silo-migrate standard run recover #{@workspace} #{run['id']}, then propose and approve a new plan."
+        end
         if status == "abandoned"
           result[:recovery] = "The executing process is gone. Run: silo-migrate standard run recover #{@workspace} #{run['id']}, then reset and re-plan."
         end
@@ -1437,10 +1480,12 @@ module SiloMigrate
         end
       end
 
-      # `state` is the last durable state; `live` is what Docker reports right now.
+      # `state` is the last durable state. `live` is whether Docker reports all of this
+      # instance's recorded containers running: nil if Docker can't say, and never a
+      # claim that HTTP works.
       def public_instance(record)
         removed = record["state"] == "removed"
-        live = !removed && PrebuiltStack.new(runtime: @runtime, lock: lock, name: record["name"], record: record).running?
+        live = removed ? false : PrebuiltStack.new(runtime: @runtime, lock: lock, name: record["name"], record: record).live?
         { name: record["name"], role: record["role"], run_id: record["run_id"], state: record["state"], live: live, port: record["port"], url: live ? "http://127.0.0.1:#{record['port']}/" : nil }
       end
     end

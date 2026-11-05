@@ -43,7 +43,6 @@ module SiloMigrate
         agent status WORKSPACE
         agent plan-propose WORKSPACE --dataset ID [--baseline seed|BASELINE_ID]
         agent plan-show WORKSPACE PLAN_ID
-        agent run-request WORKSPACE PLAN_ID
         agent run-claim WORKSPACE PLAN_ID
         agent run-execute WORKSPACE RUN_ID
         agent run-show WORKSPACE RUN_ID
@@ -223,10 +222,6 @@ module SiloMigrate
         plan_id = positional!(args)
         no_more!(args)
         service(workspace).show_plan(plan_id)
-      when "run-request"
-        plan_id = positional!(args)
-        no_more!(args)
-        service(workspace).run_plan(plan_id: plan_id)
       when "run-claim"
         plan_id = positional!(args)
         no_more!(args)
@@ -249,7 +244,7 @@ module SiloMigrate
     end
 
     def failed_run?(argv, result)
-      request = [%w[run start], %w[run execute], %w[agent run-request], %w[agent run-execute]].include?(argv[0, 2])
+      request = [%w[run start], %w[run execute], %w[agent run-execute]].include?(argv[0, 2])
       request && result[:status] != "completed"
     end
 

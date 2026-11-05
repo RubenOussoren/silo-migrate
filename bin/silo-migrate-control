@@ -28,8 +28,11 @@ if [ "${1:-}" = "start-run" ]; then
   claimed=$("$self" standard run claim "$2" "$3") || exit $?
   run_id=$(printf '%s' "$claimed" | sed -n 's/.*"run_id":"\(run-[0-9a-f]*\)".*/\1/p')
   [ -n "$run_id" ] || { echo "Error: STANDARD_OPERATION_FAILED" >&2; exit 1; }
-  "$self" --detach standard run execute "$2" "$run_id" >/dev/null
   printf '%s\n' "$claimed"
+  "$self" --detach standard run execute "$2" "$run_id" >/dev/null || {
+    echo "Error: STANDARD_RUN_NOT_STARTED. Recover with: standard run recover $2 $run_id" >&2
+    exit 1
+  }
   exit 0
 fi
 

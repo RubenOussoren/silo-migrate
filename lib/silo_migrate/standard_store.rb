@@ -26,6 +26,8 @@ module SiloMigrate
     ROOT = File.join(NamedWorkspaceStore::ROOT, "standard")
     VERSION = 1
     MAX_STATE_BYTES = 4 * 1024 * 1024
+    LOCK_RETRIES = 5
+    LOCK_RETRY_SECONDS = 0.2
 
     attr_reader :workspace, :root
 
@@ -47,7 +49,17 @@ module SiloMigrate
     # Lock-free: the registry is replaced atomically, and a status poll must never
     # contend with a run or a registration.
     def named_state
-      NamedWorkspaceStore.boundary { @named.load }
+      attempts = 0
+      begin
+        NamedWorkspaceStore.boundary { @named.load }
+      rescue NamedError => error
+        # The registry's own read-consistency check can trip on a concurrent rename.
+        attempts += 1
+        raise unless error.message == "NAMED_STATE_INVALID" && attempts < 4
+
+        sleep 0.05
+        retry
+      end
     end
 
     def ensure_ready!(create: false)
@@ -91,14 +103,14 @@ module SiloMigrate
     end
 
     # A persisted "running" with this lock free means its process has gone away.
-    def with_op_lock(&block)
+    def with_op_lock(wait: LOCK_RETRY_SECONDS * LOCK_RETRIES, &block)
       FileUtils.mkdir_p(@root, mode: 0o700)
-      exclusive(op_lock_path, &block)
+      exclusive(op_lock_path, wait, &block)
     end
 
     # The envelope is host-wide, so only one workspace may execute at a time.
-    def with_host_lock(&block)
-      exclusive(File.join(File.dirname(@named.root), ".silo-standard-execution.lock"), &block)
+    def with_host_lock(wait: LOCK_RETRY_SECONDS * LOCK_RETRIES, &block)
+      exclusive(File.join(File.dirname(@named.root), ".silo-standard-execution.lock"), wait, &block)
     end
 
     # A shared probe only overlaps a real holder's exclusive lock; a brief collision
@@ -145,15 +157,11 @@ module SiloMigrate
 
     private
 
-    LOCK_RETRIES = 5
-    LOCK_RETRY_SECONDS = 0.2
-
-    def exclusive(path)
+    def exclusive(path, wait)
       File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |lock|
-        attempts = 0
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + wait
         until lock.flock(File::LOCK_EX | File::LOCK_NB)
-          attempts += 1
-          raise StandardWorkflowError, "STANDARD_BUSY" if attempts > LOCK_RETRIES
+          raise StandardWorkflowError, "STANDARD_BUSY" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
           sleep LOCK_RETRY_SECONDS
         end

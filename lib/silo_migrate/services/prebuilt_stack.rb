@@ -140,11 +140,19 @@ module SiloMigrate
         @runtime.run(["docker", "exec", container("db"), "psql", "-U", "discourse", "-d", "discourse", "-Atc", sql], capture: true, timeout: timeout)
       end
 
-      def running?
-        record.fetch("containers").keys.sort == ROLES.sort && ROLES.all? do |role|
-          inspect = @runtime.run(["docker", "inspect", "--format", "{{.State.Running}}", container(role)], capture: true, timeout: 15)
-          inspect.success? && inspect.stdout.to_s.strip == "true"
+      # true/false from recorded IDs and ownership labels; nil if Docker can't answer.
+      def live?
+        ids = record.fetch("containers").values
+        return false unless record.fetch("containers").keys.sort == ROLES.sort
+
+        result = @runtime.run(["docker", "inspect", "--format", "{{.State.Running}} {{index .Config.Labels \"#{LABEL_INSTANCE}\"}}", *ids], capture: true, timeout: 10)
+        unless result.success?
+          return false if result.stderr.to_s.match?(/no such|not found/i)
+
+          return nil
         end
+        rows = result.stdout.to_s.lines.map(&:split)
+        rows.size == ids.size && rows.all? { |running, instance| running == "true" && instance == @name }
       end
 
       # Exact-ID removal only. Anything whose label no longer matches is refused
