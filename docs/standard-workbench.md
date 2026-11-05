@@ -10,7 +10,7 @@ silo-migrate owns the operations, durable state, approvals, validation and artif
 
 | Stage | What happens |
 | --- | --- |
-| `preflight` | Rechecks registered inputs by content hash and the exact image IDs. |
+| `preflight` | Rechecks registered inputs by content hash and the selected profile and every image’s store-independent content identity. |
 | `convert` | Runs the Khoros converter at a pinned revision against a disposable source database with no network. |
 | `site_up` | Starts the review instance and checks its runtime identity. |
 | `baseline` | Seeds a synthetic sandbox and takes a named backup, or restores an accepted pre-import baseline. Refuses identity collisions. |
@@ -32,9 +32,8 @@ WS=my-synthetic-project
 P=$(cd ../.. && pwd -P)
 
 $C named init "$WS"
+$C converter clone "$WS" # host Git; defaults to discourse-org/discourse-converters, branch main
 $C standard init "$WS" \
-  --converter-worktree "$P/worktrees/discourse-converters-runtime-prereqs" \
-  --converter-revision 4e180c2dfd4dd6ea353c6da25f7cc1e8786429fc \
   --site-settings "$P/.runtime-cache/runtime-prereqs/site-cache/site_settings.yml"
 $C standard fixture register "$WS" --snapshot development --label dev-snapshot \
   --fixture-dir "$P/worktrees/discourse-converters-runtime-prereqs/test/fixtures/khoros/inline_community_database"
@@ -59,13 +58,16 @@ $C standard plan propose "$WS" --dataset LAUNCH_DATASET_ID --baseline BASELINE_I
 
 ## Approvals and refusals
 
-A plan's digest covers its inputs, code identity, runtime lock, image IDs, converter revision, baseline decision, target instances, ports and output names. Changing any of these makes the plan stale, and an approved plan can run only once.
+A plan's digest covers its inputs, code identity, selected profile file SHA256, image content IDs, converter repo/branch/commit, baseline decision, target instances, ports and output names. Changing any of these makes the plan stale, and an approved plan can run only once.
 
 | Code | Meaning |
 | --- | --- |
 | `STANDARD_NOT_APPROVED` | The plan hasn't been approved. |
 | `STANDARD_APPROVAL_MISMATCH` | The digest doesn't match the plan. |
 | `STANDARD_STALE_PLAN` | Something the plan depends on has changed. Propose a new plan. |
+| `STANDARD_CONVERTER_DIRTY` | Commit changes (optionally on a development branch) or stash, then run `standard converter refresh WS`. |
+| `STANDARD_RUNTIME_UNQUALIFIED` | Candidate profiles require the explicit engineer planning override. |
+| `STANDARD_RUNTIME_MISMATCH` | An image or runtime assertion differs from the selected profile. Do not bypass the check. |
 | `STANDARD_INPUT_CHANGED` | A registered input file changed. Register a new dataset. |
 | `STANDARD_PLAN_CONSUMED` | This plan has already been used. |
 | `STANDARD_BUSY` | Another operation is running. |
@@ -107,17 +109,127 @@ It can read safe status, propose plans, request an already-approved run and read
 4. Coding work reads it with `standard agent finding-show`. Unreleased findings aren't listed and can't be read through this surface.
 5. Fixing the code invalidates earlier plans, so a new plan and run validate the fix.
 
-## Runtime
+## Converter selection
 
-`runtime/prebuilt-discourse/runtime-lock.json` freezes every identity. The application is the stock prebuilt `discourse/discourse` image with a small overlay adding only the locked `sqlite3` and `redcarpet` gems. `Gemfile.lock` is unchanged. Rebuild the overlay with:
+```text
+standard init WS [--converter-worktree PATH] [--discourse-profile NAME] [--site-settings PATH]
+standard converter status WS
+standard converter refresh WS
+silo-migrate-control converter clone WS [--repo URL] [--branch BRANCH]
+silo-migrate-control converter update WS
+```
+
+Create the named workspace first (`named init WS`), then clone before `standard init`.
+Without `--converter-worktree`, init selects `WS/converter` inside
+`SILO_MIGRATE_BASE_PATH`. An explicit absolute path still selects an existing
+checkout. The service never modifies it. There is no `--converter-revision`:
+init reads HEAD, branch (or `detached`), and the origin URL with userinfo removed.
+`--site-settings` defaults to `SILO_CONTROL_SITE_CACHE` when set; otherwise supply it.
+
+Proposal, approval and execution require a clean checkout (including untracked
+files) at the recorded commit. Commit your changes, optionally on a development
+branch, or stash them, then explicitly `standard converter refresh WS` to record
+the clean HEAD. Every refresh invalidates existing plans, even at the same HEAD.
+Status reports current repo/branch/commit and dirty state; ahead/behind remain
+`unknown` because status does not fetch. Plans and backup manifests retain the
+selected converter lineage.
+
+Clone and update are **host-side wrapper commands**, using the account's Git
+credentials; those credentials are never mounted in the control container. Clone
+refuses an existing `WS/converter`. Update requires the managed checkout and its
+recorded non-detached branch, refuses a dirty tree, fetches origin, then merges
+`refs/remotes/origin/BRANCH` with `--ff-only` and refreshes the workspace binding.
+It never resets, force-pulls or silently resolves divergence. Update failure leaves
+any fetched refs intact and asks the engineer to resolve the checkout deliberately.
+
+## Runtime profiles
+
+```text
+standard runtime list
+standard runtime show NAME
+standard plan propose WS --dataset ID [--baseline seed|ID] [--ports A,B] [--allow-unqualified-runtime]
+```
+
+Default: `discourse-2026.11.0-latest-3158c750`, a qualified profile in
+`runtime/profiles/`. Profiles also come from `SILO_RUNTIME_PROFILES_DIR`, an optional
+server-local candidate directory, not a reason to put local settings in Git.
+Names are filename stems; duplicate names across directories are refused rather
+than shadowing an active profile. List reports name, qualification status,
+selector (channel/release/stock index digest), and whether **every** image resolves
+locally with matching content. Show returns the profile and its file SHA256.
+No discovery command pulls an image or starts a container.
+
+Init records the profile name and exact file SHA256. Plans bind that SHA. Editing
+(including formatting) or deleting the file makes plans stale and blocks new
+plans for that workspace; a new server candidate never switches an active
+project. Keep pinned profiles immutable and choose a new profile name when
+initializing a fresh migration. A profile whose `qualification.status` is not
+`qualified` requires `plan propose --allow-unqualified-runtime`; the override and
+`runtime_qualified: false` are carried in the approved body/public view and backup
+manifest. The agent planning surface cannot supply this engineer override.
+
+The default application is the stock prebuilt `discourse/discourse` image with a
+small overlay adding only locked `sqlite3` and `redcarpet` gems. All application
+revision, Ruby, Bundler, lock hash, extensions and PostgreSQL/Redis major checks
+come from the selected profile. The profile records both the Dockerfile hash
+used for the qualified overlay (`qualified_dockerfile_sha256`) and the current
+parameterized Dockerfile hash (`dockerfile_sha256`); changing build parameters
+is not qualification. Build preparation, **not an instruction to rebuild a live
+runtime**:
 
 ```sh
 docker build --platform linux/amd64 --pull=false \
+  --build-arg STOCK_IMAGE=docker.io/discourse/discourse@sha256:f847da87e77b0506eae2167d75f0cce500cf174fde7127b60e33baaafeab65ec \
+  --build-arg EXPECTED_LOCK_SHA256=bacaa276aebc56385bf28c9fefbc6224e494e0361bd734933b4a20427e0f87d2 \
   --tag silo-migrate/discourse-migration:3158c750-overlay1 \
   -f runtime/prebuilt-discourse/Dockerfile runtime/prebuilt-discourse
 ```
 
-A rebuild may produce a different image ID, because the discarded build stage uses floating Debian packages to compile `redcarpet`. If the ID changes, update the lock deliberately. Existing plans then become stale.
+Each image has `ref`, `content_id`, and `source` (`public-digest` or `package`).
+Docker containerd and classic stores can expose different `.Id` values for the
+same payload. `content_id` is `sha256:` plus SHA256 of UTF-8 canonical JSON
+(recursively sorted keys, no whitespace, Ruby `JSON.generate`) of:
+
+```json
+{"architecture":".Architecture","os":".Os","diff_ids":".RootFS.Layers","config":{"Cmd":".Config.Cmd","Entrypoint":".Config.Entrypoint","Env":".Config.Env","User":".Config.User","WorkingDir":".Config.WorkingDir"}}
+```
+
+Null lists become `[]`; null strings become `""`. List order is preserved.
+Preflight inspects each ref locally, recomputes content, refuses a mismatch, then
+runs the resolved local `.Id`, never the mutable tag. Resolved IDs are stored in
+run artifacts, `runtime-images.json` evidence, and backup manifest lineage.
+`bin/silo-migrate-control image-identity REF` prints the same ID without Ruby on
+the host. A rebuild may change payload content (the discarded build stage uses
+floating Debian packages); select and qualify a new immutable profile deliberately.
+
+## Server control configuration
+
+The wrapper requires Python 3 on the host (the migration service still runs in
+the pinned Ruby container). With no config it keeps the existing project-root,
+gem-cache, workspace and control-image defaults. `SILO_CONTROL_SITE_CACHE` and
+`SILO_RUNTIME_PROFILES_DIR`, if set, are also forwarded and mounted read-only.
+With `SILO_CONTROL_CONFIG=/absolute/path/control.conf`, read strict literal
+`KEY=VALUE` lines: no shell evaluation, export syntax, quotes or substitutions.
+Blank lines and whole-line `#` comments are allowed; unknown or duplicate keys
+are refused. Required keys:
+
+```text
+SILO_MIGRATE_BASE_PATH=/srv/silo/workspaces
+SILO_CONTROL_GEMS=/srv/silo/gems
+SILO_CONTROL_SITE_CACHE=/srv/silo/site_settings.yml
+```
+
+Optional: `SILO_RUNTIME_PROFILES_DIR=/srv/silo/profiles` and
+`SILO_CONTROL_IMAGE_REF=ruby@sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b8310d84949240`.
+Paths are absolute; don't quote values. The configured wrapper mounts the
+repository root read-only at its own path, not its grandparent. Workspaces are
+read/write, gems/cache/profile directory read-only. The control image is inspected
+and its content ID verified before any control container starts, then the resolved
+local `.Id` is used. The expected control content ID is the documented constant
+`CONTROL_CONTENT_ID` in `bin/silo-migrate-control`, also recorded in the qualified
+profile: `sha256:c04e168879ee10209715c71cf0eb1814e7308fa794329c55ae59c508f1e7d165`.
+Changing the image ref does not bypass that content check. Docker socket access
+makes this trusted operator tooling, not a sandbox.
 
 Each instance's web container sits on an internal Docker network with no route out. Only a small proxy publishes HTTP, on `127.0.0.1` in the range 18080–18089. Containers have CPU, memory and PID limits, bounded logs and no restart policy. Docker enforces each container's limit, and admission refuses a run that would exceed 4 CPUs or 8GiB in total. Storage isn't quota-enforced; admission checks free disk.
 

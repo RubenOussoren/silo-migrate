@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "recipe": "standard-local-prebuilt-v1",
+  "provenance": {
+    "route": "https://github.com/featheredtoast/discourse-docker-compose",
+    "route_commit": "6c0336ed11d7e1fa02cdf555025e0bfc4b0a7645",
+    "stock_index_tag": "docker.io/discourse/discourse:2026.11.0-latest",
+    "stock_index_digest": "sha256:6c8d2a5f7632713bfca7269d70fcd8b87ae6b27eb1723638102caa4a066d4ba8"
+  },
+  "images": {
+    "web": {
+      "derived_from": "docker.io/discourse/discourse@sha256:f847da87e77b0506eae2167d75f0cce500cf174fde7127b60e33baaafeab65ec",
+      "ref": "silo-migrate/discourse-migration:3158c750-overlay1",
+      "content_id": "sha256:2b284718c35703f1f383bc46be1483962e8c16bcb95b9ae4f4241629e9234cb7",
+      "source": "package",
+      "qualified_dockerfile_sha256": "87f40d8f98f6c906a33e36269d1eac6d5272f93f951dac9bfa433d1d1f95bea2",
+      "dockerfile_sha256": "b065287dcf8a3ba383f8e122a8f14fffa14a2c6fa1b92ac686062421dcecd4df"
+    },
+    "db": {
+      "ref": "docker.io/discourse/postgres@sha256:893b46aab58e3562442a4763088b214959b9916f32c800069c31b2e72c003f2f",
+      "content_id": "sha256:e4bacb296c7318204806b7c82a7aa3798264196df5e5637de49b0b749cfd1142",
+      "source": "public-digest"
+    },
+    "redis": {
+      "ref": "docker.io/library/redis@sha256:a6dd428750118c2c2c67d3f555faef0aa15a2b71198b40e1cb3b9229b1cf3094",
+      "content_id": "sha256:f20468508c78313286c15540bb0e0a7e1478767f1411d7b0c9554c174e282bbd",
+      "source": "public-digest"
+    },
+    "converter": {
+      "ref": "migration-architecture/converter-test:ruby3313-trixie-candidate-20261104-01",
+      "content_id": "sha256:6de8117d7492c2938262b4d8e0a64067a4cace1b883d23fe5e02c9cec8021a29",
+      "source": "package"
+    },
+    "source_db": {
+      "ref": "mariadb@sha256:d9fc02976678d4236145299c40dc267051681b33489c994f0ec4a097ce4a9521",
+      "content_id": "sha256:59fafdddaa04751a78a676fa4a21aa2bf84eca8ce76362af16bbac1f6756b8af",
+      "source": "public-digest"
+    },
+    "control": {
+      "ref": "ruby@sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b8310d84949240",
+      "content_id": "sha256:c04e168879ee10209715c71cf0eb1814e7308fa794329c55ae59c508f1e7d165",
+      "source": "public-digest"
+    }
+  },
+  "app": {
+    "revision": "3158c7503a59d0952c84cc8c032790e80167bf38",
+    "version": "2026.11.0-latest",
+    "ruby": "4.0.9",
+    "bundler": "4.0.23",
+    "gemfile_lock_sha256": "bacaa276aebc56385bf28c9fefbc6224e494e0361bd734933b4a20427e0f87d2",
+    "required_extensions": [
+      "hstore",
+      "pg_trgm",
+      "unaccent",
+      "vector"
+    ],
+    "postgres_major": "18",
+    "redis_major": "7"
+  },
+  "limits": {
+    "aggregate_cpus": 4.0,
+    "aggregate_memory_mib": 8192,
+    "storage_new_gib": 40,
+    "host_free_min_gib": 8,
+    "ports": [
+      18080,
+      18089
+    ],
+    "stack": {
+      "web": {
+        "cpus": 0.9,
+        "memory_mib": 2304,
+        "pids": 512
+      },
+      "db": {
+        "cpus": 0.5,
+        "memory_mib": 768,
+        "pids": 128
+      },
+      "redis": {
+        "cpus": 0.25,
+        "memory_mib": 256,
+        "pids": 64
+      },
+      "proxy": {
+        "cpus": 0.1,
+        "memory_mib": 64,
+        "pids": 32
+      }
+    },
+    "conversion": {
+      "db": {
+        "cpus": 0.5,
+        "memory_mib": 768,
+        "pids": 128
+      },
+      "converter": {
+        "cpus": 1.0,
+        "memory_mib": 1024,
+        "pids": 128
+      }
+    }
+  },
+  "qualification": {
+    "status": "qualified",
+    "evidence": [
+      "mvp-dev-a1 development run-c01ce478 and launch run-360b3b46: restore-proven; MVP-DELIVERY-20261105.md.",
+      "Final-code mvp-demo development run-22cbdaf9 and launch run-40ea5e24: restore-proven; delivered MVP f18c0da, MVP-DELIVERY-20261105.md."
+    ]
+  },
+  "selector": {
+    "channel": "latest",
+    "release": "2026.11.0",
+    "stock_index_digest": "sha256:6c8d2a5f7632713bfca7269d70fcd8b87ae6b27eb1723638102caa4a066d4ba8"
+  }
+}

@@ -17,10 +17,14 @@ module SiloMigrate
       Usage: silo-migrate standard COMMAND
 
       Engineer (operates without any LLM):
-        init WORKSPACE --converter-worktree PATH --converter-revision SHA --site-settings PATH
+        init WORKSPACE [--converter-worktree PATH] [--discourse-profile NAME] [--site-settings PATH]
+        runtime list
+        runtime show NAME
+        converter status WORKSPACE
+        converter refresh WORKSPACE
         fixture register WORKSPACE --fixture-dir DIR --snapshot NAME [--label LABEL]
         status WORKSPACE
-        plan propose WORKSPACE --dataset ID [--baseline seed|BASELINE_ID] [--ports A,B]
+        plan propose WORKSPACE --dataset ID [--baseline seed|BASELINE_ID] [--ports A,B] [--allow-unqualified-runtime]
         plan show WORKSPACE PLAN_ID
         plan approve WORKSPACE PLAN_ID --sha256 DIGEST --reviewer NAME
         baseline accept WORKSPACE RUN_ID --reviewer NAME
@@ -72,7 +76,12 @@ module SiloMigrate
         write_json(result)
         failed_run?(argv, result) ? 1 : 0
       rescue StandardWorkflowError => e
-        write_error(e.code)
+        if e.code == "STANDARD_CONVERTER_DIRTY"
+          @error.write("Error: #{e.code}. #{Services::StandardWorkflowService::RECOVERY.fetch(e.code)}\n")
+          1
+        else
+          write_error(e.code)
+        end
       rescue NamedError => e
         write_error(e.message.to_s.match?(/\ANAMED_[A-Z_]+\z/) ? e.message : OPERATION_ERROR)
       rescue UsageError
@@ -99,6 +108,25 @@ module SiloMigrate
       group = args.shift
       case group
       when "init" then init(args)
+      when "runtime"
+        action = args.shift
+        case action
+        when "list" then no_more!(args); { version: 1, profiles: service("runtime-catalog").profiles.list }
+        when "show"
+          name = positional!(args)
+          no_more!(args)
+          service("runtime-catalog").profiles.show(name)
+        else invalid!
+        end
+      when "converter"
+        action = args.shift
+        single_workspace(args) do |workspace|
+          case action
+          when "status" then service(workspace).converter_status
+          when "refresh" then service(workspace).converter_refresh
+          else invalid!
+          end
+        end
       when "fixture" then fixture(args)
       when "status" then single_workspace(args) { |workspace| service(workspace).status }
       when "plan" then plan(args)
@@ -113,8 +141,8 @@ module SiloMigrate
 
     def init(args)
       workspace = positional!(args)
-      opts = options!(args, "--converter-worktree", "--converter-revision", "--site-settings")
-      service(workspace).init(converter_worktree: opts.fetch("--converter-worktree"), converter_revision: opts.fetch("--converter-revision"), site_settings: opts.fetch("--site-settings"))
+      opts = options!(args, "--converter-worktree", "--discourse-profile", "--site-settings", optional: %w[--converter-worktree --discourse-profile --site-settings])
+      service(workspace).init(converter_worktree: opts["--converter-worktree"], discourse_profile: opts.fetch("--discourse-profile", RuntimeProfiles::DEFAULT), site_settings: opts["--site-settings"])
     end
 
     # Convenience over the existing named registry: copies one synthetic fixture
@@ -134,8 +162,10 @@ module SiloMigrate
       case action
       when "propose"
         workspace = positional!(args)
+        invalid! if args.count("--allow-unqualified-runtime") > 1
+        allow = args.delete("--allow-unqualified-runtime")
         opts = options!(args, "--dataset", "--baseline", "--ports", optional: %w[--baseline --ports])
-        service(workspace).propose_plan(dataset_id: opts.fetch("--dataset"), baseline: opts.fetch("--baseline", "seed"), ports: ports(opts["--ports"]))
+        service(workspace).propose_plan(dataset_id: opts.fetch("--dataset"), baseline: opts.fetch("--baseline", "seed"), ports: ports(opts["--ports"]), allow_unqualified_runtime: !allow.nil?)
       when "show"
         workspace = positional!(args)
         plan_id = positional!(args)

@@ -2,7 +2,8 @@
 # The stock image omits the optional `generic_import` gem group, and its Ruby
 # has no compiler. The compiler stays in the discarded build stage; only the
 # two locked gems are copied into the final image. Gemfile.lock is unchanged.
-FROM docker.io/discourse/discourse@sha256:f847da87e77b0506eae2167d75f0cce500cf174fde7127b60e33baaafeab65ec AS stock
+ARG STOCK_IMAGE=docker.io/discourse/discourse@sha256:f847da87e77b0506eae2167d75f0cce500cf174fde7127b60e33baaafeab65ec
+FROM ${STOCK_IMAGE} AS stock
 
 FROM stock AS build
 ARG EXPECTED_LOCK_SHA256=bacaa276aebc56385bf28c9fefbc6224e494e0361bd734933b4a20427e0f87d2

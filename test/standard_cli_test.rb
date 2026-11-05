@@ -12,6 +12,45 @@ class StandardCLITest < SiloMigrateTest
     [cli.run(args), output.string, error.string]
   end
 
+  def test_runtime_catalog_and_converter_commands_use_strict_new_grammar
+    with_standard do
+      @runtime.images_match = true
+      code, output, error = invoke(%w[runtime list])
+      assert_equal 0, code
+      assert_empty error
+      assert_equal true, JSON.parse(output).fetch('profiles').first.fetch('local_images_match')
+      name = SiloMigrate::RuntimeProfiles::DEFAULT
+      code, output, error = invoke(['runtime', 'show', name])
+      assert_equal 0, code
+      assert_equal name, JSON.parse(output).fetch('name')
+      assert_equal 0, invoke(%w[converter status synthetic]).first
+      assert_equal 0, invoke(%w[converter refresh synthetic]).first
+      assert_equal 1, invoke(%w[runtime list extra]).first
+      assert_equal 1, invoke(%w[converter fetch synthetic]).first
+      assert_equal 1, invoke(%w[init synthetic --converter-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]).first
+      @runtime.converter_dirty = true
+      code, output, error = invoke(%w[converter refresh synthetic])
+      assert_equal 1, code
+      assert_empty output
+      assert_includes error, 'STANDARD_CONVERTER_DIRTY'
+      assert_includes error, 'development branch'
+      assert_includes error, 'standard converter refresh'
+    end
+  end
+
+  def test_engineer_override_is_recorded_and_agent_cannot_supply_it
+    with_standard do
+      args = ['plan', 'propose', 'synthetic', '--dataset', @dataset, '--allow-unqualified-runtime']
+      code, output, error = invoke(args)
+      assert_equal 0, code
+      assert_empty error
+      assert_equal true, JSON.parse(output).fetch('allow_unqualified_runtime')
+      assert_equal true, JSON.parse(output).fetch('runtime_qualified')
+      assert_equal 1, invoke(['agent', 'plan-propose', 'synthetic', '--dataset', @dataset, '--allow-unqualified-runtime']).first
+      assert_equal 1, invoke(args + ['--allow-unqualified-runtime']).first
+    end
+  end
+
   def test_status_is_single_json_document
     with_standard do
       code, output, error = invoke(%w[status synthetic])

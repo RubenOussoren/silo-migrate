@@ -16,6 +16,7 @@ rescue LoadError
   # Reported when an operation that needs it runs.
 end
 require_relative "../standard_store"
+require_relative "../runtime_profiles"
 require_relative "prebuilt_stack"
 require_relative "standard_oracle"
 require_relative "discourse_archive"
@@ -53,6 +54,7 @@ module SiloMigrate
         "STANDARD_INPUT_CHANGED" => "An input changed. Do not edit inputs: register a new dataset, then propose and approve a new plan.",
         "STANDARD_COLLISION" => "Source records collide with the baseline. Decide policy, change the fixture or baseline, then re-plan.",
         "STANDARD_RUNTIME_MISMATCH" => "Runtime identity differs from the frozen lock. Rebuild or update the lock deliberately; do not bypass the check.",
+        "STANDARD_CONVERTER_DIRTY" => "Commit changes (optionally on a development branch) or stash them, then run standard converter refresh.",
         "STANDARD_CONVERSION_FAILED" => "Conversion failed. Inspect private evidence, reset this run, then re-plan.",
         "STANDARD_UPLOADS_FAILED" => "Upload processing failed; the instance is dirty. Run the reset for this run, investigate privately, then re-plan.",
         "STANDARD_IMPORT_FAILED" => "Import failed; the instance is dirty. Run the reset for this run, investigate privately, then re-plan.",
@@ -88,20 +90,88 @@ module SiloMigrate
 
       # -- configuration ------------------------------------------------------
 
-      def init(converter_worktree:, converter_revision:, site_settings:)
-        unless converter_revision.is_a?(String) && converter_revision.match?(/\A[0-9a-f]{40}\z/)
-          raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID"
-        end
+      def profiles
+        RuntimeProfiles.new(code_root: @code_root, env: @env, runtime: @runtime)
+      end
+
+      def init(converter_worktree: nil, discourse_profile: RuntimeProfiles::DEFAULT, site_settings: nil)
+        converter_worktree ||= File.join(@store.workspace_root, "converter")
+        site_settings ||= @env["SILO_CONTROL_SITE_CACHE"]
         [converter_worktree, site_settings].each do |path|
           raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless path.is_a?(String) && path.start_with?("/") && File.exist?(path)
         end
-        @store.init!("converter_worktree" => converter_worktree, "converter_revision" => converter_revision,
+        converter = converter_identity(converter_worktree)
+        profiles.read(discourse_profile)
+        @store.init!("converter_worktree" => converter_worktree, "converter_revision" => converter.fetch("commit"), "converter" => converter,
+                     "converter_binding" => SecureRandom.hex(16),
+                     "discourse_profile" => discourse_profile, "discourse_profile_sha256" => profiles.sha256(discourse_profile),
                      "site_settings" => site_settings, "site_settings_sha256" => Digest::SHA256.file(site_settings).hexdigest)
         { version: 1, status: "initialized" }
       end
 
+      def converter_identity(worktree)
+        git = lambda do |*args|
+          result = @runtime.run(["git", "-C", worktree, *args], capture: true, timeout: 30)
+          raise StandardWorkflowError, "STANDARD_RUNTIME_MISMATCH" unless result.success?
+          result.stdout.to_s.strip
+        end
+        commit = git.call("rev-parse", "HEAD")
+        raise StandardWorkflowError, "STANDARD_RUNTIME_MISMATCH" unless commit.match?(/\A[0-9a-f]{40}\z/)
+        repo = git.call("remote", "get-url", "origin")
+        # Strip URL userinfo, including passwords/tokens; handle scp-style SSH too.
+        repo = repo.sub(%r{(\A[a-z][a-z0-9+.-]*://)[^/]*@}i, '\\1').sub(/\A[^\/@:]+@(?=[^\/]+:)/, "")
+        { "repo" => repo, "branch" => git.call("rev-parse", "--abbrev-ref", "HEAD").sub(/\AHEAD\z/, "detached"),
+          "commit" => commit, "dirty" => !git.call("status", "--porcelain", "--untracked-files=all").empty? }
+      end
+
+      def converter_status
+        config = @store.load.fetch("config")
+        { version: 1, **converter_identity(config.fetch("converter_worktree")).transform_keys(&:to_sym), ahead: "unknown", behind: "unknown" }
+      end
+
+      def converter_refresh
+        @store.with_op_lock do
+          config = @store.load.fetch("config")
+          identity = converter_identity(config.fetch("converter_worktree"))
+          raise StandardWorkflowError, "STANDARD_CONVERTER_DIRTY" if identity.fetch("dirty")
+          @store.update do |state|
+            state.fetch("config")["converter_binding"] = SecureRandom.hex(16)
+            state.fetch("config")["converter"] = identity
+            state.fetch("config")["converter_revision"] = identity.fetch("commit")
+          end
+        end
+        converter_status
+      end
+
+      def check_converter!(config)
+        current = converter_identity(config.fetch("converter_worktree"))
+        raise StandardWorkflowError, "STANDARD_CONVERTER_DIRTY" if current.fetch("dirty")
+        current == config.fetch("converter")
+      rescue StandardWorkflowError => error
+        raise if error.code == "STANDARD_CONVERTER_DIRTY"
+
+        false
+      end
+
       def lock
-        @lock ||= JSON.parse(File.read(File.join(@code_root, "runtime", "prebuilt-discourse", "runtime-lock.json")))
+        config = @store.load.fetch("config")
+        profiles.read(config.fetch("discourse_profile"), expected_sha256: config.fetch("discourse_profile_sha256"))
+      end
+
+      def profile_current?(config)
+        profiles.sha256(config.fetch("discourse_profile")) == config.fetch("discourse_profile_sha256")
+      rescue StandardWorkflowError, Errno::ENOENT
+        false
+      end
+
+      def image_id(run_id, role)
+        @store.load.fetch("runs").fetch(run_id).fetch("artifacts").fetch("resolved_image_ids").fetch(role)
+      end
+
+      def resolved_lock(run_id)
+        selected = lock
+        selected.fetch("images").each { |role, image| image["id"] = image_id(run_id, role) }
+        selected
       end
 
       # Identity of the code that will execute. Any source edit invalidates approval.
@@ -119,9 +189,13 @@ module SiloMigrate
 
       # -- planning -----------------------------------------------------------
 
-      def propose_plan(dataset_id:, baseline: "seed", ports: nil)
+      def propose_plan(dataset_id:, baseline: "seed", ports: nil, allow_unqualified_runtime: false)
         state = @store.load
         raise StandardWorkflowError, "STANDARD_SIZE_LIMIT" if state.fetch("plans").size >= MAX_PLANS
+        raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless profile_current?(state.fetch("config"))
+        raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless check_converter!(state.fetch("config"))
+        qualified = lock.dig("qualification", "status") == "qualified"
+        raise StandardWorkflowError, "STANDARD_RUNTIME_UNQUALIFIED" unless qualified || allow_unqualified_runtime
 
         named = @store.named_state
         dataset = named.fetch("datasets")[dataset_id]
@@ -145,8 +219,11 @@ module SiloMigrate
           "input_binding" => inputs.map { |input| input.slice("id", "sha256", "bytes", "type") }.sort_by { |input| input["id"] },
           "input_stat_binding" => @store.named.input_binding(named, inputs.map { |input| input["id"] }.sort),
           "code_identity" => code_identity,
-          "runtime_lock_sha256" => Digest::SHA256.hexdigest(JSON.generate(lock)),
-          "image_ids" => lock.fetch("images").transform_values { |image| image.fetch("id") },
+          "runtime_lock_sha256" => state.dig("config", "discourse_profile_sha256"),
+          "discourse_profile" => state.dig("config", "discourse_profile"),
+          "runtime_qualified" => qualified, "allow_unqualified_runtime" => allow_unqualified_runtime,
+          "image_content_ids" => lock.fetch("images").transform_values { |image| image.fetch("content_id") },
+          "converter" => state.dig("config", "converter"), "converter_binding" => state.dig("config", "converter_binding"),
           "app_revision" => lock.dig("app", "revision"),
           "converter_revision" => state.dig("config", "converter_revision"),
           "site_settings_sha256" => state.dig("config", "site_settings_sha256"),
@@ -174,7 +251,7 @@ module SiloMigrate
             "id" => plan_id, "digest" => digest, "body" => body, "status" => "proposed", "created_at" => now, "approval" => nil, "run_id" => nil
           }
         end
-        { version: 1, plan_id: plan_id, digest: digest, status: "proposed" }
+        show_plan(plan_id)
       end
 
       def approve_plan(plan_id:, sha256:, reviewer:)
@@ -302,7 +379,7 @@ module SiloMigrate
             record = state.fetch("instances")[name]
             next unless record && record["state"] != "removed"
 
-            stack = PrebuiltStack.new(runtime: @runtime, lock: lock, name: name, record: record)
+            stack = PrebuiltStack.new(runtime: @runtime, lock: nil, name: name, record: record)
             stack.remove!
             stack
           end
@@ -464,8 +541,9 @@ module SiloMigrate
         return "dataset" unless current.map { |input| input["id"] }.sort == ids.sort
         return "inputs" unless inputs_unchanged?(current) && input_layout_problem(current).nil?
         return "code" unless code_identity == body.fetch("code_identity")
-        return "runtime" unless Digest::SHA256.hexdigest(JSON.generate(lock)) == body.fetch("runtime_lock_sha256")
-        return "converter" unless state.dig("config", "converter_revision") == body.fetch("converter_revision")
+        return "runtime" unless profile_current?(state.fetch("config")) && state.dig("config", "discourse_profile_sha256") == body.fetch("runtime_lock_sha256")
+        return "converter" unless state.dig("config", "converter_binding") == body.fetch("converter_binding")
+        return "converter" unless check_converter!(state.fetch("config")) && state.dig("config", "converter") == body.fetch("converter")
         return "site_settings" unless Digest::SHA256.file(state.dig("config", "site_settings")).hexdigest == body.fetch("site_settings_sha256")
 
         baseline = body.fetch("baseline")
@@ -567,6 +645,10 @@ module SiloMigrate
           stage_method = "stage_#{stage}"
           begin_stage(run_id, stage)
           begin
+            if stage == STAGES.first
+              stale = stale_reason(plan_for(run_id), @store.load)
+              raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
+            end
             guard_disk!
             admission!(nil) if stage == STAGES.first
             send(stage_method, run_id)
@@ -685,12 +767,9 @@ module SiloMigrate
         raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
 
         named = @store.named_state
-        lock.fetch("images").each do |role, image|
-          inspected = @runtime.run(["docker", "image", "inspect", "--format", "{{.Id}}", image.fetch("id")], capture: true, timeout: 30)
-          unless inspected.success? && inspected.stdout.to_s.strip == image.fetch("id")
-            raise StandardWorkflowError.new("STANDARD_RUNTIME_MISMATCH", role)
-          end
-        end
+        resolved = lock.fetch("images").transform_values { |image| ImageIdentity.resolve(@runtime, image) }
+        @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["resolved_image_ids"] = resolved }
+        evidence(run_id, "runtime-images.json", JSON.pretty_generate(resolved) + "\n")
         manifest = materialize_inputs(run_id, body, named)
         @store.write_private(@store.run_dir(run_id, "work", "inputs.json"), JSON.pretty_generate(manifest) + "\n")
         snapshot_helpers(run_id)
@@ -803,7 +882,7 @@ module SiloMigrate
             "-v", "#{File.join(secrets, 'bootstrap.sql')}:/run-fixture/bootstrap.sql:ro",
             "-v", "#{input_path(run_id, sql)}:/run-fixture/snapshot.sql:ro",
             "-e", "MARIADB_ROOT_PASSWORD_FILE=/run-fixture/root-password", "-e", "MARIADB_ROOT_HOST=localhost",
-            lock.dig("images", "source_db", "id"), "mariadbd", "--bind-address=127.0.0.1", "--skip-name-resolve",
+            image_id(run_id, "source_db"), "mariadbd", "--bind-address=127.0.0.1", "--skip-name-resolve",
             "--innodb-buffer-pool-size=64M", "--innodb-log-file-size=32M", "--max-connections=10"], timeout: 60).stdout.strip
           created << db_id
           wait_source_db(db_id)
@@ -817,7 +896,7 @@ module SiloMigrate
             "-e", "HOME=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8", "-w", "/app"]
           converter_args += ["-v", "#{mappings_dir}:/fixture-mappings:ro"] if mappings_dir
           converter_args += ["-v", "#{uploads_dir}:/fixture-uploads:ro"] if uploads_dir
-          converter_args += ["--entrypoint", "/bin/sh", lock.dig("images", "converter", "id"), "-c", "exec sleep infinity"]
+          converter_args += ["--entrypoint", "/bin/sh", image_id(run_id, "converter"), "-c", "exec sleep infinity"]
           converter_id = checked(run_id, "conversion-container-start", converter_args, timeout: 60).stdout.strip
           created << converter_id
           convert = @runtime.run(["docker", "exec", "-w", "/app", converter_id, "bundle", "_2.6.3_", "exec", "ruby", "./convert", "--from=khoros",
@@ -943,7 +1022,7 @@ module SiloMigrate
           state.fetch("instances")[name] = { "name" => name, "containers" => {}, "networks" => [], "volumes" => [], "state" => "creating", "role" => role, "run_id" => run_id, "port" => target.fetch("port"), "hostname" => target.fetch("hostname") }
           state.fetch("runs").fetch(run_id).fetch("instances")[role] = name
         end
-        stack = PrebuiltStack.new(runtime: @runtime, lock: lock, name: name, record: @store.load.fetch("instances").fetch(name), sleeper: @sleeper)
+        stack = PrebuiltStack.new(runtime: @runtime, lock: resolved_lock(run_id), name: name, record: @store.load.fetch("instances").fetch(name), sleeper: @sleeper)
         stack.create!(hostname: target.fetch("hostname"), port: target.fetch("port"), env_file: env_file,
                       labels: { "silo-migrate.run" => run_id, "silo-migrate.role" => role }) do |record|
           @store.update { |state| state.fetch("instances")[name] = record }
@@ -955,7 +1034,7 @@ module SiloMigrate
       def stack_for(run_id, role)
         state = @store.load
         name = state.fetch("runs").fetch(run_id).fetch("instances").fetch(role)
-        PrebuiltStack.new(runtime: @runtime, lock: lock, name: name, record: state.fetch("instances").fetch(name), sleeper: @sleeper)
+        PrebuiltStack.new(runtime: @runtime, lock: nil, name: name, record: state.fetch("instances").fetch(name), sleeper: @sleeper)
       end
 
       def set_instance_state(stack, value)
@@ -1319,6 +1398,7 @@ module SiloMigrate
         run = state.fetch("runs").fetch(run_id)
         plan = state.fetch("plans").fetch(run.fetch("plan_id"))
         {
+          "runtime_qualified" => plan.dig("body", "runtime_qualified"),
           "kind" => label, "run_id" => run_id, "plan_id" => plan["id"], "plan_digest" => plan["digest"],
           "archive" => identity.slice("filename", "sha256", "bytes"), "restore_status" => identity["label"],
           "required_uploads" => identity["upload_sha256"],
@@ -1327,8 +1407,11 @@ module SiloMigrate
             "baseline" => plan.dig("body", "baseline"), "baseline_archive" => run.dig("artifacts", "baseline")&.slice("filename", "sha256", "bytes"),
             "intermediate" => run.dig("artifacts", "intermediate"), "uploads_db" => run.dig("artifacts", "uploads_db"),
             "code_identity" => plan.dig("body", "code_identity"), "converter_revision" => plan.dig("body", "converter_revision"),
-            "app_revision" => plan.dig("body", "app_revision"), "image_ids" => plan.dig("body", "image_ids"),
+            "app_revision" => plan.dig("body", "app_revision"), "image_ids" => run.dig("artifacts", "resolved_image_ids"), "image_content_ids" => plan.dig("body", "image_content_ids"),
             "runtime_lock_sha256" => plan.dig("body", "runtime_lock_sha256"),
+            "discourse_profile" => plan.dig("body", "discourse_profile"),
+            "runtime_qualified" => plan.dig("body", "runtime_qualified"),
+            "converter" => plan.dig("body", "converter"),
             "site_settings_sha256" => plan.dig("body", "site_settings_sha256"),
             "site_versions" => site["versions"]
           },
@@ -1456,6 +1539,8 @@ module SiloMigrate
         return result if summary
 
         result.merge(
+          discourse_profile: body["discourse_profile"], runtime_profile_sha256: body["runtime_lock_sha256"],
+          runtime_qualified: body["runtime_qualified"], allow_unqualified_runtime: body["allow_unqualified_runtime"], converter: body["converter"],
           operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"].slice("mode", "baseline_id"),
           collision_policy: body["collision_policy"], inputs: body["input_binding"].map { |input| input.slice("id", "type", "bytes", "sha256") },
           app_revision: body["app_revision"], converter_revision: body["converter_revision"], code_identity: body["code_identity"],
@@ -1503,7 +1588,7 @@ module SiloMigrate
       # claim that HTTP works.
       def public_instance(record)
         removed = record["state"] == "removed"
-        live = removed ? false : PrebuiltStack.new(runtime: @runtime, lock: lock, name: record["name"], record: record).live?
+        live = removed ? false : PrebuiltStack.new(runtime: @runtime, lock: nil, name: record["name"], record: record).live?
         { name: record["name"], role: record["role"], run_id: record["run_id"], state: record["state"], live: live, port: record["port"], url: live ? "http://127.0.0.1:#{record['port']}/" : nil }
       end
     end

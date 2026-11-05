@@ -1,0 +1,32 @@
+[
+  {
+    "Id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "RepoTags": [
+      "example/runtime:fixture"
+    ],
+    "Architecture": "amd64",
+    "Os": "linux",
+    "RootFS": {
+      "Type": "layers",
+      "Layers": [
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      ]
+    },
+    "Config": {
+      "Cmd": [
+        "bundle",
+        "exec",
+        "ruby",
+        "app.rb"
+      ],
+      "Entrypoint": null,
+      "Env": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "LANG=C.UTF-8"
+      ],
+      "User": null,
+      "WorkingDir": "/app"
+    }
+  }
+]

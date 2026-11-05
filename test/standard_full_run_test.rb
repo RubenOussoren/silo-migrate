@@ -155,7 +155,7 @@ class StandardCompleteRuntime < StandardScriptedRuntime
     if %w[network volume container].include?(cmd[1]) && cmd[2] == 'inspect' && !cmd.include?('--format')
       return response('', success: cmd[1] == occupied_kind)
     elsif cmd.first == 'git' && cmd.include?('rev-parse')
-      return response('a' * 40)
+      return recorded
     elsif cmd.include?('./convert')
       write_intermediate(service.store.run_dir(current_run['id'], 'work', 'converter-output', 'intermediate.sqlite'))
       return response("== Run Summary ==\nErrors : 0 (conversion) + 0 (setup)\nSkipped by policy : 0\n")
@@ -272,9 +272,22 @@ class StandardFullRunTest < SiloMigrateTest
       assert_equal run['artifacts']['final'].slice('filename', 'sha256', 'bytes'), manifest['archive']
       assert_equal Digest::SHA256.file(run['artifacts']['final']['path']).hexdigest, manifest['archive']['sha256']
       assert_equal File.size(run['artifacts']['final']['path']), manifest['archive']['bytes']
-      %w[dataset_id code_identity converter_revision app_revision image_ids runtime_lock_sha256 site_settings_sha256].each do |field|
+      %w[dataset_id code_identity converter_revision converter app_revision image_content_ids discourse_profile runtime_qualified runtime_lock_sha256 site_settings_sha256].each do |field|
         assert_equal body[field], manifest['lineage'][field], field
       end
+      assert_equal run['artifacts']['resolved_image_ids'], manifest['lineage']['image_ids']
+      image_ids = run['artifacts']['resolved_image_ids'].values
+      creates = @runtime.commands.map { |op| op[1] }.select { |cmd| cmd[0, 2] == %w[docker run] }
+      refute_empty creates
+      assert creates.all? { |cmd| image_ids.any? { |id| cmd.include?(id) } }, 'every run uses a resolved local ID, never a tag'
+      assert_equal image_ids.size, image_ids.uniq.size, 'fake stores expose distinct local IDs per ref'
+      creates.each do |cmd|
+        name = cmd.fetch(cmd.index('--name') + 1)
+        role = name.end_with?('-source-db') ? 'source_db' : name.split('-').last
+        role = 'web' if role == 'proxy'
+        assert_includes cmd, run['artifacts']['resolved_image_ids'].fetch(role), name
+      end
+      assert_equal true, manifest['runtime_qualified']
       assert_equal body['input_binding'], manifest['lineage']['inputs']
       assert_equal({ 'mode' => 'seed' }, manifest['lineage']['baseline'])
       assert_equal run['artifacts']['baseline'].slice('filename', 'sha256', 'bytes'), manifest['lineage']['baseline_archive']

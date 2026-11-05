@@ -5,7 +5,7 @@ require 'silo_migrate/services/standard_workflow_service'
 
 # Scripted command results only; no subprocess, Docker socket or host port use.
 class StandardScriptedRuntime < SiloMigrate::Runtime::Fake
-  attr_accessor :high_usage, :ownership, :images_match, :import_failure, :sweep_resources, :sweep_failure, :live_result, :live_error
+  attr_accessor :converter_head, :converter_branch, :converter_repo, :converter_dirty, :inspect_document, :high_usage, :ownership, :images_match, :import_failure, :sweep_resources, :sweep_failure, :live_result, :live_error
   def run(cmd, **options)
     result = super
     if sweep_failure && cmd.include?('ls') && cmd.include?('--filter')
@@ -23,7 +23,20 @@ class StandardScriptedRuntime < SiloMigrate::Runtime::Fake
     elsif cmd.include?('{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}')
       "99000000000 999999999999\n"
     elsif cmd[0, 3] == %w[docker image inspect]
-      images_match ? cmd.last : 'wrong-image'
+      if images_match
+        document = inspect_document || JSON.parse(File.read(File.join(__dir__, 'fixtures/image-inspect-sample.json'))).first
+        document['Id'] = 'sha256:' + Digest::SHA256.hexdigest(cmd.last)
+        JSON.generate([document])
+      else
+        'wrong-image'
+      end
+    elsif cmd.first == 'git'
+      if cmd.include?('status') then converter_dirty ? '?? untracked.txt' : ''
+      elsif cmd.include?('--abbrev-ref') then converter_branch || 'main'
+      elsif cmd.include?('rev-parse') then converter_head || 'a' * 40
+      elsif cmd.include?('remote') then converter_repo || 'https://github.com/discourse-org/discourse-converters.git'
+      else result.stdout
+      end
     elsif cmd.include?('{{json .Config.Labels}}') || cmd.include?('{{json .Labels}}')
       JSON.generate('silo-migrate.managed' => 'true', 'silo-migrate.instance' => ownership)
     else
@@ -52,13 +65,19 @@ module StandardTestWorkspace
       @code_root = File.join(dir, 'code')
       FileUtils.mkdir_p(File.join(@code_root, 'runtime'))
       FileUtils.cp_r(File.expand_path('../runtime/prebuilt-discourse', __dir__), File.join(@code_root, 'runtime'))
+      FileUtils.cp_r(File.expand_path('../runtime/profiles', __dir__), File.join(@code_root, 'runtime'))
+      profile_path = File.join(@code_root, 'runtime/profiles', SiloMigrate::RuntimeProfiles::DEFAULT + '.json')
+      profile = JSON.parse(File.read(profile_path))
+      digest = File.read(File.join(__dir__, 'fixtures/image-inspect-sample.content_id')).strip
+      profile.fetch('images').each_value { |image| image['content_id'] = digest }
+      File.write(profile_path, JSON.pretty_generate(profile))
       write(File.join(@code_root, 'lib', 'identity.rb'), '# synthetic code identity')
       @runtime = StandardScriptedRuntime.new
       @service = new_standard
       settings = write(File.join(dir, 'site-settings.yml'), "title: Synthetic\n")
       converter = File.join(dir, 'converter')
       FileUtils.mkdir_p(converter)
-      @service.init(converter_worktree: converter, converter_revision: 'a' * 40, site_settings: settings)
+      @service.init(converter_worktree: converter, site_settings: settings)
       yield
     end
   end
@@ -425,7 +444,7 @@ class StandardWorkflowTest < SiloMigrateTest
       second = SiloMigrate::Services::StandardWorkflowService.new('second', env: @env, runtime: @runtime, code_root: @code_root, execute_lock_wait: 0,
         port_probe: ->(_) { true }, disk_free: -> { 100 * 1024**3 })
       config = @service.store.load.fetch('config')
-      second.init(converter_worktree: config['converter_worktree'], converter_revision: config['converter_revision'], site_settings: config['site_settings'])
+      second.init(converter_worktree: config['converter_worktree'], site_settings: config['site_settings'])
       plan = second.propose_plan(dataset_id: dataset)
       second.approve_plan(plan_id: plan[:plan_id], sha256: plan[:digest], reviewer: 'engineer')
       run_id = second.claim(plan_id: plan[:plan_id])[:run_id]
@@ -473,7 +492,7 @@ class StandardWorkflowTest < SiloMigrateTest
         when 'code'
           File.write(File.join(@code_root, 'lib/identity.rb'), '# changed after claim')
         when 'runtime'
-          path = File.join(@code_root, 'runtime/prebuilt-discourse/runtime-lock.json')
+          path = File.join(@code_root, 'runtime/profiles/' + SiloMigrate::RuntimeProfiles::DEFAULT + '.json')
           content = JSON.parse(File.read(path))
           content['app']['revision'] = 'b' * 40
           File.write(path, JSON.generate(content))

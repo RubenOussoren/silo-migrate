@@ -12,3 +12,4 @@ customers/
 safe-ai-workspaces/
 migrations/
 sample-data/
+__pycache__/
