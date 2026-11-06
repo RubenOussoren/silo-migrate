@@ -97,8 +97,7 @@ class StandardAnalystEvidenceTest < SiloMigrateTest
         assert_operator JSON.generate(evidence).bytesize, :<=, budget, budget
         assert_equal 6, evidence[:logs].size
         assert_equal 'logs/import.log', evidence[:tails].keys.first if budget >= 12 * 1024
-        listed = evidence[:tails].keys + evidence[:omitted]
-        assert_equal evidence[:logs].map { |entry| "logs/#{entry[:name]}" }.sort, listed.sort, budget
+        assert_equal evidence[:logs].count { |entry| entry[:tail_bytes].zero? }, evidence[:tails_omitted], budget
         evidence[:logs].each do |entry|
           tail = evidence[:tails]["logs/#{entry[:name]}"]
           assert_equal tail ? tail.bytesize : 0, entry[:tail_bytes]
@@ -110,7 +109,7 @@ class StandardAnalystEvidenceTest < SiloMigrateTest
         end
         assert evidence[:failure_detail].key?('tail'), 'an oversized failure record is bounded'
       end
-      refute_empty findings.private_evidence(run_id)[:omitted], 'six large logs cannot all fit'
+      assert_operator findings.private_evidence(run_id)[:tails_omitted], :>, 0, 'six large logs cannot all fit'
     end
   end
 
@@ -141,6 +140,38 @@ class StandardAnalystEvidenceTest < SiloMigrateTest
         SiloMigrate::StandardCLI.new(env: @env, output: out, error: err).run(['finding', 'propose', 'synthetic', '--run', run_id, '--file', file.path]) }
       assert_equal 1, input
       assert_equal "Error: STANDARD_RUN_COMPLETED\n", err.string
+    end
+  end
+
+  def test_structured_state_and_index_are_bounded_too
+    with_standard do
+      run_id = claim
+      fail_at(run_id, 'convert')
+      @service.store.update { |state| 400.times { |n| state['runs'].fetch(run_id)['results']["synthetic_result_#{n}"] = 'v' * 40 } }
+      logs = @service.store.run_dir(run_id, 'logs')
+      FileUtils.mkdir_p(logs)
+      1000.times { |n| File.write(File.join(logs, format('conversion-step-%04d-%s.log', n, 'x' * 40)), "step #{n}\n") }
+      evidence = findings.private_evidence(run_id)
+      assert_operator JSON.generate(evidence).bytesize, :<=, Findings::EVIDENCE_OUTPUT_BYTES
+      assert_equal 1000, evidence[:logs_total]
+      assert_operator evidence[:logs].size, :<=, Findings::EVIDENCE_INDEX_ENTRIES
+      assert_operator evidence[:logs].size, :>, 100
+      assert_match(/omitted/, evidence[:results]['_truncated'])
+      assert_equal 3, evidence[:results]['input_count']
+    end
+  end
+
+  def test_symlinked_log_directory_is_not_followed
+    with_standard do
+      run_id = claim
+      outside = File.join(@root, 'outside-logs')
+      FileUtils.mkdir_p(outside)
+      File.write(File.join(outside, 'convert.log'), 'OUTSIDE-SECRET')
+      FileUtils.mkdir_p(@service.store.run_dir(run_id))
+      File.symlink(outside, @service.store.run_dir(run_id, 'logs'))
+      evidence = findings.private_evidence(run_id)
+      assert_empty evidence[:logs]
+      refute_includes JSON.generate(evidence), 'OUTSIDE-SECRET'
     end
   end
 

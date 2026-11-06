@@ -464,14 +464,17 @@ MIGRATION_AGENTS = ("migration-analyst", "migration-operator", "server-support")
 AGENTS_HELP = ("the service account's term-llm config.yaml needs 'agents:' with 'use_builtin: false' and "
                "'search_paths:' containing the installed agents directory, so the web UI offers only the node's agents")
 
-def agents_ready(as_account=True):
+def shipped_agents(release):
+    return tuple(sorted(path.parent.name for path in (Path(release)/"integrations/term-llm").glob("*/agent.yaml")))
+
+def agents_ready(as_account=True, expected=MIGRATION_AGENTS):
     # Without --agent the web UI offers every agent term-llm lists, so require exactly
     # the node's agents: no built-in shell agents with Docker authority. server-support's
     # shell and edits are prompt-approved per action (service --approval prompt).
     listing = output([P/"bin/term-llm", "agents"], account=as_account)
-    if not listing or "[builtin]" in listing or not re.search(r"Available agents \(" + str(len(MIGRATION_AGENTS)) + r"\):", listing):
+    if not listing or "[builtin]" in listing or not re.search(r"Available agents \(" + str(len(expected)) + r"\):", listing):
         return False
-    return all(re.search(r"(?m)^\s+" + re.escape(name) + r" - ", listing) for name in MIGRATION_AGENTS)
+    return all(re.search(r"(?m)^\s+" + re.escape(name) + r" - ", listing) for name in expected)
 
 def make_plan(allow=False):
     osinfo = os_check(allow)
@@ -573,11 +576,13 @@ def make_plan(allow=False):
              "Capacity gate for actual migration: 4 CPUs, 8 GiB RAM, 40 GiB new + 8 GiB reserve on each relevant filesystem."]
     if (home()/".config/term-llm").exists():
         notes.append("Existing term-llm config directory PRESERVED; safety/routing of existing config requires engineer review before customer use.")
+    # Before the switch, term-llm lists the agents of the release `current` still points
+    # to (agents.search_paths); after it, apply requires exactly MIGRATION_AGENTS.
     if C["TERM_LLM_SERVICE"] != "skip" and (P/"bin/term-llm").exists() and (home()/".config/term-llm/config.yaml").exists() and entry \
-            and (P/"current").exists() and not agents_ready():
+            and (P/"current").exists() and not agents_ready(expected=shipped_agents(P/"current") or MIGRATION_AGENTS):
         refuse("METAL_AGENTS_CONFIG", "existing term-llm config preserved; " + AGENTS_HELP + " (" + agents_path() + "), then re-plan")
     notes.append("Web UI agent picker: only " + ", ".join(sorted(MIGRATION_AGENTS)) + ", from " + agents_path() + " (agents.use_builtin: false); no pinned startup agent.")
-    notes.append("server-support has a shell with the account's ROOT-EQUIVALENT Docker authority and built-in file edits; each command and each write needs approval in the web UI (--approval prompt). Its read tools refuse workspaces, state/tmp and credential files.")
+    notes.append("server-support has a shell with the account's ROOT-EQUIVALENT Docker authority and built-in file edits; each command and each write needs approval in the web UI (--approval prompt; choose 'once'). Its read tools refuse workspaces, state/tmp and credential files. Approving a write to the release tree (agent definitions or tool scripts), ~/.config/term-llm (approval/agents settings) or the service unit can remove these limits: refuse such writes unless intended.")
     dry = None
     binary = P/"bin/term-llm"
     if C["TERM_LLM_SERVICE"] != "skip" and binary.exists() and entry:

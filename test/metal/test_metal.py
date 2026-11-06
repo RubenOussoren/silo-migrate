@@ -126,6 +126,32 @@ class InstallerTests(unittest.TestCase):
                     self.assertTrue(any("agent picker" in note and "server-support" in note for note in plan["notes"]))
                     self.assertTrue(any("server-support" in note and "ROOT-EQUIVALENT" in note and "approval" in note for note in plan["notes"]))
 
+    def test_plan_before_update_expects_the_current_release_agents(self):
+        # The server runs a two-agent release; planning the three-agent update must not be
+        # refused before the switch, and the post-switch check still requires all three.
+        P = self.m.P
+        (P/"bin").mkdir(parents=True)
+        (P/"bin/term-llm").write_text("")
+        (self.home/".config/term-llm").mkdir(parents=True)
+        (self.home/".config/term-llm/config.yaml").write_text("providers: {}\n")
+        for name in ("migration-analyst", "migration-operator"):
+            (P/"current/integrations/term-llm"/name).mkdir(parents=True)
+            (P/"current/integrations/term-llm"/name/"agent.yaml").write_text("name: " + name + "\n")
+        self.m.C["TERM_LLM_SERVICE"] = "install"
+        two = "Available agents (2):\n\n  [user] /x/\n    migration-analyst - a\n    migration-operator - b\n"
+        listings = {"two": two, "builtin": "Available agents (3):\n\n  [builtin]\n" + two.split("\n", 3)[3]}
+        for case, listing in listings.items():
+            def fake_output(argv, **kw):
+                return "docker users" if argv[0] == "id" else listing if argv[-1] == "agents" else "amd64"
+            with self.subTest(case=case), self.plan_stubs(), patch.object(self.m, "output", side_effect=fake_output), \
+                    patch.object(self.m, "artifact", return_value=None), patch.object(self.m, "hub_secrets_state", return_value=None):
+                if case == "two":
+                    self.assertTrue(any("server-support" in note for note in self.m.make_plan()["notes"]))
+                    self.assertFalse(self.m.agents_ready(as_account=False))
+                else:
+                    with self.assertRaisesRegex(self.m.Refusal, "METAL_AGENTS_CONFIG"):
+                        self.m.make_plan()
+
     def test_installer_expects_exactly_the_shipped_agents(self):
         shipped = sorted(path.parent.name for path in (Path(__file__).resolve().parents[2]/"integrations/term-llm").glob("*/agent.yaml"))
         self.assertEqual(sorted(self.m.MIGRATION_AGENTS), shipped)

@@ -161,12 +161,19 @@ account's Docker authority without per-command approval.
 shell has the account's **root-equivalent Docker authority**; with the service's
 `--approval prompt`, each command and each `edit_file`/`write_file` write asks the engineer
 (agents have no pre-approved write directories in term-llm 0.9.93). Choose "once" in the
-prompt: directory or command grants last for the session. Its own read tools are limited to
-`~/.config/term-llm`, `~/.config/op-cache` and `<prefix>/{etc,state,current}`; they refuse
-migration workspaces, `<prefix>/state/tmp`, term-llm credential files
-(`chatgpt_oauth.json`, `services/*/credentials/`) and other secret-named files, and redact
-secret-looking values. The path limit for edits and shell commands is the engineer's
-approval plus the agent's instructions, not a tool-enforced boundary. It also has web search. Verified against a throwaway
+prompt: directory or command grants last for the session. Its own read tools run without a
+prompt and are hard-limited: in `~/.config/term-llm` only `config.yaml`, `agents/`, `skills/`
+and `services/*/service.json`; in `~/.config/op-cache` only `config.yaml`; and
+`<prefix>/{etc,state,current}`. They refuse migration workspaces (including the configured
+`SILO_MIGRATE_BASE_PATH`; if `etc/silo-control.env` can't be read, every prefix path is
+refused), `<prefix>/state/tmp`, term-llm credential files (`chatgpt_oauth.json`,
+`services/*/credentials/`) and other secret-named files, and redact secret-looking values.
+The path limit for edits and shell commands is the engineer's approval plus the agent's
+instructions, not a tool-enforced boundary. Approving a write to the release tree (agent
+definitions, tool scripts), `~/.config/term-llm` approval/agent settings or the service unit
+can remove every agent's limits, so refuse those unless intended. The releases are owned by
+the service account; making them read-only to it is a possible later hardening. It also has
+web search. Verified against a throwaway
 0.9.93 web server: the page lists exactly those two agents. Plan uses stock service dry-run when
 the installed binary/account exist, otherwise explicitly defers it; apply runs
 it before writing service files. `install` writes without starting;

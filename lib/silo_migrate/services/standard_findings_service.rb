@@ -23,6 +23,8 @@ module SiloMigrate
       EVIDENCE_OUTPUT_BYTES = 40 * 1024
       EVIDENCE_MIN_TAIL_BYTES = 512
       EVIDENCE_FAILURE_BYTES = 4 * 1024
+      EVIDENCE_STATE_BYTES = 4 * 1024
+      EVIDENCE_INDEX_ENTRIES = 200
       # Which stage writes each private log (StandardWorkflowService#log and #checked
       # names). Keep in step with those calls; a full-run test checks every log maps.
       LOG_STAGES = {
@@ -63,10 +65,12 @@ module SiloMigrate
       # reachable from `standard agent`; do not expose it to a coding session.
       #
       # Structured state comes first (stages, assertions, results, failure), then an
-      # index of every evidence file and log with its size and stage, then tails in
-      # priority order: failed assertion groups, the failed stage's logs (latest
-      # first), then earlier stages. Tails stop at the byte budget of the serialized
-      # document; anything without a tail is listed in `omitted`.
+      # index of every evidence file and log with its size and stage (up to
+      # EVIDENCE_INDEX_ENTRIES each, with totals), then tails in priority order:
+      # failed assertion groups, the log named by the failure, the failed stage's
+      # logs (latest first), then earlier stages. Tails stop at the byte budget of
+      # the serialized document. An entry whose tail_bytes is below its bytes was not
+      # read in full; `tails_omitted` counts files with no tail at all.
       def private_evidence(run_id, budget: EVIDENCE_OUTPUT_BYTES)
         run = @store.load.fetch("runs")[run_id]
         raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
@@ -76,21 +80,24 @@ module SiloMigrate
         detail = failure_detail(File.join(directory, "private", "failure.json"))
         failed_stage = run.dig("failure", "stage") || (detail.is_a?(Hash) ? detail["stage"] : nil)
         completed = run["status"] == "completed"
-        evidence_files = files(File.join(directory, "evidence"), "*").map { |path| { name: File.basename(path), bytes: File.size(path), path: path } }
-        logs = files(File.join(directory, "logs"), "*.log").map do |path|
+        all_evidence = files(File.join(directory, "evidence"), "*")
+        all_logs = files(File.join(directory, "logs"), "*.log")
+        evidence_files = all_evidence.first(EVIDENCE_INDEX_ENTRIES).map { |path| { name: File.basename(path), bytes: File.size(path), path: path } }
+        logs = all_logs.first(EVIDENCE_INDEX_ENTRIES).map do |path|
           name = File.basename(path, ".log")
           { name: File.basename(path), bytes: File.size(path), stage: self.class.log_stage(name) || stage_by_time(stages, File.mtime(path)), path: path, mtime: File.mtime(path) }
         end
         result = {
           version: 1, run_id: run_id, status: run["status"], stage: run["stage"], failed_stage: failed_stage,
           stages: stages.to_h { |name, entry| [name, entry.slice("status", "started_at", "finished_at")] },
-          assertions: run.fetch("assertions", {}), results: run.fetch("results", {}),
+          assertions: bounded(run.fetch("assertions", {})), results: bounded(run.fetch("results", {})),
           failure: run["failure"], failure_detail: detail,
           finding: completed ? "not_applicable: run completed; summarise it, do not propose a finding" : "may_propose",
           budget_bytes: budget,
+          evidence_files_total: all_evidence.size, logs_total: all_logs.size,
           evidence_files: evidence_files.map { |file| { name: file[:name], bytes: file[:bytes], tail_bytes: 0 } },
           logs: logs.map { |log| { name: log[:name], bytes: log[:bytes], stage: log[:stage], tail_bytes: 0 } },
-          tails: {}, omitted: []
+          tails: {}, tails_omitted: 0
         }
         candidates = tail_candidates(run, result, evidence_files, logs, failed_stage, detail)
         fill_tails(result, candidates, budget)
@@ -153,7 +160,22 @@ module SiloMigrate
       private
 
       def files(directory, pattern)
+        return [] if File.symlink?(directory)
+
         Dir[File.join(directory, pattern)].select { |path| File.file?(path) && !File.symlink?(path) }.sort
+      end
+
+      # Workflow-recorded state is small; this bounds it anyway so the document fits.
+      def bounded(hash)
+        return hash if JSON.generate(hash).bytesize <= EVIDENCE_STATE_BYTES
+
+        kept = {}
+        hash.each do |key, value|
+          break if JSON.generate(kept.merge(key => value)).bytesize > EVIDENCE_STATE_BYTES - 64
+
+          kept[key] = value
+        end
+        kept.merge("_truncated" => "#{hash.size - kept.size} of #{hash.size} entries omitted")
       end
 
       # The private failure record, or its bounded tail if it is large or not JSON.
@@ -189,33 +211,39 @@ module SiloMigrate
         # A failed checked step records its log name as the failure detail.
         named = detail.is_a?(Hash) && detail["detail"].is_a?(String) ? "#{detail['detail']}.log" : nil
         ranked = logs.each_with_index.sort_by do |log, _index|
-          [log[:stage] && log[:stage] == failed_stage ? 0 : 1, log[:name] == named ? 0 : 1, -(order.index(log[:stage]) || -1), -log[:mtime].to_f, log[:name]]
+          [log[:name] == named ? 0 : 1, log[:stage] && log[:stage] == failed_stage ? 0 : 1, -(order.index(log[:stage]) || -1), -log[:mtime].to_f, log[:name]]
         end
         failures.map { |file, index| { key: "evidence/#{file[:name]}", path: file[:path], entry: result[:evidence_files][index] } } +
           ranked.map { |log, index| { key: "logs/#{log[:name]}", path: log[:path], entry: result[:logs][index] } }
       end
 
       def fill_tails(result, candidates, budget)
-        # Room for the index's tail_bytes values and the omitted list.
-        used = JSON.generate(result).bytesize + 64 + candidates.sum { |candidate| candidate[:key].bytesize + 24 }
+        # Room for the index's tail_bytes values.
+        used = JSON.generate(result).bytesize + 64 + candidates.size * 8
         candidates.each do |candidate|
           room = [budget - used, EVIDENCE_TAIL_BYTES].min
           text = room >= EVIDENCE_MIN_TAIL_BYTES ? fitted_tail(candidate[:path], room) : nil
-          if text
-            result[:tails][candidate[:key]] = text
-            candidate[:entry][:tail_bytes] = text.bytesize
-            used += JSON.generate(candidate[:key]).bytesize + JSON.generate(text).bytesize + 2
+          next unless text
+
+          result[:tails][candidate[:key]] = text
+          candidate[:entry][:tail_bytes] = text.bytesize
+          used += JSON.generate(candidate[:key]).bytesize + JSON.generate(text).bytesize + 2
+        end
+        # The serialized document must fit: drop the lowest-priority tails, then (for
+        # pathological runs) trailing index entries; the totals still show the count.
+        while JSON.generate(result).bytesize > budget
+          if (key = result[:tails].keys.last)
+            result[:tails].delete(key)
+            candidates.find { |candidate| candidate[:key] == key }[:entry][:tail_bytes] = 0
+          elsif !result[:logs].empty?
+            result[:logs].pop
+          elsif !result[:evidence_files].empty?
+            result[:evidence_files].pop
           else
-            result[:omitted] << candidate[:key]
+            break
           end
         end
-        # The serialized document must fit; drop the lowest-priority tails if not.
-        while JSON.generate(result).bytesize > budget && !result[:tails].empty?
-          key = result[:tails].keys.last
-          result[:tails].delete(key)
-          candidates.find { |candidate| candidate[:key] == key }[:entry][:tail_bytes] = 0
-          result[:omitted] << key
-        end
+        result[:tails_omitted] = candidates.size - result[:tails].size
       end
 
       # The longest whole-line tail whose JSON encoding fits in `limit` bytes.
