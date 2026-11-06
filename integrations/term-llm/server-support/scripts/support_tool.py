@@ -35,8 +35,8 @@ SECRET_COMPONENT = re.compile(
 SECRET_KEY = (r"[\w.-]*(?:api[_-]?key|apikey|token|secret|passw(?:or)?d|passphrase|bearer|authorization|credential"
               r"|private[_-]?key|access[_-]?key|session[_-]?key)[\w.-]*")
 KEY_VALUE = re.compile(
-    r"(?i)(?P<lead>(?:^|[\s{,;(\[])(?:export\s+)?)(?P<q>[\"']?)(?P<key>" + SECRET_KEY + r")(?P=q)(?P<sep>\s*[:=]\s*)"
-    r"(?P<value>\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\s,;}\]][^,;}\]\r\n]*)?")
+    r"(?i)(?P<lead>(?:^|[\s{,;(\[?&])(?:export\s+)?)(?P<q>[\"']?)(?P<key>" + SECRET_KEY + r")(?P=q)(?P<sep>\s*[:=]\s*)"
+    r"(?P<value>\"(?:[^\"\\]|\\.)*\"|'(?:[^']|'')*'|[^\s,;}\]][^,;}\]\r\n]*)?")
 FLAG = re.compile(r"(?i)(?P<flag>(?<![\w-])--?" + SECRET_KEY + r")(?P<sep>=|[ \t]+)(?P<value>\"[^\"]*\"|'[^']*'|[^\s\"',\]]+)")
 FLAG_JSON = re.compile(r"(?i)(?P<flag>\"--?" + SECRET_KEY + r"\"\s*,\s*)(?P<value>\"(?:[^\"\\]|\\.)*\")")
 FLAG_JSON_TRAILING = re.compile(r"(?i)\"--?" + SECRET_KEY + r"\"\s*,?\s*$")
@@ -176,7 +176,8 @@ def redact_line(line, state):
     if state["block"] is not None:
         if not line.strip():
             return line, 0
-        if indentation(line) > state["block"]:
+        # Deeper lines continue the value; a YAML list may also sit at the key's indent.
+        if indentation(line) > state["block"] or (indentation(line) == state["block"] and line.lstrip().startswith("- ")):
             return " " * indentation(line) + "[REDACTED]" + newline, 1
         state["block"] = None
     if PEM_BEGIN.search(line):
@@ -204,6 +205,7 @@ def redact_line(line, state):
         if NOT_SECRET.match(bare) or REFERENCE.match(bare):
             return match.group(0)
         count += 1
+        state["block"] = indentation(line)
         quote = value[0] if value[0] in "\"'" else ""
         return match.group("lead") + match.group("q") + match.group("key") + match.group("q") + match.group("sep") + quote + "[REDACTED]" + quote
 

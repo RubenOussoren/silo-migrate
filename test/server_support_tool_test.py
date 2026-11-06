@@ -60,6 +60,13 @@ class ServerSupportToolTest(unittest.TestCase):
             '-----END OPENSSH PRIVATE KEY-----',
             'export API_KEY=exportedsecretvalue',
             '{"name":"web","token":"minifiedjsonsecret","port":8080}',
+            'tokens:',
+            '- samelevellistsecret',
+            'hub_url: https://hub.example.test/x?token=querysecret123&access_token=querysecret456',
+            'Authorization: Bearer',
+            '  continuedsecretvalue',
+            "quoted_secret: 'single ''escaped'' quotesecrettail'",
+            'list_after: visible-after-list',
             'after: visible', '']))
         self.write(config / 'services/web/service.json', json.dumps({'args': ['serve', '--hub-registration-token', 'splitflagsecret', '--port', '18800',
                                                                               '--token=inlineflagsecret', '--auth', 'bearer']}, indent=2))
@@ -99,10 +106,11 @@ class ServerSupportToolTest(unittest.TestCase):
         result, raw = self.read('~/.config/term-llm/config.yaml')
         text = result['text']
         for secret in (SECRET, 'abcdefgh12345678', 'hunter2hunter2', 'b3BlbnNzaC1rZXktdjEAAAAA', 'plainbearervalue123',
-                       'multilineblocksecret', 'exportedsecretvalue', 'minifiedjsonsecret'):
+                       'multilineblocksecret', 'exportedsecretvalue', 'minifiedjsonsecret', 'samelevellistsecret', 'querysecret',
+                       'continuedsecretvalue', 'quotesecrettail'):
             self.assertNotIn(secret, raw, secret)
         for kept in ('op-cache read "op://Everybody/Snorlax LLM/credential"', 'max_tokens: 4096', 'password: ""', 'after: visible',
-                     'after_block: visible-after-block', '"port":8080'):
+                     'after_block: visible-after-block', '"port":8080', 'list_after: visible-after-list', 'https://hub.example.test/x?token='):
             self.assertIn(kept, text, kept)
         self.assertGreaterEqual(result['redactions'], 9)
 
