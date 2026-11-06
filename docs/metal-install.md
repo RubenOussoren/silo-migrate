@@ -17,6 +17,20 @@ configured. Existing Docker installations, running containers and existing
 account term-llm configuration are preserved. Do not run verification against a
 live demo's workspace. Verification creates a fresh synthetic workspace.
 
+## Quick start on a server
+
+1. Copy the artifact package directory to a trusted, root-owned location that
+   is not group/world-writable and not `/tmp` (e.g. `/srv/silo-artifacts/`), then
+   `script/metal artifacts verify DIR` and compare the manifest SHA256 with the
+   one you were given.
+2. Clone this repository's `mvp/metal-installer` branch somewhere the service
+   account can read. Run `script/metal` from that checkout: its companions
+   (`package-artifacts`, `image_identity.py`, `image_archive.py`) must sit beside it.
+3. Copy `config/metal.example.conf`, set `ARTIFACT_PACKAGE` (and anything else you
+   need), then `preflight`, `plan --plan FILE`, review, `apply --plan FILE`.
+4. `script/metal verify` runs the full synthetic workflow; `status` reports what
+   is installed. Provision provider access afterwards, as the account.
+
 ## Review, then apply
 
 Run from a checkout readable/executable by the service account. Put the literal
@@ -224,10 +238,15 @@ an empty string; shared Unicode/control-character Env fixtures test Ruby,
 Python and the wrapper. The wrapper reads control's identity from the bound
 profile (including its persisted profile SHA), never a fixed content ID.
 
-Before Docker sees an image tar, a stdlib parser checks `manifest.json` and/or
-OCI `index.json`: exactly one image, matching config digest, actual uncompressed
-layer SHA256/diff_ids and expected content ID. Docker RepoTags must be `[]` or
-exactly `[expected_ref]`; foreign OCI reference annotations are refused too.
+Before Docker sees an image tar, a stdlib parser reads it in one forward pass,
+hashing each file as stored and, for gzip streams, uncompressed. It checks
+`manifest.json` and/or OCI `index.json`: exactly one image manifest (no nested
+index), matching config digest, uncompressed layer SHA256s equal to the config's
+diff_ids (gzip or plain tar layers; zstd/unknown encodings refused) and the
+expected content ID. Every file must be reachable from that one image. Tags
+(RepoTags, `repositories`, OCI `ref.name` and `io.containerd.image.name`) may
+only name the expected ref in Docker's spellings: as given, `docker.io/`-
+normalized, or the bare tag that containerd records in `ref.name`.
 All existing tags are snapshotted using `docker image ls --no-trunc --format`
 before/after load. Any unrelated tag change refuses with
 `METAL_IMAGE_TAG_CHANGED`; it is reported, **not automatically rolled back**.
@@ -239,8 +258,10 @@ installer inspects the validated config image ID, requires its content ID, then
 tags `silo-migrate/loaded:<content-id-hex>` (refusing a conflicting existing tag).
 Receipts distinguish original `ref` and actual `resolved_ref`; wrapper, Ruby
 resolver, status and update/rollback validate this fallback by content too.
-The digest-missing daemon behavior is simulated in tests here, **not exercised
-with a real image load**. Real large-package ingestion remains unqualified.
+Real package ingestion (pre-load parse, load, tag snapshot, content check) has
+run on a fresh Debian 12 VM with the two tag-referenced package images. The
+digest-ref fallback is still only simulated: no packaged image currently uses a
+digest ref (control is pulled by digest from Docker Hub).
 
 ## Verify, update and rollback
 
@@ -282,119 +303,87 @@ workspaces, converter checkouts, backups or image data. Rollback uses history an
 the retained previous release and deletes nothing. Neither command restarts the
 term service; schedule a separate explicitly approved restart if needed.
 
-## Tests and actual evidence (2026-11-05)
-
-```sh
-python3 -I -m unittest discover -s test/metal -v
-bash -n script/metal test/metal/vm/*.sh
-# Docker build installs QEMU/tools inside the disposable harness only.
-test/metal/vm/run.sh small
-# Larger explicitly approved resource envelope; not run in this task:
-test/metal/vm/run.sh full --cpus 4 --memory 12g --disk 96G --artifacts /approved/package
-```
-
-The VM harness pins the Debian 12 container digest and cloud release
-`bookworm/20261026-2643`, verifying its official SHA512SUMS. It uses KVM through
-`--device /dev/kvm`, ephemeral SSH, cloud-init test admin, no host-published port,
-and container-loopback-only SSH forwarding. Defaults: container 0.5 CPU/1408m,
-VM 1 vCPU/1024MiB, sparse 64G overlay. Larger flags increase guest resources too
-(container memory minus 384MiB overhead). All disk/evidence is under a fresh
-`../../.runtime-cache/metal-installer-tests/run-*`. Public shallow local Git input
-is cloned with `--no-local` to preserve shallow boundaries, copied into the VM,
-and a **disposable bare-fixture** second commit is created there (no worktree
-commit/push). No existing host container/volume is stopped or modified.
-
-Real successful small-VM evidence:
-`../../.runtime-cache/metal-installer-tests/run-LRTNuq9N/{scenarios.log,harness.log,guest-state.tar.gz}`.
-Observed: Debian 12/amd64 preflight and arm64 refusal, missing-Git installation,
-real official Docker CE install on a no-Docker VM, pinned term-llm download and
-both checksum gates, account creation, lingering, stock service dry-run/install/
-start (`active`), config sentinel preserved, unchanged re-apply with an identical
-filesystem snapshot, status, second-local-commit update and rollback.
-Output ended `GUEST_SCENARIOS_OK small` / `VM_SCENARIOS_OK small`, exit 0.
-The installed release in that run was `dbc58bab60e0c552ca9ed4cec43eb45a49ef50b7`
-(the branch's then-current committed Ruby half, not uncommitted installer files).
-
-Earlier retained VM attempts failed at missing-Git commit resolution, local Git
-ownership/shallow-history transfer, and admin traversal of the private prefix;
-those defects were corrected before the successful run. They are not acceptance
-runs. **Large artifact loading and full synthetic verify were explicitly skipped**
-in every small VM; package tampering, identity mismatch, lock refusal, update
-workspace preservation, secret suppression and full verify's structured command
-contract are host-side synthetic/stub tests, not VM runtime acceptance. A final
-post-hardening rerun/result is recorded below when executed. No migrations05
-connection, customer data, provider authentication or Hub test was performed.
-
-### Final post-hardening verification
-
-- **22 host tests pass**, 0 failures/errors/skips, including Unicode UTF-8 identity,
-  exact Ruby fixture match, both held-lock paths, claimed registry state, read-only
-  preflight/plan and missing-Git bare-ref resolution. No Ruby-owned files changed.
-- Bash syntax checks pass. **ShellCheck passes** on `script/metal` and all VM shell
-  scripts; ShellCheck was installed/run only inside a disposable, bounded harness
-  container, not on the host.
-- Real post-hardening VM reruns: `run-MHYzYN1V`, then `run-aQDdV5wq`, both
-  exit 0, `VM_SCENARIOS_OK small`. The latter additionally asserts
-  `METAL_SERVICE_CONTROL_ENV_OK` for the non-secret systemd adapter environment.
-  It additionally forced a real account reconfiguration (`KEEP_RELEASES=4`) with
-  a pre-existing config sentinel, verified its checksum was unchanged, then
-  proved the following unchanged apply made zero filesystem changes. The final
-  installer included available-RAM/shared-pressure reporting, state/tmp staging,
-  site-settings **file** integration and pinned binary receipts. Both Debian cloud
-  image verification and stock term service installation/start ran for real.
-- Still **not run**: real large-image package load/extraction and full synthetic
-  migration verify, term-version rollback with two installed versions, non-default
-  separate-disk target, Debian 13/Ubuntu execution, provider auth or target host.
-  The small VM's unavailable remote converter branches were reported as such;
-  its Silo input came from the transferred local bare repository.
-- All failed/successful VM overlays/evidence were retained under the designated
-  private cache, and harness containers used `--rm`. The local harness image is
-  retained. Nothing was installed on the host or changed in host services; no
-  `silomig-*` / `silo-control-*` container or volume was modified. No worktree
-  commit or push was made by the installer developer.
-
-After that real VM run, plan reporting was tightened to distinguish existing
-versions/releases from actual downloads/clones, bind observed image identities
-into the plan SHA, and enumerate exact load/pull/verify/cache paths when a package
-is supplied. Re-apply of an existing installation now also holds the same idle
-locks as update/rollback. These final package/planning safeguards were covered by
-the host suite, together with a no-workspace-on-insufficient-capacity verify
-gate; the real large-package/full-verify path remains unrun.
-
-
-## Independent-review fixes (offline, 2026-11-05)
+## Converter Git safety
 
 Converter Git (host clone/status/fetch/merge and container identity/status) uses
 `GIT_CONFIG_NOSYSTEM=1`, disabled hooks, fsmonitor and untracked cache, and an
 exact checkout `safe.directory`; status also uses `--no-optional-locks`.
-Credential helpers are disabled except the explicit host fetch. Converter update
-holds the workspace `op.lock` across checks/fetch/merge and refuses claimed or
-running runs. Refresh takes its own op.lock and also refuses those states.
-The lock is released before the separate refresh subprocess to avoid a
-self-deadlock; refresh revalidates cleanliness and identity under its own lock.
+Credential helpers are disabled except for the explicit host fetch. Converter
+update holds the workspace `op.lock` across checks/fetch/merge and refuses claimed
+or running runs. Refresh takes its own `op.lock`, refuses those states and
+revalidates cleanliness and identity.
 
-Current review regression evidence supersedes earlier host-test counts above.
-No VM harness, real host installer apply, real-workspace control operation,
-Docker load/pull/build/tag or host package/service mutation ran in this fix task.
-Real local fixture Git/fsmonitor/hooks, lock contention, filesystem pruning,
-private snapshot cleanup and tiny synthetic Docker/OCI tar parsing are exercised;
-Docker tag inventory/load/inspect and root provisioning paths are mocked.
+## Tests and actual evidence (2026-11-05)
 
-Final bounded verification for this fix set:
+```sh
+python3 -I -B -m unittest discover -s test/metal -p 'test_*.py'
+bash -n script/metal test/metal/vm/*.sh
+# Disposable KVM harness; installs QEMU only inside its own container.
+test/metal/vm/run.sh small
+test/metal/vm/run.sh full --cpus 4 --memory 8g --disk 64G --artifacts DIR
+```
 
-- `timeout 300 python3 -I -B -m unittest discover -s test/metal -p 'test_*.py'`:
-  **44 tests, 0 failures/errors/skips**.
-- Full isolated Ruby suite: **698 runs, 6395 assertions, exactly the 3 expected
-  InstallServiceTest baseline failures, 0 errors, 1 DockerIntegration skip**;
-  seed `20261105`. Pinned image
-  `sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b8310d84949240`,
-  `--rm`, network none, read-only root/source/gems, private scratch bind,
-  1 CPU / 1 GiB / 128 PIDs, `RUN_DOCKER_TESTS=0`, 300-second timeout.
-- `bash -n script/metal`, Python AST syntax checks and `git diff --check` pass.
-- Disk before and after: `/dev/sda2` 139G total, 52G used, **80G available**
-  (40%). Scratch was confined to `../../.runtime-cache/metal-review-fix-tmp/`
-  and removed after verification; no image tarballs retained.
+The harness boots the dated official Debian 12 cloud image
+(`bookworm/20261026-2643`, checked against its SHA512SUMS) under KVM. It uses
+ephemeral SSH, no host-published port and a sparse guest disk. Before starting
+it refuses unless host free space covers the disk cap plus a 12 GiB reserve.
+It deletes the guest disk and repo copies on exit, and sweeps leftovers of
+killed runs on the next start. Evidence stays in
+`../../.runtime-cache/metal-installer-tests/run-*`.
 
-The three baseline failures are Bundler 2.5.22 versus expected 2.6.9 output,
-a pre-existing shell preset dry-run assertion, and a pre-existing installer
-fetch-versus-clone dry-run assertion. Their assertions were not weakened.
+**Fresh Debian 12 VM, real package, full scenario:**
+- **Install:** preflight with an arm64 refusal, plan with a path-authority
+  refusal, then apply (real Docker CE install, pinned term-llm download, account,
+  stock service install and start, package verify, pre-load parse and image load).
+- **Re-apply:** apply with an existing config preserved, then an unchanged
+  re-apply with an identical `find` snapshot of the whole prefix.
+- **Update and verify:** status, update and rollback, then `metal verify`.
+
+Verify runs the synthetic workflow end to end and requires a `restore-proven`
+final backup. It ran with `VERIFY_MIN_AVAILABLE_MIB=6144`, because the test VM
+had 7.6 GiB of RAM. Results:
+
+| Run | Result |
+| --- | --- |
+| full-16, -17, -18 | `METAL_VERIFY_OK` (first final backup `e14a8563…`) |
+| full-15 | `METAL_VERIFY_RUN_FAILED` at `verify_restore`, `STANDARD_RESTORE_FAILED` |
+
+**Known intermittent failure (open):** 1 of 4 completed full runs failed the
+restored-site comparison. No failure detail was retained for that run (the
+harness now exports bounded failure records). The suspected cause is a race with
+Discourse's post-restore background rebake: `verify_restore` fingerprints cooked
+HTML without waiting for it. If it fails on a server, `standard status` gives the
+run ID; the run's `private/failure.json` and `evidence/restore.failures.json`
+name the failed assertion. Reset that exact run and verify again.
+
+**Defects the VM runs found and fixed:**
+- Packages built from a renamed profile copy failed apply. Build now requires the
+  release `runtime/profiles/` file and runs apply's name-bound verification.
+- The archive parser rejected real containerd-store saves (normalized names, gzip
+  layers). See above.
+- A partial installer copy failed mid-apply. It now refuses up front, and companion
+  hashes are bound into the plan.
+- Bash spooled the >64 KiB engine here-document into `TMPDIR`, i.e.
+  `state/tmp`, on every read-only re-invocation. The engine is now read through
+  a pipe, and a test asserts `TMPDIR` is untouched.
+
+**Not exercised on a real target:**
+- **Docker:** an existing Docker installation with other workloads; every VM
+  started without Docker.
+- **Layout and versions:** a separate workspaces disk, Debian 13/Ubuntu, and
+  rolling back term-llm across two installed versions.
+- **Credentials and access:** provider authentication, Hub registration, remote
+  access to the term-llm service, and customer data.
+
+Host suites at installer commit `7947dd7`:
+- 49 installer tests pass, 0 failures/errors/skips.
+- Full isolated Ruby suite (last run at `9847b99`, no Ruby changes since): 698
+  runs, 6395 assertions, the 3 long-standing `InstallServiceTest` failures, 0
+  errors, 1 disabled Docker-integration skip. Those failures are Bundler 2.5.22
+  versus expected 2.6.9 output, a shell preset dry-run assertion and a
+  fetch-versus-clone dry-run assertion; their assertions were not weakened.
+
+Independent review of the installer found 5 blockers and 8 major issues; all
+were addressed in `9847b99` (Git hook/fsmonitor hardening, name-based release
+pruning, pre-load image checks, private package snapshot, path authority, locks).
+The fixes since then, listed above, have not been re-reviewed.
