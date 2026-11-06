@@ -110,6 +110,50 @@ It can read safe status, propose plans, request an already-approved run and read
 4. Coding work reads it with `standard agent finding-show`. Unreleased findings aren't listed and can't be read through this surface.
 5. Fixing the code invalidates earlier plans, so a new plan and run validate the fix.
 
+## Converter development (converter-developer and converter-reviewer)
+
+Two agents work on a workspace's converter checkout (`workspaces/WS/converter`) without
+ever seeing customer data. converter-developer runs on ChatGPT/Codex (`chatgpt`);
+converter-reviewer on Claude (`claude-bin`, which must be configured and signed in).
+
+- **What they see:** files tracked at HEAD plus new files the developer created through
+  its tools (recorded in `.silo-migrate/named/standard/converter-dev-files.json`). Every
+  other untracked file is invisible whatever `.gitignore` says, as are `.git`, symlinks
+  and anything outside the checkout. Released findings come through `standard agent`.
+- **What the developer may change:** those files, except `.gitignore`, `.gitattributes`,
+  `.gitmodules`, `.git/`, `.github/workflows/`, `Gemfile`, `Gemfile.lock` and `.bundle/`
+  (the converter image's gem bundle is fixed by the runtime profile).
+- **Tests:** `dev_test` copies only the visible files into a temporary directory and runs
+  `rake test` (or `rubocop`) in the profile's converter image, verified by content ID,
+  with no network, a read-only root, no capabilities and CPU/memory/PID/time limits.
+- **Commits:** only on `migration/WS/TOPIC` branches; only the visible changed paths are
+  committed (`git commit --only`), authored as the engineer with an
+  `Assisted-by: converter-developer (term-llm agent)` trailer. Identity comes from the
+  checkout's `user.name`/`user.email`, else `~/.config/silo-migrate/git-identity`
+  (`name=...` and `email=...` lines, not group/world writable).
+- **Push:** the developer calls `dev_push_propose`, which records a proposal and its
+  SHA-256 digest (repository, branch, base, head, commits, files, PR title and body).
+  Nothing is pushed until the engineer runs:
+
+  ```sh
+  silo-migrate-control converter push-show WS
+  silo-migrate-control converter push WS --sha256 DIGEST   # add --no-pr to skip the PR
+  ```
+
+  It refuses if anything changed since the proposal, pushes non-force to `origin` (which
+  must be `https://github.com/OWNER/REPO`), then opens a **draft** PR as the engineer.
+  The token is read only here, from `~/.config/silo-migrate/github/token-OWNER`
+  (mode 0600, owned by the account), through a one-command credential helper: never in
+  argv, a URL or Git config. Marking ready and merging stay with people.
+- After commits, run `standard converter refresh WS` before planning a run on the new code.
+- `converter clone`/`update` use the same token file for a github.com remote when one
+  exists, so a workspace can clone the private converter repository:
+  `silo-migrate-control converter clone WS --repo https://github.com/discourse-org/discourse-converters.git --branch main`.
+
+Limits: same-account processes (and an engineer approving server-support writes) are
+inside the trust boundary; the checks are not an OS sandbox. Tests run converter code
+in a container with Docker's default seccomp/AppArmor, not a VM.
+
 ## Converter selection
 
 ```text

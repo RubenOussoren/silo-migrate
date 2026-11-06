@@ -1,0 +1,203 @@
+name: converter-developer
+description: Writes and tests converter code for a migration workspace (Codex). Sees only the converter checkout and released findings, never customer data. Pushes only after engineer approval.
+provider: chatgpt
+model: gpt-6.1-sol
+allowed_models:
+  - "chatgpt:*"
+workspace: none
+agents_md: "false"
+# Web search and read_url, for public documentation.
+search: true
+max_turns: 80
+tools:
+  enabled: [update_plan]
+  custom:
+    - name: dev_list
+      description: "List a directory of the workspace's converter checkout (only files Git can see; ignored files are never shown)."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          path: {type: string, description: "Directory relative to the checkout root; omit for the root"}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_read
+      description: "Read a text file of the converter checkout from start_line, up to about 32 KB. Use next_line to continue."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          path: {type: string}
+          start_line: {type: integer, minimum: 1}
+        required: [workspace, path]
+        additionalProperties: false
+    - name: dev_search
+      description: "Search the converter checkout (git grep over tracked and non-ignored files). Fixed string by default; fixed=false for an extended regex."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          pattern: {type: string}
+          path: {type: string}
+          fixed: {type: boolean}
+          ignore_case: {type: boolean}
+        required: [workspace, pattern]
+        additionalProperties: false
+    - name: dev_status
+      description: "Branch, HEAD, uncommitted changes and commits not yet pushed."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_diff
+      description: "Diff of uncommitted changes (scope working) or of all unpushed commits (scope unpushed); optionally one path."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          scope: {type: string, enum: [working, unpushed]}
+          path: {type: string}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_test
+      description: "Run the converter's tests (suite test; omit file for the full suite, or one test/..._test.rb file) or rubocop (suite lint; omit file for all, or one .rb file) in a sandbox: converter image, no network, no customer data. Takes up to a few minutes."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 300
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          suite: {type: string, enum: [test, lint]}
+          file: {type: string}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_push_show
+      description: "Show the latest push proposals for this workspace and their status (proposed, pushed, pull request)."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_findings
+      description: "List investigation findings an engineer has released for coding work."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_finding_show
+      description: "Read one released finding and its synthetic reproduction. Unreleased findings are refused."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          finding_id: {type: string}
+        required: [workspace, finding_id]
+        additionalProperties: false
+    - name: dev_write
+      description: "Create or replace a file in the converter checkout (not ignored, protected or Git-internal paths). Returns a diff."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          path: {type: string}
+          content: {type: string}
+        required: [workspace, path, content]
+        additionalProperties: false
+    - name: dev_edit
+      description: "Replace exact text in a file of the converter checkout. old_text must match exactly once unless replace_all. Returns a diff."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          path: {type: string}
+          old_text: {type: string}
+          new_text: {type: string}
+          replace_all: {type: boolean}
+        required: [workspace, path, old_text, new_text]
+        additionalProperties: false
+    - name: dev_delete
+      description: "Delete a file from the converter checkout."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          path: {type: string}
+        required: [workspace, path]
+        additionalProperties: false
+    - name: dev_branch
+      description: "Create or switch to the branch migration/<workspace>/<topic>. Uncommitted changes come along."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          topic: {type: string, description: "Lowercase, e.g. null-login-users"}
+        required: [workspace, topic]
+        additionalProperties: false
+    - name: dev_commit
+      description: "Commit all visible changes on the current migration branch, authored as the engineer, with an Assisted-by trailer. Ignored files are never committed."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          message: {type: string, description: "Subject line (max 100 chars), blank line, body"}
+        required: [workspace, message]
+        additionalProperties: false
+    - name: dev_push_propose
+      description: "Propose pushing the current migration branch and opening a draft pull request. Nothing is pushed: the engineer approves the returned digest with a command."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          title: {type: string}
+          body: {type: string}
+          base: {type: string, description: "Base branch, default main"}
+        required: [workspace, title]
+        additionalProperties: false

@@ -1,0 +1,125 @@
+name: converter-reviewer
+description: Reviews converter changes before they are pushed (Claude). Read-only; runs tests and lint in the sandbox. Never sees customer data.
+provider: claude-bin
+model: opus
+allowed_models:
+  - "claude-bin:*"
+workspace: none
+agents_md: "false"
+# Web search and read_url, for public documentation.
+search: true
+max_turns: 60
+tools:
+  enabled: [update_plan]
+  custom:
+    - name: dev_list
+      description: "List a directory of the workspace's converter checkout (only files Git can see; ignored files are never shown)."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          path: {type: string, description: "Directory relative to the checkout root; omit for the root"}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_read
+      description: "Read a text file of the converter checkout from start_line, up to about 32 KB. Use next_line to continue."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          path: {type: string}
+          start_line: {type: integer, minimum: 1}
+        required: [workspace, path]
+        additionalProperties: false
+    - name: dev_search
+      description: "Search the converter checkout (git grep over tracked and non-ignored files). Fixed string by default; fixed=false for an extended regex."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          pattern: {type: string}
+          path: {type: string}
+          fixed: {type: boolean}
+          ignore_case: {type: boolean}
+        required: [workspace, pattern]
+        additionalProperties: false
+    - name: dev_status
+      description: "Branch, HEAD, uncommitted changes and commits not yet pushed."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_diff
+      description: "Diff of uncommitted changes (scope working) or of all unpushed commits (scope unpushed); optionally one path."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          scope: {type: string, enum: [working, unpushed]}
+          path: {type: string}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_test
+      description: "Run the converter's tests (suite test; omit file for the full suite, or one test/..._test.rb file) or rubocop (suite lint; omit file for all, or one .rb file) in a sandbox: converter image, no network, no customer data. Takes up to a few minutes."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 300
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          suite: {type: string, enum: [test, lint]}
+          file: {type: string}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_push_show
+      description: "Show the latest push proposals for this workspace and their status (proposed, pushed, pull request)."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_findings
+      description: "List investigation findings an engineer has released for coding work."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+        required: [workspace]
+        additionalProperties: false
+    - name: dev_finding_show
+      description: "Read one released finding and its synthetic reproduction. Unreleased findings are refused."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          finding_id: {type: string}
+        required: [workspace, finding_id]
+        additionalProperties: false
