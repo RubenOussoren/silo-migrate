@@ -32,7 +32,8 @@ DEFAULTS = dict(SILO_ACCOUNT="silomig", SILO_PREFIX="/srv/silo-migrate", SILO_WO
     SILO_REPO="https://github.com/RubenOussoren/silo-migrate.git", SILO_BRANCH="mvp/metal-installer",
     CONVERTER_REPO="https://github.com/discourse-org/discourse-converters.git", CONVERTER_BRANCH="main",
     VERIFY_CONVERTER_BRANCH="mvp/metal-installer", ARTIFACT_PACKAGE="", TERM_LLM_VERSION="0.9.93",
-    TERM_LLM_PORT="18800", TERM_LLM_SERVICE="install", DOCKER_INSTALL="if-missing", PORT_RANGE="18080-18089", KEEP_RELEASES="3")
+    TERM_LLM_PORT="18800", TERM_LLM_SERVICE="install", DOCKER_INSTALL="if-missing", PORT_RANGE="18080-18089", KEEP_RELEASES="3",
+    VERIFY_MIN_AVAILABLE_MIB="8192")
 FRESH_CONFIG = """# Work-only; no imported providers, sessions, memory or jobs.
 provider_discovery: config
 providers: {}
@@ -73,7 +74,7 @@ def now():
 
 STAGE = "COMMAND"
 
-def run(argv, *, check=True, account=False, root=False, input=None, timeout=120):
+def run(argv, *, check=True, account=False, root=False, input=None, timeout=120, relay=False):
     # Never echo argv or child output: tools may print credentials even on failure.
     cmd = list(map(str, argv))
     if root and os.geteuid() != 0:
@@ -103,10 +104,19 @@ def run(argv, *, check=True, account=False, root=False, input=None, timeout=120)
         if not check:
             return None
         refuse("METAL_" + STAGE + "_FAILED", "required command unavailable or timed out; inspect prerequisites locally")
+    if relay:
+        # Only this script's own fixed-format lines are relayed from a child copy of itself.
+        for line in result.stderr.splitlines():
+            if re.fullmatch(r"METAL_VERIFY_STEP [A-Za-z0-9 _.-]+|METAL_[A-Z_]+: [A-Za-z0-9 ,;=()./_<>-]+", line):
+                print(line, file=sys.stderr)
     if check and result.returncode:
         fixed = re.search(r"(?m)^(METAL_[A-Z_]+):", result.stderr)
         if fixed:
             refuse(fixed[1], "account step refused; inspect status locally, fix prerequisite and re-plan (raw output suppressed)")
+        # silo-migrate's own refusals are fixed codes and safe to show.
+        coded = re.search(r"(?m)^Error: ((?:STANDARD|NAMED|CONTROL)_[A-Z_]+)\b", result.stderr)
+        if coded:
+            refuse("METAL_" + STAGE + "_FAILED", "silo-migrate refused with " + coded[1] + " (other output suppressed)")
         refuse("METAL_" + STAGE + "_FAILED", "command failed (output suppressed); inspect prerequisites locally, then re-plan")
     return result
 
@@ -145,6 +155,8 @@ def read_config(path):
     for key in ("SILO_BRANCH", "CONVERTER_BRANCH", "VERIFY_CONVERTER_BRANCH"):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", result[key]) or ".." in result[key]:
             refuse("METAL_CONFIG_INVALID", "invalid branch name")
+    if not re.fullmatch(r"[0-9]{4,7}", result["VERIFY_MIN_AVAILABLE_MIB"]) or not 2048 <= int(result["VERIFY_MIN_AVAILABLE_MIB"]) <= 1048576:
+        refuse("METAL_CONFIG_INVALID", "VERIFY_MIN_AVAILABLE_MIB must be 2048..1048576")
     if result["TERM_LLM_VERSION"] != "0.9.93":
         refuse("METAL_VERSION_UNPINNED", "add a reviewed pinned release SHA before selecting another version")
     if result["TERM_LLM_SERVICE"] not in ("install", "install-and-start", "skip") or result["DOCKER_INSTALL"] not in ("if-missing", "never"):
@@ -266,7 +278,7 @@ def preflight(allow):
     result["ram_bytes"] = int(mem[1]) * 1024
     memory = {k: int(v) * 1024 for k,v in re.findall(r"^(MemAvailable|SwapTotal|SwapFree):\s+(\d+)", Path("/proc/meminfo").read_text(), re.M)}
     result["available_ram_bytes"] = memory.get("MemAvailable", 0)
-    result["capacity_ok"] = result["cpus"] >= 4 and result["available_ram_bytes"] >= 8 * 1024**3
+    result["capacity_ok"] = result["cpus"] >= 4 and result["available_ram_bytes"] >= int(C["VERIFY_MIN_AVAILABLE_MIB"]) * 1024**2
     result["load_average"] = list(os.getloadavg())
     cores = set()
     for block in Path("/proc/cpuinfo").read_text().split("\n\n"):
@@ -368,7 +380,7 @@ def make_plan(allow=False):
     groups = output(["id", "-nG", C["SILO_ACCOUNT"]]) or ""
     if "docker" not in groups.split():
         roots += [{"action": "group", "detail": "add account to docker group: ROOT-EQUIVALENT authority"}]
-    dirs = [P, W] + [P/p for p in ("bin", "etc", "releases", "term-llm", "control", "control/gems", "control/site-cache", "state", "state/logs", "state/tmp")]
+    dirs = [P, W] + [P/p for p in ("bin", "etc", "releases", "term-llm", "control", "control/gems", "control/site-cache", "state", "state/logs", "state/tmp", "state/runtime-profiles")]
     for path in dirs:
         if path.is_symlink():
             refuse("METAL_PATH_CONFLICT", "managed directory is a symlink; inspect ownership manually")
@@ -668,7 +680,7 @@ def account_apply(saved):
     STAGE = "ARTIFACT_LOAD"
     images, image_state, gems = extract_artifacts(release, plan["target"]["artifact_package"])
     env = {"SILO_MIGRATE_BASE_PATH": str(W), "SILO_CONTROL_GEMS": gems or str(P/"control/gems/unavailable"),
-           "SILO_CONTROL_SITE_CACHE": str(P/"control/site-cache/site_settings.yml"), "SILO_RUNTIME_PROFILES_DIR": str(P/"current/runtime/profiles")}
+           "SILO_CONTROL_SITE_CACHE": str(P/"control/site-cache/site_settings.yml"), "SILO_RUNTIME_PROFILES_DIR": str(P/"state/runtime-profiles")}
     atomic_write(P/"etc/silo-control.env", "".join(k + "=" + v + "\n" for k,v in env.items()))
     shim = '#!/bin/sh\nset -eu\nexport SILO_CONTROL_CONFIG=' + shlex.quote(str(P/"etc/silo-control.env")) + '\nexec ' + shlex.quote(str(P/"current/bin/silo-migrate-control")) + ' "$@"\n'
     atomic_write(P/"bin/silo-migrate-control", shim, 0o750)
@@ -801,6 +813,7 @@ def account_update(rollback=False, branch=None, term=False):
         print("METAL_ROLLBACK_OK" if rollback else "METAL_UPDATE_OK")
 
 def control(args):
+    print("METAL_VERIFY_STEP " + " ".join(a for a in args[:3] if not a.startswith("/")), file=sys.stderr)
     result = run([P/"bin/silo-migrate-control"] + args, account=True, timeout=600)
     try:
         return json.loads(result.stdout)
@@ -809,12 +822,12 @@ def control(args):
 
 def capacity_ready():
     available = re.search(r"^MemAvailable:\s+(\d+)", Path("/proc/meminfo").read_text(), re.M)
-    return ((os.cpu_count() or 0) >= 4 and available and int(available[1]) * 1024 >= 8 * 1024**3
+    return ((os.cpu_count() or 0) >= 4 and available and int(available[1]) * 1024 >= int(C["VERIFY_MIN_AVAILABLE_MIB"]) * 1024**2
             and all(shutil.disk_usage(ancestor(path)).free >= 48 * 1024**3 for path in (P, W)))
 
 def verify(keep=False):
     if not capacity_ready():
-        refuse("METAL_VERIFY_CAPACITY", "need >=4 logical CPUs, >=8 GiB available RAM and >=48 GiB free on prefix/workspaces; no workspace created")
+        refuse("METAL_VERIFY_CAPACITY", "need >=4 logical CPUs, VERIFY_MIN_AVAILABLE_MIB available RAM and >=48 GiB free on prefix/workspaces; no workspace created")
     ws = "verify-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + os.urandom(3).hex()
     runid = None
     try:
@@ -832,7 +845,10 @@ def verify(keep=False):
             # The full status projection carries the latest run and final backup.
             current = next((r for r in status.get("runs", []) if r.get("run_id") == runid), {})
             if current.get("status") in ("failed", "abandoned", "not_started"):
-                refuse("METAL_VERIFY_RUN_FAILED", "inspect standard status and recover/reset the exact verify run")
+                failure = current.get("failure") or {}
+                code = failure.get("code") if re.fullmatch(r"STANDARD_[A-Z_]+", str(failure.get("code"))) else "unknown"
+                stage = failure.get("stage") if re.fullmatch(r"[a-z_]+", str(failure.get("stage"))) else "unknown"
+                refuse("METAL_VERIFY_RUN_FAILED", "run " + str(current.get("status")) + " at stage " + stage + " with " + code + "; inspect standard status and recover/reset the exact verify run")
             if current.get("status") == "completed":
                 backup = current.get("artifacts", {}).get("final", {})
                 if backup.get("label") != "restore-proven" or not re.fullmatch(r"[a-f0-9]{64}", backup.get("sha256", "")):
@@ -963,7 +979,7 @@ def main():
         entry = account_entry()
         if entry and os.geteuid() not in (0, entry.pw_uid):
             opts = (["--config", str(Path(args.config).resolve())] if args.config else []) + (["--keep"] if args.keep else [])
-            print(run([SELF, "verify"] + opts, account=True, timeout=7200).stdout.strip())
+            print(run([SELF, "verify"] + opts, account=True, timeout=7200, relay=True).stdout.strip())
         else:
             verify(args.keep)
     elif args.command == "status":

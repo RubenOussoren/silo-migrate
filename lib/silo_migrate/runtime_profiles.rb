@@ -19,6 +19,8 @@ module SiloMigrate
     end
 
     # Ambiguous names are refused, never silently shadowed by a server candidate.
+    # SILO_RUNTIME_PROFILES_DIR is for server-local candidates only, not a second
+    # path to the release's own profiles.
     def path(name)
       raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless name.is_a?(String) && name.match?(/\A[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\z/)
 

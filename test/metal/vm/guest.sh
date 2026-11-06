@@ -15,6 +15,10 @@ if [[ $scenario == full ]]; then
   sudo mv /home/metaladmin/artifacts /opt/metal-artifacts
   sudo chmod -R a+rX /opt/metal-artifacts
   printf 'ARTIFACT_PACKAGE=/opt/metal-artifacts\n' >> /tmp/metal.conf
+  sudo cp -a /home/metaladmin/converter.git /opt/converter-repo.git
+  printf 'CONVERTER_REPO=/opt/converter-repo.git\n' >> /tmp/metal.conf
+  # The test VM is held to the Development host's 8 GiB envelope.
+  printf 'VERIFY_MIN_AVAILABLE_MIB=6144\n' >> /tmp/metal.conf
 fi
 sudo install -m 0644 /tmp/metal.conf /opt/metal.conf
 M=/opt/metal-installer/metal
@@ -79,6 +83,8 @@ sudo chmod -R a+rX /opt/metal-repo.git
 [[ $(sudo -u silomig readlink /srv/silo-migrate/current) == "$first" ]]
 if [[ $scenario == full ]]; then
   step synthetic-full-verify
+  # Owned by the service account so its host git accepts the local repository.
+  sudo chown -R silomig:silomig /opt/converter-repo.git
   "$M" verify --config /opt/metal.conf
 else
   echo 'SKIPPED: artifact loading and full synthetic verify (1 vCPU/1GiB guest); NOT migration-ready acceptance'

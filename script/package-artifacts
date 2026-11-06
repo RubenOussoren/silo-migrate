@@ -19,6 +19,16 @@ IDENTITY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(IDENTITY)
 
 
+class Invalid(Exception):
+    pass
+
+
+def require(condition, message):
+    # Explicit check rather than assert, so `python -O` cannot disable it.
+    if not condition:
+        raise Invalid(message)
+
+
 def sha(path):
     h = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -29,94 +39,112 @@ def sha(path):
 
 def safe_name(name):
     return bool(name and name not in (".", "./") and not name.startswith("/") and ".." not in PurePosixPath(name).parts
-                and "\\" not in name and not any(c.isspace() for c in name))
+                and "\\" not in name and not any(ord(c) < 32 or ord(c) == 127 for c in name))
 
 
 def profile_read(path):
     profile = json.loads(Path(path).read_text())
-    assert profile.get("version") == 1, "unsupported profile version"
-    assert isinstance(profile.get("images"), dict) and "control" in profile["images"], "missing images/control"
+    require(profile.get("version") == 1, "unsupported profile version")
+    require(isinstance(profile.get("images"), dict) and "control" in profile["images"], "missing images/control")
     for role, image in profile["images"].items():
-        assert re.fullmatch(r"[a-z][a-z0-9_]*", role), "invalid role"
-        assert image["source"] in ("package", "public-digest"), "invalid source"
-        assert re.fullmatch(r"sha256:[a-f0-9]{64}", image["content_id"]), "invalid content id"
-        assert image["ref"] and not image["ref"].startswith("-"), "invalid ref"
+        require(re.fullmatch(r"[a-z][a-z0-9_]*", role), "invalid role")
+        require(image["source"] in ("package", "public-digest"), "invalid source")
+        require(re.fullmatch(r"sha256:[a-f0-9]{64}", image["content_id"]), "invalid content id")
+        require(image["ref"] and not image["ref"].startswith("-"), "invalid ref")
         if image["source"] == "public-digest":
-            assert re.search(r"@sha256:[a-f0-9]{64}$", image["ref"]), "public images must be digest pinned"
+            require(re.search(r"@sha256:[a-f0-9]{64}$", image["ref"]), "public images must be digest pinned")
     return profile
 
 
 def verify(directory, profile_path=None):
     root = Path(directory)
-    assert root.is_dir() and not root.is_symlink(), "package must be a real directory"
+    require(root.is_dir() and not root.is_symlink(), "package must be a real directory")
     files = set()
     dirs = set()
     for path in root.rglob("*"):
-        assert not path.is_symlink(), "package symlink refused"
+        require(not path.is_symlink(), "package symlink refused")
         if path.is_dir():
             dirs.add(path.relative_to(root).as_posix())
         else:
-            assert path.is_file(), "special file refused"
+            require(path.is_file(), "special file refused")
             files.add(path.relative_to(root).as_posix())
     sums = {}
     for line in (root / "SHA256SUMS").read_text().splitlines():
         match = re.fullmatch(r"([a-f0-9]{64})  (.+)", line)
-        assert match and safe_name(match[2]) and match[2] not in sums, "invalid checksum list"
+        require(match and safe_name(match[2]) and match[2] not in sums, "invalid checksum list")
         sums[match[2]] = match[1]
-    assert files == set(sums) | {"SHA256SUMS"}, "unlisted or missing file"
+    require(files == set(sums) | {"SHA256SUMS"}, "unlisted or missing file")
     for name, digest in sums.items():
-        assert sha(root / name) == digest, "package checksum mismatch"
+        require(sha(root / name) == digest, "package checksum mismatch")
     manifest = json.loads((root / "manifest.json").read_text())
-    assert manifest["format_version"] == 1, "unsupported package version"
-    assert manifest["profile"]["file"] == "profile.json", "invalid profile path"
-    assert sha(root / "profile.json") == manifest["profile"]["sha256"], "profile checksum mismatch"
+    require(manifest["format_version"] == 1, "unsupported package version")
+    require(manifest["profile"]["file"] == "profile.json", "invalid profile path")
+    require(sha(root / "profile.json") == manifest["profile"]["sha256"], "profile checksum mismatch")
     if profile_path:
-        assert sha(profile_path) == manifest["profile"]["sha256"], "release profile mismatch"
+        require(sha(profile_path) == manifest["profile"]["sha256"], "release profile mismatch")
     profile = profile_read(root / "profile.json")
-    assert manifest["profile"]["name"] == profile["recipe"], "profile name mismatch"
+    require(manifest["profile"]["name"] == profile["recipe"], "profile name mismatch")
     expected = {"manifest.json", "profile.json", "gems.tar.gz", "site_settings.yml"}
     roles = set()
     for image in manifest["images"]:
         role = image["role"]
-        assert role not in roles and role in profile["images"], "duplicate/unknown image role"
+        require(role not in roles and role in profile["images"], "duplicate/unknown image role")
         roles.add(role)
         for key in ("ref", "source", "content_id"):
-            assert image[key] == profile["images"][role][key], "manifest/profile mismatch"
+            require(image[key] == profile["images"][role][key], "manifest/profile mismatch")
         name = "images/" + role + ".tar.gz"
-        assert image["file"] == name, "invalid image path"
-        assert sha(root / name) == image["sha256"] and (root / name).stat().st_size == image["bytes"], "image mismatch"
+        require(image["file"] == name, "invalid image path")
+        require(sha(root / name) == image["sha256"] and (root / name).stat().st_size == image["bytes"], "image mismatch")
         expected.add(name)
-    assert all(i["source"] != "package" or r in roles for r, i in profile["images"].items()), "missing packaged role"
-    assert sums.keys() == expected, "unexpected package payload"
-    assert dirs <= {"images"}, "unlisted directory"
+    require(all(i["source"] != "package" or r in roles for r, i in profile["images"].items()), "missing packaged role")
+    require(sums.keys() == expected, "unexpected package payload")
+    require(dirs <= {"images"}, "unlisted directory")
     for key, filename in (("gems", "gems.tar.gz"), ("site_settings", "site_settings.yml")):
-        assert manifest[key]["file"] == filename and sha(root / filename) == manifest[key]["sha256"], "cache checksum mismatch"
+        require(manifest[key]["file"] == filename and sha(root / filename) == manifest[key]["sha256"], "cache checksum mismatch")
     with tarfile.open(root / "gems.tar.gz", "r:gz") as archive:
         members = archive.getmembers()
-        assert len({m.name.rstrip("/") for m in members}) == len(members), "duplicate gem member"
+        require(len({m.name.rstrip("/") for m in members}) == len(members), "duplicate gem member")
         for member in members:
-            assert safe_name(member.name) and (member.isfile() or member.isdir()), "unsafe gem archive member"
-            assert not credential(member.name), "credential-like gem archive member"
-        assert sum(m.isfile() for m in members) == manifest["gems"]["file_count"], "gem count mismatch"
+            require(safe_name(member.name) and (member.isfile() or member.isdir()), "unsafe gem archive member")
+            data = archive.extractfile(member).read() if member.name in KNOWN_PUBLIC and member.isfile() else None
+            require(not credential(member.name, data), "credential-like gem archive member")
+        require(sum(m.isfile() for m in members) == manifest["gems"]["file_count"], "gem count mismatch")
     return manifest
 
 
-def credential(name):
+# Reviewed public files whose names match a credential pattern. Exact path and
+# content hash; each must be a public certificate.
+KNOWN_PUBLIC = {
+    "ruby/3.3.0/gems/wisper-2.0.1/gem-public_cert.pem": "8871e7bfcd847d066eea338b544e6a01d533fa7eafb2d92fe397e9060175360d",
+}
+
+
+def credential(name, data=None):
+    if name in KNOWN_PUBLIC and data is not None:
+        return not (hashlib.sha256(data).hexdigest() == KNOWN_PUBLIC[name]
+                    and data.startswith(b"-----BEGIN CERTIFICATE-----") and b"PRIVATE" not in data)
     return any(fnmatch.fnmatch(part.lower(), pattern) for part in PurePosixPath(name).parts
-               for pattern in ("*.pem", "*.key", ".netrc", "credentials*", "*token*"))
+               for pattern in CREDENTIAL_PATTERNS)
+
+
+# File names that commonly hold secrets. Deliberately not "*token*": source files
+# such as a tokenizer are ordinary.
+CREDENTIAL_PATTERNS = (".netrc", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*",
+                       "credentials", "credentials.*", "*.token", "*_token", "*-token", "token", "*secret*", "*.keystore")
 
 
 def package(args):
     profile = profile_read(args.profile)
     gems = Path(args.gems)
-    assert gems.is_dir() and not gems.is_symlink(), "gems must be a real directory"
+    require(gems.is_dir() and not gems.is_symlink(), "gems must be a real directory")
     paths = sorted(gems.rglob("*"))
     for path in paths:
-        assert safe_name(path.relative_to(gems).as_posix()), "unsafe gem name"
-        assert not credential(path.relative_to(gems).as_posix()), "credential-like gem name refused"
-        assert not path.is_symlink() and (path.is_dir() or path.is_file()), "gem link/special file refused"
+        require(safe_name(path.relative_to(gems).as_posix()), "unsafe gem name")
+        relative = path.relative_to(gems).as_posix()
+        require(not credential(relative, path.read_bytes() if relative in KNOWN_PUBLIC and path.is_file() else None), "credential-like gem name refused")
+        require(not path.is_symlink() and (path.is_dir() or path.is_file()), "gem link/special file refused")
     site = Path(args.site_settings)
-    assert site.name == "site_settings.yml" and site.is_file() and not site.is_symlink(), "expected site_settings.yml"
+    require(site.name == "site_settings.yml" and site.is_file() and not site.is_symlink(), "expected site_settings.yml")
     out = Path(args.output)
     out.mkdir(mode=0o750)  # Intentionally refuses existing destinations.
     (out / "images").mkdir()
@@ -128,13 +156,13 @@ def package(args):
         if image["source"] != "package" and not args.include_public:
             continue
         inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", image["ref"]], stderr=subprocess.DEVNULL))
-        assert IDENTITY.content_id(inspected) == image["content_id"], "image content mismatch"
+        require(IDENTITY.content_id(inspected) == image["content_id"], "image content mismatch")
         filename = "images/" + role + ".tar.gz"
         with open(out / filename, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as compressed:
             proc = subprocess.Popen(["docker", "image", "save", "--platform", "linux/amd64", image["ref"]], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             shutil.copyfileobj(proc.stdout, compressed)
             proc.stdout.close()
-            assert proc.wait() == 0, "docker save failed"
+            require(proc.wait() == 0, "docker save failed")
         manifest["images"].append(dict(image, role=role, file=filename, sha256=sha(out / filename), bytes=(out / filename).stat().st_size))
     with open(out / "gems.tar.gz", "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as gz, tarfile.open(fileobj=gz, mode="w") as archive:
         for path in paths:
@@ -177,5 +205,8 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, TypeError, AttributeError, KeyError, AssertionError, tarfile.TarError, subprocess.SubprocessError):
-        raise SystemExit("ARTIFACTS_INVALID: check allowlist, profile and checksums; no payload loaded")
+    except Invalid as error:
+        # Messages are fixed strings from this file; they never contain payload data.
+        raise SystemExit("ARTIFACTS_INVALID: " + str(error) + "; no payload loaded")
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, tarfile.TarError, subprocess.SubprocessError) as error:
+        raise SystemExit("ARTIFACTS_INVALID: " + type(error).__name__ + "; no payload loaded")

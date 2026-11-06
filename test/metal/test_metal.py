@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import shutil
 import os
 from pathlib import Path
 import pwd
@@ -139,7 +140,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_second_apply_is_noop_and_existing_user_config_preserved(self):
         P = self.m.P
-        for path in [P, self.m.W] + [P/p for p in ("bin", "etc", "releases", "term-llm", "control", "control/gems", "control/site-cache", "state", "state/logs", "state/tmp")]:
+        for path in [P, self.m.W] + [P/p for p in ("bin", "etc", "releases", "term-llm", "control", "control/gems", "control/site-cache", "state", "state/logs", "state/tmp", "state/runtime-profiles")]:
             path.mkdir(parents=True, exist_ok=True)
             path.chmod(0o750)
         release = P/"releases"/("a"*40)
@@ -306,32 +307,45 @@ class ArtifactTests(unittest.TestCase):
         payload = self.out/"site_settings.yml"
         original = payload.read_bytes()
         payload.write_bytes(b"tampered")
-        with self.assertRaises(AssertionError): self.pack.verify(self.out)
+        with self.assertRaises(self.pack.Invalid): self.pack.verify(self.out)
         payload.unlink()
-        with self.assertRaises(AssertionError): self.pack.verify(self.out)
+        with self.assertRaises(self.pack.Invalid): self.pack.verify(self.out)
         payload.write_bytes(original)
         extra = self.out/"extra"
         extra.write_text("unlisted")
-        with self.assertRaises(AssertionError): self.pack.verify(self.out)
+        with self.assertRaises(self.pack.Invalid): self.pack.verify(self.out)
         extra.unlink()
         extra.symlink_to(payload)
-        with self.assertRaises(AssertionError): self.pack.verify(self.out)
+        with self.assertRaises(self.pack.Invalid): self.pack.verify(self.out)
         extra.unlink()
         self.profilefile.write_text("{}")
-        with self.assertRaises(AssertionError): self.pack.verify(self.out, self.profilefile)
+        with self.assertRaises(self.pack.Invalid): self.pack.verify(self.out, self.profilefile)
 
     def test_gem_secret_patterns_refused(self):
         for name in ("private.pem", "id.key", ".netrc", "credentials.yaml", "refresh_token"):
             path = self.gems/name
             path.write_text("synthetic")
-            with self.assertRaises(AssertionError): self.build()
+            with self.assertRaises(self.pack.Invalid): self.build()
             self.assertFalse(self.out.exists())
             path.unlink()
+
+    def test_ordinary_names_and_reviewed_public_certificate_allowed(self):
+        (self.gems/"tokenizer.c").write_text("synthetic source")
+        cert = self.gems/"gem-public_cert.pem"
+        body = b"-----BEGIN CERTIFICATE-----\nsynthetic\n-----END CERTIFICATE-----\n"
+        cert.write_bytes(body)
+        with patch.dict(self.pack.KNOWN_PUBLIC, {"gem-public_cert.pem": hashlib.sha256(body).hexdigest()}, clear=True):
+            self.build()
+            self.pack.verify(self.out)
+        cert.write_bytes(body + b"changed")
+        shutil.rmtree(self.out)
+        with patch.dict(self.pack.KNOWN_PUBLIC, {"gem-public_cert.pem": hashlib.sha256(body).hexdigest()}, clear=True):
+            with self.assertRaises(self.pack.Invalid): self.build()
 
     def test_image_mismatch_refused(self):
         self.profile["images"]["web"]["content_id"] = "sha256:" + "0"*64
         self.profilefile.write_text(json.dumps(self.profile))
-        with self.assertRaises(AssertionError): self.build()
+        with self.assertRaises(self.pack.Invalid): self.build()
 
     def test_gem_tar_is_reproducible_no_owner_xattrs(self):
         self.build()
