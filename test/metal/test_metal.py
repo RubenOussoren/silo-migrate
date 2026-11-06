@@ -152,20 +152,49 @@ class InstallerTests(unittest.TestCase):
                     with self.assertRaisesRegex(self.m.Refusal, "METAL_AGENTS_CONFIG"):
                         self.m.make_plan()
 
+    def test_releases_are_sealed_read_only_and_unsealed_only_to_prune(self):
+        import stat as st
+        release = self.root/"sealed"
+        (release/"integrations/term-llm/a/scripts").mkdir(parents=True)
+        (release/"integrations/term-llm/a/scripts/tool.py").write_text("x")
+        (release/"integrations/term-llm/a/scripts/tool.py").chmod(0o755)
+        (release/"link").symlink_to("/etc/hostname")
+        self.m.seal(release)
+        for path in [release, release/"integrations/term-llm/a/scripts", release/"integrations/term-llm/a/scripts/tool.py"]:
+            self.assertEqual(0, st.S_IMODE(path.lstat().st_mode) & 0o222, path)
+        self.assertEqual(0o555, st.S_IMODE((release/"integrations/term-llm/a/scripts/tool.py").stat().st_mode))
+        if os.geteuid() != 0:
+            with self.assertRaises(PermissionError):
+                (release/"integrations/term-llm/a/scripts/tool.py").write_text("changed")
+        self.m.unseal(release)
+        shutil.rmtree(release)
+        self.assertFalse(release.exists())
+
+    def test_fetch_release_seals_a_clean_checkout(self):
+        commit = "a" * 40
+        release = self.m.P/"releases"/commit
+        release.mkdir(parents=True)
+        (release/"file").write_text("x")
+        with patch.object(self.m, "git", side_effect=lambda argv: commit if "rev-parse" in argv else ""):
+            self.assertEqual(release, self.m.fetch_release(commit))
+        self.assertEqual(0, (release/"file").stat().st_mode & 0o222)
+        self.m.unseal(release)
+
     def test_installer_expects_exactly_the_shipped_agents(self):
         shipped = sorted(path.parent.name for path in (Path(__file__).resolve().parents[2]/"integrations/term-llm").glob("*/agent.yaml"))
         self.assertEqual(sorted(self.m.MIGRATION_AGENTS), shipped)
 
     def test_agents_ready_requires_exactly_the_node_agents(self):
         three = "    migration-analyst - a\n    migration-operator - b\n    server-support - c\n"
+        five = "    converter-developer - d\n    converter-reviewer - r\n" + three
         cases = {
-            "Available agents (3):\n\n  [user] /x/\n" + three: True,
+            "Available agents (5):\n\n  [user] /x/\n" + five: True,
             "No agents configured.\n": False,
-            # The previous two-agent set is no longer enough.
-            "Available agents (2):\n\n  [user] /x/\n    migration-analyst - a\n    migration-operator - b\n": False,
-            "Available agents (20):\n\n  [builtin]\n    developer - d\n" + three: False,
-            "Available agents (3):\n\n  [user] /x/\n    migration-analyst - a\n    migration-operator - b\n    other - c\n": False,
-            "Available agents (4):\n\n  [user] /x/\n" + three + "    shell-agent - d\n": False,
+            # Earlier agent sets are no longer enough.
+            "Available agents (3):\n\n  [user] /x/\n" + three: False,
+            "Available agents (20):\n\n  [builtin]\n    developer - d\n" + five: False,
+            "Available agents (5):\n\n  [user] /x/\n    converter-developer - d\n    other - r\n" + three: False,
+            "Available agents (6):\n\n  [user] /x/\n" + five + "    shell-agent - s\n": False,
             None: False}
         for listing, ready in cases.items():
             with self.subTest(listing=listing), patch.object(self.m, "output", return_value=listing):

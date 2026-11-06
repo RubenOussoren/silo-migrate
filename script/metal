@@ -460,7 +460,7 @@ def hub_secrets_state(entry):
     directory_authority([path.parent])
     return {"path": str(path), "uid": info.st_uid, "mode": oct(info.st_mode & 0o7777), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
 
-MIGRATION_AGENTS = ("migration-analyst", "migration-operator", "server-support")
+MIGRATION_AGENTS = ("converter-developer", "converter-reviewer", "migration-analyst", "migration-operator", "server-support")
 AGENTS_HELP = ("the service account's term-llm config.yaml needs 'agents:' with 'use_builtin: false' and "
                "'search_paths:' containing the installed agents directory, so the web UI offers only the node's agents")
 
@@ -582,7 +582,8 @@ def make_plan(allow=False):
             and (P/"current").exists() and not agents_ready(expected=shipped_agents(P/"current") or MIGRATION_AGENTS):
         refuse("METAL_AGENTS_CONFIG", "existing term-llm config preserved; " + AGENTS_HELP + " (" + agents_path() + "), then re-plan")
     notes.append("Web UI agent picker: only " + ", ".join(sorted(MIGRATION_AGENTS)) + ", from " + agents_path() + " (agents.use_builtin: false); no pinned startup agent.")
-    notes.append("server-support has a shell with the account's ROOT-EQUIVALENT Docker authority and built-in file edits; each command and each write needs approval in the web UI (--approval prompt; choose 'once'). Its read tools refuse workspaces, state/tmp and credential files. Approving a write to the release tree (agent definitions or tool scripts), ~/.config/term-llm (approval/agents settings) or the service unit can remove these limits: refuse such writes unless intended.")
+    notes.append("server-support has a shell with the account's ROOT-EQUIVALENT Docker authority and built-in file edits; each command and each write needs approval in the web UI (--approval prompt; choose 'once'). Its read tools refuse workspaces, state/tmp and credential files. Approving a write to the release tree (agent definitions or tool scripts), ~/.config/term-llm (approval/agents settings) or the service unit can remove these limits: refuse such writes unless intended. Release trees are made read-only.")
+    notes.append("converter-developer (ChatGPT/Codex) and converter-reviewer (claude-bin) see only Git-visible files of workspaces/<ws>/converter and released findings; tests run in the converter image with no network. Pushes and draft PRs happen only when the engineer runs 'silo-migrate-control converter push WS --sha256 DIGEST' (token: ~/.config/silo-migrate/github/token-<owner>). claude-bin must be configured and signed in for the reviewer.")
     dry = None
     binary = P/"bin/term-llm"
     if C["TERM_LLM_SERVICE"] != "skip" and binary.exists() and entry:
@@ -698,9 +699,25 @@ def fetch_release(commit):
         finally:
             if stage.exists():
                 shutil.rmtree(stage)
-    if git(["-C", str(release), "rev-parse", "HEAD"]) != commit or git(["-C", str(release), "status", "--porcelain"]):
+    if git(["-C", str(release), "rev-parse", "HEAD"]) != commit or git(["-C", str(release), "--no-optional-locks", "status", "--porcelain"]):
         refuse("METAL_RELEASE_DIRTY", "release checkout must match exact clean commit; preserve and inspect it manually")
+    seal(release)
     return release
+
+def seal(release):
+    """Release trees are read-only to the account: an approved agent edit to an agent
+    definition or tool script fails instead of silently removing that agent's limits.
+    (The account could chmod it back; that takes an explicit, visible command.)"""
+    for directory, dirs, files in os.walk(release):
+        for name in files:
+            path = os.path.join(directory, name)
+            if not os.path.islink(path):
+                os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode) & ~0o222)
+        os.chmod(directory, stat.S_IMODE(os.lstat(directory).st_mode) & ~0o222)
+
+def unseal(release):
+    for directory, dirs, files in os.walk(release):
+        os.chmod(directory, stat.S_IMODE(os.lstat(directory).st_mode) | 0o700)
 
 def install_term():
     version = C["TERM_LLM_VERSION"]
@@ -1082,6 +1099,7 @@ def account_update(rollback=False, branch=None, term=False):
                 if path.name in protected or len(retained) < int(C["KEEP_RELEASES"]):
                     retained.add(path.name)
                 else:
+                    unseal(path)
                     shutil.rmtree(path)  # Exact managed release directories only, never workspaces/images/backups.
         print("METAL_ROLLBACK_OK" if rollback else "METAL_UPDATE_OK")
 

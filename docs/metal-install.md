@@ -151,11 +151,25 @@ Confirmed against the **real 0.9.93 binary's help**: `service install web`,
 `--auth bearer`, `--approval prompt`, `--no-projects`, `--disable-extensions`,
 `--disable-widgets`. No startup agent is pinned: with `--agent` the web UI hides its
 agent picker. Instead the account's config sets `agents.use_builtin: false`, so the
-picker offers only `migration-operator`, `migration-analyst` and `server-support` (plus
-term-llm's plain "Default" chat). Fresh configs get this and the agents search path; for an
-existing config, plan and apply refuse (`METAL_AGENTS_CONFIG`) until `term-llm agents` lists
-exactly those three agents, because built-in shell agents would otherwise run with the
-account's Docker authority without per-command approval.
+picker offers only `migration-operator`, `migration-analyst`, `server-support`,
+`converter-developer` and `converter-reviewer` (plus term-llm's plain "Default" chat). Fresh
+configs get this and the agents search path; for an existing config, plan refuses
+(`METAL_AGENTS_CONFIG`) unless `term-llm agents` lists exactly the agents shipped in the
+release `current` points to, and apply requires exactly these five after switching,
+because built-in shell agents would otherwise run with the account's Docker authority
+without per-command approval.
+
+converter-developer (`chatgpt`) and converter-reviewer (`claude-bin`) are described in
+`docs/standard-workbench.md` (Converter development). Server setup they need: `claude-bin`
+in the account's term-llm config and signed in (`claude auth login` as the account,
+`/usr/local/bin/claude` on the service PATH); a GitHub token at
+`~/.config/silo-migrate/github/token-OWNER` (mode 0600) for pushes and private clones; a
+commit identity in `~/.config/silo-migrate/git-identity` or per checkout.
+
+**Release trees are read-only to the account** (`fetch_release` removes write permission;
+pruning restores it just before deleting). An approved agent edit to an agent definition
+or tool script therefore fails instead of silently changing an agent's limits. The account
+can still `chmod` it back, which takes an explicit, visible command.
 
 `server-support` (ChatGPT, or Frontier in a new chat) helps keep the node running. Its
 shell has the account's **root-equivalent Docker authority**; with the service's
