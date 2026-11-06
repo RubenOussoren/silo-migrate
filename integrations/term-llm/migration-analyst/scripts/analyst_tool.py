@@ -10,12 +10,30 @@ WORKSPACE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 RUN = re.compile(r"run-[0-9a-f]{32}\Z")
 
 
+# script/metal installs agents as <prefix>/releases/<commit>/integrations/term-llm/<agent>,
+# reached through ~/.config/term-llm/agents links. The stock service does not pass
+# extra environment to tools, so locate the prefix's configured control shim here.
+INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
+
+
 def control_path():
     override = os.environ.get("SILO_CONTROL")
     if override:
         return override
-    agent_dir = os.environ.get("TERM_LLM_AGENT_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    agent_dir = os.path.realpath(os.environ.get("TERM_LLM_AGENT_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    installed = INSTALLED_AGENT.fullmatch(agent_dir)
+    if installed:
+        shim = os.path.join(installed[1], "bin", "silo-migrate-control")
+        if os.path.isfile(shim):
+            return shim
     return os.path.normpath(os.path.join(agent_dir, "..", "..", "..", "bin", "silo-migrate-control"))
+
+
+def control_env():
+    # Tool processes may get a minimal environment; the shim needs python3/docker on PATH.
+    env = dict(os.environ)
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    return env
 
 
 def main():
@@ -26,13 +44,13 @@ def main():
         print(json.dumps({"version": 1, "error": "STANDARD_ARGUMENTS_INVALID"}))
         return 0
     if tool == "analyst_run_evidence":
-        result = subprocess.run([control_path(), "standard", "analyst", "evidence", workspace, run_id], capture_output=True, text=True, timeout=55)
+        result = subprocess.run([control_path(), "standard", "analyst", "evidence", workspace, run_id], capture_output=True, text=True, timeout=55, env=control_env())
     elif tool == "analyst_propose_finding":
         text = args.get("text")
         if not isinstance(text, str) or not text.strip():
             print(json.dumps({"version": 1, "error": "STANDARD_ARGUMENTS_INVALID"}))
             return 0
-        result = subprocess.run([control_path(), "standard", "finding", "propose", workspace, "--run", run_id, "--file", "-"], input=text, capture_output=True, text=True, timeout=55)
+        result = subprocess.run([control_path(), "standard", "finding", "propose", workspace, "--run", run_id, "--file", "-"], input=text, capture_output=True, text=True, timeout=55, env=control_env())
     else:
         print(json.dumps({"version": 1, "error": "STANDARD_TOOL_UNKNOWN"}))
         return 0

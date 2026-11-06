@@ -73,6 +73,27 @@ else:
             return []
         return [json.loads(line) for line in self.record.read_text().splitlines()]
 
+    def test_installed_layout_finds_prefix_shim_without_environment(self):
+        # The server layout: agent dir reached through ~/.config/term-llm/agents, no SILO_CONTROL.
+        prefix = self.root / 'srv'
+        release = prefix / 'releases' / ('c' * 40)
+        agent = release / 'integrations/term-llm/migration-operator'
+        agent.mkdir(parents=True)
+        (prefix / 'current').symlink_to(release)
+        (prefix / 'bin').mkdir()
+        shim = prefix / 'bin/silo-migrate-control'
+        shim.write_text(self.control.read_text())
+        shim.chmod(0o700)
+        agents = self.root / 'home/.config/term-llm/agents'
+        agents.mkdir(parents=True)
+        (agents / 'migration-operator').symlink_to(prefix / 'current/integrations/term-llm/migration-operator')
+        env = {k: v for k, v in self.env.items() if k != 'SILO_CONTROL'}
+        env['TERM_LLM_AGENT_DIR'] = str(agents / 'migration-operator')
+        env.pop('PATH', None)
+        self.env = env
+        self.assertEqual('approved', self.call('migration_status', {'workspace': 'synthetic'})['status'])
+        self.assertEqual([['standard', 'agent', 'status', 'synthetic']], self.calls())
+
     def test_every_tool_exact_argv(self):
         cases = [
             ('migration_status', {}, ['status', 'synthetic']),

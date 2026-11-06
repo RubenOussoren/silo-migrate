@@ -153,8 +153,10 @@ the installed binary/account exist, otherwise explicitly defers it; apply runs
 it before writing service files. `install` writes without starting;
 `install-and-start` additionally enables/starts; `skip` changes neither linger nor
 service. A non-secret systemd user drop-in supplies `SILO_CONTROL` (the installed
-shim), `SILO_CONTROL_CONFIG` and `TMPDIR` to the linked agent adapters; it does not
-import credentials or modify the stock generated unit. For interactive `ask`,
+shim), `SILO_CONTROL_CONFIG` and `TMPDIR`; it does not import credentials or modify
+the stock generated unit. The stock service launcher does not pass that environment
+on to agent tools, so the operator/analyst adapters locate `<prefix>/bin/silo-migrate-control`
+from their installed release path themselves (found on the first real Hub test). For interactive `ask`,
 export those two SILO variables in the account shell too. Unmanaged existing units are refused, not adopted. The listener is
 127.0.0.1 only; no firewall or reverse-proxy change. Remote access is only through
 the opt-in reverse Hub connection below.
