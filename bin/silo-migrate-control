@@ -22,11 +22,12 @@ def refuse(code):
     raise ValueError(code)
 
 
-def capture(args):
+def capture(args, extra_env=None):
     # No inherited GIT_* settings (e.g. GIT_CONFIG_PARAMETERS) reach host Git, and
     # every call is bounded: an include pointing at a FIFO must not hang a held lock.
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+    env.update(extra_env or {})
     try:
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
                                 stdin=subprocess.DEVNULL, timeout=600)
@@ -138,7 +139,40 @@ def converter_git(checkout, credentials=False, cwd=None):
             *([] if credentials else ["-c", "credential.helper="]), "-C", str(cwd or checkout)]
 
 
+def converter_dev():
+    # Loaded by path from beside this file, never from sys.path or the working directory.
+    import importlib.util
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("converter_dev", Path(__file__).resolve().parent / "converter_dev.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def github_credentials(checkout, url, cwd=None):
+    """Git argv using the engineer's GitHub token file for a github.com HTTPS remote, or None.
+
+    Without a token for that owner, clone/fetch fall back to the account's own Git
+    configuration as before (public repositories need none)."""
+    dev = converter_dev()
+    match = dev.GITHUB_REMOTE.fullmatch(url)
+    if not match:
+        return None
+    try:
+        token_path, _ = dev.token_for(match[1], os.path.expanduser("~"))
+    except dev.Refusal as refusal:
+        if str(refusal) == "STANDARD_PUSH_TOKEN_MISSING":
+            return None
+        raise
+    options, env = dev.credential_config(token_path)
+    argv = converter_git(checkout, cwd=cwd)
+    return argv[:-2] + options + argv[-2:], env
+
+
 def host_converter(args, values, base, self):
+    if len(args) >= 2 and args[1] in ("dev", "push", "push-show"):
+        print(json.dumps(converter_dev().main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin)))
+        return 0
     if len(args) < 3 or args[1] not in ("clone", "update"):
         refuse("STANDARD_ARGUMENTS_INVALID")
     action, workspace = args[1:3]
@@ -164,8 +198,13 @@ def host_converter(args, values, base, self):
         branch = opts.get("--branch", "main")
         if not CONVERTER_REMOTE_URL.fullmatch(repo):
             refuse("STANDARD_ARGUMENTS_INVALID")
-        # Account's Git config, SSH agent and credential helpers remain host-side.
-        capture(converter_git(checkout, credentials=True, cwd=root) + ["clone", "--branch", branch, "--", repo, str(checkout)])
+        # A github.com remote uses the engineer's token file when there is one; otherwise the
+        # account's Git config, SSH agent and credential helpers, host-side as before.
+        token = github_credentials(checkout, repo, cwd=root)
+        if token:
+            capture(token[0] + ["clone", "--branch", branch, "--", repo, str(checkout)], token[1])
+        else:
+            capture(converter_git(checkout, credentials=True, cwd=root) + ["clone", "--branch", branch, "--", repo, str(checkout)])
         print(json.dumps({"version": 1, "status": "cloned"}))
         return 0
     if len(args) != 3 or checkout.is_symlink() or not checkout.is_dir():
@@ -191,8 +230,12 @@ def host_converter(args, values, base, self):
             refuse("STANDARD_CONVERTER_DIRTY: Commit changes (optionally on a development branch) or stash, then run standard converter refresh.")
         if branch == "detached" or capture(git + ["rev-parse", "--abbrev-ref", "HEAD"]) != branch:
             refuse("STANDARD_RUNTIME_MISMATCH")
-        # Only fetch may use the account's credential helper.
-        capture(converter_git(checkout, credentials=True) + ["fetch", "origin"])
+        # Only fetch may use credentials: the token file for github.com, else the account's helper.
+        token = github_credentials(checkout, capture(git + ["remote", "get-url", "origin"]))
+        if token:
+            capture(token[0] + ["fetch", "origin"], token[1])
+        else:
+            capture(converter_git(checkout, credentials=True) + ["fetch", "origin"])
         capture(git + ["merge", "--ff-only", "--", "refs/remotes/origin/" + branch])
     finally:
         os.close(fd)
