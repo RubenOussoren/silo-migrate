@@ -10,7 +10,8 @@ class StandardCompleteRuntime < StandardScriptedRuntime
   SANDBOX = SiloMigrate::Services::StandardWorkflowService::SANDBOX_ATTACHMENT
   SOURCE = "Synthetic source attachment.\n"
   DATE = '2026-01-01T00:00:00Z'
-  attr_accessor :service, :fail_stage, :occupied_kind, :stage_hook, :restore_runtime_failure
+  attr_accessor :service, :fail_stage, :occupied_kind, :stage_hook, :restore_runtime_failure, :init_server_polls
+  attr_reader :readiness_polls
   attr_reader :observations, :http_requests, :backups
 
   def self.expected
@@ -32,6 +33,7 @@ class StandardCompleteRuntime < StandardScriptedRuntime
     @http_requests = []
     @id_sequence = 0
     @seen_stages = {}
+    @init_server_polls = 0
   end
 
   def current_run
@@ -156,6 +158,12 @@ class StandardCompleteRuntime < StandardScriptedRuntime
       return response('', success: cmd[1] == occupied_kind)
     elsif cmd.include?('git') && cmd.include?('rev-parse')
       return recorded
+    elsif cmd.last == SiloMigrate::Services::StandardWorkflowService::SOURCE_DB_READY
+      @readiness_polls = (@readiness_polls || 0) + 1
+      # Models the image entrypoint: its temporary init server answers first,
+      # while PID 1 is still the entrypoint, so the guarded probe fails.
+      return response('', success: false) if @readiness_polls <= init_server_polls
+      return response("1\n")
     elsif cmd.include?('./convert')
       write_intermediate(service.store.run_dir(current_run['id'], 'work', 'converter-output', 'intermediate.sqlite'))
       return response("== Run Summary ==\nErrors : 0 (conversion) + 0 (setup)\nSkipped by policy : 0\n")
@@ -255,6 +263,41 @@ class StandardFullRunTest < SiloMigrateTest
     assert_equal SiloMigrate::Services::StandardWorkflowService::STAGES.to_h { |stage| [stage, 'passed'] }, result[:stages]
     assert_equal 'restore-proven', result.dig(:artifacts, 'final', 'label')
     result
+  end
+
+  def source_db_steps
+    ready = SiloMigrate::Services::StandardWorkflowService::SOURCE_DB_READY
+    @runtime.commands.each_with_index.filter_map do |entry, index|
+      next unless entry[0] == :run && entry[1][0, 2] == %w[docker exec]
+      if entry[1].last == ready then [:ready, index]
+      elsif entry[1].last.include?('bootstrap.sql') then [:bootstrap, index]
+      end
+    end
+  end
+
+  def test_source_db_bootstrap_waits_for_final_server_not_entrypoint_init_server
+    with_complete do
+      @runtime.init_server_polls = 3
+      completed_run
+      steps = source_db_steps
+      assert_equal 4, @runtime.readiness_polls
+      assert_equal [:ready] * 4 + [:bootstrap], steps.map(&:first)
+      assert_operator steps[3][1], :<, steps[4][1]
+    end
+  end
+
+  def test_source_db_that_never_reaches_final_server_fails_before_bootstrap
+    with_complete do
+      @runtime.init_server_polls = 1_000_000
+      clock = 0.0
+      result = Process.stub(:clock_gettime, ->(*) { clock += 5 }) { @service.run_plan(plan_id: approve[:plan_id]) }
+      detail = JSON.parse(File.read(@service.store.run_dir(result[:run_id], 'private', 'failure.json')))
+      assert_equal 'failed', result[:status]
+      assert_equal 'convert', result[:stage]
+      assert_equal 'STANDARD_CONVERSION_FAILED', result[:failure]['code']
+      assert_includes detail['detail'], 'source db readiness'
+      refute source_db_steps.any? { |kind, _| kind == :bootstrap }
+    end
   end
 
   def test_all_stages_complete_and_manifest_describes_actual_lineage

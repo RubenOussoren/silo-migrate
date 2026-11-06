@@ -991,11 +991,18 @@ module SiloMigrate
         @store.run_dir(run_id, "work", roots.first)
       end
 
+      # The image entrypoint first runs a temporary server on the same socket to
+      # create users, then stops it and execs the real mariadbd as PID 1. A query
+      # that reaches the temporary server is not readiness: the next command can
+      # land in the restart gap. Require the final server process as well.
+      SOURCE_DB_READY = 'test "$(cat /proc/1/comm)" = mariadbd && ' \
+                        "exec mariadb --defaults-extra-file=/run-fixture/root.cnf --batch --skip-column-names -e 'SELECT 1'"
+
       def wait_source_db(db_id)
         deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60
         loop do
-          ready = @runtime.run(["docker", "exec", db_id, "/bin/sh", "-c", "exec mariadb --defaults-extra-file=/run-fixture/root.cnf --batch --skip-column-names -e 'SELECT 1'"], capture: true, timeout: 5)
-          return if ready.success?
+          ready = @runtime.run(["docker", "exec", db_id, "/bin/sh", "-c", SOURCE_DB_READY], capture: true, timeout: 5)
+          return if ready.success? && ready.stdout.to_s == "1\n"
           raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "source db readiness") if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
           nap(1)
