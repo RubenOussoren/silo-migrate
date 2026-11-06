@@ -277,7 +277,8 @@ class ArtifactTests(unittest.TestCase):
         self.profile = {"version": 1, "recipe": "synthetic", "images": {
             "web": {"ref": "test/web:1", "content_id": self.identity.content_id(self.inspect), "source": "package"},
             "control": {"ref": "ruby@sha256:" + "b"*64, "content_id": self.identity.content_id(self.inspect), "source": "public-digest"}}}
-        self.profilefile = self.root/"runtime.json"
+        (self.root/"runtime/profiles").mkdir(parents=True)
+        self.profilefile = self.root/"runtime/profiles/synthetic-v1.json"
         self.profilefile.write_text(json.dumps(self.profile))
         self.gems = self.root/"gems"
         self.gems.mkdir()
@@ -306,6 +307,22 @@ class ArtifactTests(unittest.TestCase):
         self.assertFalse((self.out/"images/control.tar.gz").exists())
         result = subprocess.run([str(ROOT/"script/metal"), "artifacts", "verify", str(self.out)], capture_output=True, text=True)
         self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_build_binds_release_profile_name(self):
+        # Regression: a package built from a renamed profile copy passed its own
+        # verify but was refused by apply, which resolves the profile by name.
+        copy = self.root/"standard-local-prebuilt-v1.json"
+        copy.write_bytes(self.profilefile.read_bytes())
+        self.profilefile = copy
+        with self.assertRaises(self.pack.Invalid): self.build()
+        self.assertFalse(self.out.exists())
+        self.profilefile = self.root/"runtime/profiles/synthetic-v1.json"
+        self.build()
+        self.assertEqual("synthetic-v1", json.loads((self.out/"manifest.json").read_text())["profile"]["name"])
+        renamed = self.root/"elsewhere/runtime/profiles/other.json"
+        renamed.parent.mkdir(parents=True)
+        renamed.write_bytes(self.profilefile.read_bytes())
+        with self.assertRaises(self.pack.Invalid): self.pack.verify(self.out, renamed)
 
     def test_tampered_missing_extra_symlink_and_profile_refused(self):
         self.build()

@@ -1,6 +1,7 @@
 """Adversarial fixtures only: never talks to Docker or a real workspace."""
 import contextlib
 import fcntl
+import gzip
 import hashlib
 import io
 import json
@@ -171,9 +172,13 @@ class SecurityTests(unittest.TestCase):
 class ArchiveTests(unittest.TestCase):
     setUp = fixtures.InstallerTests.setUp
 
-    def archive(self, *, tags=None, count=1, wrong_diff=False, wrong_config=False, oci=False):
+    def archive(self, *, tags=None, count=1, wrong_diff=False, wrong_config=False, oci=False,
+                gzip_layer=False, annotations=None, extra_blob=False, layer_media=None, truncate_gzip=False):
         layer = b'tiny synthetic layer'
         diff = 'sha256:' + hashlib.sha256(layer).hexdigest()
+        stored = gzip.compress(layer, mtime=0) if gzip_layer else layer
+        if truncate_gzip:
+            stored = stored[:-6]
         config = {'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': [diff]}, 'config': {'Env': ['LANG=C']}}
         identity = module('identity_archive', 'image_identity.py')
         image = {'ref': 'test/bound:1', 'content_id': identity.content_id({'Architecture': 'amd64', 'Os': 'linux', 'RootFS': {'Layers': [diff]}, 'Config': config['config']})}
@@ -181,7 +186,7 @@ class ArchiveTests(unittest.TestCase):
             config['rootfs']['diff_ids'] = ['sha256:'+'0'*64]
         raw = json.dumps(config).encode()
         digest = hashlib.sha256(raw).hexdigest()
-        entries = {digest+'.json': raw, 'layer.tar': layer}
+        entries = {digest+'.json': raw, 'layer.tar': stored}
         if oci:
             entries = {}
             def blob(raw, media):
@@ -189,11 +194,20 @@ class ArchiveTests(unittest.TestCase):
                 entries['blobs/sha256/'+digest] = raw
                 return {'mediaType': media, 'digest': 'sha256:'+digest, 'size': len(raw)}
             cfg = blob(raw, 'application/vnd.oci.image.config.v1+json')
-            lay = blob(layer, 'application/vnd.oci.image.layer.v1.tar')
-            desc = blob(json.dumps({'schemaVersion': 2, 'config': cfg, 'layers': [lay]}).encode(), 'application/vnd.oci.image.manifest.v1+json')
+            media = layer_media or ('application/vnd.oci.image.layer.v1.tar+gzip' if gzip_layer else 'application/vnd.oci.image.layer.v1.tar')
+            lay = blob(stored, media)
+            desc = blob(json.dumps({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json', 'config': cfg, 'layers': [lay]}).encode(), 'application/vnd.oci.image.manifest.v1+json')
             if tags:
                 desc['annotations'] = {'org.opencontainers.image.ref.name': tags[0]}
+            if annotations:
+                desc['annotations'] = annotations
             entries['index.json'] = json.dumps({'schemaVersion': 2, 'manifests': [desc]*count}).encode()
+            # Real containerd-store saves carry both layouts over the same blobs.
+            entries['manifest.json'] = json.dumps([{'Config': 'blobs/sha256/'+cfg['digest'][7:], 'Layers': ['blobs/sha256/'+lay['digest'][7:]],
+                                                    'RepoTags': [] if tags is None else tags}]).encode()
+            entries['oci-layout'] = b'{"imageLayoutVersion": "1.0.0"}'
+            if extra_blob:
+                blob(b'a second, unreferenced image could hide here', 'application/octet-stream')
         else:
             entries['manifest.json'] = json.dumps([{'Config': ('0'*64 if wrong_config else digest)+'.json', 'Layers': ['layer.tar'], 'RepoTags': [] if tags is None else tags}]*count).encode()
         path = self.root/'image.tar.gz'
@@ -221,6 +235,33 @@ class ArchiveTests(unittest.TestCase):
         path, image, identity, _ = self.archive(wrong_config=True)
         with self.assertRaises(ValueError):
             parser.validate(path, image, identity)
+
+    def test_containerd_save_shape_gzip_layers_and_normalized_names(self):
+        # Shape observed in real `docker image save` output (containerd store):
+        # gzip OCI layers, docker.io-normalized name and tag-only OCI ref name.
+        parser = module('archive_real_shape_test', 'image_archive.py')
+        for gzip_layer in (False, True):
+            path, image, identity, config_id = self.archive(oci=True, gzip_layer=gzip_layer, tags=['test/bound:1'], annotations={
+                'io.containerd.image.name': 'docker.io/test/bound:1', 'org.opencontainers.image.ref.name': '1'})
+            self.assertEqual(config_id, parser.validate(path, image, identity))
+        path, image, identity, config_id = self.archive(gzip_layer=True, tags=['test/bound:1'])
+        self.assertEqual(config_id, parser.validate(path, image, identity))
+        self.assertEqual({'ruby@sha256:' + 'a'*64, 'docker.io/library/ruby@sha256:' + 'a'*64}, parser.spellings('ruby@sha256:' + 'a'*64))
+        self.assertIn('registry.example:5000/x/y:2', parser.spellings('registry.example:5000/x/y:2'))
+
+    def test_foreign_names_extra_blobs_zstd_and_truncated_gzip_refused(self):
+        parser = module('archive_real_bad_test', 'image_archive.py')
+        cases = [dict(annotations={'io.containerd.image.name': 'docker.io/library/postgres:15'}),
+                 dict(annotations={'io.containerd.image.name': 'docker.io/test/other:1'}),
+                 dict(annotations={'org.opencontainers.image.ref.name': '2'}),
+                 dict(extra_blob=True),
+                 dict(gzip_layer=True, layer_media='application/vnd.oci.image.layer.v1.tar+zstd'),
+                 dict(gzip_layer=True, layer_media='application/vnd.oci.image.layer.v1.tar'),
+                 dict(gzip_layer=True, truncate_gzip=True)]
+        for opts in cases:
+            with self.subTest(opts=opts), self.assertRaises(ValueError):
+                path, image, identity, _ = self.archive(oci=True, **opts)
+                parser.validate(path, image, identity)
 
 class ConverterGitTests(unittest.TestCase):
     setUp = fixtures.InstallerTests.setUp

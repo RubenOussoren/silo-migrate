@@ -135,6 +135,11 @@ CREDENTIAL_PATTERNS = (".netrc", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*
 
 
 def package(args):
+    # The release resolves the profile by name, so package only a profile file
+    # that lives where releases keep them; a renamed copy would never verify.
+    source = Path(args.profile)
+    require(not source.is_symlink() and source.suffix == ".json" and source.resolve().parent.parts[-2:] == ("runtime", "profiles"),
+            "--profile must be a release file under runtime/profiles/")
     profile = profile_read(args.profile)
     gems = Path(args.gems)
     require(gems.is_dir() and not gems.is_symlink(), "gems must be a real directory")
@@ -181,7 +186,8 @@ def package(args):
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     files = sorted(p for p in out.rglob("*") if p.is_file())
     (out / "SHA256SUMS").write_text("".join(sha(p) + "  " + p.relative_to(out).as_posix() + "\n" for p in files))
-    verify(out)
+    # Same name-bound check the installer applies against the release profile.
+    verify(out, args.profile)
     print("ARTIFACTS_OK " + sha(out / "manifest.json"))
 
 
