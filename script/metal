@@ -328,6 +328,7 @@ def resolve(repo, branch):
 
 def preflight(allow):
     result = os_check(allow)
+    result["installer_companions"] = companions()
     result["cpus"] = os.cpu_count()
     mem = re.search(r"MemTotal:\s+(\d+)", Path("/proc/meminfo").read_text())
     result["ram_bytes"] = int(mem[1]) * 1024
@@ -515,7 +516,7 @@ def make_plan(allow=False):
     elif C["TERM_LLM_SERVICE"] != "skip":
         notes.append("Stock service install --dry-run deferred: pinned binary/account absent; apply runs dry-run before service writes.")
     return {"format_version": 1, "config": C, "target": target, "state": dict(state, directory_authority=authority), "os": osinfo, "installer_sha256": sha(SELF),
-            "needs_root": roots, "as_account": users, "notes": notes, "service_preview_sha256": dry}
+            "companion_sha256": companions(), "needs_root": roots, "as_account": users, "notes": notes, "service_preview_sha256": dry}
 
 def computed_plan(args):
     entry = account_entry()
@@ -805,8 +806,20 @@ def switch(release):
     symlink(release, current)
     return previous
 
+COMPANIONS = ("package-artifacts", "image_identity.py", "image_archive.py")
+
+def companions():
+    # Helpers loaded from beside this script; a partial copy fails here, not mid-apply.
+    found = {}
+    for name in COMPANIONS:
+        path = SELF.parent/name
+        if path.is_symlink() or not path.is_file():
+            refuse("METAL_INSTALLER_INCOMPLETE", "run from a checkout: script/" + name + " must sit beside script/metal")
+        found[name] = sha(path)
+    return found
+
 def verify_installer(plan):
-    if plan.get("installer_sha256") != sha(SELF):
+    if plan.get("installer_sha256") != sha(SELF) or plan.get("companion_sha256") != companions():
         refuse("METAL_PLAN_STALE", "installer changed; review a new plan")
 
 @contextlib.contextmanager

@@ -92,7 +92,8 @@ fi
 git --git-dir="$run/repo.git" config core.sharedRepository all
 chmod -R a+rX "$run/repo.git"
 mkdir "$run/installer"
-cp script/metal script/package-artifacts script/image_identity.py "$run/installer/"
+# script/metal refuses (METAL_INSTALLER_INCOMPLETE) unless all its companions sit beside it.
+cp script/metal script/package-artifacts script/image_identity.py script/image_archive.py "$run/installer/"
 cp config/metal.example.conf "$run/installer/"
 # Build has no runtime demo mounts, socket or host package installation.
 docker build -t "$tag" test/metal/vm >"$run/build.log" 2>&1

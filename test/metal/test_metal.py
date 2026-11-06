@@ -59,6 +59,22 @@ class InstallerTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
 
+    def test_partial_installer_copy_refused_and_companion_change_stales_plan(self):
+        # Regression: a VM copy without image_archive.py failed mid-apply as STATE_INVALID.
+        lone = self.root/"lone"
+        lone.mkdir()
+        shutil.copyfile(self.m.SELF, lone/"metal")
+        with patch.object(self.m, "SELF", lone/"metal"):
+            with self.assertRaisesRegex(self.m.Refusal, "METAL_INSTALLER_INCOMPLETE"):
+                self.m.companions()
+            for name in self.m.COMPANIONS:
+                shutil.copyfile(ROOT/"script"/name, lone/name)
+            plan = {"installer_sha256": self.m.sha(lone/"metal"), "companion_sha256": self.m.companions()}
+            self.m.verify_installer(plan)
+            (lone/"image_archive.py").write_text("# changed after planning\n")
+            with self.assertRaisesRegex(self.m.Refusal, "METAL_PLAN_STALE"):
+                self.m.verify_installer(plan)
+
     def configured(self, body):
         path = self.root/"config"
         path.write_text(body)
