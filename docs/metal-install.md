@@ -358,7 +358,11 @@ is refused with `STANDARD_CONVERTER_CONFIG` and never executed. The check uses G
 `.git/config`; `.git` and that file must be real, account-owned and not group/world
 writable; `commondir`, `gitdir`, `config.worktree`, `.gitmodules` and submodule
 (gitlink) index entries are refused, and status ignores submodules. Remote URLs must not
-embed credentials. Only `clone` and `fetch` may use the account's own global Git config and
+embed credentials. Host Git calls drop inherited `GIT_*` environment settings and
+time out after 10 minutes. The gate runs once before the protected commands, so
+nothing else running as the service account may modify the converter checkout's
+`.git` during a converter update, refresh or run start (same-account writers are
+inside the trust boundary). Only `clone` and `fetch` may use the account's own global Git config and
 credential helpers (so private HTTPS clones work); everything else ignores it. Converter
 update holds the workspace `op.lock` across checks/fetch/merge and refuses claimed or
 running runs. Refresh takes its own op.lock and also refuses those states.
