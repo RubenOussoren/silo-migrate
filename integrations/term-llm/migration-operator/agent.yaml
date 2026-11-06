@@ -2,7 +2,8 @@ name: migration-operator
 description: Conversational interface to silo-migrate's standard local migration workflow. Safe projections only.
 workspace: none
 agents_md: "false"
-search: false
+# Web search and read_url, for public documentation (Discourse, error messages).
+search: true
 max_turns: 40
 tools:
   enabled: [update_plan]
