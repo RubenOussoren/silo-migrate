@@ -123,14 +123,23 @@ class InstallerTests(unittest.TestCase):
                         self.m.make_plan()
                 else:
                     plan = self.m.make_plan()
-                    self.assertTrue(any("agent picker" in note for note in plan["notes"]))
+                    self.assertTrue(any("agent picker" in note and "server-support" in note for note in plan["notes"]))
+                    self.assertTrue(any("server-support" in note and "ROOT-EQUIVALENT" in note and "approval" in note for note in plan["notes"]))
 
-    def test_agents_ready_requires_exactly_the_migration_agents(self):
+    def test_installer_expects_exactly_the_shipped_agents(self):
+        shipped = sorted(path.parent.name for path in (Path(__file__).resolve().parents[2]/"integrations/term-llm").glob("*/agent.yaml"))
+        self.assertEqual(sorted(self.m.MIGRATION_AGENTS), shipped)
+
+    def test_agents_ready_requires_exactly_the_node_agents(self):
+        three = "    migration-analyst - a\n    migration-operator - b\n    server-support - c\n"
         cases = {
-            "Available agents (2):\n\n  [user] /x/\n    migration-analyst - a\n    migration-operator - b\n": True,
+            "Available agents (3):\n\n  [user] /x/\n" + three: True,
             "No agents configured.\n": False,
-            "Available agents (20):\n\n  [builtin]\n    developer - d\n    migration-analyst - a\n    migration-operator - b\n": False,
-            "Available agents (2):\n\n  [user] /x/\n    migration-analyst - a\n    other - b\n": False,
+            # The previous two-agent set is no longer enough.
+            "Available agents (2):\n\n  [user] /x/\n    migration-analyst - a\n    migration-operator - b\n": False,
+            "Available agents (20):\n\n  [builtin]\n    developer - d\n" + three: False,
+            "Available agents (3):\n\n  [user] /x/\n    migration-analyst - a\n    migration-operator - b\n    other - c\n": False,
+            "Available agents (4):\n\n  [user] /x/\n" + three + "    shell-agent - d\n": False,
             None: False}
         for listing, ready in cases.items():
             with self.subTest(listing=listing), patch.object(self.m, "output", return_value=listing):

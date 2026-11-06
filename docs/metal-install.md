@@ -151,11 +151,22 @@ Confirmed against the **real 0.9.93 binary's help**: `service install web`,
 `--auth bearer`, `--approval prompt`, `--no-projects`, `--disable-extensions`,
 `--disable-widgets`. No startup agent is pinned: with `--agent` the web UI hides its
 agent picker. Instead the account's config sets `agents.use_builtin: false`, so the
-picker offers only `migration-operator` and `migration-analyst` (plus term-llm's plain
-"Default" chat). Fresh configs get this and the agents search path; for an existing config, plan and
-apply refuse (`METAL_AGENTS_CONFIG`) until `term-llm agents` lists exactly the two
-migration agents, because built-in shell agents would
-otherwise run with the account's Docker authority. Verified against a throwaway
+picker offers only `migration-operator`, `migration-analyst` and `server-support` (plus
+term-llm's plain "Default" chat). Fresh configs get this and the agents search path; for an
+existing config, plan and apply refuse (`METAL_AGENTS_CONFIG`) until `term-llm agents` lists
+exactly those three agents, because built-in shell agents would otherwise run with the
+account's Docker authority without per-command approval.
+
+`server-support` (ChatGPT, or Frontier in a new chat) helps keep the node running. Its
+shell has the account's **root-equivalent Docker authority**; with the service's
+`--approval prompt`, each command and each `edit_file`/`write_file` write asks the engineer
+(agents have no pre-approved write directories in term-llm 0.9.93). Choose "once" in the
+prompt: directory or command grants last for the session. Its own read tools are limited to
+`~/.config/term-llm`, `~/.config/op-cache` and `<prefix>/{etc,state,current}`; they refuse
+migration workspaces, `<prefix>/state/tmp`, term-llm credential files
+(`chatgpt_oauth.json`, `services/*/credentials/`) and other secret-named files, and redact
+secret-looking values. The path limit for edits and shell commands is the engineer's
+approval plus the agent's instructions, not a tool-enforced boundary. It also has web search. Verified against a throwaway
 0.9.93 web server: the page lists exactly those two agents. Plan uses stock service dry-run when
 the installed binary/account exist, otherwise explicitly defers it; apply runs
 it before writing service files. `install` writes without starting;

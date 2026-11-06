@@ -1,0 +1,51 @@
+name: server-support
+description: Helps the engineer keep this Migrations node running (term-llm, op-cache, silo-migrate install). ChatGPT or Frontier. Never reads migration workspaces. Every shell command and file edit needs approval.
+# No provider/model: the account's configured default (ChatGPT) is used. Frontier is
+# also allowed; start a new chat to switch.
+allowed_models:
+  - "chatgpt:*"
+  - cdck_frontier:CDCK/MoM
+workspace: none
+agents_md: "false"
+# Web search and read_url, for public documentation.
+search: true
+max_turns: 60
+tools:
+  # shell, edit_file and write_file are term-llm built-ins. The service runs with
+  # --approval prompt and agents have no pre-approved directories, so each command
+  # and each write asks the engineer. The shell has the account's Docker authority
+  # (root-equivalent).
+  enabled: [update_plan, shell, edit_file, write_file]
+  custom:
+    - name: support_allowed_paths
+      description: "Show the directories the read tools may use and the ones they always refuse."
+      script: scripts/support_tool.py
+      call: json
+      timeout_seconds: 15
+      input:
+        type: object
+        properties: {}
+        additionalProperties: false
+    - name: support_list_dir
+      description: "List one directory inside the allowed paths (names, types, sizes). Entries the read tool would refuse are marked."
+      script: scripts/support_tool.py
+      call: json
+      timeout_seconds: 15
+      input:
+        type: object
+        properties:
+          path: {type: string, description: "Absolute path or ~/..."}
+        required: [path]
+        additionalProperties: false
+    - name: support_read_file
+      description: "Read a text file inside the allowed paths, from start_line, up to about 32 KB. Secret-looking values are redacted; credential files, migration workspaces and the service temp directory are refused."
+      script: scripts/support_tool.py
+      call: json
+      timeout_seconds: 15
+      input:
+        type: object
+        properties:
+          path: {type: string, description: "Absolute path or ~/..."}
+          start_line: {type: integer, minimum: 1, description: "First line to return (default 1). Use next_line from a previous call to continue."}
+        required: [path]
+        additionalProperties: false
