@@ -63,9 +63,47 @@ def settings():
     return values, configured
 
 
+# Keys a plain clone or an engineer's commits need. Anything else in the checkout's
+# own .git/config (filters, credential helpers, sshCommand, includes, aliases,
+# diff/merge drivers...) could run a command as this Docker-group account.
+CONVERTER_CONFIG_KEYS = re.compile(r"(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)"
+                                   r"|remote\.origin\.(?:url|fetch)|branch\..+\.(?:remote|merge)|user\.(?:name|email)|pull\.(?:rebase|ff)|fetch\.prune)")
+CONVERTER_REMOTE_URL = re.compile(r"(?:https://\S+|ssh://\S+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._/~-]+|/[^\s:]*)")
+
+
+def converter_config_safe(checkout):
+    dot_git = checkout / ".git"
+    if dot_git.is_symlink() or not dot_git.is_dir():
+        refuse("STANDARD_CONVERTER_CONFIG")
+    # Reading a config file with --file executes nothing and follows no includes.
+    # -C / : no repository discovery from whatever the current directory is.
+    listed = capture(["env", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "git", "-C", "/", "config",
+                      "--file", str(dot_git / "config"), "--null", "--list"])
+    for entry in listed.split("\0"):
+        if not entry.strip():
+            continue
+        key, _, value = entry.lstrip("\n").partition("\n")
+        if key == "remote.origin.url":
+            safe = bool(CONVERTER_REMOTE_URL.fullmatch(value))
+        elif key == "remote.origin.fetch":
+            safe = bool(re.fullmatch(r"\+?refs/heads/[^:\s]+:refs/remotes/origin/[^:\s]+", value))
+        elif key.endswith(".remote"):
+            safe = value in ("origin", ".")
+        elif key.endswith(".merge"):
+            safe = value.startswith("refs/heads/")
+        else:
+            safe = "\n" not in value
+        if not (CONVERTER_CONFIG_KEYS.fullmatch(key) and safe):
+            refuse("STANDARD_CONVERTER_CONFIG: the converter checkout's .git/config has settings that could run commands; inspect it with git config --file converter/.git/config --list, remove them, then retry.")
+
+
 def converter_git(checkout, credentials=False, cwd=None):
-    return ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-            "-c", "core.untrackedCache=false", "-c", "safe.directory=" + str(checkout.resolve()),
+    # Only clone/fetch may use the account's own Git config and credential helpers.
+    return [*([] if credentials else ["env", "GIT_CONFIG_GLOBAL=/dev/null"]),
+            "git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+            "-c", "protocol.ssh.allow=always", "-c", "protocol.file.allow=always",
+            "-c", "safe.directory=" + str(checkout.resolve()),
             *([] if credentials else ["-c", "credential.helper="]), "-C", str(cwd or checkout)]
 
 
@@ -93,8 +131,10 @@ def host_converter(args, values, base, self):
             refuse("STANDARD_CONVERTER_EXISTS")
         repo = opts.get("--repo", "https://github.com/discourse-org/discourse-converters.git")
         branch = opts.get("--branch", "main")
+        if not CONVERTER_REMOTE_URL.fullmatch(repo):
+            refuse("STANDARD_ARGUMENTS_INVALID")
         # Account's Git config, SSH agent and credential helpers remain host-side.
-        capture(converter_git(checkout, cwd=root) + ["clone", "--branch", branch, "--", repo, str(checkout)])
+        capture(converter_git(checkout, credentials=True, cwd=root) + ["clone", "--branch", branch, "--", repo, str(checkout)])
         print(json.dumps({"version": 1, "status": "cloned"}))
         return 0
     if len(args) != 3 or checkout.is_symlink() or not checkout.is_dir():
@@ -114,6 +154,7 @@ def host_converter(args, values, base, self):
         if Path(config["converter_worktree"]).resolve() != checkout.resolve():
             refuse("STANDARD_RUNTIME_MISMATCH")
         branch = config["converter"]["branch"]
+        converter_config_safe(checkout)
         git = converter_git(checkout)
         if capture(git + ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"]):
             refuse("STANDARD_CONVERTER_DIRTY: Commit changes (optionally on a development branch) or stash, then run standard converter refresh.")

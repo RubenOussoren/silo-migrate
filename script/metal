@@ -997,6 +997,9 @@ def verify_release_images(release, bound):
 
 def account_update(rollback=False, branch=None, term=False):
     with idle_guard():
+        # Releases are cloned into, switched to and pruned from here: never via a link.
+        if (P/"releases").is_symlink() or not (P/"releases").is_dir():
+            refuse("METAL_PATH_CONFLICT", "releases directory is not a real directory; nothing changed")
         old = load(P/"state/install-manifest.json")
         if rollback:
             history = [json.loads(line) for line in (P/"state/history.jsonl").read_text().splitlines()]

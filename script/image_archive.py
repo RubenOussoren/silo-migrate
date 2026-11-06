@@ -54,14 +54,18 @@ class _Inflater:
         self.digest = hashlib.sha256()
         self.state = zlib.decompressobj(31)
 
+    # Bounded output per step: a crafted layer cannot expand into one huge allocation.
+    LIMIT = 1024 * 1024
+
     def feed(self, data):
         while data:
-            self.digest.update(self.state.decompress(data))
-            if not self.state.eof:
-                return
-            data = self.state.unused_data
-            if data:
-                self.state = zlib.decompressobj(31)
+            self.digest.update(self.state.decompress(data, self.LIMIT))
+            if self.state.eof:
+                data = self.state.unused_data
+                if data:
+                    self.state = zlib.decompressobj(31)
+            else:
+                data = self.state.unconsumed_tail
 
     def finish(self):
         self.digest.update(self.state.flush())
@@ -102,6 +106,14 @@ def _scan(path):
 
 
 def validate(path, expected, identity):
+    # Every malformed-archive outcome is the same fixed refusal, never a traceback.
+    try:
+        return _validate(path, expected, identity)
+    except (zlib.error, EOFError, RecursionError, IndexError, AttributeError, UnicodeError) as error:
+        raise ValueError("image archive identity/tag/structure refused") from error
+
+
+def _validate(path, expected, identity):
     files = _scan(path)
     allowed = spellings(expected["ref"])
     referenced = set()

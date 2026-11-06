@@ -82,6 +82,28 @@ class SecurityTests(unittest.TestCase):
         with self.assertRaises(self.m.Refusal):
             self.configured('SILO_PREFIX=/srv/silo\nSILO_WORKSPACES=/srv')
 
+    def test_symlinked_releases_directory_refuses_update_before_any_change(self):
+        P = self.m.P
+        (P/'state/logs').mkdir(parents=True)
+        elsewhere = self.root/'elsewhere'
+        (elsewhere/('a'*40)).mkdir(parents=True)
+        (P/'releases').symlink_to(elsewhere, target_is_directory=True)
+        self.m.W.mkdir(exist_ok=True)
+        (self.m.W/'.silo-standard-execution.lock').touch()
+        self.m.record({'commit': 'a'*40}, 'apply')
+        before = sorted(p.name for p in elsewhere.iterdir())
+        with patch.object(self.m, 'fetch_release', side_effect=AssertionError('cloned through link')), \
+             self.assertRaisesRegex(self.m.Refusal, 'METAL_PATH_CONFLICT'):
+            self.m.account_update(branch='main')
+        self.assertEqual(before, sorted(p.name for p in elsewhere.iterdir()))
+        self.assertFalse((P/'current').exists() or (P/'current').is_symlink())
+
+    def test_engine_fits_one_exec_argument(self):
+        # The engine is passed as one argv element: Linux caps a single argument at 128 KiB.
+        text = (ROOT/'script/metal').read_text()
+        engine = text.split(": <<'PYTHON'\n", 1)[1].split("\nPYTHON\n", 1)[0]
+        self.assertLess(len(engine.encode()), 120 * 1024)
+
     def test_installer_hash_rechecked_in_account_apply_before_any_work(self):
         with self.plan_stubs():
             saved = self.m.envelope(self.m.make_plan())
@@ -304,6 +326,33 @@ class ConverterGitTests(unittest.TestCase):
         self.assertTrue(marker.exists())
         marker.unlink()
         self.assertEqual('', wrapper['capture'](wrapper['converter_git'](checkout)+['--no-optional-locks', 'status', '--porcelain']))
+        self.assertFalse(marker.exists())
+        # Command-capable repository config is refused before any Git command runs.
+        planted = [('core.fsmonitor', str(monitor)), ('filter.x.clean', 'touch '+str(marker)),
+                   ('credential.helper', '!touch '+str(marker)), ('core.sshCommand', 'touch '+str(marker)),
+                   ('include.path', str(self.root/'evil.config')), ('remote.origin.url', 'ext::sh -c touch% '+str(marker))]
+        original_url = git('-C', checkout, 'config', 'remote.origin.url')
+        git('-C', checkout, 'config', '--unset', 'core.fsmonitor')
+        (checkout/'.git/info').mkdir(exist_ok=True)
+        (checkout/'.git/info/attributes').write_text('* filter=x\n')
+        for key, value in planted:
+            with self.subTest(key=key):
+                git('-C', checkout, 'config', key, value)
+                ran = []
+                real = globals_['capture']
+                def recording(args, real=real):
+                    ran.append(args)
+                    return real(args)
+                with patch.dict(globals_, capture=recording), self.assertRaisesRegex(ValueError, 'STANDARD_CONVERTER_CONFIG'):
+                    wrapper['host_converter'](['converter', 'update', 'synthetic'], {}, base, ROOT/'bin/silo-migrate-control')
+                self.assertEqual(1, len(ran))
+                self.assertIn('--list', ran[0])
+                self.assertFalse(marker.exists())
+                if key == 'remote.origin.url':
+                    git('-C', checkout, 'config', key, original_url)
+                else:
+                    git('-C', checkout, 'config', '--unset', key)
+        (checkout/'.git/info/attributes').unlink()
         (remote/'tracked').write_text('two')
         git('-C', remote, 'commit', '-am', 'two')
         with patch('subprocess.call', return_value=0):

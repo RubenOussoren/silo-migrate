@@ -345,13 +345,19 @@ term service; schedule a separate explicitly approved restart if needed.
 
 ## Converter Git safety
 
-Converter Git (host clone/status/fetch/merge and container identity/status) uses
-`GIT_CONFIG_NOSYSTEM=1`, disabled hooks, fsmonitor and untracked cache, and an
-exact checkout `safe.directory`; status also uses `--no-optional-locks`.
-Credential helpers are disabled except for the explicit host fetch. Converter
-update holds the workspace `op.lock` across checks/fetch/merge and refuses claimed
-or running runs. Refresh takes its own `op.lock`, refuses those states and
-revalidates cleanliness and identity.
+Converter Git (host clone/status/fetch/merge and container identity/status/archive)
+uses `GIT_CONFIG_NOSYSTEM=1`, disabled hooks, fsmonitor and untracked cache,
+pinned protocols (https, ssh and file only) and an exact checkout `safe.directory`;
+status also uses `--no-optional-locks`. Before any of these runs, the checkout's own
+`.git/config` must contain only the keys a plain clone or an engineer's commits need
+(`core.*` basics, `remote.origin.url/fetch`, `branch.*.remote/merge`, `user.name/email`,
+`pull.rebase/ff`, `fetch.prune`), with a plain https/ssh/local remote URL. Anything
+else (filters, credential helpers, `sshCommand`, includes, aliases, diff/merge drivers)
+is refused with `STANDARD_CONVERTER_CONFIG` and never executed; `.git` must be a real
+directory. Only `clone` and `fetch` may use the account's own global Git config and
+credential helpers (so private HTTPS clones work); everything else ignores it. Converter
+update holds the workspace `op.lock` across checks/fetch/merge and refuses claimed or
+running runs. Refresh takes its own op.lock and also refuses those states.
 
 ## Tests and actual evidence (2026-11-05)
 

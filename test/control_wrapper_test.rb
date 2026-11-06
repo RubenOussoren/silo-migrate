@@ -98,9 +98,9 @@ class ControlWrapperTest < SiloMigrateTest
           with patch.dict(globals_, capture=capture):
               with contextlib.redirect_stdout(io.StringIO()):
                   wrapper['host_converter'](['converter', 'clone', 'synthetic'], {}, base, self)
-              assert commands == [wrapper['converter_git'](root / 'converter', cwd=root) + ['clone', '--branch', 'main', '--', 'https://github.com/discourse-org/discourse-converters.git', str(root / 'converter')]]
+              assert commands == [wrapper['converter_git'](root / 'converter', credentials=True, cwd=root) + ['clone', '--branch', 'main', '--', 'https://github.com/discourse-org/discourse-converters.git', str(root / 'converter')]]
               checkout = root / 'converter'
-              checkout.mkdir()
+              (checkout / '.git').mkdir(parents=True)
               try:
                   wrapper['host_converter'](['converter', 'clone', 'synthetic'], {}, base, self)
                   raise AssertionError('clobbered checkout')
@@ -117,7 +117,7 @@ class ControlWrapperTest < SiloMigrateTest
               assert wrapper['converter_git'](checkout, credentials=True) + ['fetch', 'origin'] in commands
               assert wrapper['converter_git'](checkout) + ['merge', '--ff-only', '--', 'refs/remotes/origin/main'] in commands
               assert not any('reset' in command for command in commands)
-          with patch.dict(globals_, capture=lambda args: '?? dirty'):
+          with patch.dict(globals_, capture=lambda args: '' if '--list' in args else '?? dirty'):
               try:
                   wrapper['host_converter'](['converter', 'update', 'synthetic'], {}, base, self)
                   raise AssertionError('updated dirty checkout')

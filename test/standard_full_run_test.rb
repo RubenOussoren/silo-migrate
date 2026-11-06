@@ -10,7 +10,7 @@ class StandardCompleteRuntime < StandardScriptedRuntime
   SANDBOX = SiloMigrate::Services::StandardWorkflowService::SANDBOX_ATTACHMENT
   SOURCE = "Synthetic source attachment.\n"
   DATE = '2026-01-01T00:00:00Z'
-  attr_accessor :service, :fail_stage, :occupied_kind, :stage_hook, :restore_runtime_failure, :init_server_polls
+  attr_accessor :service, :fail_stage, :occupied_kind, :stage_hook, :restore_runtime_failure, :init_server_polls, :early_ready_output
   attr_reader :readiness_polls
   attr_reader :observations, :http_requests, :backups
 
@@ -162,6 +162,7 @@ class StandardCompleteRuntime < StandardScriptedRuntime
       @readiness_polls = (@readiness_polls || 0) + 1
       # Models the image entrypoint: its temporary init server answers first,
       # while PID 1 is still the entrypoint, so the guarded probe fails.
+      return response(early_ready_output) if early_ready_output && @readiness_polls <= init_server_polls
       return response('', success: false) if @readiness_polls <= init_server_polls
       return response("1\n")
     elsif cmd.include?('./convert')
@@ -283,6 +284,16 @@ class StandardFullRunTest < SiloMigrateTest
       assert_equal 4, @runtime.readiness_polls
       assert_equal [:ready] * 4 + [:bootstrap], steps.map(&:first)
       assert_operator steps[3][1], :<, steps[4][1]
+    end
+  end
+
+  def test_source_db_probe_exit_zero_without_exact_answer_is_not_ready
+    with_complete do
+      @runtime.init_server_polls = 2
+      @runtime.early_ready_output = ''
+      completed_run
+      assert_equal 3, @runtime.readiness_polls
+      assert_equal [:ready] * 3 + [:bootstrap], source_db_steps.map(&:first)
     end
   end
 

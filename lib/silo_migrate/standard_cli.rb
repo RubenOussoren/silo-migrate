@@ -76,7 +76,7 @@ module SiloMigrate
         write_json(result)
         failed_run?(argv, result) ? 1 : 0
       rescue StandardWorkflowError => e
-        if e.code == "STANDARD_CONVERTER_DIRTY"
+        if %w[STANDARD_CONVERTER_DIRTY STANDARD_CONVERTER_CONFIG].include?(e.code)
           @error.write("Error: #{e.code}. #{Services::StandardWorkflowService::RECOVERY.fetch(e.code)}\n")
           1
         else

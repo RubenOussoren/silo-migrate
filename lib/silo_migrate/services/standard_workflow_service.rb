@@ -54,6 +54,7 @@ module SiloMigrate
         "STANDARD_INPUT_CHANGED" => "An input changed. Do not edit inputs: register a new dataset, then propose and approve a new plan.",
         "STANDARD_COLLISION" => "Source records collide with the baseline. Decide policy, change the fixture or baseline, then re-plan.",
         "STANDARD_RUNTIME_MISMATCH" => "Runtime identity differs from the frozen lock. Rebuild or update the lock deliberately; do not bypass the check.",
+        "STANDARD_CONVERTER_CONFIG" => "The converter checkout's .git/config has settings that could run commands (for example filters, credential helpers, sshCommand or includes). As the service account, inspect it with git config --file converter/.git/config --list, remove those settings, then run standard converter refresh.",
         "STANDARD_CONVERTER_DIRTY" => "Commit changes (optionally on a development branch) or stash them, then run standard converter refresh.",
         "STANDARD_CONVERSION_FAILED" => "Conversion failed. Inspect private evidence, reset this run, then re-plan.",
         "STANDARD_UPLOADS_FAILED" => "Upload processing failed; the instance is dirty. Run the reset for this run, investigate privately, then re-plan.",
@@ -109,12 +110,50 @@ module SiloMigrate
         { version: 1, status: "initialized" }
       end
 
+      # Keys a plain clone or an engineer's commits need. Anything else in the
+      # checkout's own .git/config (filters, credential helpers, sshCommand,
+      # includes, protocol/alias/diff/merge drivers...) could run a command with
+      # this account's Docker authority, so it is refused, never executed.
+      CONVERTER_CONFIG_KEYS = /\A(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)|remote\.origin\.(?:url|fetch)|branch\..+\.(?:remote|merge)|user\.(?:name|email)|pull\.(?:rebase|ff)|fetch\.prune)\z/
+      CONVERTER_REMOTE_URL = %r{\A(?:https://[^\s]+|ssh://[^\s]+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._/~-]+|/[^\s:]*)\z}
+
+      def converter_git_argv(worktree)
+        ["env", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "git", "-c", "core.hooksPath=/dev/null",
+         "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "credential.helper=",
+         "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
+         "-c", "protocol.file.allow=always", "-c", "safe.directory=#{File.realpath(worktree)}", "-C", worktree]
+      end
+
+      def assert_converter_config!(worktree)
+        dot_git = File.join(worktree, ".git")
+        raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG" if File.symlink?(dot_git) || !File.directory?(dot_git)
+
+        # Reading a config file with --file executes nothing and follows no includes.
+        # -C / : no repository discovery from whatever the current directory is.
+        listed = @runtime.run(["env", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "git", "-C", "/", "config",
+                               "--file", File.join(dot_git, "config"), "--null", "--list"], capture: true, timeout: 30)
+        raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG" unless listed.success?
+
+        listed.stdout.to_s.split("\0").each do |entry|
+          next if entry.strip.empty?
+
+          key, value = entry.sub(/\A\n+/, "").split("\n", 2)
+          safe = key.to_s.match?(CONVERTER_CONFIG_KEYS) &&
+                 case key
+                 when "remote.origin.url" then value.to_s.match?(CONVERTER_REMOTE_URL)
+                 when /\.remote\z/ then %w[origin .].include?(value)
+                 when /\.merge\z/ then value.to_s.start_with?("refs/heads/")
+                 when "remote.origin.fetch" then value.to_s.match?(%r{\A\+?refs/heads/[^:\s]+:refs/remotes/origin/[^:\s]+\z})
+                 else !value.to_s.include?("\n")
+                 end
+          raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG" unless safe
+        end
+      end
+
       def converter_identity(worktree)
+        assert_converter_config!(worktree)
         git = lambda do |*args|
-          result = @runtime.run(["env", "GIT_CONFIG_NOSYSTEM=1", "git", "-c", "core.hooksPath=/dev/null",
-                                 "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
-                                 "-c", "credential.helper=", "-c", "safe.directory=#{File.realpath(worktree)}",
-                                 "-C", worktree, *args], capture: true, timeout: 30)
+          result = @runtime.run([*converter_git_argv(worktree), *args], capture: true, timeout: 30)
           raise StandardWorkflowError, "STANDARD_RUNTIME_MISMATCH" unless result.success?
           result.stdout.to_s.strip
         end
@@ -155,7 +194,7 @@ module SiloMigrate
         raise StandardWorkflowError, "STANDARD_CONVERTER_DIRTY" if current.fetch("dirty")
         current == config.fetch("converter")
       rescue StandardWorkflowError => error
-        raise if error.code == "STANDARD_CONVERTER_DIRTY"
+        raise if %w[STANDARD_CONVERTER_DIRTY STANDARD_CONVERTER_CONFIG].include?(error.code)
 
         false
       end
@@ -964,11 +1003,13 @@ module SiloMigrate
       def materialize_converter(run_id, config, code)
         revision = config.fetch("converter_revision")
         worktree = config.fetch("converter_worktree")
-        head = @runtime.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture: true, timeout: 30)
+        # git archive applies attributes (including filter drivers): same config gate.
+        assert_converter_config!(worktree)
+        head = @runtime.run([*converter_git_argv(worktree), "rev-parse", "HEAD"], capture: true, timeout: 30)
         raise StandardWorkflowError.new("STANDARD_RUNTIME_MISMATCH", "converter revision") unless head.success? && head.stdout.strip == revision
 
         archive = File.join(File.dirname(code), "converter.tar")
-        made = @runtime.run(["git", "-C", worktree, "archive", "--format=tar", "-o", archive, revision], capture: true, timeout: 120)
+        made = @runtime.run([*converter_git_argv(worktree), "archive", "--format=tar", "-o", archive, revision], capture: true, timeout: 120)
         raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "archive") unless made.success?
         extracted = @runtime.run(["tar", "-xf", archive, "-C", code, "--no-same-owner"], capture: true, timeout: 120)
         raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "extract") unless extracted.success?
@@ -999,7 +1040,8 @@ module SiloMigrate
                         "exec mariadb --defaults-extra-file=/run-fixture/root.cnf --batch --skip-column-names -e 'SELECT 1'"
 
       def wait_source_db(db_id)
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60
+        # First initialization on a busy host can be slow; each probe is still 5 s.
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 120
         loop do
           ready = @runtime.run(["docker", "exec", db_id, "/bin/sh", "-c", SOURCE_DB_READY], capture: true, timeout: 5)
           return if ready.success? && ready.stdout.to_s == "1\n"

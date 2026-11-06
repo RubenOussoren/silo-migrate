@@ -113,7 +113,7 @@ class StandardProfilesTest < SiloMigrateTest
     with_standard do
       @named.init('other')
       root = File.join(@env.fetch('SILO_MIGRATE_BASE_PATH'), 'other')
-      FileUtils.mkdir_p(File.join(root, 'converter'))
+      FileUtils.mkdir_p(File.join(root, 'converter', '.git'))
       @env['SILO_CONTROL_SITE_CACHE'] = @service.store.load.dig('config', 'site_settings')
       other = SiloMigrate::Services::StandardWorkflowService.new('other', env: @env, runtime: @runtime, code_root: @code_root)
       assert_equal 'initialized', other.init[:status]
@@ -204,6 +204,14 @@ class StandardProfilesTest
       assert File.exist?(marker), 'live fsmonitor fixture must execute without hardening'
       File.unlink(marker)
       @service.instance_variable_set(:@runtime, SiloMigrate::Runtime::Docker.new)
+      # A command-capable repository setting is refused before Git runs at all.
+      error = assert_raises(SiloMigrate::StandardWorkflowError) { @service.converter_identity(checkout) }
+      assert_equal 'STANDARD_CONVERTER_CONFIG', error.code
+      error = assert_raises(SiloMigrate::StandardWorkflowError) { @service.converter_status }
+      assert_equal 'STANDARD_CONVERTER_CONFIG', error.code
+      refute File.exist?(marker), 'a refused config must not execute converter code'
+      # Without it, live hooks remain present but are never run by identity/status.
+      git.call('config', '--unset', 'core.fsmonitor')
       assert_equal false, @service.converter_identity(checkout).fetch('dirty')
       assert_equal false, @service.converter_status.fetch(:dirty)
       refute File.exist?(marker), 'identity/status must never execute converter code'
