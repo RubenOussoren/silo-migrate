@@ -36,6 +36,27 @@ cache=../../.runtime-cache/metal-installer-tests
 mkdir -p "$cache" "$cache/base-cache"
 cache=$(realpath "$cache")
 free_gib() { df -P --block-size=1G "$cache" | awk 'NR==2 {print $4}'; }
+tag=silo-metal-vm-harness:local
+# Remove large leftovers from earlier runs (e.g. SIGKILLed, so their trap never ran).
+# Only our own run-* directories, and only when no harness container is alive.
+scrub() {
+  local dir=$1; shift
+  if docker image inspect "$tag" >/dev/null 2>&1; then
+    docker run --rm --network none --cpus 0.5 --memory 128m --entrypoint sh \
+      --mount "type=bind,src=$dir,dst=/e" "$tag" -c \
+      'cd /e && rm -rf -- "$@" && chown -R '"$(id -u):$(id -g)"' /e' sh "$@" >/dev/null 2>&1 || true
+  fi
+  (cd "$dir" && rm -rf -- "$@") 2>/dev/null || true
+}
+if [[ -z $(docker ps -q --filter name=metal-installer-test-run-) ]]; then
+  for old in "$cache"/run-*; do
+    [[ -d $old && ! -L $old ]] || continue
+    if compgen -G "$old/guest.qcow2" >/dev/null || compgen -G "$old/seed.img" >/dev/null || [[ -d $old/repo.git ]]; then
+      scrub "$old" guest.qcow2 seed.img repo.git converter.git installer
+      echo "Swept leftovers from ${old##*/}"
+    fi
+  done
+fi
 need=$((disk_gib + reserve_gib))
 [[ $scenario == full ]] && need=$((need + $(du -s --block-size=1G "$artifacts" | cut -f1)))
 have=$(free_gib)
@@ -46,7 +67,6 @@ fi
 run=$(mktemp -d "$cache/run-XXXXXXXX")
 chmod 700 "$run"
 name="metal-installer-test-${run##*/}"
-tag=silo-metal-vm-harness:local
 watchdog=
 cleanup() {
   local status=$?
@@ -55,12 +75,7 @@ cleanup() {
   local remove=(repo.git converter.git installer seed.img)
   ((keep_disk)) || remove+=(guest.qcow2)
   # Files written by the root harness: remove large ones, return the rest.
-  if docker image inspect "$tag" >/dev/null 2>&1; then
-    docker run --rm --network none --cpus 0.5 --memory 128m --entrypoint sh \
-      --mount "type=bind,src=$run,dst=/e" "$tag" -c \
-      'cd /e && rm -rf -- "$@" && chown -R '"$(id -u):$(id -g)"' /e' sh "${remove[@]}" >/dev/null 2>&1 || true
-  fi
-  (cd "$run" && rm -rf -- "${remove[@]}") 2>/dev/null || true
+  scrub "$run" "${remove[@]}"
   printf 'Cleanup: removed %s; evidence %s (%s)\n' "${remove[*]}" "$run" "$(du -sh "$run" 2>/dev/null | cut -f1)"
   exit "$status"
 }

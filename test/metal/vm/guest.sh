@@ -13,7 +13,9 @@ DOCKER_INSTALL=if-missing
 EOF
 if [[ $scenario == full ]]; then
   sudo mv /home/metaladmin/artifacts /opt/metal-artifacts
-  sudo chmod -R a+rX /opt/metal-artifacts
+  # As an engineer would stage it: root-owned, not writable by others (B4/M1).
+  sudo chown -R root:root /opt/metal-artifacts
+  sudo chmod -R a+rX,go-w /opt/metal-artifacts
   printf 'ARTIFACT_PACKAGE=/opt/metal-artifacts\n' >> /tmp/metal.conf
   sudo cp -a /home/metaladmin/converter.git /opt/converter-repo.git
   printf 'CONVERTER_REPO=/opt/converter-repo.git\n' >> /tmp/metal.conf
@@ -30,6 +32,17 @@ if SILO_METAL_TESTING=1 SILO_METAL_TEST_ARCH=arm64 "$M" preflight --config /opt/
 fi
 grep -q METAL_ARCH_UNSUPPORTED /tmp/arch.json
 step plan
+if [[ $scenario == full ]]; then
+  # A package owned by an ordinary login user must be refused, naming the path.
+  sudo chown metaladmin /opt/metal-artifacts
+  if "$M" plan --config /opt/metal.conf --plan /tmp/refused-plan.json 2>/tmp/authority.err; then
+    echo 'ERROR: login-user-owned artifact package accepted'; exit 1
+  fi
+  grep -q 'METAL_PATH_AUTHORITY: /opt/metal-artifacts' /tmp/authority.err
+  [[ ! -e /tmp/refused-plan.json ]]
+  sudo chown root /opt/metal-artifacts
+  echo 'AUTHORITY_REFUSAL_OK'
+fi
 "$M" plan --config /opt/metal.conf --plan /tmp/plan.json
 step apply
 if ! "$M" apply --config /opt/metal.conf --plan /tmp/plan.json; then

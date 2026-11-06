@@ -262,9 +262,10 @@ def directory_authority(paths):
         if state.get("exists"):
             info = path.lstat()
             if not stat.S_ISDIR(info.st_mode) or info.st_uid not in allowed or info.st_mode & 0o022:
-                refuse("METAL_PATH_AUTHORITY", "directory ancestors must be root/account-owned and not group/world writable; symlinks refused")
+                # Configured paths are not secrets; naming the component makes the fix obvious.
+                refuse("METAL_PATH_AUTHORITY", str(path) + " must be a root/account-owned directory, not group/world writable; symlinks refused (chown/chmod it, then re-plan)")
         elif state.get("exists") is None:
-            refuse("METAL_PATH_AUTHORITY", "directory ancestor unavailable; inspect as service account")
+            refuse("METAL_PATH_AUTHORITY", str(path) + " unavailable; inspect as service account")
     return states
 
 def secure_directory(path, uid, gid):
