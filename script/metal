@@ -39,7 +39,7 @@ DEFAULTS = dict(SILO_ACCOUNT="silomig", SILO_PREFIX="/srv/silo-migrate", SILO_WO
     CONVERTER_REPO="https://github.com/discourse-org/discourse-converters.git", CONVERTER_BRANCH="main",
     VERIFY_CONVERTER_BRANCH="mvp/metal-installer", ARTIFACT_PACKAGE="", TERM_LLM_VERSION="0.9.93",
     TERM_LLM_PORT="18800", TERM_LLM_SERVICE="install", DOCKER_INSTALL="if-missing", PORT_RANGE="18080-18089", KEEP_RELEASES="3",
-    VERIFY_MIN_AVAILABLE_MIB="8192")
+    VERIFY_MIN_AVAILABLE_MIB="8192", HUB_URL="", HUB_NODE_ID="", HUB_NODE_NAME="", HUB_SECRETS_FILE="")
 FRESH_CONFIG = """# Work-only; no imported providers, sessions, memory or jobs.
 provider_discovery: config
 providers: {}
@@ -167,6 +167,17 @@ def read_config(path):
         refuse("METAL_VERSION_UNPINNED", "add a reviewed pinned release SHA before selecting another version")
     if result["TERM_LLM_SERVICE"] not in ("install", "install-and-start", "skip") or result["DOCKER_INSTALL"] not in ("if-missing", "never"):
         refuse("METAL_CONFIG_INVALID", "invalid service/Docker policy")
+    hub = [result[k] for k in ("HUB_URL", "HUB_NODE_ID", "HUB_SECRETS_FILE")]
+    if any(hub) or result["HUB_NODE_NAME"]:
+        # Opt-in reverse node: the server dials out; no inbound port or firewall change.
+        if not all(hub) or result["TERM_LLM_SERVICE"] == "skip":
+            refuse("METAL_CONFIG_INVALID", "Hub needs HUB_URL, HUB_NODE_ID and HUB_SECRETS_FILE, and a term-llm service")
+        if not re.fullmatch(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9_./-]*)?", result["HUB_URL"]):
+            refuse("METAL_CONFIG_INVALID", "HUB_URL must be a credential-free HTTPS URL")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", result["HUB_NODE_ID"]) or (result["HUB_NODE_NAME"] and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}", result["HUB_NODE_NAME"])):
+            refuse("METAL_CONFIG_INVALID", "invalid Hub node id/name")
+        if not re.fullmatch(r"/[A-Za-z0-9_./-]+", result["HUB_SECRETS_FILE"]) or ".." in Path(result["HUB_SECRETS_FILE"]).parts:
+            refuse("METAL_CONFIG_INVALID", "HUB_SECRETS_FILE must be an absolute simple path")
     if not result["TERM_LLM_PORT"].isdigit() or not 1 <= int(result["TERM_LLM_PORT"]) <= 65535:
         refuse("METAL_CONFIG_INVALID", "invalid term-llm port")
     ports = re.fullmatch(r"([0-9]+)-([0-9]+)", result["PORT_RANGE"])
@@ -411,7 +422,30 @@ def artifact():
     return dict(id=sha(Path(C["ARTIFACT_PACKAGE"])/"manifest.json"), sha256=sha(Path(C["ARTIFACT_PACKAGE"])/"SHA256SUMS"), manifest=manifest)
 
 def service_args(dry=False):
-    return [str(P/"bin/term-llm"), "service", "install", "web", "--binary", str(P/"bin/term-llm"), "--no-start"] + (["--dry-run"] if dry else []) + ["--", "--host", "127.0.0.1", "--port", C["TERM_LLM_PORT"], "--auth", "bearer", "--approval", "prompt", "--agent", "migration-operator", "--no-projects", "--disable-extensions", "--disable-widgets"]
+    # Only the secrets file PATH is passed; term-llm imports it into its private store.
+    secrets = ["--secrets-file", C["HUB_SECRETS_FILE"]] if C["HUB_URL"] else []
+    hub = (["--hub-url", C["HUB_URL"], "--hub-node-id", C["HUB_NODE_ID"]] + (["--hub-node-name", C["HUB_NODE_NAME"]] if C["HUB_NODE_NAME"] else [])
+           + ["--hub-connect", "reverse", "--hub-register"]) if C["HUB_URL"] else []
+    return ([str(P/"bin/term-llm"), "service", "install", "web", "--binary", str(P/"bin/term-llm"), "--no-start"] + (["--dry-run"] if dry else []) + secrets
+            + ["--", "--host", "127.0.0.1", "--port", C["TERM_LLM_PORT"], "--auth", "bearer", "--approval", "prompt", "--agent", "migration-operator", "--no-projects", "--disable-extensions", "--disable-widgets"] + hub)
+
+def hub_secrets_state(entry):
+    # Metadata only: the file holds TERM_LLM_HUB_REGISTRATION_TOKEN and is never read or hashed here.
+    if not C["HUB_URL"]:
+        return None
+    if not entry:
+        refuse("METAL_HUB_ORDER", "install without HUB_* first, then create HUB_SECRETS_FILE as the service account and re-plan")
+    path = Path(C["HUB_SECRETS_FILE"])
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        refuse("METAL_HUB_SECRETS", "HUB_SECRETS_FILE missing; create it as the service account (mode 0600)")
+    except PermissionError:
+        refuse("METAL_HUB_SECRETS", "HUB_SECRETS_FILE unreadable for inspection; check its directory permissions")
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != entry.pw_uid or info.st_mode & 0o077 or info.st_nlink != 1:
+        refuse("METAL_HUB_SECRETS", "HUB_SECRETS_FILE must be a regular single-link file owned by the service account, mode 0600")
+    directory_authority([path.parent])
+    return {"path": str(path), "uid": info.st_uid, "mode": oct(info.st_mode & 0o7777), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
 
 def make_plan(allow=False):
     osinfo = os_check(allow)
@@ -503,7 +537,10 @@ def make_plan(allow=False):
             if C["TERM_LLM_SERVICE"] == "install-and-start":
                 users += [{"action": "start", "detail": "term-llm service start web (enable/start requested)"}]
         users += [{"action": "manifest", "detail": "atomic install-manifest.json plus append history.jsonl (hashes, image identities, timestamps)"}]
-    notes = ["No Hub registration: requires separately approved Hub/access policy.",
+    hub_notes = (["Hub reverse registration ENABLED for node " + C["HUB_NODE_ID"] + " at " + C["HUB_URL"] + ": the node dials out; anyone with access to that Hub can operate this node's agents with the service account's ROOT-EQUIVALENT Docker authority.",
+                  "If the web service is already running, restart it as the account after apply (term-llm service restart web) for Hub flags to take effect."]
+                 if C["HUB_URL"] else ["No Hub registration (opt-in via HUB_URL, HUB_NODE_ID, HUB_SECRETS_FILE)."])
+    notes = hub_notes + [
              "No provider credentials, sessions or memory copied. Use account-local auth / service install --secret NAME masked prompts.",
              "Confirmed config keys: approval.default_mode, serve.approval_mode, serve.extensions, serve.auto_title, provider_discovery, serve.projects.enabled.",
              "No confirmed config keys to disable widgets or automatic memory mining. Use confirmed --disable-widgets/--disable-extensions flags; register no jobs/mining automation.",
@@ -521,7 +558,7 @@ def make_plan(allow=False):
     elif C["TERM_LLM_SERVICE"] != "skip":
         notes.append("Stock service install --dry-run deferred: pinned binary/account absent; apply runs dry-run before service writes.")
     return {"format_version": 1, "config": C, "target": target, "state": dict(state, directory_authority=authority), "os": osinfo, "installer_sha256": sha(SELF),
-            "companion_sha256": companions(), "needs_root": roots, "as_account": users, "notes": notes, "service_preview_sha256": dry}
+            "companion_sha256": companions(), "hub_secrets": hub_secrets_state(entry), "needs_root": roots, "as_account": users, "notes": notes, "service_preview_sha256": dry}
 
 def computed_plan(args):
     entry = account_entry()

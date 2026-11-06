@@ -76,6 +76,59 @@ class InstallerTests(unittest.TestCase):
                                  capture_output=True, check=True).stdout
         self.assertLess(len(payload), 120 * 1024, "engine nears MAX_ARG_STRLEN (128 KiB) for python3 -c")
 
+    def test_hub_reverse_config_validation_and_service_flags(self):
+        base = "HUB_URL=https://hub.example.test/hub/\nHUB_NODE_ID=migrations05\nHUB_SECRETS_FILE=/home/silomig/.config/silo-migrate/hub.env\n"
+        config = self.configured(base + "HUB_NODE_NAME=Migrations05\n")
+        self.m.C = dict(config)
+        args = self.m.service_args()
+        split = args.index("--")
+        self.assertEqual(["--secrets-file", "/home/silomig/.config/silo-migrate/hub.env"], args[split-2:split])
+        self.assertEqual(["--hub-url", "https://hub.example.test/hub/", "--hub-node-id", "migrations05", "--hub-node-name", "Migrations05",
+                          "--hub-connect", "reverse", "--hub-register"], args[-9:])
+        self.assertEqual("bearer", args[args.index("--auth") + 1])  # Hub reverse registration needs bearer
+        self.assertFalse(any("TOKEN" in a or "hub-registration-token" in a for a in args))
+        for bad in ("HUB_URL=http://hub.example.test/\nHUB_NODE_ID=a\nHUB_SECRETS_FILE=/x/hub.env\n",
+                    "HUB_URL=https://user:pw@hub.example.test/\nHUB_NODE_ID=a\nHUB_SECRETS_FILE=/x/hub.env\n",
+                    "HUB_URL=https://hub.example.test/\nHUB_SECRETS_FILE=/x/hub.env\n",
+                    "HUB_URL=https://hub.example.test/\nHUB_NODE_ID=Bad_Id\nHUB_SECRETS_FILE=/x/hub.env\n",
+                    "HUB_URL=https://hub.example.test/\nHUB_NODE_ID=a\nHUB_SECRETS_FILE=relative/hub.env\n",
+                    "HUB_NODE_NAME=lonely\n",
+                    base + "TERM_LLM_SERVICE=skip\n"):
+            with self.subTest(text=bad), self.assertRaises(self.m.Refusal):
+                self.configured(bad)
+        self.m.C = dict(self.m.DEFAULTS)
+        self.assertFalse(any(a.startswith("--hub") or a == "--secrets-file" for a in self.m.service_args()))
+
+    def test_hub_secrets_file_metadata_only_and_strict(self):
+        entry = pwd.getpwuid(os.getuid())
+        secret_dir = self.root/"secret"
+        secret_dir.mkdir(mode=0o700)
+        secret = secret_dir/"hub.env"
+        self.m.C = dict(self.m.C, HUB_URL="https://hub.example.test/", HUB_NODE_ID="node", HUB_SECRETS_FILE=str(secret))
+        with self.assertRaisesRegex(self.m.Refusal, "METAL_HUB_ORDER"):
+            self.m.hub_secrets_state(None)
+        with self.assertRaisesRegex(self.m.Refusal, "METAL_HUB_SECRETS"):
+            self.m.hub_secrets_state(entry)
+        secret.write_text("TERM_LLM_HUB_REGISTRATION_TOKEN=synthetic-not-a-real-token\n")
+        secret.chmod(0o644)
+        with self.assertRaisesRegex(self.m.Refusal, "METAL_HUB_SECRETS"):
+            self.m.hub_secrets_state(entry)
+        secret.chmod(0o600)
+        real_open, opened = open, []
+        def spy(path, *a, **k):
+            opened.append(str(path)); return real_open(path, *a, **k)
+        with patch("builtins.open", spy), patch.object(self.m.Path, "read_bytes", side_effect=AssertionError("read")), patch.object(self.m.Path, "read_text", side_effect=AssertionError("read")):
+            state = self.m.hub_secrets_state(entry)
+        self.assertNotIn(str(secret), opened)
+        self.assertEqual({"path", "uid", "mode", "size", "mtime_ns"}, set(state))
+        self.assertEqual("0o600", state["mode"])
+        self.assertNotIn("synthetic-not-a-real-token", json.dumps(state))
+        link = secret_dir/"link.env"
+        link.symlink_to(secret)
+        self.m.C["HUB_SECRETS_FILE"] = str(link)
+        with self.assertRaisesRegex(self.m.Refusal, "METAL_HUB_SECRETS"):
+            self.m.hub_secrets_state(entry)
+
     def test_partial_installer_copy_refused_and_companion_change_stales_plan(self):
         # Regression: a VM copy without image_archive.py failed mid-apply as STATE_INVALID.
         lone = self.root/"lone"

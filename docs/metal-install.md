@@ -11,7 +11,7 @@ maintainer scripts from enabling/starting services.
 
 **This is not customer-data isolation, target deployment approval or hosted
 acceptance.** Docker group membership is root-equivalent. The term-llm service bearer token
-is therefore also a **root-equivalent credential**, not a narrow migration API key. No Hub registration,
+is therefore also a **root-equivalent credential**, not a narrow migration API key. No Hub registration (unless opted in, below),
 provider credentials, extension installation, memory mining, jobs or cron are
 configured. Existing Docker installations, running containers and existing
 account term-llm configuration are preserved. Do not run verification against a
@@ -156,7 +156,8 @@ service. A non-secret systemd user drop-in supplies `SILO_CONTROL` (the installe
 shim), `SILO_CONTROL_CONFIG` and `TMPDIR` to the linked agent adapters; it does not
 import credentials or modify the stock generated unit. For interactive `ask`,
 export those two SILO variables in the account shell too. Unmanaged existing units are refused, not adopted. The listener is
-127.0.0.1 only; no firewall, reverse proxy, remote access or Hub configuration.
+127.0.0.1 only; no firewall or reverse-proxy change. Remote access is only through
+the opt-in reverse Hub connection below.
 
 Config schema reference: <https://term-llm.com/reference/configuration/>;
 service behavior: <https://term-llm.com/guides/background-services/>.
@@ -168,8 +169,47 @@ Do not infer that preserving an existing config makes it work-only.
 Provision provider access **as the account**, separately, using `term-llm auth`
 or `term-llm service install web --secret NAME` with masked input. `NAME` is a
 credential variable name, **never its value**. Do not pass token/API-key values
-on argv, paste them into config, or use service token output in logs. Hub
-registration is opt-in only after an approved Hub and access policy.
+on argv, paste them into config, or use service token output in logs.
+
+### Optional reverse Hub connection
+
+For a server that accepts no inbound connections, the web node can dial out to a
+term-llm Hub and keep a websocket open (`--hub-connect reverse --hub-register`).
+The Hub then proxies to it and injects the node's bearer token server-side.
+**Anyone with access to that Hub can operate this node's agents with the
+service account's root-equivalent Docker authority**, so use only a Hub whose
+access policy you have approved. Web passkey auth does not support reverse
+registration; the installer already uses bearer auth.
+
+It is a second step after the base install, because the token file must be
+owned by the service account:
+
+```sh
+sudo -iu silomig
+install -d -m 0700 ~/.config/silo-migrate
+( umask 077; read -rsp 'Hub registration token: ' t; echo
+  printf 'TERM_LLM_HUB_REGISTRATION_TOKEN=%s\n' "$t" > ~/.config/silo-migrate/hub.env; unset t )
+exit
+```
+
+Then set in the config, plan, review and apply again:
+
+```
+HUB_URL=https://YOUR-HUB/hub/
+HUB_NODE_ID=migrations05
+HUB_NODE_NAME=Migrations05
+HUB_SECRETS_FILE=/home/silomig/.config/silo-migrate/hub.env
+```
+
+The installer validates the URL (HTTPS, no credentials) and the file's owner,
+mode 0600 and single link, but never reads it or records its hash. It passes
+only the path to the stock `service install --secrets-file`, which imports the
+token into term-llm's private service store; the reverse flags go into the
+service spec, never a token. If the service was already running, restart it as
+the account (`term-llm service restart web`). The node keeps serving locally
+when the Hub is unreachable and retries registration in the background. The
+dry-run with these exact flags was checked against the real 0.9.93 binary
+(isolated home, fake token); a live Hub registration has not been tested.
 
 **Token authority:** checked `term-llm serve --help`, `term-llm agents --help`
 and `--version` on the installed **0.9.93** binary, without starting a server.
