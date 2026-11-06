@@ -140,9 +140,10 @@ installation; images/cache loading is explicitly skipped and status says so.
 Fresh term-llm directories get config-only provider discovery, empty providers,
 `approval.default_mode: prompt`, `serve.approval_mode: prompt`, empty
 `serve.extensions`, `serve.auto_title: false`, and `serve.projects.enabled: false`.
-Existing config/data are never overwritten or imported. Agent links point at
-`current/integrations/term-llm/{migration-operator,migration-analyst}`; conflicting
-existing definitions are refused. Existing config safety requires manual review,
+Existing config/data are never overwritten or imported. Agents are found through `agents.search_paths` = `<prefix>/current/integrations/term-llm`
+(term-llm skips symlinked agent folders when listing, so the web picker showed
+nothing with per-agent links; earlier installer-created links are removed). A
+conflicting existing agent of the same name is refused. Existing config safety requires manual review,
 especially before any customer data. Same-user agents are not OS isolation.
 
 Confirmed against the **real 0.9.93 binary's help**: `service install web`,
@@ -151,8 +152,9 @@ Confirmed against the **real 0.9.93 binary's help**: `service install web`,
 `--disable-widgets`. No startup agent is pinned: with `--agent` the web UI hides its
 agent picker. Instead the account's config sets `agents.use_builtin: false`, so the
 picker offers only `migration-operator` and `migration-analyst` (plus term-llm's plain
-"Default" chat). Fresh configs get this; for an existing config, plan and apply refuse
-(`METAL_AGENTS_BUILTIN`) until it is set, because built-in shell agents would
+"Default" chat). Fresh configs get this and the agents search path; for an existing config, plan and
+apply refuse (`METAL_AGENTS_CONFIG`) until `term-llm agents` lists exactly the two
+migration agents, because built-in shell agents would
 otherwise run with the account's Docker authority. Verified against a throwaway
 0.9.93 web server: the page lists exactly those two agents. Plan uses stock service dry-run when
 the installed binary/account exist, otherwise explicitly defers it; apply runs

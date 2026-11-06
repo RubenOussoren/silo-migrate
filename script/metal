@@ -51,11 +51,20 @@ serve:
   auto_title: false
   projects:
     enabled: false
-# The web UI's agent picker then offers only the linked migration agents; built-in
+# The web UI's agent picker then offers only the installed migration agents; built-in
 # shell-capable agents would otherwise run with this account's Docker authority.
 agents:
   use_builtin: false
+  search_paths:
+    - {agents_path}
 """
+
+def agents_path():
+    # term-llm lists agents from search paths; symlinked agent folders are skipped.
+    return str(P/"current/integrations/term-llm")
+
+def fresh_config():
+    return FRESH_CONFIG.replace("{agents_path}", agents_path())
 
 class Refusal(Exception):
     pass
@@ -451,11 +460,17 @@ def hub_secrets_state(entry):
     directory_authority([path.parent])
     return {"path": str(path), "uid": info.st_uid, "mode": oct(info.st_mode & 0o7777), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
 
-def builtin_agents_off(as_account=True):
-    # Without --agent the web UI offers every agent term-llm knows, so the installed
-    # service requires built-in agents to be disabled in the account's own config.
-    value = output([P/"bin/term-llm", "config", "get", "agents.use_builtin"], account=as_account)
-    return value == "false"
+MIGRATION_AGENTS = ("migration-analyst", "migration-operator")
+AGENTS_HELP = ("the service account's term-llm config.yaml needs 'agents:' with 'use_builtin: false' and "
+               "'search_paths:' containing the installed agents directory, so the web UI offers only the migration agents")
+
+def agents_ready(as_account=True):
+    # Without --agent the web UI offers every agent term-llm lists, so require exactly
+    # the two migration agents: no built-in shell agents with Docker authority.
+    listing = output([P/"bin/term-llm", "agents"], account=as_account)
+    if not listing or "[builtin]" in listing or not re.search(r"Available agents \(2\):", listing):
+        return False
+    return all(re.search(r"(?m)^\s+" + re.escape(name) + r" - ", listing) for name in MIGRATION_AGENTS)
 
 def make_plan(allow=False):
     osinfo = os_check(allow)
@@ -558,9 +573,9 @@ def make_plan(allow=False):
     if (home()/".config/term-llm").exists():
         notes.append("Existing term-llm config directory PRESERVED; safety/routing of existing config requires engineer review before customer use.")
     if C["TERM_LLM_SERVICE"] != "skip" and (P/"bin/term-llm").exists() and (home()/".config/term-llm/config.yaml").exists() and entry \
-            and not builtin_agents_off():
-        refuse("METAL_AGENTS_BUILTIN", "existing term-llm config preserved; add 'agents:' with 'use_builtin: false' to the service account's config.yaml, then re-plan (built-in shell agents would run with Docker authority)")
-    notes.append("Web UI agent picker: only the linked migration-operator and migration-analyst (agents.use_builtin: false); no pinned startup agent.")
+            and (P/"current").exists() and not agents_ready():
+        refuse("METAL_AGENTS_CONFIG", "existing term-llm config preserved; " + AGENTS_HELP + " (" + agents_path() + "), then re-plan")
+    notes.append("Web UI agent picker: only migration-operator and migration-analyst, from " + agents_path() + " (agents.use_builtin: false); no pinned startup agent.")
     dry = None
     binary = P/"bin/term-llm"
     if C["TERM_LLM_SERVICE"] != "skip" and binary.exists() and entry:
@@ -919,19 +934,21 @@ def account_apply(saved):
     configdir = home()/".config/term-llm"
     if not configdir.exists():
         configdir.mkdir(parents=True, mode=0o700)
-        atomic_write(configdir/"config.yaml", FRESH_CONFIG, 0o600)
+        atomic_write(configdir/"config.yaml", fresh_config(), 0o600)
     datadir = home()/".local/share/term-llm"
     if not datadir.exists():
         datadir.mkdir(parents=True, mode=0o700)
     agents = configdir/"agents"
     agents.mkdir(exist_ok=True, mode=0o700)
-    for name in ("migration-operator", "migration-analyst"):
+    for name in MIGRATION_AGENTS:
         dest = agents/name
         expected = P/"current/integrations/term-llm"/name
-        if (dest.exists() or dest.is_symlink()) and (not dest.is_symlink() or os.readlink(dest) != str(expected)):
+        # Agents come from the search path. Earlier installs linked them here; term-llm
+        # skips symlinked folders when listing, so remove only those exact links.
+        if dest.is_symlink() and os.readlink(dest) == str(expected):
+            dest.unlink()
+        elif dest.exists() or dest.is_symlink():
             refuse("METAL_AGENT_CONFLICT", "existing agent preserved; resolve name conflict manually")
-        if not dest.is_symlink():
-            os.symlink(expected, dest)
     host_lock = W/".silo-standard-execution.lock"
     if not host_lock.exists():
         fd = os.open(host_lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -943,8 +960,8 @@ def account_apply(saved):
         if unit.exists() and not spec.exists():
             refuse("METAL_SERVICE_CONFLICT", "existing unmanaged service preserved; migrate manually")
         STAGE = "SERVICE_PREVIEW"
-        if not builtin_agents_off(as_account=False):
-            refuse("METAL_AGENTS_BUILTIN", "add 'agents:' with 'use_builtin: false' to the service account's term-llm config.yaml, then re-plan")
+        if not agents_ready(as_account=False):
+            refuse("METAL_AGENTS_CONFIG", AGENTS_HELP + " (" + agents_path() + "); then re-plan")
         run(service_args(True))
         STAGE = "SERVICE_INSTALL"
         run(service_args())

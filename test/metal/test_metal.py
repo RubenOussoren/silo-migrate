@@ -105,22 +105,36 @@ class InstallerTests(unittest.TestCase):
         for flag in ("--no-projects", "--disable-extensions", "--disable-widgets"):
             self.assertIn(flag, args)
         self.assertEqual("prompt", args[args.index("--approval") + 1])
-        self.assertIn("agents:\n  use_builtin: false\n", self.m.FRESH_CONFIG)
+        fresh = self.m.fresh_config()
+        self.assertIn("agents:\n  use_builtin: false\n  search_paths:\n    - " + str(self.m.P/"current/integrations/term-llm") + "\n", fresh)
+        self.assertNotIn("{agents_path}", fresh)
         P = self.m.P
         (P/"bin").mkdir(parents=True)
         (P/"bin/term-llm").write_text("")
         (self.home/".config/term-llm").mkdir(parents=True)
         (self.home/".config/term-llm/config.yaml").write_text("providers: {}\n")
+        (P/"current").mkdir()
         self.m.C["TERM_LLM_SERVICE"] = "install"
         for value, refused in (("true", True), (None, True), ("false", False)):
-            with self.subTest(value=value), self.plan_stubs(), patch.object(self.m, "builtin_agents_off", return_value=value == "false"), \
+            with self.subTest(value=value), self.plan_stubs(), patch.object(self.m, "agents_ready", return_value=value == "false"), \
                     patch.object(self.m, "artifact", return_value=None), patch.object(self.m, "hub_secrets_state", return_value=None):
                 if refused:
-                    with self.assertRaisesRegex(self.m.Refusal, "METAL_AGENTS_BUILTIN"):
+                    with self.assertRaisesRegex(self.m.Refusal, "METAL_AGENTS_CONFIG"):
                         self.m.make_plan()
                 else:
                     plan = self.m.make_plan()
                     self.assertTrue(any("agent picker" in note for note in plan["notes"]))
+
+    def test_agents_ready_requires_exactly_the_migration_agents(self):
+        cases = {
+            "Available agents (2):\n\n  [user] /x/\n    migration-analyst - a\n    migration-operator - b\n": True,
+            "No agents configured.\n": False,
+            "Available agents (20):\n\n  [builtin]\n    developer - d\n    migration-analyst - a\n    migration-operator - b\n": False,
+            "Available agents (2):\n\n  [user] /x/\n    migration-analyst - a\n    other - b\n": False,
+            None: False}
+        for listing, ready in cases.items():
+            with self.subTest(listing=listing), patch.object(self.m, "output", return_value=listing):
+                self.assertEqual(ready, self.m.agents_ready())
 
     def test_hub_secrets_file_metadata_only_and_strict(self):
         entry = pwd.getpwuid(os.getuid())
