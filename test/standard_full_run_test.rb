@@ -2,6 +2,7 @@
 require_relative 'standard_workflow_test'
 require 'rubygems/package'
 require 'sqlite3'
+require 'silo_migrate/services/standard_findings_service'
 
 # Models command results and synthetic files, not workflow methods. The real
 # service, stack, SQLite validators, archive readers, oracles and manifest writer
@@ -374,6 +375,48 @@ class StandardFullRunTest < SiloMigrateTest
       assert_equal 1, result[:results]['imported_topics']
       assert_equal 1, result[:results]['imported_posts']
       assert_equal 1, result[:results]['imported_attachments']
+    end
+  end
+
+  # Records the stage running when each private log is written.
+  def record_log_stages
+    written = []
+    @service.singleton_class.prepend(Module.new do
+      define_method(:log) do |run_id, name, result|
+        written << [name, store.load.fetch('runs').fetch(run_id)['stage']]
+        super(run_id, name, result)
+      end
+    end)
+    written
+  end
+
+  def test_analyst_evidence_maps_every_log_to_its_stage_and_completed_run_gets_no_finding
+    with_complete do
+      written = record_log_stages
+      result = completed_run
+      refute_empty written
+      written.each { |name, stage| assert_equal stage, SiloMigrate::Services::StandardFindingsService.log_stage(name), name }
+      findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
+      evidence = findings.private_evidence(result[:run_id])
+      assert_operator JSON.generate(evidence).bytesize, :<=, SiloMigrate::Services::StandardFindingsService::EVIDENCE_OUTPUT_BYTES
+      assert_equal written.map { |name, _stage| "#{name}.log" }.uniq.sort, evidence[:logs].map { |entry| entry[:name] }.sort
+      assert_equal SiloMigrate::Services::StandardWorkflowService::STAGES.to_h { |stage| [stage, 'passed'] }, evidence[:stages].transform_values { |entry| entry['status'] }
+      assert_match(/\Anot_applicable/, evidence[:finding])
+      standard_error('STANDARD_RUN_COMPLETED') { findings.propose(run_id: result[:run_id], text: 'synthetic finding') }
+    end
+  end
+
+  { 'restore' => %w[logs/final-restore.log logs/final-restore-disable.log], 'verify_site' => %w[evidence/site.failures.json] }.each do |stage, first|
+    define_method("test_analyst_evidence_for_#{stage}_failure_starts_with_that_stage") do
+      with_complete do
+        @runtime.fail_stage = stage
+        result = @service.run_plan(plan_id: approve[:plan_id])
+        assert_equal 'failed', result[:status]
+        evidence = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env).private_evidence(result[:run_id])
+        assert_equal stage, evidence[:failed_stage]
+        assert_equal first.sort, evidence[:tails].keys.first(first.size).sort
+        assert_equal 'may_propose', evidence[:finding]
+      end
     end
   end
 

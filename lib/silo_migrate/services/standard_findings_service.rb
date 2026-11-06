@@ -18,18 +18,39 @@ module SiloMigrate
       MAX_BYTES = 256 * 1024
       KINDS = %w[finding reproduction].freeze
       EVIDENCE_TAIL_BYTES = 16 * 1024
+      # term-llm 0.9.93 cuts a custom tool's output at 50 KiB (DefaultOutputLimits.MaxBytes),
+      # mid-JSON. The whole evidence document stays under this so it always arrives intact.
+      EVIDENCE_OUTPUT_BYTES = 40 * 1024
+      EVIDENCE_MIN_TAIL_BYTES = 512
+      EVIDENCE_FAILURE_BYTES = 4 * 1024
+      # Which stage writes each private log (StandardWorkflowService#log and #checked
+      # names). Keep in step with those calls; a full-run test checks every log maps.
+      LOG_STAGES = {
+        /\A(convert|conversion-[a-z-]+)\z/ => "convert",
+        /\A(backup-baseline|baseline-restore(-disable)?)\z/ => "baseline",
+        /\Auploads\z/ => "uploads",
+        /\Aimport\z/ => "import",
+        /\Abackup-final\z/ => "final_backup",
+        /\Afinal-restore(-disable)?\z/ => "restore"
+      }.freeze
+
+      def self.log_stage(name)
+        LOG_STAGES.find { |pattern, _stage| pattern.match?(name) }&.last
+      end
 
       def initialize(workspace, env: ENV)
         @store = StandardStore.new(workspace, env: env)
       end
 
       # Trusted analyst path. Returns only an ID: content is never echoed back.
+      # A completed run has nothing to diagnose, so it gets no finding.
       def propose(run_id:, text:, kind: "finding")
         raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless KINDS.include?(kind) && text.is_a?(String) && text.bytesize.between?(1, MAX_BYTES) && text.valid_encoding?
 
         id = @store.new_id("finding")
         @store.update do |state|
           raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless state.fetch("runs").key?(run_id)
+          raise StandardWorkflowError, "STANDARD_RUN_COMPLETED" if state.fetch("runs").fetch(run_id)["status"] == "completed"
 
           @store.write_private(@store.finding_dir(id, "private", "proposal.txt"), text)
           state.fetch("findings")[id] = { "id" => id, "run_id" => run_id, "kind" => kind, "status" => "proposed", "proposed_at" => Time.now.utc.iso8601,
@@ -40,23 +61,40 @@ module SiloMigrate
 
       # Trusted analyst path only. Bounded read of one run's private evidence. Never
       # reachable from `standard agent`; do not expose it to a coding session.
-      def private_evidence(run_id)
+      #
+      # Structured state comes first (stages, assertions, results, failure), then an
+      # index of every evidence file and log with its size and stage, then tails in
+      # priority order: failed assertion groups, the failed stage's logs (latest
+      # first), then earlier stages. Tails stop at the byte budget of the serialized
+      # document; anything without a tail is listed in `omitted`.
+      def private_evidence(run_id, budget: EVIDENCE_OUTPUT_BYTES)
         run = @store.load.fetch("runs")[run_id]
         raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
 
-        read_tail = lambda do |path|
-          bytes = File.size(path)
-          File.open(path, "rb") do |file|
-            file.seek([bytes - EVIDENCE_TAIL_BYTES, 0].max)
-            file.read.force_encoding("UTF-8").scrub
-          end
-        end
         directory = @store.run_dir(run_id)
-        failure = File.join(directory, "private", "failure.json")
-        evidence = Dir[File.join(directory, "evidence", "*.failures.json")].sort.to_h { |path| [File.basename(path), read_tail.call(path)] }
-        logs = Dir[File.join(directory, "logs", "*.log")].sort.to_h { |path| [File.basename(path), read_tail.call(path)] }
-        { version: 1, run_id: run_id, status: run["status"], stage: run["stage"], failure: File.file?(failure) ? JSON.parse(File.read(failure)) : nil,
-          assertion_failures: evidence, logs: logs }
+        stages = run.fetch("stages", {})
+        detail = failure_detail(File.join(directory, "private", "failure.json"))
+        failed_stage = run.dig("failure", "stage") || (detail.is_a?(Hash) ? detail["stage"] : nil)
+        completed = run["status"] == "completed"
+        evidence_files = files(File.join(directory, "evidence"), "*").map { |path| { name: File.basename(path), bytes: File.size(path), path: path } }
+        logs = files(File.join(directory, "logs"), "*.log").map do |path|
+          name = File.basename(path, ".log")
+          { name: File.basename(path), bytes: File.size(path), stage: self.class.log_stage(name) || stage_by_time(stages, File.mtime(path)), path: path, mtime: File.mtime(path) }
+        end
+        result = {
+          version: 1, run_id: run_id, status: run["status"], stage: run["stage"], failed_stage: failed_stage,
+          stages: stages.to_h { |name, entry| [name, entry.slice("status", "started_at", "finished_at")] },
+          assertions: run.fetch("assertions", {}), results: run.fetch("results", {}),
+          failure: run["failure"], failure_detail: detail,
+          finding: completed ? "not_applicable: run completed; summarise it, do not propose a finding" : "may_propose",
+          budget_bytes: budget,
+          evidence_files: evidence_files.map { |file| { name: file[:name], bytes: file[:bytes], tail_bytes: 0 } },
+          logs: logs.map { |log| { name: log[:name], bytes: log[:bytes], stage: log[:stage], tail_bytes: 0 } },
+          tails: {}, omitted: []
+        }
+        candidates = tail_candidates(run, result, evidence_files, logs, failed_stage, detail)
+        fill_tails(result, candidates, budget)
+        result
       end
 
       # Engineer path: the private proposal, plus exact-digest gated release.
@@ -113,6 +151,96 @@ module SiloMigrate
       end
 
       private
+
+      def files(directory, pattern)
+        Dir[File.join(directory, pattern)].select { |path| File.file?(path) && !File.symlink?(path) }.sort
+      end
+
+      # The private failure record, or its bounded tail if it is large or not JSON.
+      def failure_detail(path)
+        return nil unless File.file?(path) && !File.symlink?(path)
+
+        if File.size(path) <= EVIDENCE_FAILURE_BYTES
+          parsed = JSON.parse(File.read(path))
+          return parsed if JSON.generate(parsed).bytesize <= EVIDENCE_FAILURE_BYTES
+        end
+        { "tail" => fitted_tail(path, EVIDENCE_FAILURE_BYTES).to_s }
+      rescue JSON::ParserError
+        { "tail" => fitted_tail(path, EVIDENCE_FAILURE_BYTES).to_s }
+      end
+
+      # Fallback for log names LOG_STAGES does not know: the stage running when the
+      # log was last written (timestamps are whole seconds).
+      def stage_by_time(stages, mtime)
+        stages.select do |_name, entry|
+          started = entry["started_at"] && Time.parse(entry["started_at"])
+          finished = entry["finished_at"] && Time.parse(entry["finished_at"])
+          started && mtime >= started - 1 && (finished.nil? || mtime <= finished + 1)
+        end.keys.last
+      rescue ArgumentError
+        nil
+      end
+
+      def tail_candidates(run, result, evidence_files, logs, failed_stage, detail)
+        assertions = run.fetch("assertions", {})
+        failures = evidence_files.each_with_index.select { |file, _index| file[:name].end_with?(".failures.json") }
+        failures = failures.sort_by { |file, _index| [assertions.dig(file[:name].delete_suffix(".failures.json"), "result") == "failed" ? 0 : 1, file[:name]] }
+        order = run.fetch("stages", {}).keys
+        # A failed checked step records its log name as the failure detail.
+        named = detail.is_a?(Hash) && detail["detail"].is_a?(String) ? "#{detail['detail']}.log" : nil
+        ranked = logs.each_with_index.sort_by do |log, _index|
+          [log[:stage] && log[:stage] == failed_stage ? 0 : 1, log[:name] == named ? 0 : 1, -(order.index(log[:stage]) || -1), -log[:mtime].to_f, log[:name]]
+        end
+        failures.map { |file, index| { key: "evidence/#{file[:name]}", path: file[:path], entry: result[:evidence_files][index] } } +
+          ranked.map { |log, index| { key: "logs/#{log[:name]}", path: log[:path], entry: result[:logs][index] } }
+      end
+
+      def fill_tails(result, candidates, budget)
+        # Room for the index's tail_bytes values and the omitted list.
+        used = JSON.generate(result).bytesize + 64 + candidates.sum { |candidate| candidate[:key].bytesize + 24 }
+        candidates.each do |candidate|
+          room = [budget - used, EVIDENCE_TAIL_BYTES].min
+          text = room >= EVIDENCE_MIN_TAIL_BYTES ? fitted_tail(candidate[:path], room) : nil
+          if text
+            result[:tails][candidate[:key]] = text
+            candidate[:entry][:tail_bytes] = text.bytesize
+            used += JSON.generate(candidate[:key]).bytesize + JSON.generate(text).bytesize + 2
+          else
+            result[:omitted] << candidate[:key]
+          end
+        end
+        # The serialized document must fit; drop the lowest-priority tails if not.
+        while JSON.generate(result).bytesize > budget && !result[:tails].empty?
+          key = result[:tails].keys.last
+          result[:tails].delete(key)
+          candidates.find { |candidate| candidate[:key] == key }[:entry][:tail_bytes] = 0
+          result[:omitted] << key
+        end
+      end
+
+      # The longest whole-line tail whose JSON encoding fits in `limit` bytes.
+      def fitted_tail(path, limit)
+        want = [limit, File.size(path)].min
+        4.times do
+          text = read_tail(path, want)
+          encoded = JSON.generate(text).bytesize
+          return text if encoded <= limit
+
+          want = (want * limit / encoded) - 16
+          return nil if want < EVIDENCE_MIN_TAIL_BYTES / 2
+        end
+        nil
+      end
+
+      def read_tail(path, bytes)
+        File.open(path, "rb") do |file|
+          size = file.size
+          file.seek([size - bytes, 0].max)
+          text = file.read(bytes).to_s.force_encoding("UTF-8").scrub
+          newline = bytes < size ? text.index("\n") : nil
+          newline && newline < text.length - 1 ? text[(newline + 1)..] : text
+        end
+      end
 
       def record!(finding_id)
         @store.load.fetch("findings")[finding_id] || raise(StandardWorkflowError, "STANDARD_REFERENCE_INVALID")

@@ -98,12 +98,13 @@ Select the operator agent by path:
 term-llm ask --agent ./integrations/term-llm/migration-operator "Workspace my-project: what's the status?"
 ```
 
-It can read safe status, propose plans, request an already-approved run and read released findings. It can't approve, reset, release or read logs. These limits come from its tool set and the `standard agent` command surface, which doesn't include those operations.
+It can read safe status, propose plans, request an already-approved run and read released findings. It can't approve, reset, release or read logs. These limits come from its tool set and the `standard agent` command surface, which doesn't include those operations. It can also search the web for public documentation; its instructions keep workspace names, IDs and tool output out of queries.
 
 ## Investigation and release
 
 1. An analyst session reads one run's private evidence and proposes a finding:
    `term-llm ask --agent ./integrations/term-llm/migration-analyst "Investigate run RUN_ID in workspace WS"`. This agent is restricted to the `cdck_frontier` route.
+   `standard analyst evidence WS RUN_ID` returns the run's stages, assertions, results and failure record first, then every evidence file and log with its size and stage, then the ends of the most relevant files: failed assertion groups, then the failed stage's logs (the step named in the failure first, then latest first), then earlier stages. The whole document stays under 40 KiB, because term-llm 0.9.93 cuts tool output at 50 KiB. Files listed in `omitted` weren't included. A completed run gets no finding: `finding propose` refuses it with `STANDARD_RUN_COMPLETED`.
 2. The engineer reads it with `standard finding review`, checks it against the evidence, and writes the text to release. It doesn't have to match the proposal, and often shouldn't.
 3. The engineer releases that exact text: `standard finding release WS FINDING_ID --file PATH --sha256 DIGEST --reviewer NAME`. A synthetic reproduction can be attached the same way.
 4. Coding work reads it with `standard agent finding-show`. Unreleased findings aren't listed and can't be read through this surface.

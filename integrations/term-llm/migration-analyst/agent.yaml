@@ -12,7 +12,7 @@ tools:
   enabled: [update_plan]
   custom:
     - name: analyst_run_evidence
-      description: "Read the private failure record and bounded logs of one run."
+      description: "Read one run's private evidence: stages, assertions, results and failure record first, then every log with its size and stage, then bounded tails (failed stage first) within a fixed size budget."
       script: scripts/analyst_tool.py
       call: json
       timeout_seconds: 60
@@ -24,7 +24,7 @@ tools:
         required: [workspace, run_id]
         additionalProperties: false
     - name: analyst_propose_finding
-      description: "Propose a finding privately for engineer review. This does not release it to coding work."
+      description: "Propose a finding privately for engineer review of a failed run. Refused for completed runs. This does not release it to coding work."
       script: scripts/analyst_tool.py
       call: json
       timeout_seconds: 60
