@@ -12,6 +12,7 @@ import pwd
 import subprocess
 import tarfile
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -58,6 +59,22 @@ class InstallerTests(unittest.TestCase):
         self.env = patch.dict(os.environ, SILO_METAL_TESTING="1", SILO_METAL_TEST_OS_RELEASE=str(self.osfile), SILO_METAL_TEST_ARCH="amd64")
         self.env.start()
         self.addCleanup(self.env.stop)
+
+    def test_launcher_never_writes_tmpdir_and_engine_fits_one_argument(self):
+        # Regression: a >64 KiB here-document was spooled to TMPDIR, i.e. into
+        # $SILO_PREFIX/state/tmp on every read-only account re-invocation.
+        scratch = self.root/"scratch"
+        scratch.mkdir()
+        before = scratch.stat().st_mtime_ns
+        time.sleep(0.05)
+        result = subprocess.run([str(ROOT/"script/metal"), "--help"], capture_output=True, text=True,
+                                env=dict(os.environ, TMPDIR=str(scratch)), timeout=60)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(before, scratch.stat().st_mtime_ns)
+        self.assertEqual([], list(scratch.iterdir()))
+        payload = subprocess.run(["sed", "-e", "1,/^: <<.PYTHON.$/d", "-e", "/^PYTHON$/,$d", str(ROOT/"script/metal")],
+                                 capture_output=True, check=True).stdout
+        self.assertLess(len(payload), 120 * 1024, "engine nears MAX_ARG_STRLEN (128 KiB) for python3 -c")
 
     def test_partial_installer_copy_refused_and_companion_change_stales_plan(self):
         # Regression: a VM copy without image_archive.py failed mid-apply as STATE_INVALID.

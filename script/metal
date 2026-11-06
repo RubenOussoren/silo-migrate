@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Bash entry point; isolated Python stdlib engine keeps JSON/config parsing out of eval.
 set -euo pipefail
-exec python3 -I -c "$(cat <<'PYTHON'
+# Read the engine through a pipe. A here-document larger than the pipe buffer
+# is spooled by bash to $TMPDIR, which for account steps is managed state.
+engine=$(sed -e '1,/^: <<.PYTHON.$/d' -e '/^PYTHON$/,$d' "$0")
+[ -n "$engine" ] || { echo 'METAL_INSTALLER_INCOMPLETE: engine unreadable' >&2; exit 70; }
+exec python3 -I -c "$engine" "$0" "$@"
+: <<'PYTHON'
 import argparse
 import contextlib
 import datetime
@@ -1141,7 +1146,7 @@ def main():
         if saved != current:
             refuse("METAL_PLAN_STALE", "plan SHA/state differs; review a freshly generated plan")
         if not current["plan"]["needs_root"] and not current["plan"]["as_account"]:
-            print("METAL_UNCHANGED: no persistent changes")
+            print("METAL_UNCHANGED: no writes")
             return 0
         if args.command == "apply" and os.geteuid() != 0:
             opts = (["--config", str(Path(args.config).resolve())] if args.config else []) + (["--allow-untested-os"] if args.allow_untested_os else [])
@@ -1229,4 +1234,3 @@ if __name__ == "__main__":
         print("METAL_" + STAGE + "_STATE_INVALID: invalid/unavailable local state; inspect locally and re-plan (raw errors suppressed)", file=sys.stderr)
         sys.exit(1)
 PYTHON
-)" "$0" "$@"
