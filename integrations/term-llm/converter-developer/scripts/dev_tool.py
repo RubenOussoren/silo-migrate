@@ -69,16 +69,17 @@ def fail(code):
 
 
 def emit(result):
+    # Bytes throughout: the size check and the output don't depend on the locale.
     if result.returncode != 0 or not result.stdout.strip():
-        match = re.search(r"Error: ([A-Z_]+)", result.stderr)
-        return fail(match.group(1) if match else "STANDARD_OPERATION_FAILED")
-    if len(result.stdout.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        match = re.search(rb"Error: ([A-Z_]+)", result.stderr)
+        return fail(match.group(1).decode() if match else "STANDARD_OPERATION_FAILED")
+    if len(result.stdout) > MAX_OUTPUT_BYTES:
         return fail("STANDARD_OUTPUT_TOO_LARGE")
     try:
-        json.loads(result.stdout)
+        json.loads(result.stdout.decode("utf-8"))
     except ValueError:
         return fail("STANDARD_OPERATION_FAILED")
-    sys.stdout.write(result.stdout)
+    sys.stdout.buffer.write(result.stdout)
     return 0
 
 
@@ -98,17 +99,17 @@ def main():
     timeout = 290 if tool == "dev_test" else 55
     try:
         if tool == "dev_findings":
-            result = subprocess.run([control_path(), "standard", "agent", "findings", workspace], capture_output=True, text=True, timeout=timeout, env=control_env())
+            result = subprocess.run([control_path(), "standard", "agent", "findings", workspace], capture_output=True, timeout=timeout, env=control_env())
         elif tool == "dev_finding_show":
             finding = args.get("finding_id")
             if not isinstance(finding, str) or not FINDING.match(finding):
                 return fail("STANDARD_ARGUMENTS_INVALID")
-            result = subprocess.run([control_path(), "standard", "agent", "finding-show", workspace, finding], capture_output=True, text=True, timeout=timeout, env=control_env())
+            result = subprocess.run([control_path(), "standard", "agent", "finding-show", workspace, finding], capture_output=True, timeout=timeout, env=control_env())
         else:
             op, keys = TOOLS[tool]
             request = {"op": op, **{key: value for key, value in args.items() if key in keys and value is not None}}
-            result = subprocess.run([control_path(), "converter", "dev", workspace, "--role", role()], input=json.dumps(request),
-                                    capture_output=True, text=True, timeout=timeout, env=control_env())
+            result = subprocess.run([control_path(), "converter", "dev", workspace, "--role", role()], input=json.dumps(request).encode("utf-8"),
+                                    capture_output=True, timeout=timeout, env=control_env())
     except subprocess.TimeoutExpired:
         return fail("STANDARD_OPERATION_TIMEOUT")
     return emit(result)

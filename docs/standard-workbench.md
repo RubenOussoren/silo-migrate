@@ -165,7 +165,11 @@ inside the trust boundary; the checks are not an OS sandbox. The developer write
 that later runs on customer data in conversion runs: review it (and what it logs) before
 `standard converter refresh`. Runs use a materialized copy, not the checkout, and anything
 written into the checkout by other means is invisible to the agents by the content rule
-above. Commits an engineer makes by hand on an agent's branch are trusted as they are. Tests run converter code
+above. Commits an engineer makes by hand on an agent's branch are trusted as they are. Files whose
+checked-out bytes Git rewrites (`.gitattributes` `eol`, `ident`, `working-tree-encoding`)
+are never visible to the agents; the converter repository has no `.gitattributes` today,
+and agents can't add one. Switching branches may overwrite ignored files the target branch
+tracks. Tests run converter code
 in a container with Docker's default seccomp/AppArmor, not a VM.
 
 ## Converter selection

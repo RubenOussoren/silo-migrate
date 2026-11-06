@@ -670,10 +670,17 @@ def op_commit(checkout, request, home):
         # Compare-and-swap: refuses if HEAD moved meanwhile.
         checkout.git("update-ref", "-m", "commit (converter-developer)", "HEAD", commit, parent)
         # Bring the real index in line for these paths only; other staged entries stay.
-        checkout.git("--literal-pathspecs", "reset", "-q", "--", *paths)
+        warning = None
+        try:
+            checkout.git("--literal-pathspecs", "reset", "-q", "--", *paths)
+        except Refusal:
+            warning = "Committed, but the index for these paths was not refreshed; the engineer can run git reset -q -- PATHS."
         checkout._tree = checkout._visible = None
         checkout.forget(paths)
-    return {"commit": checkout.head(), "branch": checkout.branch(), "subject": subject, "author": name_ + " <" + email + ">", "files": paths}
+    result = {"commit": checkout.head(), "branch": checkout.branch(), "subject": subject, "author": name_ + " <" + email + ">", "files": paths}
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 def github_target(checkout):
@@ -757,10 +764,13 @@ def op_push_show(checkout, request, full=False):
     if digest is not None:
         records = [record for record in records if record.get("digest") == digest]
     shown = []
-    for record in records[:5]:
+    for record in records[:5 if full else 2]:
         proposal = dict(record.get("proposal", {}))
         if not full:
+            # The agent's view stays well under the tool limit; the engineer's CLI shows it all.
             proposal["body"] = bounded(proposal.get("body", ""), 4096)[0]
+            proposal["files"] = proposal.get("files", [])[:50]
+            proposal["commits"] = proposal.get("commits", [])[:20]
         shown.append({"digest": record.get("digest"), "status": record.get("status"), "proposed_at": record.get("proposed_at"),
                       "pushed_at": record.get("pushed_at"), "pull_request": record.get("pull_request"), "proposal": proposal})
     return {"proposals": shown, "total": len(records)}
@@ -818,21 +828,26 @@ def docker(argv, timeout):
     for stream in tails:
         selector.register(stream, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout
-    while selector.get_map():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            process.kill()
-            process.wait()
-            return None, bytes(tails[process.stdout]), bytes(tails[process.stderr])
-        for key, _ in selector.select(min(remaining, 1.0)):
-            chunk = os.read(key.fileobj.fileno(), 65536)
-            if not chunk:
-                selector.unregister(key.fileobj)
-                continue
-            tail = tails[key.fileobj]
-            tail.extend(chunk)
-            del tail[:-TAIL_BYTES]
-    return process.wait(), bytes(tails[process.stdout]), bytes(tails[process.stderr])
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                return None, bytes(tails[process.stdout]), bytes(tails[process.stderr])
+            for key, _ in selector.select(min(remaining, 1.0)):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                tail = tails[key.fileobj]
+                tail.extend(chunk)
+                del tail[:-TAIL_BYTES]
+        return process.wait(), bytes(tails[process.stdout]), bytes(tails[process.stderr])
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
 
 
 def clean_stale_exports(directory):
