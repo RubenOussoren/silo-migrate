@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import subprocess
 import sys
 
@@ -68,21 +69,38 @@ def settings():
 # diff/merge drivers...) could run a command as this Docker-group account.
 CONVERTER_CONFIG_KEYS = re.compile(r"(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)"
                                    r"|remote\.origin\.(?:url|fetch)|branch\..+\.(?:remote|merge)|user\.(?:name|email)|pull\.(?:rebase|ff)|fetch\.prune)")
-CONVERTER_REMOTE_URL = re.compile(r"(?:https://\S+|ssh://\S+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._/~-]+|/[^\s:]*)")
+CONVERTER_REMOTE_URL = re.compile(r"(?:https://[^\s@/]+/\S*|ssh://\S+|[A-Za-z0-9._][A-Za-z0-9._-]*@[A-Za-z0-9.][A-Za-z0-9.-]*:[A-Za-z0-9._/~-]+|/[^\s:]*)")
+
+
+def converter_owned(path, directory):
+    try:
+        info = os.lstat(path)
+    except OSError:
+        refuse("STANDARD_CONVERTER_CONFIG")
+    kind = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if not kind or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        refuse("STANDARD_CONVERTER_CONFIG")
 
 
 def converter_config_safe(checkout):
+    """Gate run before every other converter Git command; see the Ruby twin."""
     dot_git = checkout / ".git"
-    if dot_git.is_symlink() or not dot_git.is_dir():
+    converter_owned(dot_git, True)
+    converter_owned(dot_git / "config", False)
+    for extra in (dot_git / "commondir", dot_git / "gitdir", dot_git / "config.worktree", checkout / ".gitmodules"):
+        if extra.exists() or extra.is_symlink():
+            refuse("STANDARD_CONVERTER_CONFIG")
+    git = converter_git(checkout)
+    own = ("file:.git/config", "file:" + str(dot_git.resolve()) + "/config")
+    fields = capture(git + ["config", "--list", "--show-origin", "--show-scope", "--null"]).split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 3:
         refuse("STANDARD_CONVERTER_CONFIG")
-    # Reading a config file with --file executes nothing and follows no includes.
-    # -C / : no repository discovery from whatever the current directory is.
-    listed = capture(["env", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "git", "-C", "/", "config",
-                      "--file", str(dot_git / "config"), "--null", "--list"])
-    for entry in listed.split("\0"):
-        if not entry.strip():
+    for scope, origin, entry in zip(fields[0::3], fields[1::3], fields[2::3]):
+        if scope == "command":
             continue
-        key, _, value = entry.lstrip("\n").partition("\n")
+        key, _, value = entry.partition("\n")
         if key == "remote.origin.url":
             safe = bool(CONVERTER_REMOTE_URL.fullmatch(value))
         elif key == "remote.origin.fetch":
@@ -93,8 +111,13 @@ def converter_config_safe(checkout):
             safe = value.startswith("refs/heads/")
         else:
             safe = "\n" not in value
-        if not (CONVERTER_CONFIG_KEYS.fullmatch(key) and safe):
+        if not (scope == "local" and origin in own and CONVERTER_CONFIG_KEYS.fullmatch(key) and safe):
             refuse("STANDARD_CONVERTER_CONFIG: the converter checkout's .git/config has settings that could run commands; inspect it with git config --file converter/.git/config --list, remove them, then retry.")
+    dirs = capture(git + ["rev-parse", "--git-dir", "--git-common-dir"]).split("\n")
+    if len(dirs) != 2 or any(d not in (".git", str(dot_git.resolve())) for d in dirs):
+        refuse("STANDARD_CONVERTER_CONFIG")
+    if any(line.startswith("160000 ") for line in capture(git + ["ls-files", "--stage"]).splitlines()):
+        refuse("STANDARD_CONVERTER_CONFIG")
 
 
 def converter_git(checkout, credentials=False, cwd=None):
@@ -103,6 +126,7 @@ def converter_git(checkout, credentials=False, cwd=None):
             "git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
             "-c", "core.untrackedCache=false", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
             "-c", "protocol.ssh.allow=always", "-c", "protocol.file.allow=always",
+            "-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false",
             "-c", "safe.directory=" + str(checkout.resolve()),
             *([] if credentials else ["-c", "credential.helper="]), "-C", str(cwd or checkout)]
 
@@ -156,7 +180,7 @@ def host_converter(args, values, base, self):
         branch = config["converter"]["branch"]
         converter_config_safe(checkout)
         git = converter_git(checkout)
-        if capture(git + ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"]):
+        if capture(git + ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all"]):
             refuse("STANDARD_CONVERTER_DIRTY: Commit changes (optionally on a development branch) or stash, then run standard converter refresh.")
         if branch == "detached" or capture(git + ["rev-parse", "--abbrev-ref", "HEAD"]) != branch:
             refuse("STANDARD_RUNTIME_MISMATCH")

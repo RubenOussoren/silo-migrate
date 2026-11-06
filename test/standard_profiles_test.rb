@@ -114,6 +114,7 @@ class StandardProfilesTest < SiloMigrateTest
       @named.init('other')
       root = File.join(@env.fetch('SILO_MIGRATE_BASE_PATH'), 'other')
       FileUtils.mkdir_p(File.join(root, 'converter', '.git'))
+      File.write(File.join(root, 'converter', '.git', 'config'), '')
       @env['SILO_CONTROL_SITE_CACHE'] = @service.store.load.dig('config', 'site_settings')
       other = SiloMigrate::Services::StandardWorkflowService.new('other', env: @env, runtime: @runtime, code_root: @code_root)
       assert_equal 'initialized', other.init[:status]

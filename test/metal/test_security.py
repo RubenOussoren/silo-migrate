@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import tarfile
 import unittest
@@ -353,6 +354,38 @@ class ConverterGitTests(unittest.TestCase):
                 else:
                     git('-C', checkout, 'config', '--unset', key)
         (checkout/'.git/info/attributes').unlink()
+        def refused(expect_git_calls):
+            ran = []
+            real = globals_['capture']
+            def recording(args, real=real):
+                ran.append(args)
+                return real(args)
+            with patch.dict(globals_, capture=recording), self.assertRaisesRegex(ValueError, 'STANDARD_CONVERTER_CONFIG'):
+                wrapper['host_converter'](['converter', 'update', 'synthetic'], {}, base, ROOT/'bin/silo-migrate-control')
+            self.assertFalse(any('status' in args or 'fetch' in args or 'merge' in args for args in ran))
+            self.assertLessEqual(len(ran), expect_git_calls)
+            self.assertFalse(marker.exists())
+        # Reviewer reproduction 1: commondir loads config from elsewhere.
+        evil = self.root/'evil'
+        evil.mkdir()
+        (evil/'config').write_text('[filter "p"]\n\tclean = touch ' + str(marker) + '\n')
+        (checkout/'.git/commondir').write_text(os.path.relpath(evil, checkout/'.git') + '\n')
+        refused(0)
+        (checkout/'.git/commondir').unlink()
+        # Reviewer reproduction 2: a gitlink plus sub/.git with its own filter config.
+        sub = checkout/'sub'
+        git('init', '-q', '-b', 'main', sub)
+        git('-C', sub, 'config', 'filter.q.clean', 'touch ' + str(marker))
+        (sub/'f').write_text('x')
+        (sub/'.gitattributes').write_text('* filter=q\n')
+        git('-C', checkout, 'update-index', '--add', '--cacheinfo', '160000,' + 'c'*40 + ',sub')
+        refused(3)
+        git('-C', checkout, 'update-index', '--force-remove', 'sub')
+        shutil.rmtree(sub)
+        # A group-writable config is refused before Git reads it.
+        (checkout/'.git/config').chmod(0o664)
+        refused(0)
+        (checkout/'.git/config').chmod(0o644)
         (remote/'tracked').write_text('two')
         git('-C', remote, 'commit', '-am', 'two')
         with patch('subprocess.call', return_value=0):

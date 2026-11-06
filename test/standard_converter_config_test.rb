@@ -14,8 +14,8 @@ class StandardConverterConfigTest < SiloMigrateTest
     "user.name\nEngineer", "user.email\nengineer@example.test"
   ].freeze
 
-  def listed(entries)
-    entries.join("\0") + "\0"
+  def listed(entries, scope: 'local', origin: 'file:.git/config')
+    entries.map { |entry| "#{scope}\0#{origin}\0#{entry}\0" }.join + "command\0command line:\0core.hookspath\n/dev/null\0"
   end
 
   def git_commands
@@ -55,7 +55,47 @@ class StandardConverterConfigTest < SiloMigrateTest
         assert_equal 1, after.length, name
         assert_includes after.first, '--list', name
         assert_includes after.first, 'GIT_CONFIG_GLOBAL=/dev/null', name
+        assert_includes after.first, '--show-origin', name
       end
+    end
+  end
+
+  def test_config_loaded_from_anywhere_but_this_checkout_is_refused
+    { 'other file' => { origin: 'file:/elsewhere/config' }, 'global' => { scope: 'global', origin: 'file:/home/x/.gitconfig' },
+      'worktree' => { scope: 'worktree', origin: 'file:.git/config.worktree' } }.each do |name, where|
+      with_standard do
+        @runtime.converter_config = listed(CLONE.first(2), **where)
+        error = assert_raises(SiloMigrate::StandardWorkflowError, name) { @service.converter_status }
+        assert_equal 'STANDARD_CONVERTER_CONFIG', error.code, name
+      end
+    end
+  end
+
+  def test_redirected_repository_submodules_and_shared_files_are_refused
+    { 'commondir' => ->(wt) { File.write(File.join(wt, '.git/commondir'), '../../evil') },
+      'gitdir file' => ->(wt) { File.write(File.join(wt, '.git/gitdir'), '/elsewhere') },
+      'worktree config' => ->(wt) { File.write(File.join(wt, '.git/config.worktree'), '') },
+      'gitmodules' => ->(wt) { File.write(File.join(wt, '.gitmodules'), '') },
+      'group-writable config' => ->(wt) { File.chmod(0o664, File.join(wt, '.git/config')) },
+      'group-writable git dir' => ->(wt) { File.chmod(0o775, File.join(wt, '.git')) },
+      'gitlink in index' => ->(_) { @runtime.converter_index = "100644 #{'b' * 40} 0\ttracked\n160000 #{'c' * 40} 0\tsub\n" },
+      'common dir elsewhere' => ->(_) { @runtime.converter_dirs = ".git\n/elsewhere/.git\n" } }.each do |name, setup|
+      with_standard do
+        @runtime.converter_config = listed(CLONE)
+        setup.call(@service.store.load.dig('config', 'converter_worktree'))
+        before = git_commands.length
+        error = assert_raises(SiloMigrate::StandardWorkflowError, name) { @service.converter_status }
+        assert_equal 'STANDARD_CONVERTER_CONFIG', error.code, name
+        refute git_commands.drop(before).any? { |cmd| cmd.include?('status') }, name
+      end
+    end
+  end
+
+  def test_credentials_in_remote_url_are_refused
+    with_standard do
+      @runtime.converter_config = listed(CLONE + ["remote.origin.url\nhttps://user:token@github.com/discourse-org/discourse-converters.git"])
+      error = assert_raises(SiloMigrate::StandardWorkflowError) { @service.converter_status }
+      assert_equal 'STANDARD_CONVERTER_CONFIG', error.code
     end
   end
 
@@ -77,9 +117,10 @@ class StandardConverterConfigTest < SiloMigrateTest
       @runtime.converter_config = listed(CLONE)
       @service.converter_status
       git_commands.reject { |cmd| cmd.include?('--list') }.each do |cmd|
-        %w[core.hooksPath=/dev/null core.fsmonitor=false credential.helper= protocol.allow=never GIT_CONFIG_GLOBAL=/dev/null].each do |flag|
+        %w[core.hooksPath=/dev/null core.fsmonitor=false credential.helper= protocol.allow=never submodule.recurse=false GIT_CONFIG_GLOBAL=/dev/null].each do |flag|
           assert_includes cmd, flag
         end
+        assert_includes cmd, '--ignore-submodules=all' if cmd.include?('status')
       end
     end
   end

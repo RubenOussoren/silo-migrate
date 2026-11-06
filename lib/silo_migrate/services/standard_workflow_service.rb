@@ -115,30 +115,52 @@ module SiloMigrate
       # includes, protocol/alias/diff/merge drivers...) could run a command with
       # this account's Docker authority, so it is refused, never executed.
       CONVERTER_CONFIG_KEYS = /\A(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)|remote\.origin\.(?:url|fetch)|branch\..+\.(?:remote|merge)|user\.(?:name|email)|pull\.(?:rebase|ff)|fetch\.prune)\z/
-      CONVERTER_REMOTE_URL = %r{\A(?:https://[^\s]+|ssh://[^\s]+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._/~-]+|/[^\s:]*)\z}
+      CONVERTER_REMOTE_URL = %r{\A(?:https://[^\s@/]+/[^\s]*|ssh://[^\s]+|[A-Za-z0-9._][A-Za-z0-9._-]*@[A-Za-z0-9.][A-Za-z0-9.-]*:[A-Za-z0-9._/~-]+|/[^\s:]*)\z}
 
       def converter_git_argv(worktree)
         ["env", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "git", "-c", "core.hooksPath=/dev/null",
          "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "credential.helper=",
          "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
-         "-c", "protocol.file.allow=always", "-c", "safe.directory=#{File.realpath(worktree)}", "-C", worktree]
+         "-c", "protocol.file.allow=always", "-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false",
+         "-c", "safe.directory=#{File.realpath(worktree)}", "-C", worktree]
       end
 
+      def converter_owned!(path, directory:)
+        stat = File.lstat(path)
+        unless (directory ? stat.directory? : stat.file?) && !stat.symlink? && stat.uid == Process.uid && (stat.mode & 0o022).zero?
+          raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG"
+        end
+      rescue SystemCallError
+        raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG"
+      end
+
+      # Gate run before every other converter Git command. Git can load config
+      # from elsewhere (commondir, worktree config) or recurse into submodules
+      # with their own config, so the effective config and its origin are checked.
       def assert_converter_config!(worktree)
         dot_git = File.join(worktree, ".git")
-        raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG" if File.symlink?(dot_git) || !File.directory?(dot_git)
+        converter_owned!(dot_git, directory: true)
+        converter_owned!(File.join(dot_git, "config"), directory: false)
+        if %w[commondir gitdir config.worktree].any? { |name| File.exist?(File.join(dot_git, name)) || File.symlink?(File.join(dot_git, name)) } ||
+           File.exist?(File.join(worktree, ".gitmodules")) || File.symlink?(File.join(worktree, ".gitmodules"))
+          raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG"
+        end
 
-        # Reading a config file with --file executes nothing and follows no includes.
-        # -C / : no repository discovery from whatever the current directory is.
-        listed = @runtime.run(["env", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "git", "-C", "/", "config",
-                               "--file", File.join(dot_git, "config"), "--null", "--list"], capture: true, timeout: 30)
-        raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG" unless listed.success?
+        git = lambda do |*args|
+          result = @runtime.run([*converter_git_argv(worktree), *args], capture: true, timeout: 30)
+          raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG" unless result.success?
+          result.stdout.to_s
+        end
+        own = ["file:.git/config", "file:#{File.realpath(dot_git)}/config"]
+        fields = git.call("config", "--list", "--show-origin", "--show-scope", "--null").split("\0", -1)
+        fields.pop if fields.last == ""
+        raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG" unless (fields.length % 3).zero?
 
-        listed.stdout.to_s.split("\0").each do |entry|
-          next if entry.strip.empty?
+        fields.each_slice(3) do |scope, origin, entry|
+          next if scope == "command"
 
-          key, value = entry.sub(/\A\n+/, "").split("\n", 2)
-          safe = key.to_s.match?(CONVERTER_CONFIG_KEYS) &&
+          key, value = entry.split("\n", 2)
+          safe = scope == "local" && own.include?(origin) && key.to_s.match?(CONVERTER_CONFIG_KEYS) &&
                  case key
                  when "remote.origin.url" then value.to_s.match?(CONVERTER_REMOTE_URL)
                  when /\.remote\z/ then %w[origin .].include?(value)
@@ -148,6 +170,11 @@ module SiloMigrate
                  end
           raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG" unless safe
         end
+        dirs = git.call("rev-parse", "--git-dir", "--git-common-dir").split("\n")
+        unless dirs.length == 2 && dirs.all? { |dir| [".git", File.realpath(dot_git)].include?(dir) }
+          raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG"
+        end
+        raise StandardWorkflowError, "STANDARD_CONVERTER_CONFIG" if git.call("ls-files", "--stage").each_line.any? { |line| line.start_with?("160000 ") }
       end
 
       def converter_identity(worktree)
@@ -163,7 +190,7 @@ module SiloMigrate
         # Strip URL userinfo, including passwords/tokens; handle scp-style SSH too.
         repo = repo.sub(%r{(\A[a-z][a-z0-9+.-]*://)[^/]*@}i, '\\1').sub(/\A[^\/@:]+@(?=[^\/]+:)/, "")
         { "repo" => repo, "branch" => git.call("rev-parse", "--abbrev-ref", "HEAD").sub(/\AHEAD\z/, "detached"),
-          "commit" => commit, "dirty" => !git.call("--no-optional-locks", "status", "--porcelain", "--untracked-files=all").empty? }
+          "commit" => commit, "dirty" => !git.call("--no-optional-locks", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all").empty? }
       end
 
       def converter_status

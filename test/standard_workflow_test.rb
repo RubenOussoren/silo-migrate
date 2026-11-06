@@ -5,7 +5,7 @@ require 'silo_migrate/services/standard_workflow_service'
 
 # Scripted command results only; no subprocess, Docker socket or host port use.
 class StandardScriptedRuntime < SiloMigrate::Runtime::Fake
-  attr_accessor :converter_config, :converter_head, :converter_branch, :converter_repo, :converter_dirty, :inspect_document, :high_usage, :ownership, :images_match, :import_failure, :sweep_resources, :sweep_failure, :live_result, :live_error
+  attr_accessor :converter_config, :converter_dirs, :converter_index, :converter_head, :converter_branch, :converter_repo, :converter_dirty, :inspect_document, :high_usage, :ownership, :images_match, :import_failure, :sweep_resources, :sweep_failure, :live_result, :live_error
   def run(cmd, **options)
     result = super
     if sweep_failure && cmd.include?('ls') && cmd.include?('--filter')
@@ -32,6 +32,8 @@ class StandardScriptedRuntime < SiloMigrate::Runtime::Fake
       end
     elsif cmd.include?('git')
       if cmd.include?('--list') then converter_config.to_s
+      elsif cmd.include?('--git-common-dir') then converter_dirs || ".git\n.git\n"
+      elsif cmd.include?('ls-files') then converter_index.to_s
       elsif cmd.include?('status') then converter_dirty ? '?? untracked.txt' : ''
       elsif cmd.include?('--abbrev-ref') then converter_branch || 'main'
       elsif cmd.include?('rev-parse') then converter_head || 'a' * 40
@@ -78,6 +80,7 @@ module StandardTestWorkspace
       settings = write(File.join(dir, 'site-settings.yml'), "title: Synthetic\n")
       converter = File.join(dir, 'converter')
       FileUtils.mkdir_p(File.join(converter, '.git'))
+      File.write(File.join(converter, '.git', 'config'), '')
       @service.init(converter_worktree: converter, site_settings: settings)
       yield
     end

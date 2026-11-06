@@ -353,8 +353,12 @@ status also uses `--no-optional-locks`. Before any of these runs, the checkout's
 (`core.*` basics, `remote.origin.url/fetch`, `branch.*.remote/merge`, `user.name/email`,
 `pull.rebase/ff`, `fetch.prune`), with a plain https/ssh/local remote URL. Anything
 else (filters, credential helpers, `sshCommand`, includes, aliases, diff/merge drivers)
-is refused with `STANDARD_CONVERTER_CONFIG` and never executed; `.git` must be a real
-directory. Only `clone` and `fetch` may use the account's own global Git config and
+is refused with `STANDARD_CONVERTER_CONFIG` and never executed. The check uses Git's
+*effective* config with its origin, so every entry must come from this checkout's own
+`.git/config`; `.git` and that file must be real, account-owned and not group/world
+writable; `commondir`, `gitdir`, `config.worktree`, `.gitmodules` and submodule
+(gitlink) index entries are refused, and status ignores submodules. Remote URLs must not
+embed credentials. Only `clone` and `fetch` may use the account's own global Git config and
 credential helpers (so private HTTPS clones work); everything else ignores it. Converter
 update holds the workspace `op.lock` across checks/fetch/merge and refuses claimed or
 running runs. Refresh takes its own op.lock and also refuses those states.

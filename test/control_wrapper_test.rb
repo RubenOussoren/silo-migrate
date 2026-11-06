@@ -94,6 +94,8 @@ class ControlWrapperTest < SiloMigrateTest
                   return ''
               if '--abbrev-ref' in args:
                   return 'main'
+              if '--git-common-dir' in args:
+                  return '.git' + chr(10) + '.git'
               return ''
           with patch.dict(globals_, capture=capture):
               with contextlib.redirect_stdout(io.StringIO()):
@@ -101,6 +103,7 @@ class ControlWrapperTest < SiloMigrateTest
               assert commands == [wrapper['converter_git'](root / 'converter', credentials=True, cwd=root) + ['clone', '--branch', 'main', '--', 'https://github.com/discourse-org/discourse-converters.git', str(root / 'converter')]]
               checkout = root / 'converter'
               (checkout / '.git').mkdir(parents=True)
+              (checkout / '.git' / 'config').write_text('')
               try:
                   wrapper['host_converter'](['converter', 'clone', 'synthetic'], {}, base, self)
                   raise AssertionError('clobbered checkout')
@@ -117,7 +120,7 @@ class ControlWrapperTest < SiloMigrateTest
               assert wrapper['converter_git'](checkout, credentials=True) + ['fetch', 'origin'] in commands
               assert wrapper['converter_git'](checkout) + ['merge', '--ff-only', '--', 'refs/remotes/origin/main'] in commands
               assert not any('reset' in command for command in commands)
-          with patch.dict(globals_, capture=lambda args: '' if '--list' in args else '?? dirty'):
+          with patch.dict(globals_, capture=lambda args: '.git' + chr(10) + '.git' if '--git-common-dir' in args else '' if '--list' in args or 'ls-files' in args else '?? dirty'):
               try:
                   wrapper['host_converter'](['converter', 'update', 'synthetic'], {}, base, self)
                   raise AssertionError('updated dirty checkout')
