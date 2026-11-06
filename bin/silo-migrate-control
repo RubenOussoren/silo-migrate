@@ -171,7 +171,9 @@ def github_credentials(checkout, url, cwd=None):
 
 def host_converter(args, values, base, self):
     if len(args) >= 2 and args[1] in ("dev", "push", "push-show"):
-        print(json.dumps(converter_dev().main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin)))
+        result = converter_dev().main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin)
+        # UTF-8 bytes, as converter_dev.fit measured them, whatever the locale.
+        sys.stdout.buffer.write((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
         return 0
     if len(args) < 3 or args[1] not in ("clone", "update"):
         refuse("STANDARD_ARGUMENTS_INVALID")

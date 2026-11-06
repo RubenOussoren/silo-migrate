@@ -1,12 +1,13 @@
 """Host-side converter development for the converter-developer and reviewer agents.
 
 Imported by bin/silo-migrate-control. Agent operations only ever see, in
-workspaces/<ws>/converter, files tracked at HEAD and new files the developer agent
-itself created (recorded in the workspace's converter-dev-files.json). Every other
-untracked file is invisible whatever .gitignore says (the converter repository's own
-.gitignore does not cover everything a run or an engineer might leave there), as are
-.git, symlinks, other workspace content and customer data: never read, listed,
-searched, exported to tests or committed. term-llm runs custom
+workspaces/<ws>/converter, files whose current content Git or the agent vouches for:
+tracked at HEAD and unchanged from the HEAD blob, or last written by the developer's
+tools (SHA-256 recorded in the workspace's converter-dev-files.json). Every other file
+is invisible whatever .gitignore says (the converter repository's .gitignore doesn't
+cover everything a run or an engineer might leave there), as are .git, symlinks,
+other workspace content and customer data: never read, listed, searched, exported to
+tests or committed. Commits are built from exactly those verified bytes. term-llm runs custom
 tools without an approval prompt, so every limit is enforced here.
 
 The engineer's push approval (`converter push WS --sha256 DIGEST`) is the only path
@@ -18,6 +19,7 @@ it; same-account races between checking and opening a path are not defended.
 import datetime
 import difflib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -42,9 +44,10 @@ MAX_TEXT_BYTES = 32 * 1024
 MAX_LINES = 2000
 MAX_LINE_CHARS = 2000
 MAX_WRITE_BYTES = 512 * 1024
+MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_MATCHES = 200
 MAX_COMMITS = 50
-TEST_TIMEOUT = 270
+TEST_TIMEOUT = 240
 # Paths an agent may never write: they change what Git ignores or how it treats
 # files, or (workflows) need a token permission the engineer did not grant.
 PROTECTED_NAMES = {".gitignore", ".gitattributes", ".gitmodules", ".git"}
@@ -119,50 +122,111 @@ class Checkout:
         return self.git(*args, **kwargs).stdout.decode("utf-8", "replace")
 
     # -- what an agent may see ------------------------------------------------
+    # A file is visible only while its *content* is one Git or the agent vouches for:
+    # tracked at HEAD and unchanged from its HEAD blob, or last written by the agent
+    # (SHA-256 recorded at that write). A run or a person changing a file in the
+    # checkout makes it invisible; untracked files nobody recorded never appear.
 
-    def created_path(self):
+    def manifest_path(self):
         return self.standard / "converter-dev-files.json"
 
-    def created(self):
-        path = self.created_path()
-        if path.is_symlink() or not path.is_file():
-            return set()
-        try:
-            names = json.loads(path.read_text())
-        except ValueError:
-            return set()
-        return {name for name in names if isinstance(name, str)} if isinstance(names, list) else set()
+    def manifest(self):
+        path = self.manifest_path()
+        data = {}
+        if path.is_file() and not path.is_symlink():
+            try:
+                data = json.loads(path.read_text())
+            except ValueError:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        files = data.get("files") if isinstance(data.get("files"), dict) else {}
+        branches = data.get("branches") if isinstance(data.get("branches"), list) else []
+        return {"files": {k: v for k, v in files.items() if isinstance(k, str) and isinstance(v, str)},
+                "branches": [b for b in branches if isinstance(b, str)]}
 
-    def save_created(self, names):
-        path = self.created_path()
+    def save_manifest(self, data):
+        path = self.manifest_path()
         temporary = path.with_name("." + path.name + ".tmp")
-        temporary.write_text(json.dumps(sorted(names)) + "\n")
+        temporary.write_text(json.dumps({"files": dict(sorted(data["files"].items())), "branches": sorted(set(data["branches"]))}, indent=1) + "\n")
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
-        self._tree = None
+        self._visible = None
+
+    def record_write(self, relative, data):
+        manifest = self.manifest()
+        manifest["files"][relative] = hashlib.sha256(data).hexdigest()
+        self.save_manifest(manifest)
+
+    def forget(self, relatives):
+        manifest = self.manifest()
+        for relative in relatives:
+            manifest["files"].pop(relative, None)
+        self.save_manifest(manifest)
 
     def tree(self):
+        """{path: (mode, object id)} of HEAD."""
         if getattr(self, "_tree", None) is None:
-            raw = self.git("ls-tree", "-r", "-z", "--name-only", "--full-tree", "HEAD").stdout
-            self._tree = set(raw.decode("utf-8", "surrogateescape").split("\0")) - {""}
+            raw = self.git("ls-tree", "-r", "-z", "--full-tree", "HEAD").stdout.decode("utf-8", "surrogateescape")
+            tree = {}
+            for record in raw.split("\0"):
+                meta, _, name = record.partition("\t")
+                parts = meta.split()
+                if name and len(parts) == 3:
+                    tree[name] = (parts[0], parts[2])
+            self._tree = tree
         return self._tree
 
+    def blob_id(self, data):
+        if getattr(self, "_format", None) is None:
+            self._format = self.out("rev-parse", "--show-object-format").strip() or "sha1"
+        digest = hashlib.new("sha256" if self._format == "sha256" else "sha1")
+        digest.update(b"blob %d\0" % len(data))
+        digest.update(data)
+        return digest.hexdigest()
+
+    def vouched(self, relative, data):
+        entry = self.tree().get(relative)
+        if entry and entry[0] in ("100644", "100755") and self.blob_id(data) == entry[1]:
+            return True
+        recorded = self.manifest()["files"].get(relative)
+        return recorded is not None and hashlib.sha256(data).hexdigest() == recorded
+
+    def load(self, relative):
+        """(bytes, stat) of a visible file, verified on exactly the bytes returned."""
+        if any(part in PROTECTED_NAMES - {".gitignore", ".gitattributes"} for part in relative.split("/")) or not self.inside(relative):
+            refuse("STANDARD_DEV_PATH_NOT_VISIBLE")
+        try:
+            descriptor = os.open(self.path / relative, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        except OSError:
+            refuse("STANDARD_DEV_PATH_NOT_VISIBLE")
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            refuse("STANDARD_DEV_PATH_NOT_VISIBLE")
+        with os.fdopen(descriptor, "rb") as stream:
+            if info.st_size > MAX_FILE_BYTES:
+                refuse("STANDARD_DEV_FILE_TOO_LARGE")
+            data = stream.read(MAX_FILE_BYTES + 1)
+        if not self.vouched(relative, data):
+            refuse("STANDARD_DEV_PATH_NOT_VISIBLE")
+        return data, info
+
     def visible(self, prefix=""):
-        """Files tracked at HEAD plus files the developer agent created, existing as regular files."""
-        names = self.tree() | self.created()
-        if prefix:
-            names = {name for name in names if name == prefix or name.startswith(prefix if prefix.endswith("/") else prefix + "/")}
-        files = []
-        for name in sorted(names):
-            if any(part in PROTECTED_NAMES - {".gitignore", ".gitattributes"} for part in name.split("/")):
-                continue
-            try:
-                info = os.lstat(self.path / name)
-            except OSError:
-                continue
-            if stat.S_ISREG(info.st_mode) and self.inside(name):
+        """Visible files (see above), optionally under a prefix."""
+        if getattr(self, "_visible", None) is None:
+            names = set(self.tree()) | set(self.manifest()["files"])
+            files = []
+            for name in sorted(names):
+                try:
+                    self.load(name)
+                except Refusal:
+                    continue
                 files.append(name)
-        return files
+            self._visible = files
+        if not prefix:
+            return list(self._visible)
+        return [name for name in self._visible if name == prefix or name.startswith(prefix if prefix.endswith("/") else prefix + "/")]
 
     def inside(self, relative):
         """No component of the path is a symlink and it resolves inside the checkout."""
@@ -231,18 +295,6 @@ def text_lines(stream, start):
     return lines, next_line
 
 
-def open_visible(checkout, relative):
-    if relative not in checkout.visible(relative):
-        refuse("STANDARD_DEV_PATH_NOT_VISIBLE")
-    path = checkout.path / relative
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
-    info = os.fstat(descriptor)
-    if not stat.S_ISREG(info.st_mode):
-        os.close(descriptor)
-        refuse("STANDARD_DEV_PATH_NOT_VISIBLE")
-    return os.fdopen(descriptor, "rb"), info
-
-
 def bounded(text, limit=MAX_TEXT_BYTES):
     data = text.encode("utf-8", "replace")
     if len(data) <= limit:
@@ -275,7 +327,7 @@ def op_list(checkout, request):
         listed.append(entry)
         used += cost
     return {"path": directory or ".", "entries": listed, "total": len(entries), "truncated": truncated,
-            "note": "Only files Git can see are listed: ignored files are never shown."}
+            "note": "Only files tracked at HEAD (unchanged since, or changed by your own tools) and files you created are listed."}
 
 
 def op_read(checkout, request):
@@ -283,12 +335,10 @@ def op_read(checkout, request):
     start = request.get("start_line", 1)
     if not isinstance(start, int) or isinstance(start, bool) or start < 1:
         refuse("STANDARD_ARGUMENTS_INVALID")
-    stream, info = open_visible(checkout, relative)
-    with stream:
-        if b"\0" in stream.read(8192):
-            return {"path": relative, "bytes": info.st_size, "binary": True}
-        stream.seek(0)
-        lines, next_line = text_lines(stream, start)
+    data, info = checkout.load(relative)
+    if b"\0" in data[:8192]:
+        return {"path": relative, "bytes": info.st_size, "binary": True}
+    lines, next_line = text_lines(io.BytesIO(data), start)
     return {"path": relative, "bytes": info.st_size, "start_line": start, "lines": len(lines), "next_line": next_line, "text": "".join(lines)}
 
 
@@ -300,22 +350,21 @@ def op_search(checkout, request):
     flags = ["--fixed-strings"] if request.get("fixed", True) else ["--extended-regexp"]
     if request.get("ignore_case"):
         flags.append("--ignore-case")
-    try:
-        regex = re.compile(re.escape(pattern) if request.get("fixed", True) else pattern, re.I if request.get("ignore_case") else 0)
-    except re.error:
-        refuse("STANDARD_ARGUMENTS_INVALID")
-    # Tracked files only (no --untracked); the agent's own new files are searched below.
+    # Tracked files through Git (results are kept only for visible files), the agent's
+    # own new files through --no-index: one regex engine, no untracked discovery.
+    scope = directory + "/" if directory else ""
     result = checkout.git("grep", "-z", "-n", "-I", "--no-color", *flags, "-e", pattern, "--",
-                          *([":(literal)" + directory] if directory else []), ok=(0, 1), timeout=60)
+                          *([":(literal)" + directory] if directory else []), ok=(0, 1, 128), timeout=60)
+    if result.returncode == 128:
+        refuse("STANDARD_ARGUMENTS_INVALID")
     records = result.stdout.decode("utf-8", "replace").split("\n")
-    for name in sorted(checkout.created() & set(checkout.visible(directory + "/" if directory else ""))):
-        with open_visible(checkout, name)[0] as stream:
-            raw = stream.read(MAX_WRITE_BYTES + 1)
-        if b"\0" in raw[:8192]:
-            continue
-        for number, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
-            if regex.search(line):
-                records.append(name + "\0" + str(number) + "\0" + line)
+    created = [name for name in checkout.visible(scope) if name not in checkout.tree()]
+    if created:
+        extra = checkout.git("--literal-pathspecs", "grep", "--no-index", "-z", "-n", "-I", "--no-color", *flags, "-e", pattern, "--", *created,
+                             ok=(0, 1, 128), timeout=60)
+        if extra.returncode == 128:
+            refuse("STANDARD_ARGUMENTS_INVALID")
+        records += extra.stdout.decode("utf-8", "replace").split("\n")
     visible = None
     matches, used, truncated = [], 0, False
     for record in records:
@@ -398,14 +447,18 @@ def op_diff(checkout, request):
     spec = ["--", ":(literal)" + path] if path else []
     no_drivers = ["--no-color", "--no-ext-diff", "--no-textconv"]
     if scope == "working":
-        text = checkout.out("diff", *no_drivers, "HEAD", *spec)
-        stat_text = checkout.out("diff", "--stat=120", *no_drivers, "HEAD", *spec)
-        for entry in changes(checkout)[0]:
-            name = entry["path"]
-            if entry["status"] == "??" and (not path or name == path or name.startswith(path + "/")):
+        # Only visible changed paths: never an engineer's staged file or content changed outside the tools.
+        names = [entry["path"] for entry in changes(checkout)[0] if not path or entry["path"] == path or entry["path"].startswith(path + "/")]
+        tracked = [name for name in names if name in checkout.tree()]
+        text = stat_text = ""
+        if tracked:
+            text = checkout.out("--literal-pathspecs", "diff", *no_drivers, "HEAD", "--", *tracked)
+            stat_text = checkout.out("--literal-pathspecs", "diff", "--stat=120", *no_drivers, "HEAD", "--", *tracked)
+        for name in names:
+            if name not in checkout.tree():
                 extra = checkout.git("diff", *no_drivers, "--no-index", "--", "/dev/null", name, ok=(0, 1)).stdout
                 text += extra.decode("utf-8", "replace")
-                stat_text += " " + name + " (new, untracked)\n"
+                stat_text += " " + name + " (new)\n"
     elif scope == "unpushed":
         commits = unpushed(checkout)
         if not commits:
@@ -474,13 +527,11 @@ def op_write(checkout, request):
     before = ""
     mode = 0o644
     if exists:
-        stream, info = open_visible(checkout, relative)
-        with stream:
-            before = stream.read().decode("utf-8", "replace")
+        data, info = checkout.load(relative)
+        before = data.decode("utf-8", "replace")
         mode = stat.S_IMODE(info.st_mode) & 0o755
     atomic_write(target, content.encode("utf-8"), mode)
-    if not exists and relative not in checkout.tree():
-        checkout.save_created(checkout.created() | {relative})
+    checkout.record_write(relative, content.encode("utf-8"))
     return {"path": relative, "created": not exists, "bytes": len(content.encode("utf-8")), "diff": small_diff(relative, before, content)}
 
 
@@ -490,9 +541,7 @@ def op_edit(checkout, request):
     if not (isinstance(old, str) and old and isinstance(new, str)) or "\0" in old + new:
         refuse("STANDARD_ARGUMENTS_INVALID")
     target, _ = writable(checkout, relative, must_exist=True)
-    stream, info = open_visible(checkout, relative)
-    with stream:
-        raw = stream.read()
+    raw, info = checkout.load(relative)
     if b"\0" in raw[:8192]:
         refuse("STANDARD_DEV_BINARY")
     before = raw.decode("utf-8")
@@ -505,6 +554,7 @@ def op_edit(checkout, request):
     if len(after.encode("utf-8")) > MAX_WRITE_BYTES:
         refuse("STANDARD_ARGUMENTS_INVALID")
     atomic_write(target, after.encode("utf-8"), stat.S_IMODE(info.st_mode) & 0o755)
+    checkout.record_write(relative, after.encode("utf-8"))
     return {"path": relative, "replacements": count, "diff": small_diff(relative, before, after)}
 
 
@@ -512,8 +562,7 @@ def op_delete(checkout, request):
     relative = relative_path(request.get("path"))
     target, _ = writable(checkout, relative, must_exist=True)
     os.unlink(target)
-    if relative in checkout.created():
-        checkout.save_created(checkout.created() - {relative})
+    checkout.forget([relative])
     return {"path": relative, "deleted": True}
 
 
@@ -551,7 +600,18 @@ def op_branch(checkout, request):
     checkout.git("check-ref-format", "--branch", name)
     with Locked(checkout):
         exists = checkout.git("show-ref", "--verify", "--quiet", "refs/heads/" + name, ok=(0, 1)).returncode == 0
+        manifest = checkout.manifest()
+        if exists and name != checkout.branch() and name not in manifest["branches"]:
+            # Switching makes that branch's HEAD tree visible: only branches this agent
+            # created, or whose tip is already on the remote, are trusted.
+            tip = checkout.out("rev-parse", "refs/heads/" + name).strip()
+            if not checkout.out("for-each-ref", "--count=1", "--contains", tip, "--format=%(refname)", "refs/remotes/origin").strip():
+                refuse("STANDARD_DEV_BRANCH_UNTRUSTED")
         checkout.git("switch", *([] if exists else ["-c"]), name)
+        if not exists:
+            manifest["branches"].append(name)
+            checkout.save_manifest(manifest)
+        checkout._tree = checkout._visible = None
     return {"branch": name, "created": not exists, "head": checkout.head(),
             "note": "Uncommitted changes, if any, came along. The engineer runs `standard converter refresh` before planning on this branch."}
 
@@ -583,25 +643,37 @@ def op_commit(checkout, request, home):
     with Locked(checkout):
         if not checkout.branch().startswith(checkout.migration_prefix()):
             refuse("STANDARD_DEV_NOT_MIGRATION_BRANCH")
-        name, email = identity(checkout, home)
-        # Only Git-visible files and deletions of tracked files: never ignored files,
-        # symlinks or special files, whatever .gitignore says.
+        name_, email = identity(checkout, home)
+        # The commit is built from exactly the verified bytes of visible changes (and
+        # deletions of tracked files) in a temporary index: nothing else in the working
+        # tree or the engineer's index can enter it, and no hook runs.
         paths = [entry["path"] for entry in changes(checkout)[0]]
         if not paths:
             refuse("STANDARD_DEV_NOTHING_TO_COMMIT")
-        spec = "\0".join(paths).encode("utf-8", "surrogateescape")
-        checkout.git("--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul", input=spec)
-        env = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
-        # --only with these paths: anything else in the index (an engineer's staged file) stays out.
-        with tempfile.NamedTemporaryFile(prefix="silo-dev-msg-") as stream:
-            stream.write(message.encode("utf-8"))
-            stream.flush()
-            checkout.git("--literal-pathspecs", "commit", "--quiet", "--no-verify", "--only", "--cleanup=whitespace", "-F", stream.name,
-                         "--trailer", TRAILER["developer"], "--pathspec-from-file=-", "--pathspec-file-nul",
-                         input=spec, env=env, extra=["-c", "commit.gpgsign=false"])
-        checkout._tree = None
-        checkout.save_created(checkout.created() - checkout.tree())
-    return {"commit": checkout.head(), "branch": checkout.branch(), "subject": subject, "author": name + " <" + email + ">"}
+        parent = checkout.head()
+        with tempfile.TemporaryDirectory(prefix="silo-dev-commit-") as scratch:
+            index = {"GIT_INDEX_FILE": os.path.join(scratch, "index")}
+            checkout.git("read-tree", parent, env=index)
+            for name in paths:
+                if not os.path.lexists(checkout.path / name):
+                    checkout.git("--literal-pathspecs", "update-index", "--force-remove", "--", name, env=index)
+                    continue
+                data, info = checkout.load(name)
+                blob = checkout.out("hash-object", "-w", "--no-filters", "--stdin", input=data).strip()
+                mode = checkout.tree()[name][0] if name in checkout.tree() else ("100755" if info.st_mode & 0o111 else "100644")
+                checkout.git("--literal-pathspecs", "update-index", "--add", "--cacheinfo", mode + "," + blob + "," + name, env=index)
+            tree = checkout.out("write-tree", env=index).strip()
+            text = checkout.git("stripspace", input=message.encode("utf-8")).stdout
+            text = checkout.git("interpret-trailers", "--trailer", TRAILER["developer"], input=text).stdout
+            env = {"GIT_AUTHOR_NAME": name_, "GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_NAME": name_, "GIT_COMMITTER_EMAIL": email}
+            commit = checkout.out("commit-tree", tree, "-p", parent, "-F", "-", input=text, env=env).strip()
+        # Compare-and-swap: refuses if HEAD moved meanwhile.
+        checkout.git("update-ref", "-m", "commit (converter-developer)", "HEAD", commit, parent)
+        # Bring the real index in line for these paths only; other staged entries stay.
+        checkout.git("--literal-pathspecs", "reset", "-q", "--", *paths)
+        checkout._tree = checkout._visible = None
+        checkout.forget(paths)
+    return {"commit": checkout.head(), "branch": checkout.branch(), "subject": subject, "author": name_ + " <" + email + ">", "files": paths}
 
 
 def github_target(checkout):
@@ -638,9 +710,10 @@ def current_proposal(checkout, request_base, title, body):
     if checkout.git("show-ref", "--verify", "--quiet", "refs/remotes/origin/" + base, ok=(0, 1)).returncode:
         refuse("STANDARD_PUSH_BASE_UNKNOWN")
     files = checkout.out("diff", "--name-status", "--no-color", "--no-ext-diff", "--no-renames", "refs/remotes/origin/" + base + "...HEAD").splitlines()
+    stat_text = checkout.out("diff", "--stat=100", "--no-color", "--no-ext-diff", "refs/remotes/origin/" + base + "...HEAD")
     return {"version": 1, "workspace": checkout.workspace, "repository": target["owner"] + "/" + target["repo"],
             "branch": branch, "base": base, "head": checkout.head(), "commits": commits,
-            "files": files[:300], "files_total": len(files), "title": title, "body": body}
+            "files": files[:300], "files_total": len(files), "stat": bounded(stat_text, 4096)[0], "title": title, "body": body}
 
 
 def op_push_propose(checkout, request):
@@ -678,7 +751,7 @@ def load_proposals(checkout):
     return sorted(records, key=lambda record: record.get("proposed_at", ""), reverse=True)
 
 
-def op_push_show(checkout, request):
+def op_push_show(checkout, request, full=False):
     records = load_proposals(checkout)
     digest = request.get("digest")
     if digest is not None:
@@ -686,7 +759,8 @@ def op_push_show(checkout, request):
     shown = []
     for record in records[:5]:
         proposal = dict(record.get("proposal", {}))
-        proposal["body"] = bounded(proposal.get("body", ""), 4096)[0]
+        if not full:
+            proposal["body"] = bounded(proposal.get("body", ""), 4096)[0]
         shown.append({"digest": record.get("digest"), "status": record.get("status"), "proposed_at": record.get("proposed_at"),
                       "pushed_at": record.get("pushed_at"), "pull_request": record.get("pull_request"), "proposal": proposal})
     return {"proposals": shown, "total": len(records)}
@@ -718,23 +792,58 @@ def converter_image(checkout, values, repo):
 
 
 def export_visible(checkout, destination):
-    """Copy only Git-visible regular files; symlinks and everything else stay behind."""
+    """Copy only visible files, from their verified bytes; everything else stays behind."""
     copied = 0
     for name in checkout.visible():
-        source = checkout.path / name
+        data, info = checkout.load(name)
         target = Path(destination) / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
-        info = os.fstat(descriptor)
-        with os.fdopen(descriptor, "rb") as stream, open(target, "wb") as out:
-            shutil.copyfileobj(stream, out)
+        with open(target, "wb") as out:
+            out.write(data)
         os.chmod(target, 0o755 if info.st_mode & 0o111 else 0o644)
         copied += 1
     return copied
 
 
+TAIL_BYTES = 64 * 1024
+
+
 def docker(argv, timeout):
-    return subprocess.run(argv, capture_output=True, timeout=timeout)
+    """Run, keeping only the last TAIL_BYTES of stdout and stderr: memory stays bounded
+    however much a test prints. Returns (exit code or None on timeout, stdout, stderr)."""
+    import selectors
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    tails = {process.stdout: bytearray(), process.stderr: bytearray()}
+    selector = selectors.DefaultSelector()
+    for stream in tails:
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    while selector.get_map():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            process.kill()
+            process.wait()
+            return None, bytes(tails[process.stdout]), bytes(tails[process.stderr])
+        for key, _ in selector.select(min(remaining, 1.0)):
+            chunk = os.read(key.fileobj.fileno(), 65536)
+            if not chunk:
+                selector.unregister(key.fileobj)
+                continue
+            tail = tails[key.fileobj]
+            tail.extend(chunk)
+            del tail[:-TAIL_BYTES]
+    return process.wait(), bytes(tails[process.stdout]), bytes(tails[process.stderr])
+
+
+def clean_stale_exports(directory):
+    """Exports of a test run killed from outside (e.g. the tool timeout) are removed later."""
+    for path in Path(directory).glob("silo-devtest-*"):
+        try:
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and time.time() - info.st_mtime > 3600:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def op_test(checkout, request, values, repo):
@@ -757,26 +866,26 @@ def op_test(checkout, request, values, repo):
     else:
         refuse("STANDARD_ARGUMENTS_INVALID")
     image = converter_image(checkout, values, repo)
+    clean_stale_exports(tempfile.gettempdir())
     export = tempfile.mkdtemp(prefix="silo-devtest-")
     name = "silo-devtest-" + secrets.token_hex(6)
     started = time.monotonic()
     try:
         os.chmod(export, 0o700)
         copied = export_visible(checkout, export)
+        # The tool itself is killed at ~290 s: keep the container inside that, after the export.
+        budget = max(30, TEST_TIMEOUT - int(time.monotonic() - started))
         if "," in export:
             refuse("STANDARD_OPERATION_FAILED")
-        argv = ["docker", "run", "--rm", "--name", name, "--pull=never", "--network", "none", "--read-only",
+        argv = ["docker", "run", "--rm", "--name", name, "--pull=never", "--network", "none", "--read-only", "--stop-timeout", "5",
                 "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--cpus", "2", "--memory", "2g", "--memory-swap", "2g", "--pids-limit", "512", "--log-opt", "max-size=1m",
                 "--tmpfs", "/tmp:rw,exec,size=512m", "--mount", f"type=bind,src={export},dst=/app",
                 "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8", "-w", "/app",
                 "--entrypoint", command[0], image, *command[1:]]
-        try:
-            result = docker(argv, TEST_TIMEOUT)
-            code, stdout, stderr = result.returncode, result.stdout, result.stderr
-        except subprocess.TimeoutExpired as error:
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
-            code, stdout, stderr = None, error.stdout or b"", error.stderr or b""
+        code, stdout, stderr = docker(argv, budget)
+        if code is None:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
     finally:
         shutil.rmtree(export, ignore_errors=True)
     out, err = stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace")
@@ -790,7 +899,7 @@ def op_test(checkout, request, values, repo):
     return {"suite": suite, "file": file, "exit_code": code, "timed_out": code is None, "files_exported": copied,
             "seconds": round(time.monotonic() - started), "summary": summary[-1] if summary else None,
             "stdout_tail": out_tail, "stdout_truncated": out_cut, "stderr_tail": err_tail, "stderr_truncated": err_cut,
-            "sandbox": "converter image, no network, read-only root, only Git-visible files of the checkout"}
+            "sandbox": "converter image, no network, read-only root, only the files your tools can see"}
 
 
 # -- engineer: push approval -------------------------------------------------------
@@ -813,7 +922,10 @@ def token_for(owner, home):
     return path, token
 
 
-CREDENTIAL_HELPER = '!f() { test "$1" = get || exit 0; echo username=x-access-token; printf "password=%s\\n" "$(cat "$SILO_GITHUB_TOKEN_FILE")"; }; f'
+# Answers only `get` for https://github.com; any other host gets nothing.
+CREDENTIAL_HELPER = ('!f() { test "$1" = get || exit 0; h=; p=; while IFS= read -r l && test -n "$l"; do case "$l" in '
+                     'host=github.com) h=1;; protocol=https) p=1;; esac; done; test "$h$p" = 11 || exit 0; '
+                     'echo username=x-access-token; printf "password=%s\\n" "$(cat "$SILO_GITHUB_TOKEN_FILE")"; }; f')
 
 
 def credential_config(token_path):
@@ -895,6 +1007,26 @@ def write_record(path, record):
 
 # -- dispatch ------------------------------------------------------------------------
 
+OUTPUT_LIMIT = 46 * 1024
+
+
+def fit(result):
+    """Keep the printed JSON (UTF-8, ensure_ascii=False) under the tool limit: shorten the
+    largest text field (keeping the end of *_tail fields) until it fits."""
+    for _ in range(16):
+        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= OUTPUT_LIMIT:
+            return result
+        texts = [key for key, value in result.items() if isinstance(value, str) and len(value) > 256]
+        if not texts:
+            break
+        key = max(texts, key=lambda k: len(result[k].encode("utf-8")))
+        half = len(result[key]) // 2
+        result[key] = ("…[shortened to fit]\n" + result[key][-half:]) if key.endswith("_tail") else (result[key][:half] + "\n…[shortened to fit]\n")
+        result["shortened"] = True
+    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > OUTPUT_LIMIT:
+        refuse("STANDARD_OUTPUT_TOO_LARGE")
+    return result
+
 def main(args, values, base, repo, host, stdin, home=None):
     """`converter dev WS --role ROLE` (JSON request on stdin), `converter push WS --sha256 D [--no-pr]`,
     `converter push-show WS`."""
@@ -921,7 +1053,7 @@ def main(args, values, base, repo, host, stdin, home=None):
             result = op_test(checkout, request, values, repo)
         else:
             result = handlers[op](checkout, request)
-        return dict(version=1, **result)
+        return fit(dict(version=1, **result))
     if len(args) >= 3 and args[1] == "push":
         workspace, rest = args[2], args[3:]
         open_pr = "--no-pr" not in rest
@@ -930,5 +1062,6 @@ def main(args, values, base, repo, host, stdin, home=None):
             refuse("STANDARD_ARGUMENTS_INVALID")
         return dict(version=1, **push(Checkout(base, workspace, host), rest[1], home, open_pr))
     if len(args) == 3 and args[1] == "push-show":
-        return dict(version=1, **op_push_show(Checkout(base, args[2], host), {}))
+        # The engineer's view: full PR text, files and diff stat of every proposal.
+        return dict(version=1, **op_push_show(Checkout(base, args[2], host), {}, full=True))
     refuse("STANDARD_ARGUMENTS_INVALID")

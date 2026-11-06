@@ -187,7 +187,7 @@ class ConverterDevTest(unittest.TestCase):
         self.assertNotIn('customer.sqlite', tracked)
         self.assertNotIn('inputs-link', tracked.split())  # symlink to inputs is outside the checkout
         self.assertNotIn('exports/customer-users.csv', git(self.checkout, 'ls-tree', '-r', '--name-only', 'HEAD'))
-        self.assertEqual('[]\n', (self.root / '.silo-migrate/named/standard/converter-dev-files.json').read_text())
+        self.assertEqual({}, json.loads((self.root / '.silo-migrate/named/standard/converter-dev-files.json').read_text())['files'])
         self.assertEqual('STANDARD_DEV_NOTHING_TO_COMMIT', self.call('commit', message='again')['error'])
 
     def test_commit_identity_from_node_file(self):
@@ -225,6 +225,7 @@ class ConverterDevTest(unittest.TestCase):
             digest = proposed['digest']
             self.assertEqual('silo-migrate-control converter push example-forum --sha256 ' + digest, proposed['approve'])
             self.assertEqual(1, len(proposed['proposal']['commits']))
+            self.assertIn('lib/importer.rb', proposed['proposal']['stat'])
             self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('push', sha256=digest)['error'])
             self.assertEqual('', git(self.origin, 'branch', '--list', 'migration/*'))  # nothing pushed by the agent
             push = lambda d: self.dev.main(['converter', 'push', self.ws, '--sha256', d], {}, self.base, ROOT, self.host, io.StringIO(''), home=str(self.home))
@@ -283,8 +284,70 @@ class ConverterDevTest(unittest.TestCase):
         options, env = self.dev.credential_config(path)
         self.assertNotIn(token, ' '.join(options))
         helper = options[-1].split('=', 1)[1][1:]
-        out = subprocess.run(['sh', '-c', helper + ' get'], capture_output=True, text=True, env=dict(os.environ, **env)).stdout
-        self.assertEqual('username=x-access-token\npassword=' + token + '\n', out)
+        ask = lambda request: subprocess.run(['sh', '-c', helper + ' get'], input=request, capture_output=True, text=True, env=dict(os.environ, **env)).stdout
+        self.assertEqual('username=x-access-token\npassword=' + token + '\n', ask('protocol=https\nhost=github.com\npath=discourse-org/x.git\n\n'))
+        for request in ('protocol=https\nhost=evil.example\n\n', 'protocol=http\nhost=github.com\n\n', 'host=github.com\n\n', ''):
+            with self.subTest(request=request):
+                self.assertEqual('', ask(request))
+
+    # -- review findings: content binding, staged files, branches, output size ------------
+
+    def test_staged_engineer_files_never_reach_diff_or_status(self):
+        git(self.checkout, 'add', '-f', 'exports/customer-users.csv', 'log/convert.log')
+        self.call('edit', path='README.md', old_text='Converter', new_text='Converter tools')
+        for request in ({}, {'path': 'exports'}, {'path': 'log'}, {'scope': 'working'}):
+            with self.subTest(request=request):
+                result = self.call('diff', **request)
+                self.assertNotIn('customer-users', result.get('stat', ''))
+        self.assertEqual([{'status': 'M', 'path': 'README.md'}], self.call('status')['changes'])
+
+    def test_content_changed_outside_the_tools_is_invisible(self):
+        self.call('write', path='lib/created.rb', content='# mine\n')
+        (self.checkout / 'lib/created.rb').write_text(MARKER + '\n')       # e.g. a run writing over it
+        (self.checkout / 'README.md').write_text(MARKER + '\n')            # a tracked file rewritten
+        for path in ('lib/created.rb', 'README.md'):
+            with self.subTest(path=path):
+                self.assertEqual('STANDARD_DEV_PATH_NOT_VISIBLE', self.call('read', path=path)['error'])
+                self.assertEqual('STANDARD_DEV_PATH_NOT_VISIBLE', self.call('edit', path=path, old_text=MARKER, new_text='x')['error'])
+        self.assertEqual([], self.call('search', pattern=MARKER)['matches'])
+        self.assertEqual([], self.call('status')['changes'])
+        self.assertNotIn('README', self.call('diff')['stat'])
+        names = {entry['name'] for entry in self.call('list')['entries']}
+        self.assertNotIn('README.md', names)
+        self.set_identity()
+        self.call('branch', topic='fix')
+        self.assertEqual('STANDARD_DEV_NOTHING_TO_COMMIT', self.call('commit', message='x')['error'])
+        # Nor can the agent overwrite content it can't see: the engineer cleans it up.
+        self.assertEqual('STANDARD_DEV_PATH_NOT_VISIBLE', self.call('write', path='lib/created.rb', content='# mine again\n')['error'])
+        self.assertEqual(MARKER + '\n', (self.checkout / 'lib/created.rb').read_text())
+
+    def test_switching_to_an_untrusted_local_branch_is_refused(self):
+        git(self.checkout, 'switch', '-q', '-c', 'migration/example-forum/evil')
+        git(self.checkout, 'add', '-f', 'exports/customer-users.csv')
+        git(self.checkout, 'commit', '-q', '-m', 'data')
+        git(self.checkout, 'switch', '-q', 'main')
+        self.assertEqual('STANDARD_DEV_BRANCH_UNTRUSTED', self.call('branch', topic='evil')['error'])
+        self.assertEqual('main', git(self.checkout, 'branch', '--show-current'))
+        self.call('branch', topic='mine')
+        git(self.checkout, 'switch', '-q', 'main')
+        self.assertEqual('migration/example-forum/mine', self.call('branch', topic='mine')['branch'])  # its own branch
+
+    def test_non_ascii_output_fits(self):
+        self.call('write', path='lib/accents.rb', content=''.join('# café crème brûlée ☃ ' + str(n) + '\n' for n in range(3000)))
+        for op, extra in (('diff', {}), ('read', {'path': 'lib/accents.rb'})):
+            with self.subTest(op=op):
+                result = self.call(op, **extra)
+                self.assertNotIn('error', result)
+                self.assertLess(len(json.dumps(result, ensure_ascii=False).encode()), 47 * 1024)
+
+    def test_docker_runner_keeps_bounded_tails_and_times_out(self):
+        code, out, err = self.dev.docker([sys.executable, '-c', 'import sys; sys.stdout.write("x" * 5_000_000); sys.stderr.write("e" * 300_000); print("END")'], 60)
+        self.assertEqual(0, code)
+        self.assertLessEqual(len(out), self.dev.TAIL_BYTES)
+        self.assertTrue(out.endswith(b'END\n'))
+        self.assertLessEqual(len(err), self.dev.TAIL_BYTES)
+        code, _, _ = self.dev.docker([sys.executable, '-c', 'import time; time.sleep(30)'], 1)
+        self.assertIsNone(code)
 
     # -- tests in the sandbox ------------------------------------------------------
 
@@ -297,7 +360,8 @@ class ConverterDevTest(unittest.TestCase):
             seen['files'] = sorted(str(p.relative_to(export)) for p in export.rglob('*') if p.is_file())
             seen['text'] = ''.join(p.read_text(errors='replace') for p in export.rglob('*') if p.is_file())
             seen['argv'] = argv
-            return subprocess.CompletedProcess(argv, 0, b'Run options\n3 runs, 5 assertions, 0 failures, 0 errors, 0 skips\n', b'')
+            return 0, b'Run options\n3 runs, 5 assertions, 0 failures, 0 errors, 0 skips\n', b''
+
         self.call('write', path='lib/new.rb', content='# new\n')
         with mock.patch.object(self.dev, 'converter_image', return_value='sha256:' + 'b' * 64), mock.patch.object(self.dev, 'docker', side_effect=fake_docker):
             result = self.call('test', role='reviewer')

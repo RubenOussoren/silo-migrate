@@ -13,7 +13,7 @@ tools:
   enabled: [update_plan]
   custom:
     - name: dev_list
-      description: "List a directory of the workspace's converter checkout (only files Git can see; ignored files are never shown)."
+      description: "List a directory of the workspace's converter checkout: files tracked at HEAD (unchanged, or changed by the developer's tools) and files the developer created. Nothing else is ever shown."
       script: scripts/dev_tool.py
       call: json
       timeout_seconds: 60
@@ -38,7 +38,7 @@ tools:
         required: [workspace, path]
         additionalProperties: false
     - name: dev_search
-      description: "Search the converter checkout (git grep over tracked and non-ignored files). Fixed string by default; fixed=false for an extended regex."
+      description: "Search the same files as dev_list (git grep). Fixed string by default; fixed=false for an extended regex."
       script: scripts/dev_tool.py
       call: json
       timeout_seconds: 60
