@@ -1141,7 +1141,7 @@ def main():
         if saved != current:
             refuse("METAL_PLAN_STALE", "plan SHA/state differs; review a freshly generated plan")
         if not current["plan"]["needs_root"] and not current["plan"]["as_account"]:
-            print("METAL_UNCHANGED: no writes")
+            print("METAL_UNCHANGED: no persistent changes")
             return 0
         if args.command == "apply" and os.geteuid() != 0:
             opts = (["--config", str(Path(args.config).resolve())] if args.config else []) + (["--allow-untested-os"] if args.allow_untested_os else [])

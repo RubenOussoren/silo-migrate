@@ -72,11 +72,23 @@ printf 'KEEP_RELEASES=4\n' | sudo tee -a /opt/metal.conf >/dev/null
 "$M" plan --config /opt/metal.conf --plan /tmp/plan-preserve.json
 "$M" apply --config /opt/metal.conf --plan /tmp/plan-preserve.json
 [[ $before == "$(sudo sha256sum /home/silomig/.config/term-llm/config.yaml)" ]]
-sudo find /srv/silo-migrate -printf '%P %s %T@\n' | sort > /tmp/before
+# Planning may use the private scratch directory transiently (e.g. Docker CLI
+# image inspection with TMPDIR), so only state/tmp's own mtime is excluded; it
+# must be left empty, and every other path's size and mtime must be unchanged.
+snapshot() { sudo find /srv/silo-migrate -printf '%P %s %T@\n' | grep -v '^state/tmp [0-9]* ' | sort; }
+snapshot > /tmp/before
 "$M" plan --config /opt/metal.conf --plan /tmp/plan-again.json
 "$M" apply --config /opt/metal.conf --plan /tmp/plan-again.json
-sudo find /srv/silo-migrate -printf '%P %s %T@\n' | sort > /tmp/after
-cmp /tmp/before /tmp/after
+snapshot > /tmp/after
+if [[ -n $(sudo find /srv/silo-migrate/state/tmp -mindepth 1 -print -quit) ]]; then
+  echo 'ERROR: unchanged apply left scratch entries in state/tmp'; exit 1
+fi
+if ! cmp -s /tmp/before /tmp/after; then
+  # Disposable synthetic VM: path, size and mtime only, never file contents.
+  echo 'IDEMPOTENCY_DIFF (metadata only):'
+  diff /tmp/before /tmp/after | head -20
+  exit 1
+fi
 [[ $before == "$(sudo sha256sum /home/silomig/.config/term-llm/config.yaml)" ]]
 step status
 "$M" status --config /opt/metal.conf

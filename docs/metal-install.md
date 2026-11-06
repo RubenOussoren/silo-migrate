@@ -44,7 +44,12 @@ file containing the plan and SHA256 of its canonical JSON. Use a new filename
 when replanning. Apply recomputes it and refuses *any* difference before root
 steps. A changed branch commit, artifact package, account/config state or
 installer bytes requires fresh review. Successful unchanged re-apply prints
-`METAL_UNCHANGED: no writes`. After account creation the read-only plan/status
+`METAL_UNCHANGED: no persistent changes`. Planning may create and remove
+transient scratch in the private `$SILO_PREFIX/state/tmp`; the Debian VM test
+checks that nothing else under the prefix changes and that scratch is left
+empty. A changed companion helper (`script/package-artifacts`,
+`image_identity.py`, `image_archive.py`) also stales the plan; run from a
+checkout so they sit beside `script/metal`. After account creation the read-only plan/status
 snapshot is taken as that account where the invoking admin cannot traverse the
 0750 prefix. Apply escalates its serialized root phase explicitly; account
 steps still execute as the configured non-root account. Preflight never invokes sudo.
