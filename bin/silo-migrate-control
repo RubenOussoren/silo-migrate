@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Trusted host control launcher; no shell evaluation and no container Git credentials."""
+import fcntl
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ import sys
 
 CONTROL_REF = "ruby@sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b8310d84949240"
 # Same qualified control payload as runtime/profiles/discourse-2026.11.0-latest-3158c750.json.
-CONTROL_CONTENT_ID = "sha256:c04e168879ee10209715c71cf0eb1814e7308fa794329c55ae59c508f1e7d165"
+DEFAULT_PROFILE = "discourse-2026.11.0-latest-3158c750"
 KEYS = {"SILO_MIGRATE_BASE_PATH", "SILO_CONTROL_GEMS", "SILO_CONTROL_SITE_CACHE",
         "SILO_RUNTIME_PROFILES_DIR", "SILO_CONTROL_IMAGE_REF"}
 
@@ -21,7 +22,8 @@ def refuse(code):
 
 
 def capture(args):
-    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=dict(os.environ, GIT_CONFIG_NOSYSTEM="1"))
     if result.returncode:
         refuse("STANDARD_OPERATION_FAILED")
     return result.stdout.strip()
@@ -61,6 +63,12 @@ def settings():
     return values, configured
 
 
+def converter_git(checkout, credentials=False, cwd=None):
+    return ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false", "-c", "safe.directory=" + str(checkout.resolve()),
+            *([] if credentials else ["-c", "credential.helper="]), "-C", str(cwd or checkout)]
+
+
 def host_converter(args, values, base, self):
     if len(args) < 3 or args[1] not in ("clone", "update"):
         refuse("STANDARD_ARGUMENTS_INVALID")
@@ -86,25 +94,63 @@ def host_converter(args, values, base, self):
         repo = opts.get("--repo", "https://github.com/discourse-org/discourse-converters.git")
         branch = opts.get("--branch", "main")
         # Account's Git config, SSH agent and credential helpers remain host-side.
-        capture(["git", "clone", "--branch", branch, "--", repo, str(checkout)])
+        capture(converter_git(checkout, cwd=root) + ["clone", "--branch", branch, "--", repo, str(checkout)])
         print(json.dumps({"version": 1, "status": "cloned"}))
         return 0
     if len(args) != 3 or checkout.is_symlink() or not checkout.is_dir():
         refuse("STANDARD_ARGUMENTS_INVALID")
-    state_path = root / ".silo-migrate/named/standard/state.json"
-    state = json.loads(state_path.read_text())
-    config = state["config"]
-    if Path(config["converter_worktree"]).resolve() != checkout.resolve():
-        refuse("STANDARD_RUNTIME_MISMATCH")
-    branch = config["converter"]["branch"]
-    git = ["git", "-C", str(checkout)]
-    if capture(git + ["status", "--porcelain", "--untracked-files=all"]):
-        refuse("STANDARD_CONVERTER_DIRTY: Commit changes (optionally on a development branch) or stash, then run standard converter refresh.")
-    if branch == "detached" or capture(git + ["rev-parse", "--abbrev-ref", "HEAD"]) != branch:
-        refuse("STANDARD_RUNTIME_MISMATCH")
-    capture(git + ["fetch", "origin"])
-    capture(git + ["merge", "--ff-only", "--", "refs/remotes/origin/" + branch])
+    standard = root / ".silo-migrate/named/standard"
+    # Match StandardStore's op.lock. Never create/truncate it or follow a link.
+    fd = os.open(standard / "op.lock", os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            refuse("STANDARD_BUSY")
+        state = json.loads((standard / "state.json").read_text())
+        if any(run.get("status") in ("claimed", "running") for run in state.get("runs", {}).values()):
+            refuse("STANDARD_BUSY")
+        config = state["config"]
+        if Path(config["converter_worktree"]).resolve() != checkout.resolve():
+            refuse("STANDARD_RUNTIME_MISMATCH")
+        branch = config["converter"]["branch"]
+        git = converter_git(checkout)
+        if capture(git + ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"]):
+            refuse("STANDARD_CONVERTER_DIRTY: Commit changes (optionally on a development branch) or stash, then run standard converter refresh.")
+        if branch == "detached" or capture(git + ["rev-parse", "--abbrev-ref", "HEAD"]) != branch:
+            refuse("STANDARD_RUNTIME_MISMATCH")
+        # Only fetch may use the account's credential helper.
+        capture(converter_git(checkout, credentials=True) + ["fetch", "origin"])
+        capture(git + ["merge", "--ff-only", "--", "refs/remotes/origin/" + branch])
+    finally:
+        os.close(fd)
+    # Refresh takes the same lock itself; it rechecks identity and cleanliness.
     return subprocess.call([str(self), "standard", "converter", "refresh", workspace], env=values)
+
+
+def control_image(repo, values, base, args):
+    profile_name = DEFAULT_PROFILE
+    config = None
+    # Find only syntactically valid, initialized workspace arguments. Grouped
+    # commands (plan/run/dataset/etc.) put WS after the subcommand.
+    candidates = args[1:] if args[:1] == ["start-run"] else args[2:] if args[:1] == ["standard"] else []
+    for workspace in candidates:
+        if re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}", workspace):
+            binding = base / workspace / ".silo-migrate/named/standard/state.json"
+            if binding.is_file():
+                config = json.loads(binding.read_text())["config"]
+                profile_name = config["discourse_profile"]
+                break
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", profile_name):
+        refuse("STANDARD_RUNTIME_MISMATCH")
+    directories = {repo / "runtime/profiles", Path(values.get("SILO_RUNTIME_PROFILES_DIR", str(repo / "runtime/profiles")))}
+    paths = list({p.resolve() for d in directories if (p := d / (profile_name + ".json")).is_file()})
+    if len(paths) != 1:
+        refuse("STANDARD_RUNTIME_MISMATCH")
+    raw = paths[0].read_bytes()
+    if config and hashlib.sha256(raw).hexdigest() != config["discourse_profile_sha256"]:
+        refuse("STANDARD_RUNTIME_MISMATCH")
+    return json.loads(raw)["images"]["control"]
 
 
 def main(args):
@@ -124,8 +170,15 @@ def main(args):
         return host_converter(args, values, base, self)
     image = values.get("SILO_CONTROL_IMAGE_REF", CONTROL_REF) if configured else CONTROL_REF.split("@", 1)[1]
     if configured:
-        document = inspect(image)
-        if identity(document) != CONTROL_CONTENT_ID or not re.fullmatch(r"sha256:[0-9a-f]{64}", document.get("Id", "")):
+        control = control_image(repo, values, base, args)
+        image = values.get("SILO_CONTROL_IMAGE_REF", control["ref"])
+        try:
+            document = inspect(image)
+        except ValueError:
+            if "@sha256:" not in image:
+                raise
+            document = inspect("silo-migrate/loaded:" + control["content_id"][7:])
+        if identity(document) != control["content_id"] or not re.fullmatch(r"sha256:[0-9a-f]{64}", document.get("Id", "")):
             refuse("STANDARD_RUNTIME_MISMATCH")
         image = document["Id"]
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -166,8 +219,7 @@ def main(args):
                    "GEM_HOME": "/gems", "GEM_PATH": "/gems:/gems/ruby/3.3.0", "BUNDLE_PATH": "/gems",
                    "BUNDLE_FROZEN": "true", "BUNDLE_APP_CONFIG": "/tmp/bundle-config", "BUNDLE_AUTO_INSTALL": "false",
                    "BUNDLE_DISABLE_VERSION_CHECK": "true", "RUBYOPT": "-W0", "SILO_MIGRATE_BASE_PATH": str(base),
-                   "SILO_MIGRATE_USER_CONFIG": "/tmp/user-config.env", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_COUNT": "1",
-                   "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*"}
+                   "SILO_MIGRATE_USER_CONFIG": "/tmp/user-config.env", "GIT_CONFIG_NOSYSTEM": "1"}
     for key, value in environment.items():
         command.extend(["-e", key + "=" + value])
     command.extend(["-w", str(repo), image, "bundle", "_2.6.9_", "exec", "ruby", "bin/silo-migrate", *args])

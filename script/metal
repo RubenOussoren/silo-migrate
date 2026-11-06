@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -27,7 +28,7 @@ import urllib.request
 SELF = Path(sys.argv.pop(1)).resolve()
 ROOT = SELF.parent.parent
 PIN = "2d264d175d7f8a7108a3d3530338efa2b81dadcaf5ce02c3d0f701fa88ad3d4e"
-PACKAGES = ("git", "curl", "ca-certificates", "python3", "util-linux", "gzip", "tar")
+PACKAGES = ("git", "curl", "ca-certificates", "python3", "util-linux", "gzip", "tar", "gnupg")
 DEFAULTS = dict(SILO_ACCOUNT="silomig", SILO_PREFIX="/srv/silo-migrate", SILO_WORKSPACES="",
     SILO_REPO="https://github.com/RubenOussoren/silo-migrate.git", SILO_BRANCH="mvp/metal-installer",
     CONVERTER_REPO="https://github.com/discourse-org/discourse-converters.git", CONVERTER_BRANCH="main",
@@ -86,7 +87,7 @@ def run(argv, *, check=True, account=False, root=False, input=None, timeout=120,
                    "LOGNAME=" + entry.pw_name, "PATH=" + str(P / "bin") + ":/usr/local/bin:/usr/bin:/bin",
                    "LANG=C.UTF-8", "TMPDIR=" + str(P/"state/tmp"), "XDG_RUNTIME_DIR=/run/user/" + str(uid),
                    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + str(uid) + "/bus",
-                   "GIT_TERMINAL_PROMPT=0"]
+                   "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1"]
         cmd = (["sudo", "-u", C["SILO_ACCOUNT"], "-H", "--"] if os.geteuid() != uid else []) + envargs + cmd
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1")
     try:
@@ -125,7 +126,7 @@ def output(argv, **kwargs):
     return result.stdout.strip() if result and result.returncode == 0 else None
 
 def git(args, **kwargs):
-    return output(["git", "-c", "credential.helper=", "-c", "core.hooksPath=/dev/null"] + args, **kwargs)
+    return output(["git", "-c", "credential.helper=", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"] + args, **kwargs)
 
 def read_config(path):
     result = dict(DEFAULTS)
@@ -168,6 +169,12 @@ def read_config(path):
         refuse("METAL_CONFIG_INVALID", "invalid port range (maximum 101 ports)")
     if not result["KEEP_RELEASES"].isdigit() or int(result["KEEP_RELEASES"]) < 2:
         refuse("METAL_CONFIG_INVALID", "KEEP_RELEASES must be at least two")
+    result["SILO_PREFIX"] = str(Path(prefix).resolve())
+    workspace = Path(result["SILO_WORKSPACES"]).resolve()
+    managed = Path(result["SILO_PREFIX"])
+    if workspace == managed or workspace in managed.parents or (managed in workspace.parents and workspace != managed / "workspaces"):
+        refuse("METAL_CONFIG_INVALID", "workspace must be separate from prefix or its dedicated workspaces directory")
+    result["SILO_WORKSPACES"] = str(workspace)
     return result
 
 def test_override(name, default):
@@ -240,6 +247,53 @@ def path_state(path):
         return {"exists": False}
     except PermissionError:
         return {"exists": None, "accessible": False}
+
+def directory_chain(path):
+    path = Path(path)
+    return list(reversed(path.parents)) + [path]
+
+def directory_authority(paths):
+    entry = account_entry()
+    allowed = {0} | ({entry.pw_uid} if entry else set())
+    states = {}
+    for path in sorted({p for target in paths for p in directory_chain(target)}, key=str):
+        state = path_state(path)
+        states[str(path)] = state
+        if state.get("exists"):
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in allowed or info.st_mode & 0o022:
+                refuse("METAL_PATH_AUTHORITY", "directory ancestors must be root/account-owned and not group/world writable; symlinks refused")
+        elif state.get("exists") is None:
+            refuse("METAL_PATH_AUTHORITY", "directory ancestor unavailable; inspect as service account")
+    return states
+
+def secure_directory(path, uid, gid):
+    # Walk via pinned directory descriptors: no symlink following or owner repair.
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        parts = Path(path).parts[1:]
+        for index, part in enumerate(parts):
+            created = False
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(part, 0o750, dir_fd=fd)
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                created = True
+            info = os.fstat(child)
+            if created:
+                os.fchown(child, uid, gid)
+            elif info.st_uid not in ({uid} if index == len(parts)-1 else {0, uid}) or info.st_mode & 0o022:
+                os.close(child)
+                refuse("METAL_PATH_AUTHORITY", "unexpected directory owner or writable ancestor; no ownership repair performed")
+            if index == len(parts)-1:
+                os.fchmod(child, 0o750)
+            os.close(fd)
+            fd = child
+    except OSError:
+        refuse("METAL_PATH_AUTHORITY", "unsafe/unavailable directory component; symlinks refused")
+    finally:
+        os.close(fd)
 
 def resolve(repo, branch):
     local = ["--upload-pack=git -c " + shlex.quote("safe.directory=" + repo) + " upload-pack"] if repo.startswith("/") else []
@@ -345,7 +399,7 @@ def artifact():
     pack = module("package_artifacts", "package-artifacts")
     try:
         manifest = pack.verify(C["ARTIFACT_PACKAGE"])
-    except (OSError, ValueError, TypeError, AttributeError, KeyError, AssertionError, tarfile.TarError):
+    except (pack.Invalid, OSError, ValueError, TypeError, AttributeError, KeyError, AssertionError, tarfile.TarError):
         refuse("METAL_ARTIFACT_INVALID", "verify the allowlisted package before applying; no images loaded")
     return dict(id=sha(Path(C["ARTIFACT_PACKAGE"])/"manifest.json"), sha256=sha(Path(C["ARTIFACT_PACKAGE"])/"SHA256SUMS"), manifest=manifest)
 
@@ -364,7 +418,7 @@ def make_plan(allow=False):
     roots, users = [], []
     missing = missing_packages()
     if missing:
-        roots += [{"action": "packages", "packages": missing, "detail": "apt-get update; apt-get install -y --no-upgrade (only missing packages)"}]
+        roots += [{"action": "packages", "packages": missing, "detail": "apt-get update; apt-get install -y --no-upgrade (only missing packages; --no-upgrade does not pin dependencies or prevent new dependency installs and maintainer scripts/services)"}]
     docker = bool(shutil.which("docker"))
     if not docker:
         if C["DOCKER_INSTALL"] == "never":
@@ -374,13 +428,21 @@ def make_plan(allow=False):
             refuse("METAL_DOCKER_CONFLICT", "existing Docker/container runtime packages preserved; resolve missing Docker binary manually")
         if osinfo["id"] != "debian" or osinfo["version"] != "12":
             refuse("METAL_DOCKER_OS_UNTESTED", "automatic official Debian Docker CE install supported on Debian 12 only")
-        roots += [{"action": "docker", "detail": "official Docker Debian bookworm signed-by repository; install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; never remove/replace existing runtime"}]
+        for path in ("/etc/apt/keyrings/docker.asc", "/etc/apt/sources.list.d/docker.list"):
+            if os.path.lexists(path):
+                refuse("METAL_DOCKER_REPO_CONFLICT", "existing Docker key/repository preserved; inspect manually")
+        roots += [{"action": "docker", "detail": "official Docker Debian bookworm signed-by repository; install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; never remove/replace existing runtime; pinned key fingerprint 9DC858229FC7DD38854AE2D88D81803C0EBFCD88; apt maintainer scripts enable/start Docker/containerd and Docker may change iptables/nftables forwarding/NAT rules; --no-upgrade does not pin dependencies"}]
     if not entry:
         roots += [{"action": "account", "detail": "useradd --create-home --home-dir /home/" + C["SILO_ACCOUNT"] + " --shell /bin/bash " + C["SILO_ACCOUNT"]}]
     groups = output(["id", "-nG", C["SILO_ACCOUNT"]]) or ""
     if "docker" not in groups.split():
-        roots += [{"action": "group", "detail": "add account to docker group: ROOT-EQUIVALENT authority"}]
+        roots += [{"action": "group", "detail": "add account to docker group: ROOT-EQUIVALENT authority; an already running user manager must be restarted separately to acquire new supplementary groups"}]
     dirs = [P, W] + [P/p for p in ("bin", "etc", "releases", "term-llm", "control", "control/gems", "control/site-cache", "state", "state/logs", "state/tmp", "state/runtime-profiles")]
+    account_dirs = [home()/part for part in (".config", ".config/term-llm", ".config/term-llm/agents",
+        ".config/term-llm/services/web", ".config/systemd/user", ".local/share/term-llm")]
+    authority = directory_authority(dirs + account_dirs + [P/"term-llm"/C["TERM_LLM_VERSION"]])
+    if C["ARTIFACT_PACKAGE"]:
+        authority.update(directory_authority([Path(C["ARTIFACT_PACKAGE"])]))
     for path in dirs:
         if path.is_symlink():
             refuse("METAL_PATH_CONFLICT", "managed directory is a symlink; inspect ownership manually")
@@ -407,7 +469,7 @@ def make_plan(allow=False):
         packaged = {i["role"]: i for i in package["manifest"]["images"]}
         profile_images = load(Path(C["ARTIFACT_PACKAGE"])/"profile.json")["images"]
         for role, image in sorted(profile_images.items()):
-            inspected = output(["docker", "image", "inspect", image["ref"]])
+            resolved_ref, inspected = inspect_image(image)
             observed = json.loads(inspected) if inspected else None
             local = {"local_id": observed[0]["Id"], "content_id": identity.content_id(observed)} if observed else None
             image_inventory[role] = local
@@ -451,7 +513,7 @@ def make_plan(allow=False):
         dry = digest_bytes(dry.encode())
     elif C["TERM_LLM_SERVICE"] != "skip":
         notes.append("Stock service install --dry-run deferred: pinned binary/account absent; apply runs dry-run before service writes.")
-    return {"format_version": 1, "config": C, "target": target, "state": state, "os": osinfo, "installer_sha256": sha(SELF),
+    return {"format_version": 1, "config": C, "target": target, "state": dict(state, directory_authority=authority), "os": osinfo, "installer_sha256": sha(SELF),
             "needs_root": roots, "as_account": users, "notes": notes, "service_preview_sha256": dry}
 
 def computed_plan(args):
@@ -488,8 +550,15 @@ def symlink(target, link):
     if link.exists() and not link.is_symlink():
         refuse("METAL_PATH_CONFLICT", "managed link conflicts with an existing non-symlink")
     temp = link.with_name(".metal-link-" + str(os.getpid()))
-    os.symlink(str(target), temp)
-    os.replace(temp, link)
+    for stale in link.parent.glob(".metal-link-*"):
+        if stale.is_symlink() and stale.lstat().st_uid == os.geteuid():
+            stale.unlink()
+    try:
+        os.symlink(str(target), temp)
+        os.replace(temp, link)
+    finally:
+        if temp.is_symlink():
+            temp.unlink()
 
 def apply_roots(actions):
     for action in actions:
@@ -501,11 +570,24 @@ def apply_roots(actions):
             # Same signed-by Debian repository route as script/install, no distro replacement/removal.
             if shutil.which("docker"):
                 refuse("METAL_PLAN_STALE", "Docker appeared after planning; re-plan")
-            run(["install", "-m", "0755", "-d", "/etc/apt/keyrings"], root=True)
-            run(["curl", "-fsSL", "https://download.docker.com/linux/debian/gpg", "-o", "/etc/apt/keyrings/docker.asc"], root=True)
-            run(["chmod", "a+r", "/etc/apt/keyrings/docker.asc"], root=True)
+            for path in ("/etc/apt/keyrings/docker.asc", "/etc/apt/sources.list.d/docker.list"):
+                if os.path.lexists(path):
+                    refuse("METAL_DOCKER_REPO_CONFLICT", "existing Docker key/repository preserved")
+            # Download and verify in the approved filesystem, never /tmp.
+            with tempfile.TemporaryDirectory(dir=P/"state/tmp", prefix="docker-key-") as temporary:
+                key = Path(temporary)/"docker.asc"
+                run(["curl", "-fsSL", "https://download.docker.com/linux/debian/gpg", "-o", key])
+                info = output(["gpg", "--batch", "--homedir", temporary, "--with-colons", "--show-keys", key]) or ""
+                primary = [line.split(":")[9] for line in info.splitlines() if line.startswith("fpr:")]
+                if not primary or primary[0] != "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" or sum(line.startswith("pub:") for line in info.splitlines()) != 1:
+                    refuse("METAL_DOCKER_KEY", "Docker signing key fingerprint mismatch")
+                Path("/etc/apt/keyrings").mkdir(mode=0o755, exist_ok=True)
+                with open("/etc/apt/keyrings/docker.asc", "xb") as out:
+                    out.write(key.read_bytes())
+                os.chmod("/etc/apt/keyrings/docker.asc", 0o644)
             repo = "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable\n"
-            run(["tee", "/etc/apt/sources.list.d/docker.list"], root=True, input=repo)
+            with open("/etc/apt/sources.list.d/docker.list", "x") as out:
+                out.write(repo)
             run(["apt-get", "update"], root=True, timeout=600)
             run(["apt-get", "install", "-y", "--no-upgrade", "--no-remove", "docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"], root=True, timeout=900)
         elif kind == "account":
@@ -516,7 +598,7 @@ def apply_roots(actions):
             run(["usermod", "-aG", "docker", C["SILO_ACCOUNT"]], root=True)
         elif kind == "directory":
             entry = pwd.getpwnam(C["SILO_ACCOUNT"])
-            run(["install", "-d", "-m", "0750", "-o", str(entry.pw_uid), "-g", str(entry.pw_gid), action["path"]], root=True)
+            secure_directory(action["path"], entry.pw_uid, entry.pw_gid)
         elif kind == "linger":
             run(["loginctl", "enable-linger", C["SILO_ACCOUNT"]], root=True)
 
@@ -584,15 +666,43 @@ def install_term():
         if flag not in serve_help:
             refuse("METAL_TERM_FLAGS", "pinned serve help does not support required flags")
 
+def inspect_image(image):
+    ref = image["ref"]
+    inspected = output(["docker", "image", "inspect", ref])
+    if not inspected and "@sha256:" in ref:
+        ref = "silo-migrate/loaded:" + image["content_id"][7:]
+        inspected = output(["docker", "image", "inspect", ref])
+    return ref, inspected
+
+def image_tags():
+    listing = output(["docker", "image", "ls", "--no-trunc", "--format", "{{.Repository}}:{{.Tag}} {{.ID}}"])
+    if listing is None:
+        refuse("METAL_IMAGE_INVENTORY", "cannot snapshot Docker image tags")
+    return dict(line.split() for line in listing.splitlines() if not line.startswith("<none>:") and ":<none> " not in line)
+
 def extract_artifacts(release, package):
     if not package:
         return [], "skipped-no-package", ""
+    directory_authority([Path(C["ARTIFACT_PACKAGE"])])
+    # Private account-owned snapshot on the prefix filesystem. Only this copy is
+    # verified/loaded/extracted, and TemporaryDirectory cleans it on every exit.
+    with tempfile.TemporaryDirectory(prefix="package-", dir=P/"state/tmp") as stage:
+        os.chmod(stage, 0o700)
+        root = Path(stage)/"package"
+        shutil.copytree(C["ARTIFACT_PACKAGE"], root, symlinks=True)
+        return extract_artifact_copy(release, package, root)
+
+def extract_artifact_copy(release, package, root):
+    if not package:
+        return [], "skipped-no-package", ""
     pack = module("package_artifacts", "package-artifacts")
-    root = Path(C["ARTIFACT_PACKAGE"])
-    profile = release/"runtime/profiles"/"discourse-2026.11.0-latest-3158c750.json"
+    name = package["manifest"]["profile"]["name"]
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", name):
+        refuse("METAL_ARTIFACT_INVALID", "invalid bound profile filename")
+    profile = release/"runtime/profiles"/(name + ".json")
     try:
         manifest = pack.verify(root, profile)
-    except (OSError, ValueError, TypeError, AttributeError, KeyError, AssertionError, tarfile.TarError):
+    except (pack.Invalid, OSError, ValueError, TypeError, AttributeError, KeyError, AssertionError, tarfile.TarError):
         refuse("METAL_ARTIFACT_INVALID", "package/release profile mismatch; no images loaded")
     if sha(root/"manifest.json") != package["id"] or sha(root/"SHA256SUMS") != package["sha256"]:
         refuse("METAL_PLAN_STALE", "artifact package changed; re-plan")
@@ -601,20 +711,44 @@ def extract_artifacts(release, package):
     identity = module("image_identity", "image_identity.py")
     receipts = []
     for role, image in images.items():
-        existing = output(["docker", "image", "inspect", image["ref"]])
+        resolved_ref, existing = inspect_image(image)
         valid = existing and identity.content_id(json.loads(existing)) == image["content_id"]
         if not valid:
             if role in packaged:
-                # docker load reads gzip directly; never interpolate an archive into a shell.
-                run(["docker", "image", "load", "--input", root/packaged[role]["file"]], timeout=3600)
+                resolved_ref = image["ref"]
+                parser = module("image_archive", "image_archive.py")
+                try:
+                    loaded_id = parser.validate(root/packaged[role]["file"], image, identity)
+                except (ValueError, KeyError, TypeError, tarfile.TarError):
+                    refuse("METAL_IMAGE_ARCHIVE", "archive must contain exactly the bound image and no foreign tags; nothing loaded")
+                before = image_tags()
+                loaded = run(["docker", "image", "load", "--input", root/packaged[role]["file"]], timeout=3600, check=False)
+                after = image_tags()
+                if {k:v for k,v in before.items() if k != image["ref"]} != {k:v for k,v in after.items() if k != image["ref"]}:
+                    refuse("METAL_IMAGE_TAG_CHANGED", "Docker load changed another tag; inspect daemon locally; no automatic tag repair")
+                if not loaded or loaded.returncode:
+                    refuse("METAL_IMAGE_LOAD", "Docker load failed; tag snapshot checked; inspect daemon locally (raw output suppressed)")
+                # Docker load does not recreate registry RepoDigests. Resolve by
+                # validated config ID/content, not by claiming the digest ref exists.
+                if "@sha256:" in image["ref"] and not output(["docker", "image", "inspect", image["ref"]]):
+                    observed = json.loads(output(["docker", "image", "inspect", loaded_id]) or "null")
+                    if not observed or identity.content_id(observed) != image["content_id"]:
+                        refuse("METAL_IMAGE_IDENTITY", "loaded image identity mismatch")
+                    local_ref = "silo-migrate/loaded:" + image["content_id"][7:]
+                    old_tag = after.get(local_ref)
+                    if old_tag and old_tag != loaded_id:
+                        refuse("METAL_IMAGE_TAG_CHANGED", "deterministic local tag already refers to another image")
+                    run(["docker", "image", "tag", loaded_id, local_ref])
+                    resolved_ref = local_ref
             elif image["source"] == "public-digest":
+                resolved_ref = image["ref"]
                 run(["docker", "pull", "--platform", "linux/amd64", image["ref"]], timeout=3600)
             else:
                 refuse("METAL_IMAGE_MISSING", "required package image unavailable")
-        inspect = json.loads(output(["docker", "image", "inspect", image["ref"]]) or "null")
+        inspect = json.loads(output(["docker", "image", "inspect", resolved_ref]) or "null")
         if not inspect or identity.content_id(inspect) != image["content_id"]:
             refuse("METAL_IMAGE_IDENTITY", "image content_id mismatch; preserve package and investigate")
-        receipts.append(dict(role=role, ref=image["ref"], content_id=image["content_id"], local_id=inspect[0]["Id"]))
+        receipts.append(dict(role=role, ref=image["ref"], resolved_ref=resolved_ref, content_id=image["content_id"], local_id=inspect[0]["Id"]))
     gemsha = manifest["gems"]["sha256"]
     gems = P/"control/gems"/gemsha
     if not gems.exists():
@@ -623,7 +757,11 @@ def extract_artifacts(release, package):
             with tarfile.open(root/"gems.tar.gz", "r:gz") as tar:
                 # Explicit extraction works on Debian's Python 3.11 too. The
                 # verifier rejects links, traversal, duplicates and special files.
+                seen = set()
                 for member in tar.getmembers():
+                    if not pack.safe_name(member.name) or not (member.isfile() or member.isdir()) or member.name.rstrip("/") in seen:
+                        refuse("METAL_ARTIFACT_INVALID", "unsafe or duplicate gem archive member")
+                    seen.add(member.name.rstrip("/"))
                     dest = temp/member.name
                     if member.isdir():
                         dest.mkdir(parents=True, exist_ok=True, mode=0o750)
@@ -666,11 +804,35 @@ def switch(release):
     symlink(release, current)
     return previous
 
+def verify_installer(plan):
+    if plan.get("installer_sha256") != sha(SELF):
+        refuse("METAL_PLAN_STALE", "installer changed; review a new plan")
+
+@contextlib.contextmanager
+def install_lock():
+    path = P/"state/install.lock"
+    directory_authority([path.parent])
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        entry = account_entry()
+        if os.geteuid() == 0 and entry:
+            os.fchown(fd, entry.pw_uid, entry.pw_gid)
+        if not stat.S_ISREG(os.fstat(fd).st_mode) or os.fstat(fd).st_nlink != 1 or os.fstat(fd).st_uid not in ({0, entry.pw_uid} if entry else {0}) or os.fstat(fd).st_mode & 0o022:
+            refuse("METAL_BUSY", "invalid installer lock")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            refuse("METAL_BUSY", "another installer operation holds install.lock")
+        yield
+    finally:
+        os.close(fd)
+
 def account_apply(saved):
     global STAGE
     if os.geteuid() != pwd.getpwnam(C["SILO_ACCOUNT"]).pw_uid:
         refuse("METAL_ACCOUNT_REQUIRED", "account actions must run as configured service account")
     plan = saved["plan"]
+    verify_installer(plan)
     STAGE = "TERM_DOWNLOAD"
     install_term()
     print("METAL_TERM_VERIFIED", flush=True)
@@ -761,6 +923,22 @@ def idle_guard():
         for fd in opened:
             os.close(fd)
 
+def verify_release_images(release, bound):
+    if not bound:
+        return [], "skipped-no-package"
+    name = bound["manifest"]["profile"]["name"]
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", name):
+        refuse("METAL_UPDATE_IMAGES", "invalid bound profile")
+    profile = module("package_artifacts", "package-artifacts").profile_read(release/"runtime/profiles"/(name + ".json"))
+    identity = module("image_identity", "image_identity.py")
+    receipts = []
+    for role, image in profile["images"].items():
+        ref, observed = inspect_image(image)
+        if not observed or identity.content_id(json.loads(observed)) != image["content_id"]:
+            refuse("METAL_UPDATE_IMAGES", "bound profile requires unavailable/mismatched local images; no pull/load performed")
+        receipts.append(dict(role=role, ref=image["ref"], resolved_ref=ref, content_id=image["content_id"], local_id=json.loads(observed)[0]["Id"]))
+    return receipts, "verified"
+
 def account_update(rollback=False, branch=None, term=False):
     with idle_guard():
         old = load(P/"state/install-manifest.json")
@@ -773,14 +951,6 @@ def account_update(rollback=False, branch=None, term=False):
             if not release.is_dir():
                 refuse("METAL_NO_ROLLBACK", "previous release directory missing")
             target = next(item for item in reversed(history) if item["commit"] == prev).copy()
-            if term:
-                previous_bin = P/"bin/term-llm.previous"
-                if not previous_bin.is_symlink() or not previous_bin.resolve().is_file():
-                    refuse("METAL_NO_TERM_ROLLBACK", "no previous term-llm version retained")
-                active = (P/"bin/term-llm").resolve()
-                symlink(previous_bin.resolve(), P/"bin/term-llm")
-                symlink(active, previous_bin)
-                target["term_llm_version"] = (P/"bin/term-llm").resolve().parent.name
         else:
             selected = branch or C["SILO_BRANCH"]
             commit = resolve(C["SILO_REPO"], selected)
@@ -789,25 +959,29 @@ def account_update(rollback=False, branch=None, term=False):
                 return
             release = fetch_release(commit)
             target = dict(old, commit=commit, branch=selected)
-            # Update must never load/pull images; new profile must be satisfiable locally.
-            profile_files = list((release/"runtime/profiles").glob("*.json"))
-            identity = module("image_identity", "image_identity.py")
-            for profile in profile_files:
-                for image in load(profile)["images"].values():
-                    inspected = output(["docker", "image", "inspect", image["ref"]])
-                    if old.get("image_verification") == "verified" and (not inspected or identity.content_id(json.loads(inspected)) != image["content_id"]):
-                        refuse("METAL_UPDATE_IMAGES", "new profile requires unavailable images; provision through a separately reviewed apply")
+        bound = target.get("artifact_package")
+        images, verification = verify_release_images(release, bound)
+        target["images"] = images
+        target["image_verification"] = verification
+        if rollback and term:
+            previous_bin = P/"bin/term-llm.previous"
+            if not previous_bin.is_symlink() or not previous_bin.resolve().is_file():
+                refuse("METAL_NO_TERM_ROLLBACK", "no previous term-llm version retained")
+            active = (P/"bin/term-llm").resolve()
+            symlink(previous_bin.resolve(), P/"bin/term-llm")
+            symlink(active, previous_bin)
+            target["term_llm_version"] = (P/"bin/term-llm").resolve().parent.name
         previous = switch(release)
         for key in ("installed_at", "operation", "previous_commit"):
             target.pop(key, None)
         record(target, "rollback" if rollback else "update", previous)
         if not rollback:
-            protected = {release.resolve(), (P/"previous").resolve()}
+            protected = {release.name, (P/"previous").resolve().name}
             dirs = sorted((p for p in (P/"releases").iterdir() if p.is_dir() and not p.is_symlink() and re.fullmatch(r"[0-9a-f]{40}", p.name)), key=lambda p:p.stat().st_mtime, reverse=True)
             retained = set(protected)
             for path in dirs:
-                if path in protected or len(retained) < int(C["KEEP_RELEASES"]):
-                    retained.add(path)
+                if path.name in protected or len(retained) < int(C["KEEP_RELEASES"]):
+                    retained.add(path.name)
                 else:
                     shutil.rmtree(path)  # Exact managed release directories only, never workspaces/images/backups.
         print("METAL_ROLLBACK_OK" if rollback else "METAL_UPDATE_OK")
@@ -877,7 +1051,7 @@ def status():
         if image_state == "verified":
             identity = module("image_identity", "image_identity.py")
             for image in manifest.get("images", []):
-                inspected = output(["docker", "image", "inspect", image["ref"]], account=True)
+                inspected = output(["docker", "image", "inspect", image.get("resolved_ref", image["ref"])], account=True)
                 if not inspected or identity.content_id(json.loads(inspected)) != image["content_id"]:
                     image_state = "mismatch-or-unavailable"
                     break
@@ -892,7 +1066,7 @@ def status():
 def main():
     global C, P, W
     parser = argparse.ArgumentParser(description="Debian 12/amd64 single-account installer; no host Ruby/Node/compiler")
-    parser.add_argument("command", choices=("preflight", "plan", "apply", "verify", "update", "status", "rollback", "artifacts", "_account-apply", "_account-update", "_account-rollback"))
+    parser.add_argument("command", choices=("preflight", "plan", "apply", "verify", "update", "status", "rollback", "artifacts", "_account-apply", "_account-update", "_account-rollback", "_locked-apply"))
     parser.add_argument("extra", nargs="*")
     parser.add_argument("--config")
     parser.add_argument("--json", action="store_true")
@@ -933,6 +1107,9 @@ def main():
                 print("Needs root" if section == "needs_root" else "As " + C["SILO_ACCOUNT"])
                 for i, action in enumerate(plan["plan"][section], 1):
                     print(str(i) + ". " + action["detail"] + (" " + action["path"] if "path" in action else "") + (" " + shlex.join(action["argv"]) if "argv" in action else ""))
+            print("Directory authority (all ancestors, bound into plan SHA):")
+            for path, state in plan["plan"]["state"]["directory_authority"].items():
+                print(path + " " + canonical(state))
             print("\n".join(plan["plan"]["notes"]))
             print("Plan SHA256: " + plan["sha256"])
         if args.plan:
@@ -941,26 +1118,62 @@ def main():
             with os.fdopen(fd, "w") as stream:
                 json.dump(plan, stream, indent=2, sort_keys=True)
                 stream.write("\n")
-    elif args.command == "apply":
+    elif args.command in ("apply", "_locked-apply"):
         if not args.plan:
             parser.error("apply requires --plan FILE")
         saved = load(args.plan)
+        verify_installer(saved["plan"])
         current = envelope(computed_plan(args))
         if saved != current:
             refuse("METAL_PLAN_STALE", "plan SHA/state differs; review a freshly generated plan")
         if not current["plan"]["needs_root"] and not current["plan"]["as_account"]:
             print("METAL_UNCHANGED: no writes")
             return 0
-        apply_roots(current["plan"]["needs_root"])
-        if current["plan"]["as_account"]:
-            # Pass approved plan via stdin, not a world-readable temporary file.
-            confargs = ["--config", str(Path(args.config).resolve())] if args.config else []
-            run([SELF, "_account-apply"] + confargs, account=True, input=canonical(saved), timeout=7200)
+        if args.command == "apply" and os.geteuid() != 0:
+            opts = (["--config", str(Path(args.config).resolve())] if args.config else []) + (["--allow-untested-os"] if args.allow_untested_os else [])
+            result = run([SELF, "_locked-apply", "--plan", str(Path(args.plan).resolve())] + opts, root=True, timeout=7200)
+            print(result.stdout.strip())
+            return 0
+        # Only the lock's missing parent directories precede serialization.
+        # No account/package/service mutation occurs until install.lock is held.
+        entry = account_entry()
+        bootstrap = []
+        for directory in (P, P/"state", P/"state/tmp"):
+            if not directory.exists():
+                secure_directory(directory, entry.pw_uid if entry else 0, entry.pw_gid if entry else 0)
+                bootstrap.append(directory)
+        with install_lock():
+            if not entry:
+                run(["useradd", "--create-home", "--home-dir", "/home/" + C["SILO_ACCOUNT"], "--shell", "/bin/bash", C["SILO_ACCOUNT"]], root=True)
+                entry = account_entry()
+                for directory in bootstrap:
+                    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        if os.fstat(fd).st_uid != 0:
+                            refuse("METAL_PATH_AUTHORITY", "bootstrap directory ownership changed")
+                        os.fchown(fd, entry.pw_uid, entry.pw_gid)
+                    finally:
+                        os.close(fd)
+                os.chown(P/"state/install.lock", entry.pw_uid, entry.pw_gid, follow_symlinks=False)
+            # Recheck authority and installer after acquiring serialization.
+            directory_authority([P, W, home()])
+            verify_installer(saved["plan"])
+            locked = make_plan(args.allow_untested_os)
+            expected_state = {k:v for k,v in saved["plan"]["state"].items() if k != "directory_authority"}
+            observed_state = {k:v for k,v in locked["state"].items() if k != "directory_authority"}
+            if locked["target"] != saved["plan"]["target"] or expected_state != observed_state:
+                refuse("METAL_PLAN_STALE", "installation changed before lock acquisition; re-plan")
+            verify_installer(saved["plan"])
+            apply_roots([a for a in current["plan"]["needs_root"] if a["action"] != "account"])
+            if current["plan"]["as_account"]:
+                confargs = ["--config", str(Path(args.config).resolve())] if args.config else []
+                run([SELF, "_account-apply"] + confargs, account=True, input=canonical(saved), timeout=7200)
         print("METAL_APPLY_OK")
     elif args.command == "_account-apply":
         saved = json.load(sys.stdin)
         if saved != envelope(saved["plan"]) or saved["plan"]["config"] != C:
             refuse("METAL_PLAN_STALE", "internal plan/config mismatch")
+        verify_installer(saved["plan"])
         if (P/"state/install-manifest.json").exists():
             with idle_guard():
                 account_apply(saved)
@@ -974,7 +1187,8 @@ def main():
     elif args.command in ("_account-update", "_account-rollback"):
         if os.geteuid() != pwd.getpwnam(C["SILO_ACCOUNT"]).pw_uid:
             refuse("METAL_ACCOUNT_REQUIRED", "run update/rollback through service account")
-        account_update(args.command == "_account-rollback", args.branch, args.term_llm)
+        with install_lock():
+            account_update(args.command == "_account-rollback", args.branch, args.term_llm)
     elif args.command == "verify":
         entry = account_entry()
         if entry and os.geteuid() not in (0, entry.pw_uid):

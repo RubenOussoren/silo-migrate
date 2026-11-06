@@ -111,7 +111,10 @@ module SiloMigrate
 
       def converter_identity(worktree)
         git = lambda do |*args|
-          result = @runtime.run(["git", "-C", worktree, *args], capture: true, timeout: 30)
+          result = @runtime.run(["env", "GIT_CONFIG_NOSYSTEM=1", "git", "-c", "core.hooksPath=/dev/null",
+                                 "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+                                 "-c", "credential.helper=", "-c", "safe.directory=#{File.realpath(worktree)}",
+                                 "-C", worktree, *args], capture: true, timeout: 30)
           raise StandardWorkflowError, "STANDARD_RUNTIME_MISMATCH" unless result.success?
           result.stdout.to_s.strip
         end
@@ -121,7 +124,7 @@ module SiloMigrate
         # Strip URL userinfo, including passwords/tokens; handle scp-style SSH too.
         repo = repo.sub(%r{(\A[a-z][a-z0-9+.-]*://)[^/]*@}i, '\\1').sub(/\A[^\/@:]+@(?=[^\/]+:)/, "")
         { "repo" => repo, "branch" => git.call("rev-parse", "--abbrev-ref", "HEAD").sub(/\AHEAD\z/, "detached"),
-          "commit" => commit, "dirty" => !git.call("status", "--porcelain", "--untracked-files=all").empty? }
+          "commit" => commit, "dirty" => !git.call("--no-optional-locks", "status", "--porcelain", "--untracked-files=all").empty? }
       end
 
       def converter_status
@@ -131,7 +134,11 @@ module SiloMigrate
 
       def converter_refresh
         @store.with_op_lock do
-          config = @store.load.fetch("config")
+          state = @store.load
+          if state.fetch("runs").values.any? { |run| %w[claimed running].include?(run["status"]) }
+            raise StandardWorkflowError, "STANDARD_BUSY"
+          end
+          config = state.fetch("config")
           identity = converter_identity(config.fetch("converter_worktree"))
           raise StandardWorkflowError, "STANDARD_CONVERTER_DIRTY" if identity.fetch("dirty")
           @store.update do |state|

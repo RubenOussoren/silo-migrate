@@ -81,9 +81,10 @@ def verify(directory, profile_path=None):
     require(manifest["profile"]["file"] == "profile.json", "invalid profile path")
     require(sha(root / "profile.json") == manifest["profile"]["sha256"], "profile checksum mismatch")
     if profile_path:
+        require(Path(profile_path).name == manifest["profile"]["name"] + ".json", "release profile filename mismatch")
         require(sha(profile_path) == manifest["profile"]["sha256"], "release profile mismatch")
     profile = profile_read(root / "profile.json")
-    require(manifest["profile"]["name"] == profile["recipe"], "profile name mismatch")
+    require(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", manifest["profile"]["name"]), "invalid profile name")
     expected = {"manifest.json", "profile.json", "gems.tar.gz", "site_settings.yml"}
     roles = set()
     for image in manifest["images"]:
@@ -151,7 +152,7 @@ def package(args):
     shutil.copyfile(args.profile, out / "profile.json")
     shutil.copyfile(site, out / "site_settings.yml")
     manifest = {"format_version": 1, "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "profile": {"name": profile["recipe"], "file": "profile.json", "sha256": sha(args.profile)}, "images": []}
+                "profile": {"name": Path(args.profile).stem, "file": "profile.json", "sha256": sha(args.profile)}, "images": []}
     for role, image in profile["images"].items():
         if image["source"] != "package" and not args.include_public:
             continue

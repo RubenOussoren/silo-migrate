@@ -64,7 +64,7 @@ class ControlWrapperTest < SiloMigrateTest
                   raise AssertionError('accepted wrong payload')
               except ValueError as error:
                   assert str(error) == 'STANDARD_RUNTIME_MISMATCH'
-              with patch.dict(globals_, CONTROL_CONTENT_ID=expected), patch('pathlib.Path.stat', return_value=Stat()):
+              with patch.dict(globals_, control_image=lambda *args: {'content_id': expected, 'ref': 'local:control'}), patch('pathlib.Path.stat', return_value=Stat()):
                   try:
                       wrapper['main'](['standard', 'runtime', 'list'])
                   except RuntimeError as error:
@@ -98,7 +98,7 @@ class ControlWrapperTest < SiloMigrateTest
           with patch.dict(globals_, capture=capture):
               with contextlib.redirect_stdout(io.StringIO()):
                   wrapper['host_converter'](['converter', 'clone', 'synthetic'], {}, base, self)
-              assert commands == [['git', 'clone', '--branch', 'main', '--', 'https://github.com/discourse-org/discourse-converters.git', str(root / 'converter')]]
+              assert commands == [wrapper['converter_git'](root / 'converter', cwd=root) + ['clone', '--branch', 'main', '--', 'https://github.com/discourse-org/discourse-converters.git', str(root / 'converter')]]
               checkout = root / 'converter'
               checkout.mkdir()
               try:
@@ -108,13 +108,14 @@ class ControlWrapperTest < SiloMigrateTest
                   assert str(error) == 'STANDARD_CONVERTER_EXISTS'
               standard = marker / 'standard'
               standard.mkdir()
+              (standard / 'op.lock').touch()
               (standard / 'state.json').write_text(json.dumps({'config': {'converter_worktree': str(checkout), 'converter': {'branch': 'main'}}}))
               commands.clear()
               with patch('subprocess.call', return_value=0) as call:
                   assert wrapper['host_converter'](['converter', 'update', 'synthetic'], {}, base, self) == 0
                   call.assert_called_once_with([str(self), 'standard', 'converter', 'refresh', 'synthetic'], env={})
-              assert ['git', '-C', str(checkout), 'fetch', 'origin'] in commands
-              assert ['git', '-C', str(checkout), 'merge', '--ff-only', '--', 'refs/remotes/origin/main'] in commands
+              assert wrapper['converter_git'](checkout, credentials=True) + ['fetch', 'origin'] in commands
+              assert wrapper['converter_git'](checkout) + ['merge', '--ff-only', '--', 'refs/remotes/origin/main'] in commands
               assert not any('reset' in command for command in commands)
           with patch.dict(globals_, capture=lambda args: '?? dirty'):
               try:

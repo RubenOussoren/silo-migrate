@@ -5,10 +5,13 @@ compilers. It is a Bash `set -euo pipefail` entry point with an isolated Python
 stdlib engine (`python3 -I`), shared with the package/identity tools. Debian 12
 amd64 is the supported target. Python 3 and Bash are bootstrap requirements
 (the Debian cloud image includes them); the planner installs only missing
-packages from its documented prerequisite list, without upgrades/removals.
+packages from its documented prerequisite list, with `--no-upgrade --no-remove`.
+These flags do not pin versions or prevent new dependency installs or package
+maintainer scripts from enabling/starting services.
 
 **This is not customer-data isolation, target deployment approval or hosted
-acceptance.** Docker group membership is root-equivalent. No Hub registration,
+acceptance.** Docker group membership is root-equivalent. The term-llm service bearer token
+is therefore also a **root-equivalent credential**, not a narrow migration API key. No Hub registration,
 provider credentials, extension installation, memory mining, jobs or cron are
 configured. Existing Docker installations, running containers and existing
 account term-llm configuration are preserved. Do not run verification against a
@@ -43,7 +46,8 @@ steps. A changed branch commit, artifact package, account/config state or
 installer bytes requires fresh review. Successful unchanged re-apply prints
 `METAL_UNCHANGED: no writes`. After account creation the read-only plan/status
 snapshot is taken as that account where the invoking admin cannot traverse the
-0750 prefix; only root changes use root sudo. Preflight never invokes sudo.
+0750 prefix. Apply escalates its serialized root phase explicitly; account
+steps still execute as the configured non-root account. Preflight never invokes sudo.
 
 Preflight reports OS, architecture, logical/physical CPUs, load, total/available
 RAM, swap use and optional `vmstat 1 3` si/so sample, `/tmp` filesystem/usage,
@@ -69,6 +73,15 @@ sized against other workloads on migrations05. Engineer-supplied hardware/OS
 beliefs are not baked into detection. RAID, LUKS and boot/EFI changes are out of
 scope. Existing Docker, including docker.io, is never replaced with Docker CE.
 
+The root plan's Docker action refuses existing `/etc/apt/keyrings/docker.asc`
+and `/etc/apt/sources.list.d/docker.list`; neither is overwritten. It verifies
+Docker's primary signing fingerprint
+`9DC858229FC7DD38854AE2D88D81803C0EBFCD88` with GnuPG before publishing the key.
+The plan explicitly reports that apt maintainer scripts may enable/start
+Docker/containerd and Docker can change iptables/nftables forwarding/NAT rules.
+This is not a no-services/no-firewall operation on the installation target.
+These root effects are **not executed by the offline regression tests**.
+
 ## Files and service
 
 Managed directories are owned by the regular account with mode 0750. Existing
@@ -77,7 +90,18 @@ recursively chowned. Releases are detached clean checkouts under
 `releases/<commit>`; `current` and `previous` switch atomically. No data is copied
 from the engineer's home. Large downloads, release/cache staging and child
 `TMPDIR` use **`$SILO_PREFIX/state/tmp`**, never the host's RAM-backed `/tmp`.
-Docker loads directly from each package's gzip file; no extra image tar staging.
+Apply copies the entire package into an account-owned **0700** temporary
+snapshot under `state/tmp`, verifies that copy against the approved hashes, and
+uses only the snapshot for load/extraction. It is removed on success or failure.
+Plan records UID/GID/mode for the package directory and **all** ancestors of it,
+managed directories, the workspace and account home. Root/account ownership and
+no group/world-write are required, even on sticky temporary directories. Deliver
+packages to an appropriate trusted filesystem, not `/tmp`. Managed directory
+creation walks directory descriptors with `O_NOFOLLOW`, refuses wrong owners,
+and never recursively repairs ownership. Prefix is canonicalised once during
+configuration; workspaces may be separate or exactly `P/workspaces`, never
+elsewhere overlapping the prefix. Stale installer-owned `.metal-link-*` symlinks
+are cleaned without deleting ordinary files.
 
 The pinned term-llm v0.9.93 linux_amd64 archive must match **both** the installer
 SHA256 `2d264d175d7f8a7108a3d3530338efa2b81dadcaf5ce02c3d0f701fa88ad3d4e`
@@ -88,7 +112,9 @@ and release `checksums.txt`. A binary hash receipt detects later corruption.
 - `SILO_MIGRATE_BASE_PATH`: workspace root;
 - `SILO_CONTROL_GEMS`: content-addressed extracted gem cache;
 - `SILO_CONTROL_SITE_CACHE`: **the `site_settings.yml` file**, not its directory;
-- `SILO_RUNTIME_PROFILES_DIR`: `current/runtime/profiles`.
+- `SILO_RUNTIME_PROFILES_DIR`: `state/runtime-profiles` (server-local candidates,
+  **not** a second mount of the release's own `runtime/profiles`). Empty/different
+  local profiles leave release names resolvable; a duplicate name is refused.
 
 The shim exports `SILO_CONTROL_CONFIG` and execs the installed control wrapper.
 No artifact package means a deliberately **not migration-ready**, shell/service
@@ -128,6 +154,29 @@ credential variable name, **never its value**. Do not pass token/API-key values
 on argv, paste them into config, or use service token output in logs. Hub
 registration is opt-in only after an approved Hub and access policy.
 
+**Token authority:** checked `term-llm serve --help`, `term-llm agents --help`
+and `--version` on the installed **0.9.93** binary, without starting a server.
+`--agent migration-operator` selects the startup agent; it is not an agent
+allowlist. The official [agents guide](https://term-llm.com/guides/agents/)
+describes named agent selection and native Web/CLI handovers to other agents
+with their own tool permissions. The [Web guide](https://term-llm.com/guides/web-ui-and-api/)
+also documents an authenticated interactive shell and explicitly says a shared
+bearer token represents one operator security domain. Thus a token holder must
+be trusted as the service account, including choosing other available agents;
+prompt approval and `--no-projects` are not a security boundary against that
+operator. This is documentation/help evidence, **not** a live HTTP authorization
+probe. Do not distribute this token to restricted/customer users.
+
+Per the [official service guide](https://term-llm.com/guides/background-services/#where-credentials-live),
+Linux secrets are mode-0600 files in the private
+`~/.config/term-llm/services/web/` directory (or the corresponding
+`$XDG_CONFIG_HOME` location), alongside `service.json`; the launch specification
+contains names, not values. No token/secret file was opened for this check.
+`service token web` explicitly discloses it: never capture that output in logs.
+An existing systemd user manager does not acquire `usermod -aG docker` changes
+until it is restarted/newly started; schedule an explicitly approved manager
+restart/logout, not merely a unit daemon-reload or service restart.
+
 `state/install-manifest.json` and `state/history.jsonl` record repository/branch/
 commit, term version/archive SHA, package id/checksum, image refs/content_ids/
 local ids, config and plan hashes, operation and timestamps. Logs in
@@ -161,12 +210,34 @@ members and profile mismatch are refused. SHA256SUMS covers every other file
 No `.runtime-cache` tree, config, sessions or memory is copied wholesale.
 
 Before extraction/load, apply verifies the package against the exact release
-profile, then verifies **every** runtime image plus control by portable
+profile filename (`manifest.profile.name + ".json"`), then verifies **every**
+runtime image plus control by portable
 content_id. IDs retain the `sha256:` prefix; control's profile identity is
 `sha256:c04e168879ee10209715c71cf0eb1814e7308fa794329c55ae59c508f1e7d165`.
 `python3 -I script/image_identity.py REF` or `--inspect-json FILE` canonicalises
 architecture, OS, diff IDs and Cmd/Entrypoint/Env/User/WorkingDir, with UTF-8
-(non-ASCII not escaped) matching Ruby. These are not Docker local image IDs.
+(non-ASCII not escaped) matching Ruby. These are not Docker local image IDs. Missing Architecture/OS normalises to
+an empty string; shared Unicode/control-character Env fixtures test Ruby,
+Python and the wrapper. The wrapper reads control's identity from the bound
+profile (including its persisted profile SHA), never a fixed content ID.
+
+Before Docker sees an image tar, a stdlib parser checks `manifest.json` and/or
+OCI `index.json`: exactly one image, matching config digest, actual uncompressed
+layer SHA256/diff_ids and expected content ID. Docker RepoTags must be `[]` or
+exactly `[expected_ref]`; foreign OCI reference annotations are refused too.
+All existing tags are snapshotted using `docker image ls --no-trunc --format`
+before/after load. Any unrelated tag change refuses with
+`METAL_IMAGE_TAG_CHANGED`; it is reported, **not automatically rolled back**.
+This also detects concurrent unrelated retagging conservatively.
+
+A Docker archive is not proof that a registry digest reference was restored.
+If `docker image inspect ORIGINAL_DIGEST_REF` cannot resolve after load, the
+installer inspects the validated config image ID, requires its content ID, then
+tags `silo-migrate/loaded:<content-id-hex>` (refusing a conflicting existing tag).
+Receipts distinguish original `ref` and actual `resolved_ref`; wrapper, Ruby
+resolver, status and update/rollback validate this fallback by content too.
+The digest-missing daemon behavior is simulated in tests here, **not exercised
+with a real image load**. Real large-package ingestion remains unqualified.
 
 ## Verify, update and rollback
 
@@ -185,12 +256,25 @@ engineer-approves a plan, starts/polls the exact run (one-hour timeout), require
 SHA. Success resets that run unless `--keep`; failed runs are retained for exact
 status/recover/reset with a fixed failure code. Evidence and backups survive reset.
 
+Apply/update/rollback are serialized by nonblocking exclusive
+`P/state/install.lock` for their mutating phases (including the account child).
+First installation must create the lock's missing parent directories before
+opening it; no account/package/service/release mutation precedes that lock.
+The approved installer SHA is rechecked in the account child and immediately
+before root actions. Apply rechecks mutable state after acquiring the lock.
+
 Update/rollback hold nonblocking exclusive locks on the existing host execution
-lock and every existing workspace op.lock and reject claimed/running registry
-state. No lock files are created by these commands. Update clones a new detached
-release, checks locally available image identities when previously verified,
+lock `W/.silo-standard-execution.lock` (the **same path/inode** used by
+`StandardStore#with_host_lock`) and every existing workspace op.lock and reject claimed/running registry
+state. Workspace lock files are never created by these commands; the installer
+lock is maintained separately. Update clones a new detached
+release, re-derives all image receipts from the bound release profile and
+checks local content IDs regardless of old verification. Rollback performs the
+same fresh gate. No package binding means `images=[]` and
+`image_verification=skipped-no-package`, never inherited `verified`. Update
 switches/records and prunes only managed commit directories beyond KEEP_RELEASES
-while protecting current and previous. It never pulls images or alters
+while protecting current and previous by release **name**, including through
+a symlinked prefix ancestor. It never pulls images or alters
 workspaces, converter checkouts, backups or image data. Rollback uses history and
 the retained previous release and deletes nothing. Neither command restarts the
 term service; schedule a separate explicitly approved restart if needed.
@@ -273,3 +357,41 @@ is supplied. Re-apply of an existing installation now also holds the same idle
 locks as update/rollback. These final package/planning safeguards were covered by
 the host suite, together with a no-workspace-on-insufficient-capacity verify
 gate; the real large-package/full-verify path remains unrun.
+
+
+## Independent-review fixes (offline, 2026-11-05)
+
+Converter Git (host clone/status/fetch/merge and container identity/status) uses
+`GIT_CONFIG_NOSYSTEM=1`, disabled hooks, fsmonitor and untracked cache, and an
+exact checkout `safe.directory`; status also uses `--no-optional-locks`.
+Credential helpers are disabled except the explicit host fetch. Converter update
+holds the workspace `op.lock` across checks/fetch/merge and refuses claimed or
+running runs. Refresh takes its own op.lock and also refuses those states.
+The lock is released before the separate refresh subprocess to avoid a
+self-deadlock; refresh revalidates cleanliness and identity under its own lock.
+
+Current review regression evidence supersedes earlier host-test counts above.
+No VM harness, real host installer apply, real-workspace control operation,
+Docker load/pull/build/tag or host package/service mutation ran in this fix task.
+Real local fixture Git/fsmonitor/hooks, lock contention, filesystem pruning,
+private snapshot cleanup and tiny synthetic Docker/OCI tar parsing are exercised;
+Docker tag inventory/load/inspect and root provisioning paths are mocked.
+
+Final bounded verification for this fix set:
+
+- `timeout 300 python3 -I -B -m unittest discover -s test/metal -p 'test_*.py'`:
+  **44 tests, 0 failures/errors/skips**.
+- Full isolated Ruby suite: **698 runs, 6395 assertions, exactly the 3 expected
+  InstallServiceTest baseline failures, 0 errors, 1 DockerIntegration skip**;
+  seed `20261105`. Pinned image
+  `sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b8310d84949240`,
+  `--rm`, network none, read-only root/source/gems, private scratch bind,
+  1 CPU / 1 GiB / 128 PIDs, `RUN_DOCKER_TESTS=0`, 300-second timeout.
+- `bash -n script/metal`, Python AST syntax checks and `git diff --check` pass.
+- Disk before and after: `/dev/sda2` 139G total, 52G used, **80G available**
+  (40%). Scratch was confined to `../../.runtime-cache/metal-review-fix-tmp/`
+  and removed after verification; no image tarballs retained.
+
+The three baseline failures are Bundler 2.5.22 versus expected 2.6.9 output,
+a pre-existing shell preset dry-run assertion, and a pre-existing installer
+fetch-versus-clone dry-run assertion. Their assertions were not weakened.

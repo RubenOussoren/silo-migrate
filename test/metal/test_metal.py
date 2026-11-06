@@ -17,6 +17,11 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+SCRATCH = ROOT / "../../.runtime-cache/metal-review-fix-tmp"
+SCRATCH.mkdir(parents=True, exist_ok=True, mode=0o700)
+# A test runner's permissive umask must not make authority fixtures unsafe.
+os.umask(0o022)
+tempfile.tempdir = str(SCRATCH.resolve())
 
 
 def module(name, filename):

@@ -31,6 +31,10 @@ module SiloMigrate
 
     def resolve(runtime, image)
       result = runtime.run(["docker", "image", "inspect", image.fetch("ref")], capture: true, timeout: 30)
+      if !result.success? && image.fetch("ref").include?("@sha256:")
+        local_ref = "silo-migrate/loaded:#{image.fetch('content_id').delete_prefix('sha256:')}"
+        result = runtime.run(["docker", "image", "inspect", local_ref], capture: true, timeout: 30)
+      end
       raise StandardWorkflowError, "STANDARD_RUNTIME_MISMATCH" unless result.success?
 
       documents = JSON.parse(result.stdout)

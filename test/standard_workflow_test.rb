@@ -30,7 +30,7 @@ class StandardScriptedRuntime < SiloMigrate::Runtime::Fake
       else
         'wrong-image'
       end
-    elsif cmd.first == 'git'
+    elsif cmd.include?('git')
       if cmd.include?('status') then converter_dirty ? '?? untracked.txt' : ''
       elsif cmd.include?('--abbrev-ref') then converter_branch || 'main'
       elsif cmd.include?('rev-parse') then converter_head || 'a' * 40

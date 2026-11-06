@@ -12,7 +12,7 @@ def content_id(inspect):
             raise ValueError("expected exactly one image")
         inspect = inspect[0]
     config = inspect.get("Config") or {}
-    obj = {"architecture": inspect["Architecture"], "os": inspect["Os"],
+    obj = {"architecture": inspect.get("Architecture") or "", "os": inspect.get("Os") or "",
            "diff_ids": (inspect.get("RootFS") or {}).get("Layers") or [],
            "config": {k: config.get(k) or ([] if k in ("Cmd", "Entrypoint", "Env") else "")
                       for k in ("Cmd", "Entrypoint", "Env", "User", "WorkingDir")}}

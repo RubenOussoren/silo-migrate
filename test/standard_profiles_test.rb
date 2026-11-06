@@ -153,3 +153,73 @@ class StandardFullRunTest
     end
   end
 end
+
+class StandardProfilesTest
+  def test_control_char_identity_matches_shared_python_and_wrapper_fixture
+    fixture = File.join(__dir__, 'fixtures/image-inspect-controls.json')
+    expected = File.read(fixture.sub('.json', '.content_id')).strip
+    assert_equal expected, SiloMigrate::ImageIdentity.content_id(JSON.parse(File.read(fixture)).first)
+  end
+
+  def test_metal_release_and_separate_server_local_profiles_mount_layout
+    with_standard do
+      local = File.join(File.dirname(@code_root), 'state', 'runtime-profiles')
+      FileUtils.mkdir_p(local)
+      profiles = SiloMigrate::RuntimeProfiles.new(code_root: @code_root,
+        env: { 'SILO_RUNTIME_PROFILES_DIR' => local }, runtime: @runtime)
+      name = SiloMigrate::RuntimeProfiles::DEFAULT
+      assert_equal profile_path, profiles.path(name), 'empty server-local mount must not hide release profiles'
+      FileUtils.cp(profile_path, File.join(local, 'different-candidate.json'))
+      assert_equal profile_path, profiles.path(name), 'different server-local profile is not ambiguous'
+      FileUtils.cp(profile_path, File.join(local, name + '.json'))
+      standard_error('STANDARD_RUNTIME_MISMATCH') { profiles.path(name) }
+    end
+  end
+
+  def test_converter_identity_and_status_disable_live_git_code_execution
+    with_standard do
+      checkout = @service.store.load.fetch('config').fetch('converter_worktree')
+      git = lambda do |*args|
+        _out, err, status = Open3.capture3('git', '-c', 'core.hooksPath=/dev/null', '-C', checkout, *args)
+        assert status.success?, err
+      end
+      git.call('init', '-b', 'main')
+      git.call('config', 'user.email', 'fixture@example.test')
+      git.call('config', 'user.name', 'Fixture')
+      File.write(File.join(checkout, 'tracked'), 'synthetic')
+      git.call('add', '.')
+      git.call('commit', '-m', 'fixture')
+      git.call('remote', 'add', 'origin', 'https://example.test/converter.git')
+      marker = File.join(File.dirname(checkout), 'executed')
+      monitor = File.join(File.dirname(checkout), 'monitor')
+      File.write(monitor, "#!/bin/sh\ntouch #{marker}\nprintf '\\0'\n")
+      File.chmod(0o700, monitor)
+      git.call('config', 'core.fsmonitor', monitor)
+      %w[post-merge post-checkout].each do |hook|
+        path = File.join(checkout, '.git/hooks', hook)
+        File.write(path, "#!/bin/sh\ntouch #{marker}\n")
+        File.chmod(0o700, path)
+      end
+      Open3.capture3('git', '-C', checkout, 'status', '--porcelain')
+      assert File.exist?(marker), 'live fsmonitor fixture must execute without hardening'
+      File.unlink(marker)
+      @service.instance_variable_set(:@runtime, SiloMigrate::Runtime::Docker.new)
+      assert_equal false, @service.converter_identity(checkout).fetch('dirty')
+      assert_equal false, @service.converter_status.fetch(:dirty)
+      refute File.exist?(marker), 'identity/status must never execute converter code'
+    end
+  end
+
+  def test_host_execution_lock_is_exactly_the_metal_workspace_base_lock
+    with_standard do
+      @service.store.with_host_lock(wait: 0) do
+        path = File.join(@env.fetch('SILO_MIGRATE_BASE_PATH'), '.silo-standard-execution.lock')
+        assert File.file?(path)
+        File.open(path, File::RDONLY | File::NOFOLLOW) do |lock|
+          refute lock.flock(File::LOCK_EX | File::LOCK_NB), 'installer and StandardStore must contend on same inode'
+        end
+      end
+    end
+  end
+
+end

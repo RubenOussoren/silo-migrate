@@ -154,7 +154,7 @@ class StandardCompleteRuntime < StandardScriptedRuntime
     text = cmd.join(' ')
     if %w[network volume container].include?(cmd[1]) && cmd[2] == 'inspect' && !cmd.include?('--format')
       return response('', success: cmd[1] == occupied_kind)
-    elsif cmd.first == 'git' && cmd.include?('rev-parse')
+    elsif cmd.include?('git') && cmd.include?('rev-parse')
       return recorded
     elsif cmd.include?('./convert')
       write_intermediate(service.store.run_dir(current_run['id'], 'work', 'converter-output', 'intermediate.sqlite'))
