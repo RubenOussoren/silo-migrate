@@ -106,7 +106,15 @@ if [[ $scenario == full ]]; then
   step synthetic-full-verify
   # Owned by the service account so its host git accepts the local repository.
   sudo chown -R silomig:silomig /opt/converter-repo.git
-  "$M" verify --config /opt/metal.conf
+  if ! "$M" verify --config /opt/metal.conf; then
+    # Disposable synthetic VM only: failure records and assertion lists, bounded;
+    # never logs, password or env files.
+    echo 'VERIFY_FAILURE_EVIDENCE (synthetic VM; failure records only, 4 KiB each):'
+    sudo find /srv/silo-migrate/workspaces -path '*/runs/*' -size -64k \
+      \( -path '*/private/failure.json' -o -path '*/evidence/*.failures.json' \) -print0 |
+      sudo xargs -0 -r -n1 sh -c 'echo "== ${1#/srv/silo-migrate/workspaces/}"; head -c 4096 "$1"; echo' _
+    exit 1
+  fi
 else
   echo 'SKIPPED: artifact loading and full synthetic verify (1 vCPU/1GiB guest); NOT migration-ready acceptance'
 fi
