@@ -99,6 +99,29 @@ class InstallerTests(unittest.TestCase):
         self.m.C = dict(self.m.DEFAULTS)
         self.assertFalse(any(a.startswith("--hub") or a == "--secrets-file" for a in self.m.service_args()))
 
+    def test_web_service_offers_only_migration_agents(self):
+        args = self.m.service_args()
+        self.assertNotIn("--agent", args)
+        for flag in ("--no-projects", "--disable-extensions", "--disable-widgets"):
+            self.assertIn(flag, args)
+        self.assertEqual("prompt", args[args.index("--approval") + 1])
+        self.assertIn("agents:\n  use_builtin: false\n", self.m.FRESH_CONFIG)
+        P = self.m.P
+        (P/"bin").mkdir(parents=True)
+        (P/"bin/term-llm").write_text("")
+        (self.home/".config/term-llm").mkdir(parents=True)
+        (self.home/".config/term-llm/config.yaml").write_text("providers: {}\n")
+        self.m.C["TERM_LLM_SERVICE"] = "install"
+        for value, refused in (("true", True), (None, True), ("false", False)):
+            with self.subTest(value=value), self.plan_stubs(), patch.object(self.m, "builtin_agents_off", return_value=value == "false"), \
+                    patch.object(self.m, "artifact", return_value=None), patch.object(self.m, "hub_secrets_state", return_value=None):
+                if refused:
+                    with self.assertRaisesRegex(self.m.Refusal, "METAL_AGENTS_BUILTIN"):
+                        self.m.make_plan()
+                else:
+                    plan = self.m.make_plan()
+                    self.assertTrue(any("agent picker" in note for note in plan["notes"]))
+
     def test_hub_secrets_file_metadata_only_and_strict(self):
         entry = pwd.getpwuid(os.getuid())
         secret_dir = self.root/"secret"

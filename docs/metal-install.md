@@ -147,8 +147,14 @@ especially before any customer data. Same-user agents are not OS isolation.
 
 Confirmed against the **real 0.9.93 binary's help**: `service install web`,
 `--binary`, `--no-start`, `--dry-run`, and serve flags `--host`, `--port`,
-`--auth bearer`, `--approval prompt`, `--agent migration-operator`, `--no-projects`,
-`--disable-extensions`, `--disable-widgets`. Plan uses stock service dry-run when
+`--auth bearer`, `--approval prompt`, `--no-projects`, `--disable-extensions`,
+`--disable-widgets`. No startup agent is pinned: with `--agent` the web UI hides its
+agent picker. Instead the account's config sets `agents.use_builtin: false`, so the
+picker offers only `migration-operator` and `migration-analyst` (plus term-llm's plain
+"Default" chat). Fresh configs get this; for an existing config, plan and apply refuse
+(`METAL_AGENTS_BUILTIN`) until it is set, because built-in shell agents would
+otherwise run with the account's Docker authority. Verified against a throwaway
+0.9.93 web server: the page lists exactly those two agents. Plan uses stock service dry-run when
 the installed binary/account exist, otherwise explicitly defers it; apply runs
 it before writing service files. `install` writes without starting;
 `install-and-start` additionally enables/starts; `skip` changes neither linger nor
@@ -215,8 +221,8 @@ dry-run with these exact flags was checked against the real 0.9.93 binary
 
 **Token authority:** checked `term-llm serve --help`, `term-llm agents --help`
 and `--version` on the installed **0.9.93** binary, without starting a server.
-`--agent migration-operator` selects the startup agent; it is not an agent
-allowlist. The official [agents guide](https://term-llm.com/guides/agents/)
+Disabling built-in agents narrows the picker; it is not an authorization
+boundary. The official [agents guide](https://term-llm.com/guides/agents/)
 describes named agent selection and native Web/CLI handovers to other agents
 with their own tool permissions. The [Web guide](https://term-llm.com/guides/web-ui-and-api/)
 also documents an authenticated interactive shell and explicitly says a shared

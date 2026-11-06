@@ -51,6 +51,10 @@ serve:
   auto_title: false
   projects:
     enabled: false
+# The web UI's agent picker then offers only the linked migration agents; built-in
+# shell-capable agents would otherwise run with this account's Docker authority.
+agents:
+  use_builtin: false
 """
 
 class Refusal(Exception):
@@ -427,7 +431,7 @@ def service_args(dry=False):
     hub = (["--hub-url", C["HUB_URL"], "--hub-node-id", C["HUB_NODE_ID"]] + (["--hub-node-name", C["HUB_NODE_NAME"]] if C["HUB_NODE_NAME"] else [])
            + ["--hub-connect", "reverse", "--hub-register"]) if C["HUB_URL"] else []
     return ([str(P/"bin/term-llm"), "service", "install", "web", "--binary", str(P/"bin/term-llm"), "--no-start"] + (["--dry-run"] if dry else []) + secrets
-            + ["--", "--host", "127.0.0.1", "--port", C["TERM_LLM_PORT"], "--auth", "bearer", "--approval", "prompt", "--agent", "migration-operator", "--no-projects", "--disable-extensions", "--disable-widgets"] + hub)
+            + ["--", "--host", "127.0.0.1", "--port", C["TERM_LLM_PORT"], "--auth", "bearer", "--approval", "prompt", "--no-projects", "--disable-extensions", "--disable-widgets"] + hub)
 
 def hub_secrets_state(entry):
     # Metadata only: the file holds TERM_LLM_HUB_REGISTRATION_TOKEN and is never read or hashed here.
@@ -446,6 +450,12 @@ def hub_secrets_state(entry):
         refuse("METAL_HUB_SECRETS", "HUB_SECRETS_FILE must be a regular single-link file owned by the service account, mode 0600")
     directory_authority([path.parent])
     return {"path": str(path), "uid": info.st_uid, "mode": oct(info.st_mode & 0o7777), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
+
+def builtin_agents_off(as_account=True):
+    # Without --agent the web UI offers every agent term-llm knows, so the installed
+    # service requires built-in agents to be disabled in the account's own config.
+    value = output([P/"bin/term-llm", "config", "get", "agents.use_builtin"], account=as_account)
+    return value == "false"
 
 def make_plan(allow=False):
     osinfo = os_check(allow)
@@ -547,6 +557,10 @@ def make_plan(allow=False):
              "Capacity gate for actual migration: 4 CPUs, 8 GiB RAM, 40 GiB new + 8 GiB reserve on each relevant filesystem."]
     if (home()/".config/term-llm").exists():
         notes.append("Existing term-llm config directory PRESERVED; safety/routing of existing config requires engineer review before customer use.")
+    if C["TERM_LLM_SERVICE"] != "skip" and (P/"bin/term-llm").exists() and (home()/".config/term-llm/config.yaml").exists() and entry \
+            and not builtin_agents_off():
+        refuse("METAL_AGENTS_BUILTIN", "existing term-llm config preserved; add 'agents:' with 'use_builtin: false' to the service account's config.yaml, then re-plan (built-in shell agents would run with Docker authority)")
+    notes.append("Web UI agent picker: only the linked migration-operator and migration-analyst (agents.use_builtin: false); no pinned startup agent.")
     dry = None
     binary = P/"bin/term-llm"
     if C["TERM_LLM_SERVICE"] != "skip" and binary.exists() and entry:
@@ -929,6 +943,8 @@ def account_apply(saved):
         if unit.exists() and not spec.exists():
             refuse("METAL_SERVICE_CONFLICT", "existing unmanaged service preserved; migrate manually")
         STAGE = "SERVICE_PREVIEW"
+        if not builtin_agents_off(as_account=False):
+            refuse("METAL_AGENTS_BUILTIN", "add 'agents:' with 'use_builtin: false' to the service account's term-llm config.yaml, then re-plan")
         run(service_args(True))
         STAGE = "SERVICE_INSTALL"
         run(service_args())
