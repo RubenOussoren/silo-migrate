@@ -42,6 +42,7 @@ module SiloMigrate
       Trusted analyst path (separate private investigation session only):
         analyst evidence WORKSPACE RUN_ID
         finding propose WORKSPACE --run RUN_ID --file PATH|- [--kind finding|reproduction]
+        finding propose WORKSPACE --kind schema --file PATH|-   (source schema; no run)
 
       Conversational adapter (safe projections only):
         agent status WORKSPACE
@@ -212,8 +213,11 @@ module SiloMigrate
       workspace = positional!(args)
       case action
       when "propose"
-        opts = options!(args, "--run", "--file", "--kind", optional: %w[--kind])
-        findings(workspace).propose(run_id: opts.fetch("--run"), text: read_bounded(opts.fetch("--file")), kind: opts.fetch("--kind", "finding"))
+        # A schema finding describes the source, not a run: it has no --run.
+        opts = options!(args, "--run", "--file", "--kind", optional: %w[--run --kind])
+        kind = opts.fetch("--kind", "finding")
+        invalid! unless (kind == "schema") == opts["--run"].nil?
+        findings(workspace).propose(run_id: opts["--run"], text: read_bounded(opts.fetch("--file")), kind: kind)
       when "review"
         identifier = positional!(args)
         no_more!(args)

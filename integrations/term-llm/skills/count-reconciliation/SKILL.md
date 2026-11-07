@@ -1,0 +1,32 @@
+---
+name: count-reconciliation
+description: Compare record counts across a migration - source, intermediate database and Discourse destination - and explain every difference. Use after a conversion or import run, or when the engineer asks whether everything arrived.
+---
+
+# Count reconciliation
+
+Compare, per entity, three numbers: **source** (what should migrate), **intermediate**
+(what the converter wrote, e.g. discourse-converters' intermediate database) and
+**destination** (what Discourse imported). For a merge or delta, compare against what
+was already in the destination before the run too.
+
+| Entity | Source filter to agree on first |
+| --- | --- |
+| users | exclude guests/bots/system accounts; banned and inactive count separately |
+| groups, group members | custom groups only; built-in groups map to Discourse's own |
+| categories | forums/categories; link forums usually become permalinks, not categories |
+| topics | visible + unapproved + soft-deleted, each separately |
+| posts | including first posts; per visibility state |
+| private messages | conversations vs messages (one PM to 5 people may be 1 topic) |
+| polls, votes; likes; tags | as present in the source |
+| uploads | attachments in records, files present, files imported |
+| permalinks | old URLs covered |
+
+Explain every non-zero difference with a **reason and a count**, for example: skipped by
+design (spam users, empty forums), merged (duplicate emails into one user), dropped by an
+error (see the run's logs), unsupported by the importer, or a source filter mismatch.
+"About right" is not a result. A difference with no explanation is a finding.
+
+Report a table: entity, source, intermediate, destination, difference, reason. Say which
+numbers were measured and which were taken from earlier reports. Never include real
+names or values; counts and categories are enough.

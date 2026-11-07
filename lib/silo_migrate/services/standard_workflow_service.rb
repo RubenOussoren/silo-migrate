@@ -1196,7 +1196,7 @@ module SiloMigrate
         upload = base_fp.fetch("uploads").find { |candidate| candidate["file_sha256"] == expected }
         failures = []
         failures << "sandbox-upload-absent" unless upload
-        failures.concat(attachment_http_failures(run_id, stack.record.fetch("port"), upload, sandbox, "sandbox")) if upload
+        failures.concat(attachment_http_failures(run_id, stack.record.fetch("port"), upload, expected, "sandbox")) if upload
         assert_clean!(run_id, "baseline_seed", failures, "STANDARD_VERIFY_FAILED")
         @store.update do |state|
           state.fetch("runs").fetch(run_id).fetch("artifacts")["sandbox_attachment"] = { "sha256" => expected, "bytes" => sandbox.bytesize, "sha1" => upload.fetch("sha1") }
@@ -1336,8 +1336,9 @@ module SiloMigrate
       def expected_for(run_id)
         inputs = run_inputs(run_id)
         expected = JSON.parse(File.read(input_path(run_id, typed_input(inputs, "expected"))))
-        uploads = inputs.select { |input| input["type"] == "upload" }
-        [expected, uploads.map { |input| input["sha256"] }, uploads.to_h { |input| [input["sha256"], File.binread(input_path(run_id, input))] }]
+        # The run's bound checksums stand for the upload bytes: served files are compared
+        # by SHA-256, so no upload is read into memory here, whatever its size.
+        [expected, inputs.select { |input| input["type"] == "upload" }.map { |input| input["sha256"] }]
       end
 
       def stage_verify_site(run_id)
@@ -1346,10 +1347,10 @@ module SiloMigrate
         evidence(run_id, "site.imported.json", site)
         state = @store.load
         base = JSON.parse(File.read(@store.run_dir(run_id, "evidence", "baseline.fingerprint.json")))
-        expected, attachments, bytes = expected_for(run_id)
+        expected, attachments = expected_for(run_id)
         failures = StandardOracle.baseline_failures(base, site)
         failures.concat(StandardOracle.imported_failures(expected, site, attachment_sha256s: attachments, baseline: base))
-        failures.concat(http_content_failures(run_id, stack, site, expected, attachments, bytes, state, "review"))
+        failures.concat(http_content_failures(run_id, stack, site, expected, attachments, state, "review"))
         failures.concat(database_count_failures(stack, base, expected))
         assert_clean!(run_id, "site", failures, "STANDARD_VERIFY_FAILED")
         record_results(run_id, **measured_counts(site, attachments))
@@ -1362,13 +1363,13 @@ module SiloMigrate
       end
 
       # Real downloads over the published loopback port, compared byte for byte.
-      def http_content_failures(run_id, stack, site, expected, attachments, bytes, state, label)
+      def http_content_failures(run_id, stack, site, expected, attachments, state, label)
         port = stack.record.fetch("port")
         failures = []
         sandbox = state.fetch("runs").fetch(run_id).dig("artifacts", "sandbox_attachment")
         sandbox_upload = sandbox && site.fetch("uploads").find { |upload| upload["sha1"] == sandbox["sha1"] }
         if sandbox_upload
-          failures.concat(attachment_http_failures(run_id, port, sandbox_upload, SANDBOX_ATTACHMENT, "#{label}-sandbox"))
+          failures.concat(attachment_http_failures(run_id, port, sandbox_upload, Digest::SHA256.hexdigest(SANDBOX_ATTACHMENT), "#{label}-sandbox"))
         else
           failures << "sandbox-upload-record-missing"
         end
@@ -1376,7 +1377,7 @@ module SiloMigrate
           upload = site.fetch("uploads").find { |candidate| candidate["file_sha256"] == sha }
           next failures << "source-upload-record-missing" unless upload
 
-          failures.concat(attachment_http_failures(run_id, port, upload, bytes.fetch(sha), "#{label}-source"))
+          failures.concat(attachment_http_failures(run_id, port, upload, sha, "#{label}-source"))
         end
         # Public JSON, independent of the fingerprint script's process.
         latest = @http.call("http://127.0.0.1:#{port}/latest.json", 2_000_000)
@@ -1393,15 +1394,15 @@ module SiloMigrate
         failures
       end
 
-      def attachment_http_failures(run_id, port, upload, expected, label)
+      def attachment_http_failures(run_id, port, upload, expected_sha256, label)
         failures = []
         [["direct", upload.fetch("url")], ["short", upload.fetch("short_path")]].each do |kind, path|
           response = @http.call("http://127.0.0.1:#{port}#{path}", 1_048_576)
-          unless response.fetch(:status) == 200 && response.fetch(:body).b == expected.b
+          unless response.fetch(:status) == 200 && Digest::SHA256.hexdigest(response.fetch(:body).b) == expected_sha256
             failures << "attachment-http-#{label}-#{kind}:#{response.fetch(:status)}"
           end
         end
-        evidence(run_id, "http-#{label}.json", { "url" => upload["url"], "short_path" => upload["short_path"], "sha256" => Digest::SHA256.hexdigest(expected), "failures" => failures })
+        evidence(run_id, "http-#{label}.json", { "url" => upload["url"], "short_path" => upload["short_path"], "sha256" => expected_sha256, "failures" => failures })
         failures
       end
 
@@ -1447,7 +1448,7 @@ module SiloMigrate
       def stage_final_backup(run_id)
         stack = stack_for(run_id, "review")
         site = JSON.parse(File.read(@store.run_dir(run_id, "evidence", "site.imported.json")))
-        _expected, attachments, _bytes = expected_for(run_id)
+        _expected, attachments = expected_for(run_id)
         sandbox = @store.load.fetch("runs").fetch(run_id).dig("artifacts", "sandbox_attachment")
         required = site.fetch("uploads").select { |upload| attachments.include?(upload["file_sha256"]) || upload["sha1"] == sandbox["sha1"] }.map { |upload| archive_member(upload) }
         raise StandardWorkflowError.new("STANDARD_BACKUP_FAILED", "required uploads") if required.size != attachments.size + 1
@@ -1589,12 +1590,12 @@ module SiloMigrate
         restored = fingerprint(stack)
         evidence(run_id, "site.restored.json", restored)
         map = { source.dig("runtime", "base_url") => restored.dig("runtime", "base_url") }
-        expected, attachments, bytes = expected_for(run_id)
+        expected, attachments = expected_for(run_id)
         base = JSON.parse(File.read(@store.run_dir(run_id, "evidence", "baseline.fingerprint.json")))
         failures = StandardOracle.runtime_failures(restored, lock)
         failures.concat(StandardOracle.restored_failures(source, restored, base_url_map: map))
         failures.concat(StandardOracle.imported_failures(expected, restored, attachment_sha256s: attachments, baseline: base))
-        failures.concat(http_content_failures(run_id, stack, restored, expected, attachments, bytes, state, "restore"))
+        failures.concat(http_content_failures(run_id, stack, restored, expected, attachments, state, "restore"))
         failures.concat(database_count_failures(stack, base, expected))
         failures.concat(no_input_mount_failures(stack))
         assert_clean!(run_id, "restore", failures, "STANDARD_RESTORE_FAILED")

@@ -16,7 +16,9 @@ module SiloMigrate
     # an OS sandbox; OS/container isolation of the analyst is a separate control.
     class StandardFindingsService
       MAX_BYTES = 256 * 1024
-      KINDS = %w[finding reproduction].freeze
+      # schema: tables, columns, counts and invented examples of a source, proposed by the
+      # data agent from the project's source data. It belongs to no run.
+      KINDS = %w[finding reproduction schema].freeze
       EVIDENCE_TAIL_BYTES = 16 * 1024
       # term-llm 0.9.93 cuts a custom tool's output at 50 KiB (DefaultOutputLimits.MaxBytes),
       # mid-JSON. The whole evidence document stays under this so it always arrives intact.
@@ -50,9 +52,13 @@ module SiloMigrate
         raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless KINDS.include?(kind) && text.is_a?(String) && text.bytesize.between?(1, MAX_BYTES) && text.valid_encoding?
 
         id = @store.new_id("finding")
+        raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless (kind == "schema") == run_id.nil?
+
         @store.update do |state|
-          raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless state.fetch("runs").key?(run_id)
-          raise StandardWorkflowError, "STANDARD_RUN_COMPLETED" if state.fetch("runs").fetch(run_id)["status"] == "completed"
+          unless kind == "schema"
+            raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless state.fetch("runs").key?(run_id)
+            raise StandardWorkflowError, "STANDARD_RUN_COMPLETED" if state.fetch("runs").fetch(run_id)["status"] == "completed"
+          end
 
           @store.write_private(@store.finding_dir(id, "private", "proposal.txt"), text)
           state.fetch("findings")[id] = { "id" => id, "run_id" => run_id, "kind" => kind, "status" => "proposed", "proposed_at" => Time.now.utc.iso8601,

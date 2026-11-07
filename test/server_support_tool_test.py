@@ -37,6 +37,7 @@ class ServerSupportToolTest(unittest.TestCase):
         self.write(self.prefix / 'state/tmp/upload-part', 'CUSTOMER-ROW alice@example.test')
         self.write(self.prefix / 'workspaces/acme/inputs/source.sql', 'CUSTOMER-ROW')
         self.write(self.outside_workspaces / 'acme/inputs/source.sql', 'CUSTOMER-ROW')
+        self.write(self.prefix / 'intake/acme/forum.sql', 'CUSTOMER-ROW')
         config = self.home / '.config/term-llm'
         self.write(config / 'config.yaml', '\n'.join([
             'default_provider: chatgpt',
@@ -141,12 +142,14 @@ class ServerSupportToolTest(unittest.TestCase):
     def test_workspaces_and_service_temp_are_refused_even_through_links(self):
         for path in (self.prefix / 'workspaces/acme/inputs/source.sql', self.prefix / 'workspaces', self.outside_workspaces / 'acme/inputs/source.sql',
                      self.prefix / 'state/tmp/upload-part', self.home / '.config/term-llm/ws-link/inputs/source.sql',
-                     self.home / '.config/term-llm/agents/tmp-link', str(self.prefix / 'state') + '/../workspaces/acme/inputs/source.sql'):
+                     self.home / '.config/term-llm/agents/tmp-link', str(self.prefix / 'state') + '/../workspaces/acme/inputs/source.sql',
+                     self.prefix / 'intake/acme/forum.sql', self.prefix / 'intake', str(self.prefix / 'state') + '/../intake/acme/forum.sql'):
             with self.subTest(path=path):
                 result, raw = self.read(path)
                 self.assertEqual('SUPPORT_PATH_REFUSED_CUSTOMER_DATA', result['error'])
                 self.assertNotIn('CUSTOMER-ROW', raw)
         self.assertEqual('SUPPORT_PATH_REFUSED_CUSTOMER_DATA', self.call('support_list_dir', {'path': str(self.prefix / 'workspaces')})[0]['error'])
+        self.assertEqual('SUPPORT_PATH_REFUSED_CUSTOMER_DATA', self.call('support_list_dir', {'path': str(self.prefix / 'intake')})[0]['error'])
 
     def test_configured_workspaces_parsing_fails_closed(self):
         inside = self.prefix / 'state/ws'

@@ -14,7 +14,7 @@ account is root-equivalent through Docker anyway, but keep the release sealed (`
 
 | Command | What it does |
 | --- | --- |
-| `silo doctor` | Checks the release and installer checkout, update source, web service, agents, ChatGPT/Frontier/Claude sign-ins, GitHub token, commit identity, Docker, disk and the read-only release; prints the exact fix for anything wrong. Nothing secret is printed. |
+| `silo doctor` | Checks the release and installer checkout, update source, web service, agents, skills link, ChatGPT/Frontier/Claude sign-ins, GitHub token, commit identity, Docker, disk and the read-only release; prints the exact fix for anything wrong. Nothing secret is printed. |
 | `silo update [--branch B]` | (root) Pulls the installer checkout (fast-forward only), runs `metal update`, restarts the web service, then `silo doctor`. Branch defaults to the installed one. |
 | `silo use-github` | (root, once) Points `SILO_REPO` in `/etc/silo-migrate/metal.conf` and the installer checkout at GitHub (silo-migrate is public), after checking GitHub is reachable; keeps a timestamped backup of the config. From then on updates need no copied bundles. `CONVERTER_REPO` is left as it is: `metal plan` resolves it without a token; workspaces clone the private converter with `converter clone WS --repo https://github.com/discourse-org/discourse-converters.git` and the token file. |
 | `silo restart` | Restarts the term-llm web service (ends open web chats). |
@@ -34,8 +34,46 @@ scp -r EXPORT-FILES SERVER:/srv/silo-migrate/intake/mybb-acme/
 ssh SERVER silo intake mybb-acme          # hands the files to the service account, shows a count
 ```
 
-Sorting, converting and registering the files is the Frontier-only data agent's job (next
-release), guided by skills; no other agent reads customer files.
+Then open a chat with **migration-data** (Frontier only) in the web UI, for example:
+"Workspace mybb-acme: take the export from the drop folder, register it, load it into the
+source database, and tell me the forum software and version, table prefix, charset and the
+main row counts. Then propose a schema finding with invented examples."
+
+## The data agent (migration-data)
+
+migration-data is the only agent that handles customer data. Its tools (no approval prompts;
+each is a fixed operation of `silo-migrate-control data WS`) can:
+
+- look at the drop folder: list, head/tail/search (gzip/bzip2/xz decompressed on the fly),
+  archive listings;
+- create the workspace once (named workspace, source + platform label, dataset, a clone of
+  discourse-converters with your GitHub token, the standard workflow binding);
+- **take** files: moved into `workspaces/WS/inputs/`, read-only, SHA-256, registered, with a
+  provenance record. Bytes are never changed;
+- run its own Ruby/Python scripts and archive extraction in a sandbox (control image, no
+  network, read-only root, inputs read-only, one new `work/<name>` output folder, 2 CPUs,
+  4 GB, time limit), as jobs it polls; register finished outputs into `inputs/derived/`
+  with the script's hash and inputs;
+- run the project's **source database**: `silo-src-WS`, MariaDB (MySQL dumps) or PostgreSQL 18
+  with Discourse's extensions (PostgreSQL dumps, Discourse backups), images from the runtime
+  profile, data in volume `silo-src-WS-data`, on internal network `silo-src-WS` (no way out),
+  with a read-only user `silo_ro`; load dumps as jobs, show tables and sizes, reset;
+- read a failed run's evidence, and propose findings: a **schema finding** (no run: tables,
+  columns, counts, invented examples) or a run's cause. You review and release them
+  (`standard finding review/release`); only released text reaches converter-developer.
+
+Every operation is logged in `workspaces/WS/.silo-migrate/data/audit.jsonl` (script code and
+finding text by hash); moved and derived files in `provenance.jsonl`. Database passwords stay
+in `.silo-migrate/data/db/secret.env` (0600) and never appear in tool output or Docker argv.
+
+Free SQL queries come with DBHub once term-llm can attach an MCP server to one agent only
+(in term-llm 0.9.93 any chat can switch on any configured MCP server).
+
+**Skills** ship in the release (`integrations/term-llm/skills`) and reach the account through
+the link `~/.config/term-llm/skills` → `<prefix>/current/integrations/term-llm/skills` that
+`metal apply/update` creates if absent (doctor shows the fix otherwise). Each agent's
+`skills:` decides what it sees: migration-data gets all of them, the others none (term-llm
+0.9.93 can't give an agent a subset).
 
 ## op-cache (Frontier's key)
 

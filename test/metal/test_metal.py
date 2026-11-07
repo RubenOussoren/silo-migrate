@@ -152,6 +152,69 @@ class InstallerTests(unittest.TestCase):
                     with self.assertRaisesRegex(self.m.Refusal, "METAL_AGENTS_CONFIG"):
                         self.m.make_plan()
 
+    def test_plan_before_the_data_agent_update_accepts_the_running_analyst_release(self):
+        # migrations07 runs five agents including migration-analyst; planning the update that
+        # ships migration-data must not be refused before the switch.
+        P = self.m.P
+        (P/"bin").mkdir(parents=True)
+        (P/"bin/term-llm").write_text("")
+        (self.home/".config/term-llm").mkdir(parents=True)
+        (self.home/".config/term-llm/config.yaml").write_text("providers: {}\n")
+        running = ("converter-developer", "converter-reviewer", "migration-analyst", "migration-operator", "server-support")
+        for name in running:
+            (P/"current/integrations/term-llm"/name).mkdir(parents=True)
+            (P/"current/integrations/term-llm"/name/"agent.yaml").write_text("name: " + name + "\n")
+        self.m.C["TERM_LLM_SERVICE"] = "install"
+        listing = "Available agents (5):\n\n  [user] /x/\n" + "".join("    " + name + " - x\n" for name in running)
+        def fake_output(argv, **kw):
+            return "docker users" if argv[0] == "id" else listing if argv[-1] == "agents" else "amd64"
+        with self.plan_stubs(), patch.object(self.m, "output", side_effect=fake_output), \
+                patch.object(self.m, "artifact", return_value=None), patch.object(self.m, "hub_secrets_state", return_value=None):
+            notes = self.m.make_plan()["notes"]
+            self.assertTrue(any("migration-data" in note and "Frontier only" in note for note in notes))
+            self.assertFalse(self.m.agents_ready(as_account=False))
+
+    def test_skills_root_is_linked_to_the_current_release_and_never_replaced(self):
+        config = self.home/".config/term-llm"
+        config.mkdir(parents=True)
+        link = config/"skills"
+        self.assertTrue(self.m.link_skills())
+        self.assertEqual(str(self.m.P/"current/integrations/term-llm/skills"), os.readlink(link))
+        self.assertTrue(self.m.link_skills())  # idempotent
+        link.unlink()
+        link.symlink_to("/elsewhere")
+        self.assertFalse(self.m.link_skills())
+        self.assertEqual("/elsewhere", os.readlink(link))
+        link.unlink()
+        link.mkdir()
+        (link/"mine").mkdir()
+        self.assertFalse(self.m.link_skills())
+        self.assertTrue((link/"mine").is_dir())
+
+    def test_shipped_skills_are_valid_for_term_llm(self):
+        root = Path(__file__).resolve().parents[2]/"integrations/term-llm"
+        names = set()
+        for manifest in sorted((root/"skills").glob("*/SKILL.md")):
+            text = manifest.read_text()
+            self.assertTrue(text.startswith("---\n"), manifest)
+            front = text.split("---\n", 2)[1]
+            fields = dict(line.split(": ", 1) for line in front.strip().splitlines())
+            self.assertEqual(manifest.parent.name, fields["name"])
+            self.assertRegex(fields["name"], r"^[a-z0-9]+(-[a-z0-9]+)*$")
+            self.assertLessEqual(len(fields["name"]), 64)
+            self.assertTrue(0 < len(fields["description"]) <= 1024)
+            self.assertLess(len(text.splitlines()), 80, "keep skills short")
+            names.add(fields["name"])
+        selectors = {}
+        for agent in root.glob("*/agent.yaml"):
+            line = next((l for l in agent.read_text().splitlines() if l.startswith("skills:")), None)
+            self.assertIsNotNone(line, agent.parent.name + " needs an explicit skills: (empty means all skills)")
+            selectors[agent.parent.name] = line.split(":", 1)[1].strip().strip('"')
+        # term-llm 0.9.93: a bare name list disables model activation and ",+" exposes every
+        # installed skill, so only migration-data has skills and its list names all of them.
+        self.assertEqual(names | {"+"}, set(selectors.pop("migration-data").split(",")))
+        self.assertEqual({"none"}, set(selectors.values()))
+
     def test_releases_are_sealed_read_only_and_unsealed_only_to_prune(self):
         import stat as st
         release = self.root/"sealed"
@@ -185,10 +248,12 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(sorted(self.m.MIGRATION_AGENTS), shipped)
 
     def test_agents_ready_requires_exactly_the_node_agents(self):
-        three = "    migration-analyst - a\n    migration-operator - b\n    server-support - c\n"
+        three = "    migration-data - a\n    migration-operator - b\n    server-support - c\n"
         five = "    converter-developer - d\n    converter-reviewer - r\n" + three
         cases = {
             "Available agents (5):\n\n  [user] /x/\n" + five: True,
+            # The previous release's five (migration-analyst) are not this release's.
+            "Available agents (5):\n\n  [user] /x/\n" + five.replace("migration-data", "migration-analyst"): False,
             "No agents configured.\n": False,
             # Earlier agent sets are no longer enough.
             "Available agents (3):\n\n  [user] /x/\n" + three: False,

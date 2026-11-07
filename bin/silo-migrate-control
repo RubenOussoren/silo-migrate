@@ -169,6 +169,19 @@ def github_credentials(checkout, url, cwd=None):
     return argv[:-2] + options + argv[-2:], env
 
 
+def host_data(args, values, base, self):
+    """`data WS`: the migration-data agent's operations (bin/data_tools.py), JSON on stdin."""
+    import importlib.util
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("data_tools", Path(__file__).resolve().parent / "data_tools.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    result = module.main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin,
+                         module.control_runner(self))
+    sys.stdout.buffer.write((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
+    return 0
+
+
 def host_converter(args, values, base, self):
     if len(args) >= 2 and args[1] in ("dev", "push", "push-show"):
         result = converter_dev().main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin)
@@ -285,6 +298,8 @@ def main(args):
     gems = Path(values.get("SILO_CONTROL_GEMS", str(project / ".runtime-cache/gems")))
     if args[:1] == ["converter"]:
         return host_converter(args, values, base, self)
+    if args[:1] == ["data"]:
+        return host_data(args, values, base, self)
     image = values.get("SILO_CONTROL_IMAGE_REF", CONTROL_REF) if configured else CONTROL_REF.split("@", 1)[1]
     if configured:
         control = control_image(repo, values, base, args)
@@ -349,6 +364,6 @@ if __name__ == "__main__":
     except (ValueError, OSError, KeyError, TypeError):
         # Do not disclose raw Git/config/inspect data (may contain credentials).
         error = sys.exc_info()[1]
-        code = str(error) if isinstance(error, ValueError) and str(error).startswith("STANDARD_") else "STANDARD_OPERATION_FAILED"
+        code = str(error) if isinstance(error, ValueError) and re.match(r"(STANDARD|NAMED)_", str(error)) else "STANDARD_OPERATION_FAILED"
         print("Error: " + code, file=sys.stderr)
         sys.exit(1)

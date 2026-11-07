@@ -1,0 +1,215 @@
+name: migration-data
+description: The only agent that handles customer data (Frontier only). Intake, sandboxed conversion scripts, the project's source database and run investigation. Proposes findings; cannot release them.
+provider: cdck_frontier
+model: CDCK/MoM
+allowed_models:
+  - cdck_frontier:CDCK/MoM
+workspace: none
+agents_md: "false"
+search: false
+max_turns: 60
+# Skills shipped with the release (integrations/term-llm/skills, linked as the account's
+# ~/.config/term-llm/skills). term-llm 0.9.93 can't give an agent a subset: a bare name list
+# turns model activation off, and ",+" lists these first but shows every installed skill.
+# Every shipped skill is this agent's, so ",+" is exactly this set; the other agents have none.
+skills: "intake-basics,sql-dump,export-to-sql,uploads-sorting,source-profile,count-reconciliation,path-converter,mybb,+"
+tools:
+  enabled: [update_plan]
+  custom:
+    - name: data_status
+      description: "Overview of a workspace: drop folder contents, registered inputs (IDs, paths, types, sizes, SHA-256), work folders, recent jobs, the source database. Start here."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input: &workspace_only
+        type: object
+        properties:
+          workspace: {type: string, description: "Project/workspace name, e.g. arc. Also the drop folder <prefix>/intake/<workspace>."}
+        required: [workspace]
+        additionalProperties: false
+    - name: data_list
+      description: "List a folder: area intake (the drop folder), inputs (registered, read-only), work (sandbox outputs) or converter (the workspace's converter checkout, read-only). Files show size and a sniffed kind (and the inner kind of compressed files). Symlinks are never followed."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          area: {type: string, enum: [intake, inputs, work, converter]}
+          path: {type: string, description: "Folder inside the area; omit for its top"}
+        required: [workspace, area]
+        additionalProperties: false
+    - name: data_peek
+      description: "Read part of one file. mode head (from offset, decompressing gzip/bzip2/xz unless decompress is false), tail (raw end bytes), search (stream the whole file for a fixed string, or a regex with regex true; returns line numbers and short context; stops after max_matches or ~40 s) or archive (list zip/tar entries). At most 32 KiB per call."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          area: {type: string, enum: [intake, inputs, work, converter]}
+          path: {type: string}
+          mode: {type: string, enum: [head, tail, search, archive]}
+          offset: {type: integer, description: "head: decompressed byte offset to start at"}
+          bytes: {type: integer, description: "head/tail: bytes to return (max 32768, default 8192)"}
+          pattern: {type: string, description: "search: text to find (max 200 characters)"}
+          regex: {type: boolean}
+          ignore_case: {type: boolean}
+          max_matches: {type: integer, description: "search: 1-100, default 40"}
+          decompress: {type: boolean}
+        required: [workspace, area, path, mode]
+        additionalProperties: false
+    - name: data_create
+      description: "Create the workspace once: named workspace, a source with its platform label (e.g. mybb, phpbb, discourse), the initial dataset, a clone of discourse-converters from GitHub (engineer's token) and the standard workflow binding. Steps already done are skipped."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 300
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          platform: {type: string, description: "Source platform label, lowercase, e.g. mybb"}
+          converter_branch: {type: string, description: "discourse-converters branch to clone (default main)"}
+        required: [workspace, platform]
+        additionalProperties: false
+    - name: data_take
+      description: "Move one file from the drop folder into inputs/ (renamed to a safe name), make it read-only, checksum it and register it in the dataset with a type label (e.g. mysql-dump, postgres-dump, discourse-backup, archive, xml, json, csv, uploads). The bytes are never changed. Records provenance."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 300
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          path: {type: string, description: "Path inside the drop folder"}
+          type: {type: string, description: "Lowercase label: letters, digits, - and _"}
+          name: {type: string, description: "Optional file name in inputs/ (letters, digits, . _ -)"}
+        required: [workspace, path, type]
+        additionalProperties: false
+    - name: data_register
+      description: "Register a finished output: move one file from work/<folder>/ into inputs/derived/, read-only, checksummed, with provenance (the job and script hash that produced it and the inputs it saw)."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 300
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          path: {type: string, description: "Path inside work/, starting with the folder name"}
+          type: {type: string}
+          name: {type: string}
+        required: [workspace, path, type]
+        additionalProperties: false
+    - name: data_script
+      description: "Run your own Ruby (default) or Python script in the sandbox: no network, read-only root, registered inputs read-only at /in, one new writable folder work/<into> at /out, silo-migrate at /silo (read-only), 2 CPUs, 4 GB memory, a time limit. Starts a job and returns at once; poll data_job. Use it for XML/JSON/CSV to SQL, splitting, sorting uploads and checks."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 160
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          language: {type: string, enum: [ruby, python]}
+          code: {type: string, description: "The whole script (max 256 KiB)"}
+          into: {type: string, description: "New work folder name: lowercase letters, digits, - and _"}
+          timeout_minutes: {type: integer, description: "1-360, default 30"}
+        required: [workspace, code, into]
+        additionalProperties: false
+    - name: data_extract
+      description: "Extract an archive (zip, tar, tar.gz/bz2/xz, or one gzip/bzip2/xz file) from inputs/ into a new work folder, in the sandbox. Links, devices and unsafe names are skipped and counted. Starts a job; poll data_job."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 160
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          path: {type: string, description: "inputs/... path of the archive"}
+          into: {type: string}
+          timeout_minutes: {type: integer}
+        required: [workspace, path, into]
+        additionalProperties: false
+    - name: data_job
+      description: "Status of a job (script, extract or db_load): running, succeeded, failed, timed_out; exit code, log tail and the files it wrote."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 130
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          job_id: {type: string}
+        required: [workspace, job_id]
+        additionalProperties: false
+    - name: data_db_up
+      description: "Start (or restart) the project's source database: mariadb for MySQL/MariaDB dumps, postgres for PostgreSQL dumps and Discourse backups (PostgreSQL 18 with Discourse's extensions). Internal network with no outside access, data in a project volume, a read-only user for later query access."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 210
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          engine: {type: string, enum: [mariadb, postgres]}
+        required: [workspace, engine]
+        additionalProperties: false
+    - name: data_db_load
+      description: "Load a registered SQL dump (plain, gzip, bzip2 or xz; PostgreSQL custom-format dumps via pg_restore) into the source database. Starts a job; poll data_job, then data_db_status for schemas and table counts."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 210
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          path: {type: string, description: "inputs/... path"}
+          charset: {type: string, enum: [utf8mb4, utf8mb3, utf8, latin1, binary], description: "MariaDB client character set (default utf8mb4; a dump's own SET NAMES still applies)"}
+          stop_on_error: {type: boolean, description: "default true"}
+          timeout_minutes: {type: integer, description: "default 120"}
+        required: [workspace, path]
+        additionalProperties: false
+    - name: data_db_status
+      description: "Source database status: engine, running/ready, loads, and per schema the number of tables and approximate size. Free SQL queries come later through DBHub."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 100
+      input: *workspace_only
+    - name: data_db_reset
+      description: "Remove the source database (container, volume, network) to start over. Registered inputs are untouched. Needs confirm true."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 210
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          confirm: {type: boolean}
+        required: [workspace, confirm]
+        additionalProperties: false
+    - name: data_run_evidence
+      description: "Read one workflow run's private evidence: stages, assertions, results and failure record first, then every log with its size and stage, then bounded tails (failed stage first)."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          run_id: {type: string}
+        required: [workspace, run_id]
+        additionalProperties: false
+    - name: data_propose_finding
+      description: "Propose a finding privately for the engineer. Without run_id: a schema finding (tables, columns, counts, invented example rows) for converter work. With run_id: the cause of a failed run. Never include real customer values. The engineer decides what is released to coding agents."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          text: {type: string}
+          run_id: {type: string}
+        required: [workspace, text]
+        additionalProperties: false

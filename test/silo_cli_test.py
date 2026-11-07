@@ -237,6 +237,36 @@ class SiloTest(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(self.s.Stop):
                 self.s.intake(self.entry, name)
 
+    def test_intake_second_run_says_the_files_now_belong_to_the_account(self):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.s.intake(self.entry, 'arc')
+        self.assertIn('scp FILES', out.getvalue())
+        (self.prefix / 'intake/arc/dump.sql').write_text('-- MySQL dump\n')
+        out = io.StringIO()
+        as_account = lambda fd: os.stat_result((stat.S_IFDIR | 0o700, 0, 0, 1, 99999, 99999, 0, 0, 0, 0))
+        with contextlib.redirect_stdout(out), mock.patch.object(self.s, 'is_root', return_value=True), mock.patch.object(self.s.os, 'fchown'), \
+                mock.patch.object(self.s.os, 'chown'), mock.patch.object(self.s.os, 'fstat', side_effect=as_account):
+            self.s.intake(pwd.struct_passwd(('silomig', 'x', 99999, 99999, '', '/x', '/bin/bash')), 'arc')
+        text = out.getvalue()
+        self.assertIn('1 file(s)', text)
+        self.assertIn('now belong to silomig', text)
+        self.assertIn('migration-data', text)
+        self.assertNotIn('scp FILES', text)
+
+    def test_doctor_checks_the_skills_link(self):
+        skills = self.prefix / 'current/integrations/term-llm/skills/intake-basics'
+        os.chmod(self.prefix / 'current/integrations/term-llm', 0o755)
+        skills.mkdir(parents=True)
+        (skills / 'SKILL.md').write_text('---\nname: intake-basics\ndescription: x\n---\n')
+        check = self.statuses(self.healthy())['skills']
+        self.assertEqual('WARN', check['status'])
+        self.assertIn('ln -s ' + str(self.prefix / 'current/integrations/term-llm/skills'), check['fix'])
+        (self.home / '.config/term-llm/skills').symlink_to(self.prefix / 'current/integrations/term-llm/skills')
+        check = self.statuses(self.healthy())['skills']
+        self.assertEqual(('OK', '1 linked from the release'), (check['status'], check['detail']))
+
     def test_claude_link_goes_in_the_service_path_not_roots(self):
         target = self.home / '.local/bin/claude'
         target.parent.mkdir(parents=True)

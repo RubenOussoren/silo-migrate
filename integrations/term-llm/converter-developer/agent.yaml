@@ -9,6 +9,8 @@ agents_md: "false"
 # Web search and read_url, for public documentation.
 search: true
 max_turns: 80
+# Skills from ~/.config/term-llm/skills. Always explicit: an empty selector means every skill.
+skills: none
 tools:
   enabled: [update_plan]
   custom:

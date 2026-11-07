@@ -5,6 +5,9 @@ agents_md: "false"
 # Web search and read_url, for public documentation (Discourse, error messages).
 search: true
 max_turns: 40
+# Skills from ~/.config/term-llm/skills. Always explicit: an empty selector means every skill.
+# none until term-llm can give an agent a subset (count-reconciliation would fit here).
+skills: none
 tools:
   enabled: [update_plan]
   custom:

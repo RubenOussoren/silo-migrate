@@ -10,6 +10,8 @@ agents_md: "false"
 # Web search and read_url, for public documentation.
 search: true
 max_turns: 60
+# Skills from ~/.config/term-llm/skills. Always explicit: an empty selector means every skill.
+skills: none
 tools:
   # shell, edit_file and write_file are term-llm built-ins. The service runs with
   # --approval prompt and agents have no pre-approved directories, so each command

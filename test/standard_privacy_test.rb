@@ -118,6 +118,30 @@ class StandardPrivacyTest < SiloMigrateTest
     end
   end
 
+  def test_schema_finding_has_no_run_and_is_released_like_any_finding
+    with_standard do
+      findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
+      standard_error('STANDARD_ARGUMENT_INVALID') { findings.propose(run_id: nil, text: 'x') }
+      standard_error('STANDARD_ARGUMENT_INVALID') { findings.propose(run_id: claim, text: 'x', kind: 'schema') }
+      id = findings.propose(run_id: nil, text: "#{MARKER} users(uid int)", kind: 'schema')[:finding_id]
+      assert_empty findings.released_list[:findings]
+      code, out, err = cli('finding', 'propose', 'synthetic', '--file', '/dev/null')
+      assert_equal [1, ''], [code, out]
+      assert_includes err, 'STANDARD_ARGUMENTS_INVALID'
+      code, _out, err = cli('finding', 'propose', 'synthetic', '--kind', 'schema', '--run', 'run-' + 'a' * 32, '--file', '/dev/null')
+      assert_equal 1, code
+      assert_includes err, 'STANDARD_ARGUMENTS_INVALID'
+      released = "users: uid int, username varchar(120); example user_1\n"
+      findings.release(finding_id: id, released_text: released, sha256: Digest::SHA256.hexdigest(released), reviewer: 'engineer')
+      listed = findings.released_list[:findings]
+      assert_equal [[id, 'schema', nil]], listed.map { |entry| entry.values_at(:finding_id, :kind, :run_id) }
+      code, out, _err = cli('agent', 'finding-show', 'synthetic', id)
+      assert_equal 0, code
+      assert_equal released, JSON.parse(out).fetch('summary')
+      refute_includes out, MARKER
+    end
+  end
+
   def test_tampered_reproduction_refused
     with_standard do
       id = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env).propose(run_id: claim, text: MARKER)[:finding_id]

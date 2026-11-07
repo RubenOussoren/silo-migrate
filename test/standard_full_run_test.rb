@@ -473,10 +473,11 @@ class StandardFullRunTest < SiloMigrateTest
       refute inputs.any? { |input| input['relative'].include?('.new-after-preflight') }
       sql_mount = @runtime.commands.flat_map { |op| op[1] }.grep(%r{:/run-fixture/snapshot\.sql:ro\z})
       assert_equal [@service.store.run_dir(result[:run_id], 'work', 'inputs/dataset/source-sql') + ':/run-fixture/snapshot.sql:ro'], sql_mount
-      actual, shas, bytes = @service.send(:expected_for, result[:run_id])
+      # Uploads are identified by their bound checksums; their bytes are not loaded.
+      actual, shas, *rest = @service.send(:expected_for, result[:run_id])
       assert_equal StandardCompleteRuntime.expected, actual
       assert_equal [Digest::SHA256.hexdigest(StandardCompleteRuntime::SOURCE)], shas
-      assert_equal [StandardCompleteRuntime::SOURCE], bytes.values
+      assert_empty rest
     end
   end
 

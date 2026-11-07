@@ -220,10 +220,12 @@ else:
         self.assertEqual([], self.calls())
 
 
-ANALYST = ROOT / 'integrations/term-llm/migration-analyst/scripts/analyst_tool.py'
+DATA = ROOT / 'integrations/term-llm/migration-data/scripts/data_tool.py'
 
 
-class AnalystToolAdapterTest(unittest.TestCase):
+class DataToolAdapterTest(unittest.TestCase):
+    """migration-data's adapter: every tool is one `data WS` request with only its own keys."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -233,17 +235,17 @@ class AnalystToolAdapterTest(unittest.TestCase):
         self.control.write_text('''#!/usr/bin/env python3
 import json, os, sys
 with open(os.environ['ARGV_RECORD'], 'a') as out:
-    out.write(json.dumps([sys.argv[1:], sys.stdin.read() if '-' in sys.argv else None]) + '\\n')
+    out.write(json.dumps([sys.argv[1:], json.loads(sys.stdin.read())]) + '\\n')
 mode = os.environ.get('MODE', 'ok')
 if mode == 'refuse':
-    print('Error: STANDARD_RUN_COMPLETED', file=sys.stderr)
+    print('Error: STANDARD_PATH_INVALID', file=sys.stderr)
     sys.exit(1)
 if mode == 'large':
-    print(json.dumps({'version': 1, 'tails': {'logs/x.log': 'x' * (49 * 1024)}}))
+    print(json.dumps({'version': 1, 'text': 'x' * (49 * 1024)}))
 elif mode == 'garbage':
-    print('{"version": 1, "tails": {"logs/x.log": "cut')
+    print('{"version": 1, "text": "cut')
 else:
-    print(json.dumps({'version': 1, 'status': 'failed'}))
+    print(json.dumps({'version': 1, 'status': 'ok'}))
 ''')
         self.control.chmod(0o700)
         self.run_id = 'run-' + 'a' * 32
@@ -251,40 +253,55 @@ else:
     def call(self, tool, args, mode='ok'):
         env = dict(os.environ, SILO_CONTROL=str(self.control), ARGV_RECORD=str(self.record), PYTHONDONTWRITEBYTECODE='1',
                    TERM_LLM_TOOL_NAME=tool, MODE=mode)
-        result = subprocess.run([sys.executable, '-I', '-B', str(ANALYST)], input=json.dumps(args), capture_output=True,
+        result = subprocess.run([sys.executable, '-I', '-B', str(DATA)], input=json.dumps(args), capture_output=True,
                                 text=True, env=env, timeout=10)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual('', result.stderr)
         return json.loads(result.stdout), result.stdout
 
     def calls(self):
-        return [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+        calls = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+        if self.record.exists():
+            self.record.unlink()
+        return calls
 
-    def test_exact_argv_and_finding_text_on_stdin(self):
-        self.assertEqual('failed', self.call('analyst_run_evidence', {'workspace': 'synthetic', 'run_id': self.run_id})[0]['status'])
-        self.call('analyst_propose_finding', {'workspace': 'synthetic', 'run_id': self.run_id, 'text': 'synthetic cause'})
-        self.assertEqual([
-            [['standard', 'analyst', 'evidence', 'synthetic', self.run_id], None],
-            [['standard', 'finding', 'propose', 'synthetic', '--run', self.run_id, '--file', '-'], 'synthetic cause'],
-        ], self.calls())
+    def test_every_declared_tool_maps_to_one_data_request(self):
+        import re
+        declared = re.findall(r'(?m)^    - name: ([a-z_]+)$', (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text())
+        self.assertEqual(15, len(declared))
+        for tool in declared:
+            with self.subTest(tool=tool):
+                self.call(tool, {'workspace': 'arc', 'path': 'x', 'unexpected': 'dropped'})
+                (argv, request), = self.calls()
+                self.assertEqual(['data', 'arc'], argv)
+                self.assertNotIn('unexpected', request)
+                self.assertNotIn('workspace', request)
 
-    def test_oversize_or_truncated_output_is_refused_not_passed_on(self):
-        for mode, code in (('large', 'STANDARD_EVIDENCE_TOO_LARGE'), ('garbage', 'STANDARD_OPERATION_FAILED')):
+    def test_requests_carry_only_allowed_keys(self):
+        cases = {
+            'data_peek': ({'area': 'intake', 'path': 'dump.sql', 'mode': 'search', 'pattern': 'CREATE TABLE', 'op': 'db_reset'},
+                          {'op': 'peek', 'area': 'intake', 'path': 'dump.sql', 'mode': 'search', 'pattern': 'CREATE TABLE'}),
+            'data_take': ({'path': 'dump.sql', 'type': 'mysql-dump', 'confirm': True}, {'op': 'take', 'path': 'dump.sql', 'type': 'mysql-dump'}),
+            'data_script': ({'code': 'puts 1', 'into': 'xml', 'language': 'ruby'}, {'op': 'script', 'code': 'puts 1', 'into': 'xml', 'language': 'ruby'}),
+            'data_db_up': ({'engine': 'postgres'}, {'op': 'db_up', 'engine': 'postgres'}),
+            'data_propose_finding': ({'text': 'schema', 'run_id': None}, {'op': 'propose_finding', 'text': 'schema'}),
+            'data_run_evidence': ({'run_id': self.run_id}, {'op': 'run_evidence', 'run_id': self.run_id}),
+        }
+        for tool, (args, request) in cases.items():
+            with self.subTest(tool=tool):
+                self.call(tool, dict(args, workspace='arc'))
+                self.assertEqual([[['data', 'arc'], request]], self.calls())
+
+    def test_oversize_truncated_or_refused_output_becomes_a_fixed_error(self):
+        for mode, code in (('large', 'STANDARD_OUTPUT_TOO_LARGE'), ('garbage', 'STANDARD_OPERATION_FAILED'), ('refuse', 'STANDARD_PATH_INVALID')):
             with self.subTest(mode=mode):
-                result, raw = self.call('analyst_run_evidence', {'workspace': 'synthetic', 'run_id': self.run_id}, mode=mode)
+                result, raw = self.call('data_status', {'workspace': 'arc'}, mode=mode)
                 self.assertEqual({'version': 1, 'error': code}, result)
                 self.assertLess(len(raw), 200)
 
-    def test_refusal_returns_fixed_code(self):
-        result, _raw = self.call('analyst_propose_finding', {'workspace': 'synthetic', 'run_id': self.run_id, 'text': 'x'}, mode='refuse')
-        self.assertEqual({'version': 1, 'error': 'STANDARD_RUN_COMPLETED'}, result)
-
-    def test_invalid_arguments_never_invoke_control(self):
-        cases = [('analyst_run_evidence', {'workspace': '../x', 'run_id': self.run_id}),
-                 ('analyst_run_evidence', {'workspace': 'synthetic', 'run_id': self.run_id + ';id'}),
-                 ('analyst_propose_finding', {'workspace': 'synthetic', 'run_id': self.run_id, 'text': '  '}),
-                 ('analyst_release_finding', {'workspace': 'synthetic', 'run_id': self.run_id})]
-        for tool, args in cases:
+    def test_invalid_workspace_or_unknown_tool_never_invokes_control(self):
+        for tool, args in (('data_status', {'workspace': '../x'}), ('data_status', {}), ('data_release_finding', {'workspace': 'arc'}),
+                           ('analyst_run_evidence', {'workspace': 'arc', 'run_id': self.run_id})):
             with self.subTest(tool=tool, args=args):
                 result, _raw = self.call(tool, args)
                 self.assertIn(result['error'], ('STANDARD_ARGUMENTS_INVALID', 'STANDARD_TOOL_UNKNOWN'))

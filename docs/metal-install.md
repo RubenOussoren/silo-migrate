@@ -153,7 +153,7 @@ Confirmed against the **real 0.9.93 binary's help**: `service install web`,
 `--auth bearer`, `--approval prompt`, `--no-projects`, `--disable-extensions`,
 `--disable-widgets`. No startup agent is pinned: with `--agent` the web UI hides its
 agent picker. Instead the account's config sets `agents.use_builtin: false`, so the
-picker offers only `migration-operator`, `migration-analyst`, `server-support`,
+picker offers only `migration-operator`, `migration-data`, `server-support`,
 `converter-developer` and `converter-reviewer` (plus term-llm's plain "Default" chat). Fresh
 configs get this and the agents search path; for an existing config, plan refuses
 (`METAL_AGENTS_CONFIG`) unless `term-llm agents` lists exactly the agents shipped in the
@@ -161,6 +161,8 @@ release `current` points to, and apply requires exactly these five after switchi
 because built-in shell agents would otherwise run with the account's Docker authority
 without per-command approval.
 
+migration-data (Frontier only; intake, sandbox, source database) and the skills link
+`~/.config/term-llm/skills` are described in `docs/node-operations.md`.
 converter-developer (`chatgpt`) and converter-reviewer (`claude-bin`) are described in
 `docs/standard-workbench.md` (Converter development). Server setup they need: `claude-bin`
 in the account's term-llm config and signed in (`claude auth login` as the account,
@@ -197,7 +199,7 @@ it before writing service files. `install` writes without starting;
 service. A non-secret systemd user drop-in supplies `SILO_CONTROL` (the installed
 shim), `SILO_CONTROL_CONFIG` and `TMPDIR`; it does not import credentials or modify
 the stock generated unit. The stock service launcher does not pass that environment
-on to agent tools, so the operator/analyst adapters locate `<prefix>/bin/silo-migrate-control`
+on to agent tools, so the agents' adapters locate `<prefix>/bin/silo-migrate-control`
 from their installed release path themselves (found on the first real Hub test). For interactive `ask`,
 export those two SILO variables in the account shell too. Unmanaged existing units are refused, not adopted. The listener is
 127.0.0.1 only; no firewall or reverse-proxy change. Remote access is only through

@@ -404,10 +404,14 @@ class StandardWorkflowTest < SiloMigrateTest
       source_root = File.join(@root, 'inputs/snapshot')
       File.write(File.join(source_root, 'expected.json'), '{"changed":true}')
       File.write(File.join(source_root, 'uploads/one.txt'), 'changed attachment')
-      actual, shas, bytes = @service.send(:expected_for, run_id)
+      # Uploads are compared by their bound checksums; none is read into memory.
+      upload_copy = @service.send(:input_path, run_id, inputs.find { |input| input['type'] == 'upload' })
+      File.chmod(0o000, upload_copy)
+      actual, shas, *rest = @service.send(:expected_for, run_id)
+      File.chmod(0o400, upload_copy)
       assert_equal expected, actual
       assert_equal [Digest::SHA256.hexdigest('original attachment')], shas
-      assert_equal ['original attachment'], bytes.values
+      assert_empty rest
       tree = @service.send(:input_tree, run_id, inputs, 'upload', 'uploads')
       assert_equal 'original attachment', File.binread(File.join(tree, 'one.txt'))
     end

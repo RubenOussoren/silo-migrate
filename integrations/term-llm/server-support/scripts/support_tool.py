@@ -2,7 +2,7 @@
 """Read-only, path-limited file tools for the server-support agent.
 
 term-llm runs custom tools without an approval prompt, so every limit is enforced
-here: only allow-listed files under the allowed roots, never migration workspaces or
+here: only allow-listed files under the allowed roots, never migration workspaces, intake drop folders or
 the service temp directory (customer data), never credential files, and
 secret-looking values are redacted. Edits are not offered here; the agent uses
 term-llm's built-in edit_file/write_file, which prompt the engineer for every write.
@@ -124,7 +124,8 @@ def boundaries():
         denied.append(os.environ["SILO_MIGRATE_BASE_PATH"])
     root = prefix()
     if root:
-        denied += [os.path.join(root, "workspaces"), os.path.join(root, "state", "tmp")]
+        # Intake drop folders hold customers' exports exactly as received.
+        denied += [os.path.join(root, "workspaces"), os.path.join(root, "intake"), os.path.join(root, "state", "tmp")]
         workspaces = configured_workspaces(root)
         if workspaces is not None:
             denied += workspaces
