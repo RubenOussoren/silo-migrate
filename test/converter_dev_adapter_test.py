@@ -108,5 +108,29 @@ print(json.dumps({'version': 1, 'ok': True}))
                 self.assertTrue(self.call(agent, 'dev_status', {'workspace': 'arc'})['ok'])
         self.assertEqual(4, len(self.calls()))
 
+    def test_only_the_developer_may_start_an_agent_and_only_the_reviewer(self):
+        import re
+        delegation = ('spawn_agent', 'wait_agent', 'continue_agent', 'list_agents', 'cancel_agent', 'queue_agent', 'initiate_handover', 'hub_delegate')
+        for agent in ('converter-developer', 'converter-reviewer', 'migration-data', 'migration-operator', 'server-support'):
+            text = (AGENTS / agent / 'agent.yaml').read_text()
+            enabled = re.search(r'(?m)^  enabled: \[(.*)\]', text)
+            tools = [name.strip() for name in enabled.group(1).split(',')] if enabled else []
+            with self.subTest(agent=agent):
+                if agent == 'converter-developer':
+                    self.assertEqual(['spawn_agent', 'wait_agent'], [tool for tool in tools if tool in delegation])
+                    spawn = re.search(r'(?ms)^spawn:\n((?:  .*\n)+)', text).group(1)
+                    self.assertIn('allowed_agents: [converter-reviewer]', spawn)
+                    self.assertIn('max_depth: 1', spawn)
+                    # A spawned agent must pass its parent's model rule too: the developer lists
+                    # claude-bin so the reviewer (claude-bin only) can run, and nothing more.
+                    allowed = text.split('allowed_models:')[1].split('workspace:')[0]
+                    self.assertEqual(['chatgpt:*', 'claude-bin:*'], re.findall(r'(?m)^  - "([^"]+)"', allowed))
+                else:
+                    self.assertEqual([], [tool for tool in tools if tool in delegation])
+                    self.assertNotRegex(text, r'(?m)^spawn:')
+        reviewer = (AGENTS / 'converter-reviewer/agent.yaml').read_text()
+        self.assertRegex(reviewer, r'(?m)^provider: claude-bin$')
+        self.assertEqual(['claude-bin:*'], re.findall(r'(?m)^  - "([^"]+)"', reviewer.split('allowed_models:')[1].split('workspace:')[0]))
+
 if __name__ == '__main__':
     unittest.main()

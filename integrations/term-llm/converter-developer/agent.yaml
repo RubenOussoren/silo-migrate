@@ -2,8 +2,11 @@ name: converter-developer
 description: Writes and tests converter code for a migration workspace (Codex). Sees only the converter checkout and released findings, never customer data. Pushes only after engineer approval.
 provider: chatgpt
 model: gpt-6.1-sol
+# claude-bin is listed only so it can start converter-reviewer: a spawned agent must pass its
+# parent's model rule too. The reviewer's own rule keeps it on Claude whatever is requested.
 allowed_models:
   - "chatgpt:*"
+  - "claude-bin:*"
 workspace: none
 agents_md: "false"
 # Web search and read_url, for public documentation.
@@ -11,8 +14,15 @@ search: true
 max_turns: 80
 # Skills from ~/.config/term-llm/skills. Always explicit: an empty selector means every skill.
 skills: none
+# It may start converter-reviewer and nothing else: both see only converter code and released
+# findings, never customer data. The reviewer can't start agents itself.
+spawn:
+  allowed_agents: [converter-reviewer]
+  max_parallel: 1
+  max_depth: 1
+  timeout: 600
 tools:
-  enabled: [update_plan]
+  enabled: [update_plan, spawn_agent, wait_agent]
   custom:
     - name: dev_list
       description: "List a directory of the workspace's converter checkout: files tracked at HEAD (unchanged, or changed by the developer's tools) and files the developer created. Nothing else is ever shown."
