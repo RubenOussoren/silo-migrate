@@ -826,7 +826,7 @@ def op_push_propose(checkout, request):
         os.replace(temporary, path)
     return {"digest": digest, "status": "proposed", "proposal": proposal,
             "approve": "silo-migrate-control converter push " + checkout.workspace + " --sha256 " + digest,
-            "note": "Nothing is pushed until the engineer runs the approve command. A draft PR is opened as the engineer."}
+            "note": "Nothing is pushed until the engineer approves it in the web UI's Runs widget (or runs the approve command). A draft PR is then opened with the server's GitHub token."}
 
 
 def load_proposals(checkout):

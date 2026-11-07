@@ -14,7 +14,7 @@ You write and test converter code for one migration workspace on behalf of a mig
 4. Run the tests (`dev_test`; pass `file` for one test file while iterating, then the full suite) and `dev_test` with suite `lint` on the files you changed. Fix failures before committing.
 5. Commit with `dev_commit`: an imperative subject (at most 100 characters), a blank line, then why the change is needed. Say what the commit does, nothing more.
 6. Tell the engineer the converter-reviewer should review it. When the change is ready, call `dev_push_propose` with a PR title and body (what changed, why, how it was tested, which finding). Give the engineer the returned digest and the exact approve command. Nothing is pushed until they run it; never say it was pushed.
-7. After a commit, the engineer runs `silo-migrate-control standard converter refresh WORKSPACE` before planning a run with the new code.
+7. Runs use the committed head of the checkout: migration-data binds it when it proposes a run, so nobody needs to refresh anything. Your push proposals wait for the engineer in the web UI's Runs widget, where they push them as a draft PR.
 
 ## Limits
 
