@@ -688,8 +688,9 @@ def op_branch(checkout, request):
         exists = checkout.git("show-ref", "--verify", "--quiet", "refs/heads/" + name, ok=(0, 1)).returncode == 0
         # One branch (one PR) per project: each push then updates the same draft PR. A second
         # branch only when the engineer asked for a separate PR.
+        mine = set(checkout.manifest()["branches"])
         others = [ref for ref in checkout.out("for-each-ref", "--format=%(refname:short)", "refs/heads/" + checkout.migration_prefix()).split()
-                  if ref != name]
+                  if ref != name and (ref in mine or checkout.git("show-ref", "--verify", "--quiet", "refs/remotes/origin/" + ref, ok=(0, 1)).returncode == 0)]
         if not exists and others and request.get("new_pr") is not True:
             refuse("STANDARD_DEV_ONE_BRANCH: this project already has " + others[0] + (" and others" if len(others) > 1 else "") +
                    "; keep committing there (dev_branch with its topic switches to it). Only if the engineer asks for a separate PR, pass new_pr: true.")
@@ -1191,10 +1192,11 @@ RUBY_SOURCES = (".rb", ".rake", ".thor")
 
 def ruby_files(checkout, prefix=""):
     """Visible Ruby sources, as CI's syntax_tree step selects them (Gemfile + *.rb, *.rake, *.thor)."""
-    return [name for name in checkout.visible(prefix) if name.endswith(RUBY_SOURCES) or name == "Gemfile"]
+    return [name for name in checkout.visible(prefix) if (name.endswith(RUBY_SOURCES) or name == "Gemfile")
+            and not any(part.startswith("-") for part in name.split("/"))]
 
 
-def run_in_sandbox(checkout, values, repo, command, collect=None, tool="dev_test"):
+def run_in_sandbox(checkout, values, repo, command, collect=None, tool="dev_test", reserve=0, prepare=None):
     """Run command in the converter image on an export of the visible files: no network, read-only
     root, the locked gems, emoji table and site settings read-only. Returns ("early", result) when
     dependencies aren't ready, else ("ran", details). collect(export) reads files back afterwards."""
@@ -1229,8 +1231,11 @@ def run_in_sandbox(checkout, values, repo, command, collect=None, tool="dev_test
                 settings_target.touch()
         except OSError:
             refuse("STANDARD_OPERATION_FAILED")
-        # The tool itself is killed at ~290 s: keep the container inside that, after the export.
-        budget = max(30, TEST_TIMEOUT - int(time.monotonic() - started))
+        if prepare is not None:
+            prepare(Path(export))
+        # The tool itself is killed at ~290 s: keep the container inside that, after the export,
+        # leaving `reserve` seconds for what the caller does afterwards.
+        budget = max(30, TEST_TIMEOUT - reserve - int(time.monotonic() - started))
         if "," in export:
             refuse("STANDARD_OPERATION_FAILED")
         argv = ["docker", "run", "--rm", "--name", name, "--pull=never", "--network", "none", "--read-only", "--stop-timeout", "5",
@@ -1264,9 +1269,10 @@ SANDBOX_NOTE = ("converter image, no network, read-only root, only the files you
                 "test depend on them while blocking the network.")
 # CI (.github/workflows/ci.yml) runs rubocop and `stree check` on Gemfile + *.rb/*.rake/*.thor; lint does both.
 LINT_SCRIPT = ('if [ "$1" = "-" ]; then bundle _2.6.3_ exec rubocop --format simple --no-color; else bundle _2.6.3_ exec rubocop --format simple '
-               '--no-color "$1"; fi; r=$?; shift; echo "== syntax_tree =="; bundle _2.6.3_ exec stree check "$@"; s=$?; '
+               '--no-color "$1"; fi; r=$?; shift; echo "== syntax_tree =="; if [ "$#" -gt 0 ]; then bundle _2.6.3_ exec stree check "$@"; s=$?; '
+               'else s=0; fi; '
                'echo "== exit rubocop=$r syntax_tree=$s =="; [ "$r" -eq 0 ] && [ "$s" -eq 0 ]')
-STREE_WARN = re.compile(r"^(?:\x1b\[[0-9;]*m)*\[(?:\x1b\[[0-9;]*m)*warn(?:\x1b\[[0-9;]*m)*\] (\S+)", re.M)  # colours optional
+STREE_WARN = re.compile(r"^(?:\x1b\[[0-9;]*m)*\[(?:\x1b\[[0-9;]*m)*warn(?:\x1b\[[0-9;]*m)*\] (.+?)\s*$", re.M)  # colours optional
 
 
 def op_test(checkout, request, values, repo):
@@ -1282,12 +1288,13 @@ def op_test(checkout, request, values, repo):
     elif suite == "lint":
         if file is not None:
             file = relative_path(file)
-            if not (file.endswith(RUBY_SOURCES) or file in ("Gemfile", "convert")) or file not in checkout.visible(file):
+            if (not (file.endswith(RUBY_SOURCES) or file in ("Gemfile", "convert")) or file not in checkout.visible(file)
+                    or any(part.startswith("-") for part in file.split("/"))):
                 refuse("STANDARD_ARGUMENTS_INVALID")
-            targets = [file] if file != "convert" else []
+            targets = [file] if file != "convert" else []  # CI's syntax_tree step doesn't check `convert`
         else:
             targets = ruby_files(checkout)
-        command = ["sh", "-c", LINT_SCRIPT, "lint", file or "-", *(targets or ["Gemfile"])]
+        command = ["sh", "-c", LINT_SCRIPT, "lint", file or "-", *targets]
     else:
         refuse("STANDARD_ARGUMENTS_INVALID")
     kind, ran = run_in_sandbox(checkout, values, repo, command)
@@ -1299,10 +1306,14 @@ def op_test(checkout, request, values, repo):
               "seconds": round(time.monotonic() - ran["started"]), "summary": summary[-1] if summary else None, "dependencies": ran["prepared"]}
     if suite == "lint":
         # stree prints its [warn] lines on stderr (rubocop's report is on stdout).
-        unformatted = list(dict.fromkeys(STREE_WARN.findall(out.split("== syntax_tree ==", 1)[-1]) + STREE_WARN.findall(err)))
-        exits = re.search(r"== exit rubocop=(\d+) syntax_tree=(\d+) ==", out)
-        result["syntax_tree"] = ("not run" if not exits else "all files formatted" if exits[2] == "0" and not unformatted
-                                 else f"{len(unformatted)} file(s) not formatted: run dev_format on them" if unformatted else "failed (see stdout_tail)")
+        # The last markers count: code running in the container could print fake ones earlier.
+        unformatted = list(dict.fromkeys(STREE_WARN.findall(out.rsplit("== syntax_tree ==", 1)[-1]) + STREE_WARN.findall(err)))
+        exits = re.findall(r"== exit rubocop=(\d+) syntax_tree=(\d+) ==", out)
+        last = exits[-1] if exits else None
+        result["syntax_tree"] = ("not run" if not last else "not checked for this file" if not targets
+                                 else "all files formatted" if last[1] == "0" and not unformatted
+                                 else f"{len(unformatted)} file(s) not formatted: run dev_format on them" if unformatted
+                                 else "failed (see stderr_tail and stdout_tail)")
         result["syntax_tree_unformatted"] = unformatted[:100]
     out_tail, out_cut = tail_text(out, 20 * 1024)
     err_tail, err_cut = tail_text(err, 4 * 1024)
@@ -1338,58 +1349,90 @@ def read_export(export, relative):
         os.close(directory)
 
 
+def format_target_allowed(checkout, relative):
+    """dev_write's own path rules, without re-hashing every visible file for each one."""
+    parts = relative.split("/")
+    return not (any(part in PROTECTED_NAMES for part in parts) or relative.startswith((".github/workflows/", ".bundle/"))
+                or relative in PROTECTED_PATHS or any(part.startswith("-") for part in parts)) and checkout.inside(relative)
+
+
 def op_format(checkout, request, values, repo):
     """Format Ruby files with syntax_tree (the repository's .streerc), as CI checks them, and write the
     result through the same recorded path as dev_write. path: a file or a folder; none means the
-    uncommitted changed Ruby files."""
+    uncommitted changed Ruby files. Protected files are left out."""
     raw = request.get("path")
+    visible = set(checkout.visible())
     if raw:
         prefix = relative_path(raw)
-        targets = [name for name in ruby_files(checkout, prefix) if name != "Gemfile"]
+        candidates = [name for name in ruby_files(checkout, prefix) if name != "Gemfile"]
     else:
         shown, _ = changes(checkout)
-        visible = set(checkout.visible())
-        targets = [entry["path"] for entry in shown if entry["path"] in visible and entry["path"].endswith(RUBY_SOURCES)]
-    targets = sorted(set(targets))
+        candidates = [entry["path"] for entry in shown if entry["path"] in visible and entry["path"].endswith(RUBY_SOURCES)]
+    targets = sorted({name for name in candidates if name in visible and format_target_allowed(checkout, name)})
+    skipped = {name: "protected or not visible" for name in sorted(set(candidates) - set(targets))}
     if not targets:
-        return {"formatted": [], "unchanged": 0, "note": "No Ruby files to format there."}
+        return {"formatted": [], "unchanged": 0, "skipped": dict(list(skipped.items())[:50]), "note": "No Ruby files to format there."}
     if len(targets) > MAX_FORMAT_FILES:
         refuse("STANDARD_ARGUMENTS_INVALID")
-    for name in targets:
-        writable(checkout, name, must_exist=True)
+    exported = {}
+
+    def remember(export):
+        # The bytes formatted are the bytes exported: a file changed in the checkout meanwhile is left alone.
+        for name in targets:
+            exported[name] = hashlib.sha256((export / name).read_bytes()).hexdigest()
 
     def collect(export):
         return {name: data for name in targets if (data := read_export(export, name)) is not None}
-    kind, ran = run_in_sandbox(checkout, values, repo, ["bundle", "_2.6.3_", "exec", "stree", "write", *targets], collect, tool="dev_format")
+    kind, ran = run_in_sandbox(checkout, values, repo, ["bundle", "_2.6.3_", "exec", "stree", "write", *targets], collect,
+                               tool="dev_format", reserve=60, prepare=remember)
     if kind == "early":
         return dict(formatted=[], **ran)
     if ran["code"] != 0 or ran["collected"] is None:
         err_tail, _ = tail_text(ran["err"] + ran["out"], 4 * 1024)
         return {"formatted": [], "exit_code": ran["code"], "timed_out": ran["code"] is None, "error_tail": err_tail,
                 "note": "syntax_tree couldn't format these files (a syntax error?). Nothing was changed."}
-    formatted, diffs = [], []
+    changed_meanwhile, writes = [], []
     for name in targets:
         after = ran["collected"].get(name)
         if after is None or len(after) > MAX_WRITE_BYTES:
+            skipped[name] = "formatter output missing, not a regular file, or too large"
+            continue
+        try:
+            after.decode("utf-8")
+        except UnicodeDecodeError:
+            after = None
+        if after is None or b"\0" in after:
+            skipped[name] = "formatter output isn't UTF-8 text (check .streerc and plugins)"
             continue
         before, info = checkout.load(name)
-        if after == before:
+        if hashlib.sha256(before).hexdigest() != exported.get(name):
+            changed_meanwhile.append(name)
             continue
-        target, _ = writable(checkout, name, must_exist=True)
-        mode = stat.S_IMODE(info.st_mode) & 0o755
-        atomic_write(target, after, mode)
-        try:
-            checkout.record_write(name, after)
-        except Exception:
+        if after != before:
+            writes.append((name, before, after, stat.S_IMODE(info.st_mode) & 0o755))
+    done = []
+    try:
+        for name, before, after, mode in writes:
+            atomic_write(checkout.path / name, after, mode)
+            done.append((name, before, mode))
+        # One manifest update for all of them: each recorded write would otherwise rebuild visibility.
+        manifest = checkout.manifest()
+        for name, _before, after, _mode in writes:
+            manifest["files"][name] = hashlib.sha256(after).hexdigest()
+        checkout.save_manifest(manifest)
+    except Exception:
+        # Never leave files the agent wrote but can't see: put every old version back.
+        for name, before, mode in done:
             try:
-                atomic_write(target, before, mode)
+                atomic_write(checkout.path / name, before, mode)
             except OSError:
                 pass
-            raise
-        formatted.append(name)
-        if len(diffs) < 5:
-            diffs.append(small_diff(name, before.decode("utf-8", "replace"), after.decode("utf-8", "replace")))
-    return {"formatted": formatted, "unchanged": len(targets) - len(formatted), "diffs": bounded("\n".join(diffs), 16 * 1024)[0],
+        raise
+    diffs = [small_diff(name, before.decode("utf-8", "replace"), after.decode("utf-8", "replace")) for name, before, after, _ in writes[:5]]
+    rejected = sum(1 for name in targets if name in skipped)
+    return {"formatted": [name for name, *_ in writes], "unchanged": len(targets) - len(writes) - len(changed_meanwhile) - rejected,
+            "changed_during_run": changed_meanwhile, "skipped": dict(list(sorted(skipped.items()))[:50]),
+            "diffs": bounded("\n".join(diffs), 16 * 1024)[0],
             "note": "Formatted with the repository's .streerc. Review the changes (dev_diff), run the tests, then commit."}
 
 

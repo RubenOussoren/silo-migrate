@@ -335,6 +335,86 @@ class ConverterDevTest(unittest.TestCase):
         self.assertEqual((None, None, b'ok'), (self.dev.read_export(export, 'a/file.rb'), self.dev.read_export(export, 'b/new.rb'),
                                                self.dev.read_export(export, 'c/ok.rb')))
 
+    def fake_format_docker(self, change):
+        def fake(argv, timeout):
+            mounts = self.mounts(argv)
+            if 'install' in argv:
+                (Path(mounts['/deps'][0]) / 'specifications').mkdir(parents=True, exist_ok=True)
+                return 0, b'', b''
+            change(Path(mounts['/app'][0]))
+            return 0, b'', b''
+        return [mock.patch.object(self.dev, 'converter_image_document', return_value=IMAGE_DOCUMENT),
+                mock.patch.object(self.dev, 'docker', side_effect=fake), mock.patch.object(self.dev, 'fetch_emoji', side_effect=lambda d, t: None)]
+
+    def format_with(self, change, **request):
+        patches = self.fake_format_docker(change)
+        for patch in patches:
+            patch.start()
+        try:
+            return self.call('format', **request)
+        finally:
+            for patch in patches:
+                patch.stop()
+
+    def test_format_skips_odd_output_protected_files_and_files_changed_meanwhile(self):
+        for name in ('a', 'b', 'c', 'd', 'e'):
+            self.call('write', path=f'lib/fmt/{name}.rb', content=f'{name}  = 1\n')
+        git(self.checkout, 'add', '-f', '.github/workflows')
+        self.write(self.checkout / '.github/workflows/helper.rb', 'x  = 1\n')
+        git(self.checkout, 'add', '-f', '.github/workflows/helper.rb')
+        git(self.checkout, 'commit', '-qm', 'helper')
+
+        def change(export):
+            fmt = export / 'lib/fmt'
+            (fmt / 'a.rb').write_bytes(b'a = 1\n')                      # fine
+            (fmt / 'b.rb').write_bytes(b'b = 1\0\n')                   # NUL: not text
+            (fmt / 'c.rb').write_bytes(b'\xff\xfe = 1\n')              # not UTF-8
+            (fmt / 'd.rb').unlink()
+            os.mkfifo(fmt / 'd.rb')                                     # a FIFO must not hang the read
+            (fmt / 'e.rb').write_bytes(b'e' * (self.dev.MAX_WRITE_BYTES + 10))  # too large
+            # Meanwhile someone changes a.rb's sibling in the real checkout:
+            (self.checkout / 'lib/fmt/e.rb').write_text('e  = 2\n')
+        result = self.format_with(change, path='lib')
+        self.assertEqual(['lib/fmt/a.rb'], result['formatted'])
+        self.assertEqual(['lib/fmt/b.rb', 'lib/fmt/c.rb', 'lib/fmt/d.rb', 'lib/fmt/e.rb'], [n for n in result['skipped'] if n.startswith('lib/fmt/')])
+        self.assertIn('UTF-8', result['skipped']['lib/fmt/b.rb'])
+        self.assertIn('too large', result['skipped']['lib/fmt/e.rb'])
+        self.assertEqual(1, result['unchanged'])  # lib/importer.rb; the skipped ones aren't counted as unchanged
+        self.assertEqual(b'b  = 1\n', (self.checkout / 'lib/fmt/b.rb').read_bytes())
+        # e.rb (too large, and also changed in the checkout after export) is never overwritten.
+        self.assertEqual('e  = 2\n', (self.checkout / 'lib/fmt/e.rb').read_text())
+        # A protected file under a formatted folder is left out, not a refusal of the whole call.
+        result = self.format_with(lambda export: None, path='.github')
+        self.assertEqual({'.github/workflows/helper.rb': 'protected or not visible'}, result['skipped'])
+        self.assertEqual([], result['formatted'])
+
+    def test_format_reports_a_file_changed_in_the_checkout_during_the_run(self):
+        self.call('write', path='lib/new.rb', content='x  = 1\n')
+        def change(export):
+            (export / 'lib/new.rb').write_bytes(b'x = 1\n')
+            self.call('write', path='lib/new.rb', content='y  = 2\n')  # the agent's own later write, outside the lock in this test
+        patches = self.fake_format_docker(change)
+        for patch in patches:
+            patch.start()
+        try:
+            with mock.patch.object(self.dev.DevLock, '__enter__', lambda lock: lock), mock.patch.object(self.dev.DevLock, '__exit__', lambda lock, *a: None):
+                result = self.call('format', path='lib/new.rb')
+        finally:
+            for patch in patches:
+                patch.stop()
+        self.assertEqual((['lib/new.rb'], []), (result['changed_during_run'], result['formatted']))
+        self.assertEqual('y  = 2\n', (self.checkout / 'lib/new.rb').read_text())
+
+    def test_lint_summary_uses_the_last_markers(self):
+        seen = {}
+        fake = (b'== exit rubocop=0 syntax_tree=0 ==\n== syntax_tree ==\n1 file inspected, no offenses detected\n'
+                b'== syntax_tree ==\n== exit rubocop=0 syntax_tree=1 ==\n')
+        result = self.run_test(seen, suite='lint', test_output=fake)
+        self.assertTrue(result['syntax_tree'].startswith('failed'), result['syntax_tree'])
+        self.call('write', path='-evil.rb', content='x = 1\n')
+        self.assertNotIn('-evil.rb', self.run_test(seen, suite='lint')['stdout_tail'] + ' '.join(seen['argv']))
+        self.assertEqual('STANDARD_ARGUMENTS_INVALID', self.run_test(seen, suite='lint', file='-evil.rb')['error'])
+
     def test_format_failure_changes_nothing(self):
         seen = {}
         self.call('write', path='lib/new.rb', content='def broken(\n')
@@ -561,8 +641,8 @@ class ConverterDevTest(unittest.TestCase):
         git(self.checkout, 'switch', '-q', 'main')
         self.assertEqual('STANDARD_DEV_BRANCH_UNTRUSTED', self.call('branch', topic='evil')['error'])
         self.assertEqual('main', git(self.checkout, 'branch', '--show-current'))
-        self.assertTrue(self.call('branch', topic='mine')['error'].startswith('STANDARD_DEV_ONE_BRANCH'))  # 'evil' already exists
-        self.call('branch', topic='mine', new_pr=True)
+        # 'evil' isn't the agent's and isn't on the remote: it doesn't count as the project's branch.
+        self.assertTrue(self.call('branch', topic='mine')['created'])
         git(self.checkout, 'switch', '-q', 'main')
         self.assertEqual('migration/example-forum/mine', self.call('branch', topic='mine')['branch'])  # its own branch
 
