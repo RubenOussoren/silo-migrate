@@ -27,8 +27,11 @@ Without DBHub: `data_db_status`, `CREATE TABLE` from the dump, and sandbox scrip
   or count with a script), embedded attachments, quotes, smilies, mentions.
 
 ## Write the finding (`data_propose_finding` without run_id)
-Plain text, short sections: Identity; Tables (one block per table: columns with types and
-meaning; counts); Relationships; Encodings and markup; Uploads; Open questions.
+Markdown (the engineer reads it rendered): start with `## Decisions needed` (numbered, each with
+the facts and a suggested answer), then `## Identity`, `## Tables` (`###` per table: columns with
+types and meaning; counts, a table is fine), `## Relationships`, `## Encodings and markup`,
+`## Uploads`, `## Example rows`. Leave out anything code doesn't need that identifies the
+customer: the source database name, hostnames, URLs, real record IDs (thread/post/user IDs).
 
 Examples must be **invented**: `user_1`, `example@example.invalid`, `Example topic`,
 timestamps like `1700000000`, IPs from `192.0.2.0/24`. Show value *shapes* (length,

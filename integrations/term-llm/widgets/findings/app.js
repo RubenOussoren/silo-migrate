@@ -24,6 +24,79 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+// A small Markdown subset rendered as DOM nodes (never as HTML): headings (also ALL-CAPS section
+// lines), bullet and numbered lists, pipe tables, fenced code, `code` and **bold**. Links stay text.
+// Section lines as migration-data writes them: two or more ALL-CAPS words first ("OPEN QUESTIONS for
+// converter work"), or one ALL-CAPS word with an optional note ("UPLOADS (open)").
+const CAPS_HEADING = /^(?:[A-Z][A-Z0-9&/'’-]+\s+[A-Z][A-Z0-9&/'’-]+\b(?![a-z]).*|[A-Z][A-Z0-9&/'’-]{3,}(?:\s*\([^)]*\))?:?)$/;
+const isCapsHeading = (line) => line.length <= 120 && !line.endsWith('.') && CAPS_HEADING.test(line);
+
+function inline(text) {
+  const nodes = [];
+  const pattern = /`([^`]+)`|\*\*([^*]+)\*\*/g;
+  let last = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > last) nodes.push(text.slice(last, match.index));
+    nodes.push(match[1] !== undefined ? el('code', {}, match[1]) : el('strong', {}, match[2]));
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes;
+}
+
+function markdown(text) {
+  const root = el('div', { class: 'md' });
+  const lines = (text || '').replace(/\r\n?/g, '\n').split('\n');
+  let list = null;
+  let paragraph = null;
+  const close = () => { list = null; paragraph = null; };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```')) {
+      close();
+      const code = [];
+      for (i++; i < lines.length && !lines[i].trim().startsWith('```'); i++) code.push(lines[i]);
+      root.append(el('pre', {}, code.join('\n')));
+      continue;
+    }
+    if (!trimmed) { close(); continue; }
+    const heading = trimmed.match(/^(#{1,4})\s+(.*)$/);
+    if (heading || isCapsHeading(trimmed)) {
+      close();
+      root.append(el(heading ? `h${Math.min(6, heading[1].length + 2)}` : 'h4', {}, inline(heading ? heading[2] : trimmed)));
+      continue;
+    }
+    if (trimmed.startsWith('|') && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+      close();
+      const cells = (row) => row.trim().replace(/^\||\|$/g, '').split('|').map((cell) => cell.trim());
+      const table = el('table', {}, el('thead', {}, el('tr', {}, cells(line).map((cell) => el('th', {}, inline(cell))))));
+      const body = el('tbody');
+      for (i += 2; i < lines.length && lines[i].trim().startsWith('|'); i++) body.append(el('tr', {}, cells(lines[i]).map((cell) => el('td', {}, inline(cell)))));
+      i--;
+      table.append(body);
+      root.append(el('div', { class: 'table' }, table));
+      continue;
+    }
+    const item = trimmed.match(/^([-*]|\d+[.)])\s+(.*)$/);
+    if (item) {
+      paragraph = null;
+      const ordered = /\d/.test(item[1]);
+      if (!list || (list.tagName === 'OL') !== ordered) {
+        list = el(ordered ? 'ol' : 'ul');
+        root.append(list);
+      }
+      list.append(el('li', {}, inline(item[2])));
+      continue;
+    }
+    if (list && /^\s{2,}/.test(line) && list.lastChild) { list.lastChild.append(' ', ...inline(trimmed)); continue; }
+    list = null;
+    if (!paragraph) { paragraph = el('p'); root.append(paragraph); } else paragraph.append(el('br'));
+    paragraph.append(...inline(trimmed));
+  }
+  return root;
+}
+
 function ago(iso) {
   if (!iso) return '';
   const seconds = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
@@ -94,8 +167,23 @@ async function loadList() {
   $('next').disabled = data.page + 1 >= data.pages;
 }
 
+let formatted = localStorage.getItem('silo-findings-plain') !== '1';
+const views = new Set();  // text blocks on screen; the toggle re-renders them without touching the editor
+
 function textBlock(label, text) {
-  return el('div', { class: 'block' }, el('h3', {}, label), el('pre', {}, text ?? '(none)'));
+  const body = el('div', { class: 'view' });
+  const toggle = el('button', { type: 'button', class: 'toggle', onclick: () => {
+    formatted = !formatted;
+    localStorage.setItem('silo-findings-plain', formatted ? '0' : '1');
+    for (const view of views) view();
+  } });
+  const show = () => {
+    body.replaceChildren(text == null ? el('p', { class: 'empty' }, '(none)') : formatted ? markdown(text) : el('pre', {}, text));
+    toggle.textContent = formatted ? 'Plain text' : 'Formatted';
+  };
+  views.add(show);
+  show();
+  return el('div', { class: 'block' }, el('h3', {}, label, ' ', toggle), body);
 }
 
 function editor(label, text) {
@@ -105,7 +193,15 @@ function editor(label, text) {
   const count = () => { counter.textContent = `${new TextEncoder().encode(area.value).length} bytes`; };
   area.addEventListener('input', count);
   count();
-  return { area, node: el('div', { class: 'block' }, el('h3', {}, label), area, counter) };
+  const preview = el('div', { class: 'view preview', hidden: true });
+  const toggle = el('button', { type: 'button', class: 'toggle', onclick: () => {
+    const showing = preview.hidden;
+    if (showing) preview.replaceChildren(markdown(area.value));
+    preview.hidden = !showing;
+    area.hidden = showing;
+    toggle.textContent = showing ? 'Edit' : 'Preview';
+  } }, 'Preview');
+  return { area, node: el('div', { class: 'block' }, el('h3', {}, label, ' ', toggle), area, preview, counter) };
 }
 
 async function act(action, record, text) {
@@ -130,6 +226,7 @@ async function act(action, record, text) {
 
 async function loadDetail() {
   const pane = $('detail-pane');
+  views.clear();
   if (!state.selected) { pane.replaceChildren(el('p', { class: 'empty' }, 'Select a finding.')); return; }
   let record;
   try {

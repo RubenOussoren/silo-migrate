@@ -46,6 +46,10 @@ MyBB 1.8 needs MySQL 5.x+; 1.6 is very old (expect latin1 tables).
 only if the forum allowed it. Stored text is usually unescaped; check subjects for HTML
 entities. Line breaks are literal newlines.
 
+**Emoji.** With `$config['database']['encoding'] = 'utf8'` (tables utf8, not utf8mb4), MyBB 1.8
+replaces every 4-byte character (emoji, some CJK) with `?` before saving (`validate_utf8_string`,
+`allow_mb4=false`): they are lost, not encoded. Count `?` oddities only if it matters.
+
 **Watch for:** latin1 tables with UTF-8 bytes (mojibake), guests posting by `username`
 with `uid` 0, PMs duplicated per recipient, moved-thread redirects, link forums, users in
 "awaiting activation", and plugin tables (count them; ask what matters).

@@ -42,3 +42,19 @@ button:disabled { opacity: .4; cursor: default; }
 #toast { position: fixed; right: 18px; bottom: 18px; max-width: 420px; padding: 10px 14px; border-radius: 8px; background: #222; color: #fff; opacity: 0; transition: opacity .2s; pointer-events: none; }
 #toast.show { opacity: .95; } #toast.bad { background: var(--danger); }
 @media (max-width: 760px) { main { grid-template-columns: 1fr; height: auto; } #list-pane { border-right: 0; max-height: 50vh; } }
+.toggle { margin-left: 8px; padding: 1px 8px; border: 1px solid var(--line); border-radius: 10px; background: none; color: var(--muted); font: inherit; font-size: 11px; font-weight: 400; cursor: pointer; }
+.view { border: 1px solid var(--line); border-radius: 6px; padding: 4px 14px; max-height: 55vh; overflow: auto; }
+.view > pre { border: 0; padding: 6px 0; max-height: none; }
+.preview { min-height: 200px; }
+.md { font-size: 13.5px; line-height: 1.5; }
+.md h3, .md h4, .md h5, .md h6 { margin: 14px 0 4px; font-size: 13px; letter-spacing: .02em; }
+.md h3 { font-size: 15px; }
+.md p { margin: 6px 0; }
+.md ul, .md ol { margin: 4px 0 8px; padding-left: 22px; }
+.md li { margin: 2px 0; }
+.md code { font: 12px ui-monospace, monospace; padding: 0 3px; border-radius: 3px; background: #8882; word-break: break-word; }
+.md pre { margin: 6px 0; padding: 8px; border: 1px solid var(--line); border-radius: 6px; max-height: none; }
+.md .table { overflow-x: auto; margin: 8px 0; }
+.md table { border-collapse: collapse; font-size: 12.5px; }
+.md th, .md td { border: 1px solid var(--line); padding: 3px 8px; text-align: left; vertical-align: top; }
+.md th { background: #8881; }
