@@ -276,6 +276,7 @@ else:
                 self.assertEqual(['data', 'arc'], argv)
                 self.assertNotIn('unexpected', request)
                 self.assertNotIn('workspace', request)
+                self.assertEqual('chat', request['via'])
 
     def test_requests_carry_only_allowed_keys(self):
         cases = {
@@ -289,8 +290,8 @@ else:
         }
         for tool, (args, request) in cases.items():
             with self.subTest(tool=tool):
-                self.call(tool, dict(args, workspace='arc'))
-                self.assertEqual([[['data', 'arc'], request]], self.calls())
+                self.call(tool, dict(args, workspace='arc', via='shell'))
+                self.assertEqual([[['data', 'arc'], dict(request, via='chat')]], self.calls())
 
     def test_oversize_truncated_or_refused_output_becomes_a_fixed_error(self):
         for mode, code in (('large', 'STANDARD_OUTPUT_TOO_LARGE'), ('garbage', 'STANDARD_OPERATION_FAILED'), ('refuse', 'STANDARD_PATH_INVALID')):

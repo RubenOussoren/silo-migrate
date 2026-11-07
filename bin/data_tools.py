@@ -244,6 +244,7 @@ class Workspace:
         self.values = values
         self.control = control
         self.data = self.root / ".silo-migrate" / "data"
+        self.chat = False
 
     # state -------------------------------------------------------------------
     def initialized(self):
@@ -527,8 +528,8 @@ def search(fd, request, decompress):
             if not piece:
                 break
             window = tail + piece
-            found = matcher.search(window)
-            if found and found.end() > len(tail):
+            found = next((match for match in matcher.finditer(window) if match.end() > len(tail)), None)
+            if found:
                 start = max(0, found.start() - 80)
                 matches.append({"line": number, "offset": scanned - len(tail) + found.start(), "text": text_of(window[start:start + MAX_LINE])})
                 if len(matches) >= wanted:
@@ -697,7 +698,12 @@ def settle(ws, meta, dest_fd, name, relative, kind, pending, record):
         size = os.fstat(placed).st_size
     finally:
         os.close(placed)
-    input_id = register(ws, meta, relative, digest, size, kind)
+    # A take killed at the tool's time limit can leave its registration finishing on its own:
+    # then the registry already holds exactly these bytes, and the retry adopts that record.
+    existing = find_registered(ws, relative)
+    if existing and (existing["sha256"], existing["bytes"]) != (digest, size):
+        refuse("STANDARD_INPUT_CHANGED")
+    input_id = existing["id"] if existing else register(ws, meta, relative, digest, size, kind)
     ws.append("provenance.jsonl", dict(record["provenance"], at=now(), input_id=input_id, path=relative, sha256=digest, bytes=size, type=kind))
     pending.unlink()
     return {"input_id": input_id, "path": relative, "sha256": digest, "bytes": size, "type": kind}
@@ -724,7 +730,7 @@ def move_in(ws, meta, src_root, parts, dest_fd, name, relative, kind, provenance
         if info.st_nlink != 1 or (owner_check and info.st_uid != os.getuid()):
             # Not yet handed to the account (run `silo intake` as root) or linked elsewhere.
             refuse("STANDARD_PATH_INVALID")
-        if info.st_size > MAX_TOOL_INPUT:
+        if ws.chat and info.st_size > MAX_TOOL_INPUT:
             refuse("STANDARD_INPUT_TOO_LARGE_FOR_TOOL")
         try:
             os.stat(name, dir_fd=dest_fd, follow_symlinks=False)
@@ -1008,7 +1014,15 @@ def finish(ws, job):
     job.update(status=status, exit_code=code, oom_killed=bool(state.get("OOMKilled")), finished_at=now())
     if job.get("kind") == "db_load":
         # The dump ran as the database administrator and may have changed the read-only user.
-        job["read_only_user_checked"] = harden_ro_user(ws, job.get("engine"))
+        try:
+            checked = harden_ro_user(ws, job.get("engine"))
+        except Refusal:
+            checked = False
+        job["read_only_user_checked"] = checked
+        state = db_state(ws)
+        if state:
+            state["ro_user"] = checked
+            ws.write_json(ws.data_dir("db") / "state.json", state)
     ws.write_json(log_dir / (job["id"] + ".json"), job)
     docker(["rm", "-f", job["container"]], timeout=60)
     return combined
@@ -1019,7 +1033,10 @@ def output_listing(directory, limit=50, seconds=20):
     files, total, deadline = [], 0, time.monotonic() + seconds
     for top, _dirs, names, dirfd in os.fwalk(str(directory), follow_symlinks=False):
         for name in names:
-            info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            try:
+                info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
             if stat.S_ISREG(info.st_mode):
                 total += 1
                 if len(files) < limit:
@@ -1101,36 +1118,49 @@ def ro_password(ws):
 
 
 def harden_ro_user(ws, engine):
-    """(Re)create the read-only user and reduce it to reading, whatever a loaded dump did to it."""
+    """(Re)create the read-only user and reduce it to reading after a dump ran as administrator.
+    Best effort against a hostile dump: the source database is untrusted and disposable, and
+    query access (DBHub) must open its sessions read-only itself."""
     if engine not in ENGINES:
         return False
     password = ro_password(ws)
     if engine == "mariadb":
+        listed = db_exec(ws, engine, query=(f"SELECT 'role', Role FROM mysql.roles_mapping WHERE User = '{RO_USER}' AND Role <> '';\n"
+                                            f"SELECT 'host', Host FROM mysql.user WHERE User = '{RO_USER}' AND Host <> '%';\nSHOW DATABASES;\n"))
+        if listed.returncode:
+            return False
+        roles, hosts, databases = [], [], []
+        for line in listed.stdout.decode("utf-8", "replace").splitlines():
+            kind, _, value = line.partition("\t")
+            # Names come from the dump: only plain ones are ever put into a statement.
+            target = {"role": roles, "host": hosts}.get(kind) if _ else databases
+            name = value if _ else line
+            if target is not None and name and re.fullmatch(r"[A-Za-z0-9_$.%-]{1,64}", name):
+                target.append(name)
         sql = (f"CREATE USER IF NOT EXISTS '{RO_USER}'@'%';\nALTER USER '{RO_USER}'@'%' IDENTIFIED BY '{password}';\n"
-               f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM '{RO_USER}'@'%';\nSET DEFAULT ROLE NONE FOR '{RO_USER}'@'%';\n"
-               "SELECT CONCAT('REVOKE `', Role, '` FROM `', User, '`@`', Host, '`;') FROM mysql.roles_mapping "
-               f"WHERE User = '{RO_USER}' AND Role <> '';\n")
-        first = db_exec(ws, engine, sql)
-        if first.returncode:
-            return False
-        revokes = first.stdout.decode("utf-8", "replace")
-        databases = db_exec(ws, engine, query="SHOW DATABASES;")
-        if databases.returncode:
-            return False
-        grants = "".join(f"GRANT SELECT, SHOW VIEW ON `{name}`.* TO '{RO_USER}'@'%';\n"
-                         for name in databases.stdout.decode("utf-8", "replace").splitlines()
-                         if name and name not in SYSTEM_DATABASES.split("|") and "`" not in name)
-        return db_exec(ws, engine, revokes + grants + "FLUSH PRIVILEGES;\n").returncode == 0
+               + "".join(f"DROP USER IF EXISTS '{RO_USER}'@'{host}';\n" for host in hosts)
+               + f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM '{RO_USER}'@'%';\nSET DEFAULT ROLE NONE FOR '{RO_USER}'@'%';\n"
+               + "".join(f"REVOKE `{role}` FROM '{RO_USER}'@'%';\n" for role in roles)
+               + "".join(f"GRANT SELECT, SHOW VIEW ON `{name}`.* TO '{RO_USER}'@'%';\n" for name in databases
+                         if name not in SYSTEM_DATABASES.split("|"))
+               + "FLUSH PRIVILEGES;\n")
+        return db_exec(ws, engine, sql).returncode == 0
+    each_schema = ("DO $$DECLARE s text; BEGIN FOR s IN SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' "
+                   "AND nspname <> 'information_schema' LOOP {body} END LOOP; END$$;\n")
     sql = (f"DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{RO_USER}') THEN CREATE ROLE {RO_USER} LOGIN; END IF; END$$;\n"
            f"ALTER ROLE {RO_USER} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '{password}';\n"
+           f"ALTER ROLE {RO_USER} RESET ALL;\nALTER ROLE {RO_USER} IN DATABASE source RESET ALL;\n"
            f"ALTER ROLE {RO_USER} SET default_transaction_read_only = on;\n"
            f"DO $$DECLARE r text; BEGIN FOR r IN SELECT b.rolname FROM pg_auth_members m JOIN pg_roles b ON b.oid = m.roleid "
            f"JOIN pg_roles u ON u.oid = m.member WHERE u.rolname = '{RO_USER}' LOOP EXECUTE format('REVOKE %I FROM {RO_USER}', r); END LOOP; END$$;\n"
-           f"GRANT CONNECT ON DATABASE source TO {RO_USER};\n"
-           "DO $$DECLARE s text; BEGIN FOR s IN SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' "
-           f"AND nspname <> 'information_schema' LOOP EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM {RO_USER}', s); "
-           f"EXECUTE format('GRANT USAGE ON SCHEMA %I TO {RO_USER}', s); "
-           f"EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO {RO_USER}', s); END LOOP; END$$;\n")
+           f"REVOKE CREATE, TEMPORARY ON DATABASE source FROM PUBLIC, {RO_USER};\nGRANT CONNECT ON DATABASE source TO {RO_USER};\n"
+           + each_schema.format(body=(
+               f"EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM PUBLIC, {RO_USER}', s); "
+               f"EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM PUBLIC, {RO_USER}', s); "
+               f"EXECUTE format('REVOKE ALL ON ALL FUNCTIONS IN SCHEMA %I FROM PUBLIC, {RO_USER}', s); "
+               f"EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM PUBLIC, {RO_USER}', s); "
+               f"EXECUTE format('GRANT USAGE ON SCHEMA %I TO {RO_USER}', s); "
+               f"EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO {RO_USER}', s);")))
     return db_exec(ws, engine, sql).returncode == 0
 
 
@@ -1181,7 +1211,8 @@ def op_db_up(ws, request):
                 if docker(["volume", "inspect", names["volume"]], timeout=30).returncode == 0:
                     refuse("STANDARD_DB_STATE_MISSING")
                 db_secret(ws, engine)
-            command = (["--innodb-buffer-pool-size=1G", "--max-allowed-packet=1G", "--innodb-flush-log-at-trx-commit=2", "--skip-name-resolve"]
+            command = (["--innodb-buffer-pool-size=1G", "--max-allowed-packet=1G", "--innodb-flush-log-at-trx-commit=2", "--skip-name-resolve",
+                        "--event-scheduler=DISABLED"]
                        if engine == "mariadb" else
                        ["postgres", "-c", "fsync=off", "-c", "full_page_writes=off", "-c", "max_wal_size=4GB", "-c", "maintenance_work_mem=512MB"])
             data = "/var/lib/mysql" if engine == "mariadb" else "/var/lib/postgresql"
@@ -1208,12 +1239,16 @@ def op_db_up(ws, request):
             "next": "data_db_load with a registered input" if ready else "still starting; check data_db_status"}
 
 
-def registered(ws, relative):
-    """The registry record of an input path: its checksum stands for the bytes (inputs are read-only)."""
+def find_registered(ws, relative):
     for record in ws.named_state().get("inputs", {}).values():
         if base64.b64decode(record["path"]).decode("utf-8", "replace") == relative:
             return record
-    refuse("STANDARD_INPUT_NOT_REGISTERED")
+    return None
+
+
+def registered(ws, relative):
+    """The registry record of an input path: its checksum stands for the bytes (inputs are read-only)."""
+    return find_registered(ws, relative) or refuse("STANDARD_INPUT_NOT_REGISTERED")
 
 
 SQL_KINDS = {"mariadb": ("mysql-dump", "sql", "text"), "postgres": ("postgres-dump", "sql", "text")}
@@ -1259,16 +1294,16 @@ def op_db_load(ws, request):
         if engine == "mariadb":
             # --sandbox: the client refuses \! and system, so the dump can't run commands here.
             script = (f'set -o pipefail; {decompress} /in/dump | MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -h source-db -uroot --sandbox '
-                      f'--default-character-set={charset} {"" if stop_on_error else "--force "}source; code=$?; echo LOAD_DONE; exit $code')
+                      f'--default-character-set={charset} {"" if stop_on_error else "--force "}source > /dev/null; code=$?; echo LOAD_DONE; exit $code')
         elif custom:
             script = (f'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore --no-owner --no-privileges -h source-db -U postgres -d source '
-                      f'{"--exit-on-error " if stop_on_error else ""}/in/dump; code=$?; echo LOAD_DONE; exit $code')
+                      f'{"--exit-on-error " if stop_on_error else ""}/in/dump > /dev/null; code=$?; echo LOAD_DONE; exit $code')
         else:
             # psql runs backslash commands from the dump (\! runs a shell). A random \restrict key,
             # with the dump's own \restrict/\unrestrict lines dropped, refuses all of them.
             key = secrets.token_hex(16)
             script = (f'set -o pipefail; {{ printf "%s\\n" "\\\\restrict {key}"; {decompress} /in/dump | sed -E "/^\\\\\\\\(un)?restrict /d"; }} | '
-                      f'PGPASSWORD="$POSTGRES_PASSWORD" psql -h source-db -U postgres -d source -q -v ON_ERROR_STOP={1 if stop_on_error else 0}; '
+                      f'PGPASSWORD="$POSTGRES_PASSWORD" psql -h source-db -U postgres -d source -q -v ON_ERROR_STOP={1 if stop_on_error else 0} > /dev/null; '
                       'code=$?; echo LOAD_DONE; exit $code')
 
         def argv(name):
@@ -1426,6 +1461,9 @@ def main(args, values, base, repo, host, stdin, control):
     if not isinstance(request, dict) or request.get("op") not in OPS:
         refuse("STANDARD_DATA_OPERATION_REFUSED")
     ws = Workspace(base, args[1], repo, host, values, control)
+    # Set by migration-data's adapter on every request (the agent can't change it): chat tools
+    # have 300 s, a shell has no limit.
+    ws.chat = request.get("via") == "chat"
     op = request["op"]
     error = None
     try:

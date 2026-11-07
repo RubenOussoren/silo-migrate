@@ -141,8 +141,9 @@ class FakeDocker:
                 code = 0 if self.ready else 1
             elif input and b'information_schema.tables' in input:
                 out = b'source\t2\t1\n'
-            elif input == b'SHOW DATABASES;':
-                out = b'information_schema\nmysql\nsource\n'
+            elif input and input.startswith(b"SELECT 'role'"):
+                # As a hostile dump could leave them: an extra host entry and an injected role name.
+                out = b"role\tsafe_role\nrole\tx`; GRANT ALL ON *.* TO silo_ro@'%'; --\nhost\t172.%\ninformation_schema\nmysql\nsource\n"
         elif argv[0] == 'rm':
             self.state.pop(argv[-1], None)
         return subprocess.CompletedProcess(argv, code, out, err)
@@ -384,8 +385,11 @@ class DataToolsTest(unittest.TestCase):
             for password in passwords:
                 self.assertNotIn(password, joined)
         hardening = b''.join(inp for argv, inp in self.docker.calls if inp)
-        for statement in (b'CREATE USER IF NOT EXISTS', b'REVOKE ALL PRIVILEGES, GRANT OPTION', b'SET DEFAULT ROLE NONE', b'GRANT SELECT, SHOW VIEW ON `source`'):
+        for statement in (b'CREATE USER IF NOT EXISTS', b'REVOKE ALL PRIVILEGES, GRANT OPTION', b'SET DEFAULT ROLE NONE', b'GRANT SELECT, SHOW VIEW ON `source`',
+                          b"DROP USER IF EXISTS 'silo_ro'@'172.%'", b"REVOKE `safe_role` FROM"):
             self.assertIn(statement, hardening)
+        self.assertNotIn(b'GRANT ALL', hardening)  # names from the dump are never spliced in unchecked
+        self.assertNotIn(b'`mysql`', hardening)
         self.refused('STANDARD_DB_ENGINE_MISMATCH', 'db_up', engine='postgres')
         self.assertEqual([['source', 2]], [[s['schema'], s['tables']] for s in self.op('db_status')['schemas']])
 
@@ -412,7 +416,7 @@ class DataToolsTest(unittest.TestCase):
         for expected in ('--read-only', '--cap-drop ALL', 'dst=/in/dump,readonly', '--env-file'):
             self.assertIn(expected, joined)
         self.assertIn('gzip -dc /in/dump | MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -h source-db -uroot --sandbox', loader[-1])
-        self.assertTrue(loader[-1].endswith('source; code=$?; echo LOAD_DONE; exit $code'), loader[-1])  # a failed load fails the job
+        self.assertTrue(loader[-1].endswith('source > /dev/null; code=$?; echo LOAD_DONE; exit $code'), loader[-1])  # a failed load fails the job
         self.assertFalse(any(password in joined for password in self.passwords()))
         self.assertEqual(started['job_id'], self.op('db_status')['loads'][0]['job_id'])
         self.refused('STANDARD_CONFIRMATION_REQUIRED', 'db_reset')
@@ -442,7 +446,9 @@ class DataToolsTest(unittest.TestCase):
         self.assertIn('pg_restore --no-owner --no-privileges', script)
         self.assertNotIn('--exit-on-error', script)
         hardening = b''.join(inp for argv, inp in self.docker.calls if inp)
-        for statement in (b'NOSUPERUSER', b'default_transaction_read_only = on', b'GRANT SELECT ON ALL TABLES IN SCHEMA', b'REVOKE %I FROM silo_ro'):
+        for statement in (b'NOSUPERUSER', b'default_transaction_read_only = on', b'GRANT SELECT ON ALL TABLES IN SCHEMA', b'REVOKE %I FROM silo_ro',
+                          b'IN DATABASE source RESET ALL', b'REVOKE CREATE, TEMPORARY ON DATABASE source FROM PUBLIC',
+                          b'REVOKE ALL ON ALL FUNCTIONS IN SCHEMA %I FROM PUBLIC'):
             self.assertIn(statement, hardening)
 
     def test_plain_postgres_dump_runs_with_backslash_commands_restricted(self):
@@ -456,7 +462,7 @@ class DataToolsTest(unittest.TestCase):
         # sed pattern ^\\(un)?restrict (a literal backslash), as run for real in the smoke test.
         self.assertRegex(script, r'printf "%s\\n" "\\\\restrict [0-9a-f]{32}"; gzip -dc /in/dump \| ')
         self.assertIn(r'sed -E "/^\\\\(un)?restrict /d"; } | ', script)
-        self.assertIn('ON_ERROR_STOP=1; code=$?; echo LOAD_DONE; exit $code', script)
+        self.assertIn('ON_ERROR_STOP=1 > /dev/null; code=$?; echo LOAD_DONE; exit $code', script)
 
     def test_unsupported_dumps_and_unregistered_inputs_are_refused(self):
         self.create()
@@ -525,8 +531,27 @@ class DataToolsTest(unittest.TestCase):
         with mock.patch.object(self.d, 'open_regular', side_effect=as_root):
             self.refused('STANDARD_PATH_INVALID', 'take', path='root-owned.sql', type='mysql-dump')
         self.assertTrue((self.intake / 'root-owned.sql').exists())
+        (self.intake / 'huge.sql').write_text(DUMP)
         with mock.patch.object(self.d, 'MAX_TOOL_INPUT', 10):
-            self.refused('STANDARD_INPUT_TOO_LARGE_FOR_TOOL', 'take', path='root-owned.sql', type='mysql-dump')
+            # Too big for a chat tool's 300 s; the same request from a shell (no "via") works.
+            self.refused('STANDARD_INPUT_TOO_LARGE_FOR_TOOL', 'take', path='huge.sql', type='mysql-dump', via='chat')
+            self.assertEqual('inputs/huge.sql', self.op('take', path='huge.sql', type='mysql-dump')['path'])
+
+    def test_retry_adopts_a_registration_that_finished_after_the_tool_was_killed(self):
+        self.create()
+        (self.intake / 'slow.sql').write_text(DUMP)
+        real_register = self.d.register
+        def finishes_in_background(*args):
+            real_register(*args)  # the control process completes on its own...
+            raise self.d.Refusal('STANDARD_OPERATION_TIMEOUT')  # ...after the tool gave up
+        with mock.patch.object(self.d, 'register', side_effect=finishes_in_background):
+            self.refused('STANDARD_OPERATION_TIMEOUT', 'take', path='slow.sql', type='mysql-dump')
+        adds = len([argv for argv, _ in self.control.calls if argv[:3] == ['named', 'input', 'add']])
+        retry = self.op('take', path='slow.sql', type='mysql-dump')
+        self.assertEqual(('resumed', 'input-%032x' % 1), (retry['how'], retry['input_id']))
+        self.assertEqual(adds, len([argv for argv, _ in self.control.calls if argv[:3] == ['named', 'input', 'add']]))
+        provenance = [json.loads(line) for line in (self.base / 'arc/.silo-migrate/data/provenance.jsonl').read_text().splitlines()]
+        self.assertEqual(['input-%032x' % 1], [record['input_id'] for record in provenance])
 
     def test_search_keeps_memory_bounded_on_one_huge_line(self):
         line = b'INSERT INTO t VALUES ' + b'(1,"x"),' * (600 * 1024) + b'(2,"NEEDLE");\nnext line\n'
@@ -550,6 +575,12 @@ class DataToolsTest(unittest.TestCase):
         self.assertLessEqual(max(reads), 1024 * 1024)
         boundary = self.op('peek', area='intake', path='one-line.sql.gz', mode='search', pattern='next line')
         self.assertEqual(2, boundary['matches'][0]['line'])
+        # Two matches close together across a piece boundary: the second isn't lost.
+        piece = 1024 * 1024
+        data = b'a' * (piece - 3) + b'XYZ' + b'XYZ' + b'b' * 10 + b'\n'
+        (self.intake / 'pair.txt').write_bytes(data)
+        both = self.op('peek', area='intake', path='pair.txt', mode='search', pattern='XYZ')
+        self.assertEqual([piece - 3, piece], [match['offset'] for match in both['matches']])
 
     def test_db_reset_removes_only_the_database(self):
         self.create()

@@ -85,7 +85,8 @@ def main():
     if not isinstance(args, dict) or not isinstance(args.get("workspace"), str) or not WORKSPACE.match(args["workspace"]):
         return fail("STANDARD_ARGUMENTS_INVALID")
     op, keys, timeout = TOOLS[tool]
-    request = {"op": op, **{key: value for key, value in args.items() if key in keys and value is not None}}
+    # "via": the host applies chat-only limits (a tool has 300 s); the agent can't set or drop it.
+    request = {"op": op, **{key: value for key, value in args.items() if key in keys and value is not None}, "via": "chat"}
     try:
         result = subprocess.run([control_path(), "data", args["workspace"]], input=json.dumps(request).encode("utf-8"),
                                 capture_output=True, timeout=timeout, env=control_env())

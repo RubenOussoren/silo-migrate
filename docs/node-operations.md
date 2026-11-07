@@ -69,8 +69,12 @@ loader containers) and `ro.env` (read-only user, host side only). They never app
 argv, and job logs are scrubbed of them.
 
 Dumps are untrusted: the MariaDB client runs with `--sandbox` and psql under a random
-`\restrict` key, so a dump can't run shell commands; after every load the read-only user is
-reset to read-only, whatever the dump did. The project network is `--internal` and gives the
+`\restrict` key, so a dump can't run shell commands, and a dump's own query output is
+discarded. After every load the read-only user is re-created and reduced to reading (MariaDB:
+privileges, roles, other host entries; event scheduler off; PostgreSQL: role attributes,
+settings, memberships, PUBLIC grants). That is best effort against a hostile dump, not a
+boundary: the source database is disposable, and query access (DBHub, later) must open its
+sessions read-only itself. The project network is `--internal` and gives the
 host no address on it (`inhibit_ipv4`): containers can't reach the internet or host services.
 Jobs stop, and new ones are refused, when the disk's free space drops below 20 GiB or 10%.
 
@@ -81,7 +85,8 @@ request as the service account from a shell instead (no time limit), for example
 printf '%s' '{"op":"take","path":"forum.sql.gz","type":"mysql-dump"}' | /srv/silo-migrate/bin/silo-migrate-control data arc
 ```
 
-An interrupted take or register resumes when it is run again.
+An interrupted take or register resumes when it is run again (also when its registration
+finished after the tool gave up).
 
 Free SQL queries come with DBHub once term-llm can attach an MCP server to one agent only
 (in term-llm 0.9.93 any chat can switch on any configured MCP server).
