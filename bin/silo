@@ -574,6 +574,14 @@ def web_project(entry, project):
     try:
         with opener.open(request, timeout=20) as response:
             reply = json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        try:
+            code = (json.loads(error.read(4096) or b"{}").get("error") or {}).get("code")
+        except (OSError, ValueError, AttributeError, http.client.HTTPException):
+            code = None
+        if error.code == 409 and code == "project_duplicate":  # this folder is already a project
+            return "web UI project: " + project + " (already there), folder " + str(folder)
+        return manual + " (the web service refused it: HTTP %d%s)" % (error.code, ", " + code if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,40}", code) else "")
     except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
         return manual + " (the web service didn't answer)"
     if not isinstance(reply, dict):

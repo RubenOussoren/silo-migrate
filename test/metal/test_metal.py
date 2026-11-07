@@ -487,6 +487,25 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaisesRegex(self.m.Refusal, "METAL_BUSY"):
                 self.m.account_update(rollback)
 
+    def test_unchanged_release_still_retries_the_service_settings(self):
+        P = self.m.P
+        (P/"releases").mkdir(parents=True)
+        (P/"state/logs").mkdir(parents=True)
+        (self.m.W).mkdir(parents=True, exist_ok=True)
+        (self.m.W/".silo-standard-execution.lock").touch()
+        a = "a"*40
+        (P/"releases"/a).mkdir()
+        os.symlink(P/"releases"/a, P/"current")
+        self.m.record({"commit": a, "term_llm_version": "0.9.93"}, "apply")
+        for refreshed, expected in ((True, "METAL_SERVICE_UPDATED\nMETAL_UNCHANGED\n"), (False, "METAL_UNCHANGED\n")):
+            with self.subTest(refreshed=refreshed), patch.object(self.m, "resolve", return_value=a), \
+                    patch.object(self.m, "refresh_service", return_value=refreshed) as refresh, \
+                    patch.object(self.m, "fetch_release") as fetch, contextlib.redirect_stdout(io.StringIO()) as out:
+                self.m.account_update(False)
+            refresh.assert_called_once_with()
+            fetch.assert_not_called()
+            self.assertEqual(expected, out.getvalue())
+
     def test_update_rollback_leave_workspaces_and_backups_untouched(self):
         P = self.m.P
         for path in (P/"releases", P/"state/logs", self.m.W/"ws/backups"):

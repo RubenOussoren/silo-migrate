@@ -1126,6 +1126,9 @@ def account_update(rollback=False, branch=None, term=False):
             selected = branch or C["SILO_BRANCH"]
             commit = resolve(C["SILO_REPO"], selected)
             if commit == old["commit"]:
+                # The service settings are still checked, so a skipped re-install is retried.
+                if refresh_service():
+                    print("METAL_SERVICE_UPDATED", flush=True)
                 print("METAL_UNCHANGED")
                 return
             release = fetch_release(commit)

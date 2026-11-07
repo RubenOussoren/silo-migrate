@@ -307,7 +307,10 @@ class SiloTest(unittest.TestCase):
             def __exit__(self, *a): return False
         def fake_urlopen(request, timeout=0):
             sent.append(request)
-            return Reply(json.dumps({'project': {'id': 'prj_1'}, 'duplicate': len(sent) > 1}).encode())
+            if len(sent) > 1:  # what term-llm 0.9.93 answers for a folder that is already a project
+                raise urllib.error.HTTPError(request.full_url, 409, 'Conflict', {}, io.BytesIO(b'{"error":{"code":"project_duplicate"}}'))
+            return Reply(json.dumps({'project': {'id': 'prj_1'}}).encode())
+        import urllib.error
         import urllib.request
         handlers = []
         def fake_build_opener(*given):
@@ -337,6 +340,12 @@ class SiloTest(unittest.TestCase):
         redirect = next(h for h in handlers if isinstance(h, urllib.request.HTTPRedirectHandler))
         self.assertIsNone(redirect.redirect_request(None, None, 302, 'Found', {}, 'http://elsewhere.example/'))
         self.assertNotIn(token, out.getvalue())
+        # Any other refusal says so, with its status.
+        def refusing(request, timeout=0):
+            raise urllib.error.HTTPError(request.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'{"error":{"code":"unauthorized"}}'))
+        with mock.patch.object(self.s, 'run', side_effect=fake_run), \
+                mock.patch('urllib.request.build_opener', return_value=types.SimpleNamespace(open=refusing)):
+            self.assertIn('refused it: HTTP 401, unauthorized', self.s.web_project(self.entry, 'mybb-acme'))
         # A URL that isn't local is never sent the token.
         spec.write_text(json.dumps({'url': 'https://example.test/ui/', 'args': ['--projects']}))
         with mock.patch.object(self.s, 'run', side_effect=fake_run), mock.patch('urllib.request.build_opener', side_effect=fake_build_opener):
