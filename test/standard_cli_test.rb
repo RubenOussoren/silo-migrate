@@ -25,6 +25,9 @@ class StandardCLITest < SiloMigrateTest
       assert_equal name, JSON.parse(output).fetch('name')
       assert_equal 0, invoke(%w[converter status synthetic]).first
       assert_equal 0, invoke(%w[converter refresh synthetic]).first
+      assert_equal 0, invoke(%w[converter refresh synthetic --if-changed]).first
+      assert_equal 1, invoke(%w[converter refresh synthetic --if-changed extra]).first
+      assert_equal 1, invoke(%w[converter status synthetic --if-changed]).first
       assert_equal 1, invoke(%w[runtime list extra]).first
       assert_equal 1, invoke(%w[converter fetch synthetic]).first
       assert_equal 1, invoke(%w[init synthetic --converter-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]).first

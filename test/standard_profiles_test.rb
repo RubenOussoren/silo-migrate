@@ -91,8 +91,14 @@ class StandardProfilesTest < SiloMigrateTest
       @service.converter_refresh
       assert_equal 'b' * 40, propose[:converter]['commit']
       current = approve
+      @service.converter_refresh(if_changed: true)
+      assert_equal 'approved', @service.show_plan(current[:plan_id])[:status], 'refresh --if-changed keeps plans valid at the same HEAD'
       @service.converter_refresh
       assert_equal 'stale', @service.show_plan(current[:plan_id])[:status], 'explicit refresh invalidates approvals even at same HEAD'
+      later = approve
+      @runtime.converter_head = 'c' * 40
+      @service.converter_refresh(if_changed: true)
+      assert_equal 'stale', @service.show_plan(later[:plan_id])[:status], 'a changed HEAD rebinds even with --if-changed'
     end
   end
 

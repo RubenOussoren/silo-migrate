@@ -247,7 +247,7 @@ def doctor_checks(entry, runner=run):
     ui = str(PREFIX / "current/integrations/term-llm")
     findings = (spec is not None and "--disable-widgets" not in args and "--disable-extensions" not in args
                 and ui + "/widgets" in args and ui + "/extensions" in args and "silo-findings" in args)
-    add("OK" if findings else "WARN", "findings widget", "on: the Findings tab and widget in the web UI" if findings else "off: release findings from the terminal",
+    add("OK" if findings else "WARN", "findings widget", "on: the Findings and Runs tabs and widgets in the web UI" if findings else "off: release findings and approve runs from the terminal",
         None if findings else "silo update")
     try:
         info = os.lstat(WIDGET_RUNTIME)
@@ -437,7 +437,9 @@ def use_github(silo_repo=GITHUB_SILO):
 
 def shell(entry):
     need_root("silo shell")
-    argv = as_account(["bash", "-l"], entry)
+    # A login shell (the account's profile), then an interactive one: Debian's /etc/profile
+    # resets PATH, so <prefix>/bin (silo-migrate-control) is put back in front afterwards.
+    argv = as_account(["bash", "-l", "-c", 'export PATH="$1:$PATH"; exec bash -i', "silo-shell", str(PREFIX / "bin")], entry)
     os.chdir(entry.pw_dir)
     os.execvp(argv[0], argv)
 

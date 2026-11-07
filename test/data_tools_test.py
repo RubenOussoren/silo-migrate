@@ -775,24 +775,30 @@ class DataToolsTest(unittest.TestCase):
                 if answers.pop(0) == 'deps-missing':
                     self.d.refuse('STANDARD_CONVERTER_DEPS_MISSING: run dev_test once on this commit')
                 return json.dumps(plan)
+            if argv == ['standard', 'converter', 'refresh', 'arc', '--if-changed']:
+                calls.append((argv, timeout))
+                return json.dumps({'version': 1, 'commit': 'a' * 40, 'branch': 'migration/arc/mybb-converter', 'dirty': False})
             if argv[:2] == ['converter', 'deps']:
                 calls.append((argv, timeout))
                 return json.dumps({'version': 1, 'dependencies': {'status': 'prepared', 'gems_added': ['markbridge-0.5.0']}})
             return original(argv, input=input, timeout=timeout)
         self.control = control
         result = self.op('plan_propose', source=source, settings=settings, reconciliation=checks, charset='latin1')
-        self.assertEqual([['standard', 'plan', 'propose', 'arc', '--operation', 'convert', '--charset', 'latin1', '--source', source,
-                           '--settings', settings, '--reconciliation', checks], ['converter', 'deps', 'arc', '--budget', '150'], calls[0][0]], [c for c, _ in calls])
+        propose = ['standard', 'plan', 'propose', 'arc', '--operation', 'convert', '--charset', 'latin1', '--source', source,
+                   '--settings', settings, '--reconciliation', checks]
+        self.assertEqual([['standard', 'converter', 'refresh', 'arc', '--if-changed'], propose, ['converter', 'deps', 'arc', '--budget', '150'], propose],
+                         [c for c, _ in calls])
         self.assertLessEqual(sum(timeout for _, timeout in calls), 285)
         self.assertEqual('plan-' + 'e' * 32, result['plan_id'])
         self.assertEqual({'status': 'prepared', 'gems_added': ['markbridge-0.5.0']}, result['dependencies_prepared'])
         self.assertNotIn('private', result)
-        self.assertIn('silo-migrate-control standard plan approve arc PLAN_ID --sha256 DIGEST', result['next'])
+        self.assertIn('Runs widget', result['next'])
+        self.assertEqual('migration/arc/mybb-converter', result['converter_branch'])
         calls.clear()
         answers.append('plan')
         self.op('plan_propose', source=source, settings=settings)
-        self.assertEqual([['standard', 'plan', 'propose', 'arc', '--operation', 'convert', '--charset', 'utf8mb4', '--source', source, '--settings', settings]],
-                         [c for c, _ in calls])
+        self.assertEqual([['standard', 'converter', 'refresh', 'arc', '--if-changed'], ['standard', 'plan', 'propose', 'arc', '--operation', 'convert', '--charset', 'utf8mb4',
+                                                                       '--source', source, '--settings', settings]], [c for c, _ in calls])
         for bad in ({'source': 'input-1', 'settings': settings}, {'source': source, 'settings': source + ' --x'},
                     {'source': source, 'settings': settings, 'charset': 'koi8r'}, {'source': source}):
             with self.subTest(bad=bad):

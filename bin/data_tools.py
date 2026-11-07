@@ -1555,24 +1555,27 @@ def op_plan_propose(ws, request):
     argv = ["standard", "plan", "propose", ws.name, "--operation", "convert", "--charset", charset,
             *[flag for key, value in roles.items() for flag in ("--" + key, value)]]
     prepared = None
+    # Bind the workspace to the converter's committed branch head (a dirty checkout refuses:
+    # commit first). The plan shows that commit and the engineer approves exactly it.
+    converter = json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
     try:
-        plan = json.loads(ws.control(argv, timeout=45))
+        plan = json.loads(ws.control(argv, timeout=30))
     except Refusal as refusal:
         if not str(refusal).startswith("STANDARD_CONVERTER_DEPS_MISSING"):
             raise
         # The converter commit's locked gems aren't prepared yet: prepare them (public gems
         # only, the same step dev_test runs), then propose again.
         # 150 s to build (+ up to ~35 s to remove a container that ran out of time) fits in
-        # this call's 190, and 45 + 190 + 45 stays inside the tool's 290.
+        # this call's 190, and 30 + 30 + 190 + 30 stays inside the tool's 290.
         prepared = json.loads(ws.control(["converter", "deps", ws.name, "--budget", "150"], timeout=190)).get("dependencies")
-        plan = json.loads(ws.control(argv, timeout=45))
+        plan = json.loads(ws.control(argv, timeout=30))
     return {"plan_id": plan.get("plan_id"), "digest": plan.get("digest"), "status": plan.get("status"), "operation": plan.get("operation"),
             "platform": plan.get("platform"), "roles": plan.get("roles"), "inputs": plan.get("inputs"), "source_charset": plan.get("source_charset"),
-            "converter_revision": plan.get("converter_revision"), "converter_deps": plan.get("converter_deps"), "dependencies_prepared": prepared,
+            "converter_revision": plan.get("converter_revision"), "converter_branch": converter.get("branch"),
+            "converter_deps": plan.get("converter_deps"), "dependencies_prepared": prepared,
             "mutations": plan.get("mutations"), "not_included": plan.get("not_included"),
-            "next": ("Tell the engineer the plan ID and digest. They approve and start it as the service account: "
-                     "silo-migrate-control standard plan approve " + ws.name + " PLAN_ID --sha256 DIGEST --reviewer \"NAME\", then "
-                     "silo-migrate-control start-run " + ws.name + " PLAN_ID. When it finishes, read it with data_run_evidence.")}
+            "next": ("Tell the engineer the plan is waiting in the web UI's Runs widget (the Runs tab), where they review, "
+                     "approve and start it. When it has finished, read it with data_run_evidence.")}
 
 
 def op_propose_finding(ws, request):

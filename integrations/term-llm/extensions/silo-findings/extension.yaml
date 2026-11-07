@@ -1,5 +1,5 @@
-title: Findings to review
-description: Shows migration-data's findings waiting for review, with links to the Findings widget where they are released or rejected.
+title: Findings and runs waiting
+description: Shows migration-data's findings waiting for review, and plans and converter pushes waiting for approval, with links to the Findings and Runs widgets where they are decided.
 format_version: 1
 css: style.css
 js: main.js

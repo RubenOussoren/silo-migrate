@@ -61,7 +61,10 @@ $C standard plan propose "$WS" --dataset LAUNCH_DATASET_ID --baseline BASELINE_I
 A convert plan (`standard_convert`) runs only `preflight`, `convert` and `reconcile`. It
 converts a customer's registered dump into the intermediate database and counts what
 arrived. Nothing is imported into Discourse yet. migration-data prepares the inputs and
-proposes the plan (`data_plan_propose`). You approve and start it as the service account:
+proposes the plan (`data_plan_propose`), which first rebinds the workspace to the
+converter's committed branch head (`standard converter refresh`; a dirty checkout refuses).
+You approve and start it in the web UI's **Runs** widget (see below), or as the service
+account:
 
 ```sh
 $C standard plan propose "$WS" --operation convert --source INPUT_ID --settings INPUT_ID \
@@ -120,6 +123,32 @@ $C start-run "$WS" PLAN_ID
   and `_errors`.
 - **Findings on a completed convert run are allowed:** differences are what converter work
   fixes.
+
+## The Runs widget
+
+The web UI's **Runs** widget (`<base>/widgets/runs/`) is where the engineer makes the decisions
+that used to be terminal commands as the service account. A **Runs · N** tab on the chat page
+(beside **Findings · N**) counts what is waiting and links into it. Per project, it shows:
+
+- **Plans:** what each plan binds (operation, platform, converter branch and commit, inputs by
+  path and hash, limits). For a convert plan, it also shows the converter settings and the
+  reconciliation checks themselves. Buttons:
+  - **Approve:** the exact digest the page shows, with your commit identity as the reviewer.
+  - **Start run:** in the background, as `start-run`.
+  - **Discard:** a proposal nobody will approve, e.g. a stale one.
+- **Runs:** stages, failure code and recovery text, and the reconciliation table with its
+  numbers (you may see them; the operator sees only totals), plus the converter summary.
+  Buttons:
+  - **Reset:** finished or failed runs.
+  - **Recover:** abandoned or never-started runs.
+- **Converter pushes:** converter-developer's proposals, with the PR text, commits, files and
+  diff stat. **Push and open draft PR** (exact digest) replaces `converter push WS --sha256 D`.
+
+It runs as the service account on a Unix socket behind the web UI sign-in, like the Findings
+widget. Every button runs the same `silo-migrate-control` command a terminal would, which
+validates and records it. Agents have no web UI sign-in.
+The tab's counts come straight from disk; lists and details use `standard status`, `plan show`
+and `run show`, so stale plans and abandoned runs are shown as such.
 
 ## Approvals and refusals
 

@@ -21,7 +21,7 @@ module SiloMigrate
         runtime list
         runtime show NAME
         converter status WORKSPACE
-        converter refresh WORKSPACE
+        converter refresh WORKSPACE [--if-changed]    (--if-changed: keep plans valid when nothing changed)
         fixture register WORKSPACE --fixture-dir DIR --snapshot NAME [--label LABEL]
         status WORKSPACE
         plan propose WORKSPACE --dataset ID [--baseline seed|BASELINE_ID] [--ports A,B] [--allow-unqualified-runtime]
@@ -29,6 +29,7 @@ module SiloMigrate
                                                        (real data: convert and reconcile counts only; no import)
         plan show WORKSPACE PLAN_ID
         plan approve WORKSPACE PLAN_ID --sha256 DIGEST --reviewer NAME
+        plan discard WORKSPACE PLAN_ID --reviewer NAME          (a proposal nobody will approve)
         baseline accept WORKSPACE RUN_ID --reviewer NAME
         run start WORKSPACE PLAN_ID
         run claim WORKSPACE PLAN_ID
@@ -132,10 +133,11 @@ module SiloMigrate
         end
       when "converter"
         action = args.shift
+        if_changed = action == "refresh" && args.size == 2 && args.delete("--if-changed")
         single_workspace(args) do |workspace|
           case action
           when "status" then service(workspace).converter_status
-          when "refresh" then service(workspace).converter_refresh
+          when "refresh" then service(workspace).converter_refresh(if_changed: !!if_changed)
           else invalid!
           end
         end
@@ -194,6 +196,11 @@ module SiloMigrate
         plan_id = positional!(args)
         opts = options!(args, "--sha256", "--reviewer")
         service(workspace).approve_plan(plan_id: plan_id, sha256: opts.fetch("--sha256"), reviewer: opts.fetch("--reviewer"))
+      when "discard"
+        workspace = positional!(args)
+        plan_id = positional!(args)
+        opts = options!(args, "--reviewer")
+        service(workspace).discard_plan(plan_id: plan_id, reviewer: opts.fetch("--reviewer"))
       else invalid!
       end
     end

@@ -206,7 +206,10 @@ module SiloMigrate
         { version: 1, **converter_identity(config.fetch("converter_worktree")).transform_keys(&:to_sym), ahead: "unknown", behind: "unknown" }
       end
 
-      def converter_refresh
+      # An explicit refresh always rebinds, which makes proposed and approved plans stale even at
+      # the same HEAD. if_changed (what migration-data runs before each proposal) keeps the binding
+      # when the checkout's identity is unchanged, so earlier proposals stay valid.
+      def converter_refresh(if_changed: false)
         @store.with_op_lock do
           state = @store.load
           if state.fetch("runs").values.any? { |run| %w[claimed running].include?(run["status"]) }
@@ -215,6 +218,8 @@ module SiloMigrate
           config = state.fetch("config")
           identity = converter_identity(config.fetch("converter_worktree"))
           raise StandardWorkflowError, "STANDARD_CONVERTER_DIRTY" if identity.fetch("dirty")
+          next if if_changed && identity == config.fetch("converter")
+
           @store.update do |state|
             state.fetch("config")["converter_binding"] = SecureRandom.hex(16)
             state.fetch("config")["converter"] = identity
@@ -351,6 +356,24 @@ module SiloMigrate
           plan["status"] = "approved"
           plan["approval"] = { "digest" => sha256, "reviewer" => reviewer, "approved_at" => now }
           { version: 1, plan_id: plan_id, digest: sha256, status: "approved" }
+        end
+      end
+
+      # Engineer: set aside a proposal nobody will approve (stale, superseded or unwanted), so
+      # it stops waiting for a decision. A discarded plan can never be approved or run.
+      def discard_plan(plan_id:, reviewer:)
+        unless reviewer.is_a?(String) && reviewer.match?(/\A[[:print:]]{1,120}\z/)
+          raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID"
+        end
+
+        @store.update do |state|
+          plan = state.fetch("plans")[plan_id]
+          raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless plan
+          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless %w[proposed approved].include?(plan["status"])
+
+          plan["status"] = "discarded"
+          plan["discarded"] = { "reviewer" => reviewer, "discarded_at" => now }
+          { version: 1, plan_id: plan_id, status: "discarded" }
         end
       end
 

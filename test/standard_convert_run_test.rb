@@ -511,6 +511,26 @@ class StandardConvertRunTest < SiloMigrateTest
     end
   end
 
+  def test_discarded_plans_can_never_be_approved_or_run
+    with_convert do
+      plan = propose_convert
+      standard_error('STANDARD_ARGUMENT_INVALID') { @service.discard_plan(plan_id: plan[:plan_id], reviewer: '') }
+      assert_equal 'discarded', @service.discard_plan(plan_id: plan[:plan_id], reviewer: 'Ruben (web UI)')[:status]
+      assert_equal 'discarded', @service.show_plan(plan[:plan_id])[:status]
+      standard_error('STANDARD_TRANSITION_INVALID') { @service.approve_plan(plan_id: plan[:plan_id], sha256: plan[:digest], reviewer: 'x') }
+      standard_error('STANDARD_PLAN_CONSUMED') { @service.claim(plan_id: plan[:plan_id]) }
+      standard_error('STANDARD_TRANSITION_INVALID') { @service.discard_plan(plan_id: plan[:plan_id], reviewer: 'x') }
+      approved = approve_convert
+      assert_equal 'discarded', @service.discard_plan(plan_id: approved[:plan_id], reviewer: 'x')[:status]
+      standard_error('STANDARD_PLAN_CONSUMED') { @service.claim(plan_id: approved[:plan_id]) }
+      out = StringIO.new
+      cli = SiloMigrate::StandardCLI.new(env: @env, output: out, error: StringIO.new, runtime: @runtime, code_root: @code_root)
+      third = propose_convert
+      assert_equal 0, cli.run(['plan', 'discard', 'synthetic', third[:plan_id], '--reviewer', 'Ruben'])
+      assert_equal 'discarded', JSON.parse(out.string)['status']
+    end
+  end
+
   def test_full_run_still_refuses_findings_once_completed
     with_convert do
       service = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
