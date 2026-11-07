@@ -147,10 +147,16 @@ class Checkout:
 
     def save_manifest(self, data):
         path = self.manifest_path()
-        temporary = path.with_name("." + path.name + ".tmp")
-        temporary.write_text(json.dumps({"files": dict(sorted(data["files"].items())), "branches": sorted(set(data["branches"]))}, indent=1) + "\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        # A unique temporary name: concurrent savers must never share (and steal) one file.
+        descriptor, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w") as stream:
+                stream.write(json.dumps({"files": dict(sorted(data["files"].items())), "branches": sorted(set(data["branches"]))}, indent=1) + "\n")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         self._visible = None
 
     def record_write(self, relative, data):
@@ -531,7 +537,15 @@ def op_write(checkout, request):
         before = data.decode("utf-8", "replace")
         mode = stat.S_IMODE(info.st_mode) & 0o755
     atomic_write(target, content.encode("utf-8"), mode)
-    checkout.record_write(relative, content.encode("utf-8"))
+    try:
+        checkout.record_write(relative, content.encode("utf-8"))
+    except Exception:
+        if not exists:  # never leave a file the agent wrote but can't see
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+        raise
     return {"path": relative, "created": not exists, "bytes": len(content.encode("utf-8")), "diff": small_diff(relative, before, content)}
 
 
@@ -567,6 +581,37 @@ def op_delete(checkout, request):
 
 
 # -- branch, commit, push ----------------------------------------------------------
+
+# Operations that change the checkout or the manifest of what the agent wrote. Models often send
+# several tool calls at once; these run one at a time per workspace (reads don't wait).
+MUTATING = {"write", "edit", "delete", "branch", "commit", "push-propose"}
+DEV_LOCK_WAIT = 45  # the adapter gives a call 55 s
+
+
+class DevLock:
+    def __init__(self, checkout, wait=DEV_LOCK_WAIT):
+        self.checkout, self.wait = checkout, wait
+
+    def __enter__(self):
+        import fcntl
+        try:
+            self.fd = os.open(self.checkout.standard / "converter-dev.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError:
+            refuse("STANDARD_PATH_INVALID")
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    refuse("STANDARD_BUSY")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+
 
 class Locked:
     """The workspace op.lock, as `converter update` and StandardStore take it."""
@@ -1069,10 +1114,11 @@ def main(args, values, base, repo, host, stdin, home=None):
         handlers = {"list": op_list, "read": op_read, "search": op_search, "status": op_status, "diff": op_diff,
                     "push-show": op_push_show, "write": op_write, "edit": op_edit, "delete": op_delete,
                     "branch": op_branch, "push-propose": op_push_propose}
-        if op == "commit":
-            result = op_commit(checkout, request, home)
-        elif op == "test":
+        if op == "test":
             result = op_test(checkout, request, values, repo)
+        elif op in MUTATING:
+            with DevLock(checkout):
+                result = op_commit(checkout, request, home) if op == "commit" else handlers[op](checkout, request)
         else:
             result = handlers[op](checkout, request)
         return fit(dict(version=1, **result))

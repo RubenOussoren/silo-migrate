@@ -9,6 +9,7 @@ import runpy
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -73,6 +74,35 @@ class ConverterDevTest(unittest.TestCase):
         (self.checkout / 'inputs-link').symlink_to(self.root / 'inputs/source.sql')
         (self.checkout / 'lib/linked-dir').symlink_to(self.root / 'inputs')
         self.outputs = []
+
+    def test_parallel_writes_all_stay_visible(self):
+        # Seen on arc: the model sent six dev_write calls at once; unlocked manifest updates lost
+        # entries (files became invisible) and a shared temporary name failed two writes.
+        from concurrent.futures import ThreadPoolExecutor
+        import random
+        real_record = self.dev.Checkout.record_write
+
+        def slow_record(checkout, relative, data):  # widen the race the way real Git calls do
+            time.sleep(random.random() * 0.05)
+            return real_record(checkout, relative, data)
+        names = ['lib/parallel_%02d.rb' % n for n in range(12)]
+        with mock.patch.object(self.dev.Checkout, 'record_write', slow_record):
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                results = list(pool.map(lambda name: self.call('write', path=name, content='# %s\n' % name), names))
+        self.assertEqual([], [r for r in results if 'error' in r])
+        listed = self.call('status')
+        visible = json.dumps(listed)
+        for name in names:
+            self.assertIn(name, visible)
+        self.assertIn('# lib/parallel_03.rb', self.call('read', path='lib/parallel_03.rb')['text'])
+        self.assertEqual([], [p.name for p in (self.root / '.silo-migrate/named/standard').iterdir() if p.name.startswith('.converter-dev-files')])
+
+    def test_a_write_whose_record_fails_leaves_no_invisible_file(self):
+        with mock.patch.object(self.dev.Checkout, 'record_write', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.dev.main(['converter', 'dev', self.ws, '--role', 'developer'], {}, self.base, ROOT, self.host,
+                              io.StringIO(json.dumps({'op': 'write', 'path': 'lib/orphan.rb', 'content': 'x\n'})), home=str(self.home))
+        self.assertFalse((self.checkout / 'lib/orphan.rb').exists())
 
     def test_branch_works_in_a_workspace_that_never_ran_anything(self):
         # migration-data creates workspaces fresh: no op.lock until something takes it.
