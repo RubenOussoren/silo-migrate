@@ -141,7 +141,13 @@ converter-reviewer on Claude (`claude-bin`, which must be configured and signed 
   sources) and Bundler 2.6.3; otherwise `STANDARD_DEV_DEPS_UNSUPPORTED` (a new converter image
   is needed). Upstream's lockfile has no checksums, so gems are pinned by version and trusted
   from rubygems.org over TLS. Built once per key (about 4 s and 1 MB for a markbridge bump);
-  other workspaces with the same lockfile reuse it. Old keys aren't pruned yet.
+  other workspaces with the same lockfile reuse it. Old keys aren't pruned yet. The step uses
+  Docker's default bridge network, so a gem's build code could reach the host and the LAN, not
+  only rubygems.org. Customer data services aren't on that network: source databases and
+  Discourse stacks are on internal networks, and published ports bind to `127.0.0.1`. Restricting
+  outbound traffic from that network to port 443 with a host firewall would narrow it further.
+  The emoji table is frozen per key; if upstream changes its emoji URL, `dev_test` warns
+  (`emoji_warning`).
 - **Tests:** `dev_test` copies only the visible files into a temporary directory and runs
   `rake test` (or `rubocop`) in the profile's converter image, verified by content ID,
   with no network, a read-only root, no capabilities and CPU/memory/PID/time limits, and

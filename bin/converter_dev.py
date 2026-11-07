@@ -950,6 +950,21 @@ def emoji_repo_key():
     return re.sub(r"[^a-zA-Z0-9_-]", "_", re.sub(r"^https?://", "", EMOJI_BASE))
 
 
+EMOJI_SOURCE = "support/emojis/discourse_emoji_data.rb"
+
+
+def emoji_warning(checkout):
+    """None, or a note when the checkout's emoji code no longer uses the URL this step caches."""
+    try:
+        data, _ = checkout.load(EMOJI_SOURCE)
+    except Refusal:
+        return None
+    if ('BASE_URI = "' + EMOJI_BASE + '"').encode() in data:
+        return None
+    return ("The converter's emoji download URL changed (" + EMOJI_SOURCE + "), so the cached emoji table isn't used: "
+            "tests that map emoji may fail offline. Tell the engineer: dev_test, emoji URL changed.")
+
+
 def committed(checkout, relative):
     """Bytes of a file only as committed at HEAD (agents can't write these paths)."""
     try:
@@ -982,6 +997,11 @@ def check_lockfile(data):
         refuse("STANDARD_DEV_DEPS_UNSUPPORTED")
 
 
+# Both containers read Bundler settings from an empty place, never from a config file the
+# image (or the checkout's .bundle/) might carry: only the environment below decides.
+BUNDLE_ENV = ("BUNDLE_APP_CONFIG=/tmp/bundle-config", "BUNDLE_USER_HOME=/tmp/bundle-home", "BUNDLE_FROZEN=true")
+
+
 def image_gem_env(document, overlay):
     """Environment that layers the overlay over the image's own bundle (BUNDLE_PATH/ruby/ABI),
     as Bundler's BUNDLE_PATH mode would set it up: gems, then executables (rubocop...)."""
@@ -992,7 +1012,7 @@ def image_gem_env(document, overlay):
     if not (match and safe.fullmatch(bundle) and safe.fullmatch(home) and all(safe.fullmatch(part) for part in path.split(":"))):
         refuse("STANDARD_RUNTIME_MISMATCH")
     gems = f"{bundle.rstrip('/')}/ruby/{match[1]}.{match[2]}.0"
-    return ["GEM_HOME=" + overlay, "GEM_PATH=" + ":".join((overlay, gems, home)), "PATH=" + ":".join((overlay + "/bin", gems + "/bin", path))]
+    return [*BUNDLE_ENV, "GEM_HOME=" + overlay, "GEM_PATH=" + ":".join((overlay, gems, home)), "PATH=" + ":".join((overlay + "/bin", gems + "/bin", path))]
 
 
 def deps_root(checkout):
@@ -1058,6 +1078,10 @@ def prepare_dependencies(checkout, document, started):
                 time.sleep(1)
         if (ready / "ready.json").is_file():
             return ready, {"status": "ready", "key": key[:12]}
+        if ready.is_symlink() or ready.is_file():
+            ready.unlink()
+        elif ready.exists():
+            shutil.rmtree(ready)
         clean_stale_builds(root)
         build = Path(tempfile.mkdtemp(prefix=".build-", dir=root))
         try:
@@ -1075,8 +1099,7 @@ def prepare_dependencies(checkout, document, started):
                     "--tmpfs", "/tmp:rw,exec,size=1g",
                     "--mount", f"type=bind,src={build / 'lock'},dst=/lock,readonly", "--mount", f"type=bind,src={build / 'gems'},dst=/deps",
                     "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8",
-                    "-e", "BUNDLE_GEMFILE=/lock/Gemfile", "-e", "BUNDLE_FROZEN=true", "-e", "BUNDLE_APP_CONFIG=/tmp/bundle-config",
-                    "-e", "BUNDLE_USER_HOME=/tmp/bundle-home", *[arg for item in image_gem_env(document, "/deps") for arg in ("-e", item)],
+                    "-e", "BUNDLE_GEMFILE=/lock/Gemfile", *[arg for item in image_gem_env(document, "/deps") for arg in ("-e", item)],
                     "-w", "/tmp", "--entrypoint", "env", document["Id"], "-u", "BUNDLE_PATH",
                     "bundle", "_" + BUNDLER_VERSION + "_", "install", "--no-cache"]
             code, stdout, stderr = docker(argv, max(10, int(deadline - time.monotonic())))
@@ -1084,7 +1107,7 @@ def prepare_dependencies(checkout, document, started):
                 subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
             if code != 0:
                 return None, {"status": "failed", "step": "gems", "exit_code": code, "timed_out": code is None,
-                              "stdout_tail": stdout[-4096:].decode("utf-8", "replace"), "stderr_tail": stderr[-4096:].decode("utf-8", "replace")}
+                              "stdout_tail": stdout[-2048:].decode("utf-8", "replace"), "stderr_tail": stderr[-2048:].decode("utf-8", "replace")}
             added = sorted(path.name[:-len(".gemspec")] for path in (build / "gems/specifications").glob("*.gemspec"))
             try:
                 fetch_emoji(build / "emoji_cache", deadline)
@@ -1126,13 +1149,16 @@ def op_test(checkout, request, values, repo):
     document = converter_image_document(checkout, values, repo)
     image = document["Id"]
     deps, prepared = prepare_dependencies(checkout, document, started)
+    warning = emoji_warning(checkout)
+    if warning:
+        prepared = dict(prepared, emoji_warning=warning)
     if deps is None:
         return {"suite": suite, "file": file, "exit_code": None, "timed_out": False, "summary": None, "dependencies": prepared,
                 "note": "Tests did not run: the step that installs the checkout's locked gems (and the emoji table) didn't finish. "
                         "Retry once; if it fails again, stop and tell the engineer: dev_test, dependencies " + prepared["status"] + "."}
-    if prepared["status"] == "prepared" and TEST_TIMEOUT - (time.monotonic() - started) < TEST_MIN_SECONDS:
+    if TEST_TIMEOUT - (time.monotonic() - started) < TEST_MIN_SECONDS:
         return {"suite": suite, "file": file, "exit_code": None, "timed_out": False, "summary": None, "dependencies": prepared,
-                "note": "Dependencies are now installed; tests did not run yet. Run dev_test again."}
+                "note": "Dependencies are ready, but not enough time is left for tests in this call. Run dev_test again."}
     clean_stale_exports(tempfile.gettempdir())
     export = tempfile.mkdtemp(prefix="silo-devtest-")
     name = "silo-devtest-" + secrets.token_hex(6)
@@ -1140,7 +1166,10 @@ def op_test(checkout, request, values, repo):
         os.chmod(export, 0o700)
         copied = export_visible(checkout, export)
         # Docker would create this mount point as root inside the export: make it ours first.
-        (Path(export) / "tmp/emoji_cache").mkdir(parents=True, exist_ok=True)
+        try:
+            (Path(export) / "tmp/emoji_cache").mkdir(parents=True, exist_ok=True)
+        except OSError:
+            refuse("STANDARD_OPERATION_FAILED")
         # The tool itself is killed at ~290 s: keep the container inside that, after the export.
         budget = max(30, TEST_TIMEOUT - int(time.monotonic() - started))
         if "," in export:

@@ -429,6 +429,7 @@ class ConverterDevTest(unittest.TestCase):
                 seen.setdefault('deps', []).append(argv)
                 lock = Path(mounts['/lock'][0])
                 seen['lock_files'] = sorted(p.name for p in lock.iterdir())
+                time.sleep(seen.get('deps_seconds', 0))
                 if deps_code == 0:
                     self.write(Path(mounts['/deps'][0]) / 'specifications/markbridge-0.5.0.gemspec', '# spec\n')
                 return deps_code, b'Fetching markbridge 0.5.0\n', b'' if deps_code == 0 else b'Could not reach rubygems.org\n'
@@ -476,6 +477,9 @@ class ConverterDevTest(unittest.TestCase):
         self.assertIn('GEM_PATH=/deps:/opt/bundle/ruby/3.3.0:/usr/local/bundle', argv)
         self.assertIn('PATH=/deps/bin:/opt/bundle/ruby/3.3.0/bin:/usr/local/bundle/bin:/usr/bin', argv)
         self.assertIn('GEM_HOME=/deps', argv)
+        for setting in self.dev.BUNDLE_ENV:
+            self.assertIn(setting, argv)
+        self.assertNotIn('emoji_warning', result['dependencies'])
         self.assertEqual([IMAGE_ID, '-u', 'BUNDLE_PATH', 'bundle', '_2.6.3_', 'exec', 'rake', 'test'], argv[argv.index(IMAGE_ID):])
         self.assertEqual('env', argv[argv.index('--entrypoint') + 1])
         self.assertEqual(['raw_githubusercontent_com_discourse_discourse-emojis_main_/dist/aliases.json',
@@ -502,7 +506,8 @@ class ConverterDevTest(unittest.TestCase):
             self.assertTrue(any(argv[i:i + len(flag)] == flag for i in range(len(argv))), flag)
         self.assertNotIn(str(self.root), ' '.join(argv))
         self.assertEqual([IMAGE_ID, '-u', 'BUNDLE_PATH', 'bundle', '_2.6.3_', 'install', '--no-cache'], argv[argv.index(IMAGE_ID):])
-        self.assertIn('BUNDLE_FROZEN=true', argv)
+        for setting in self.dev.BUNDLE_ENV:
+            self.assertIn(setting, argv)
         cache = Path(self.temp.name) / 'state/converter-deps'
         ready = [p for p in cache.iterdir() if not p.name.startswith('.')]
         self.assertEqual(1, len(ready))
@@ -544,14 +549,69 @@ class ConverterDevTest(unittest.TestCase):
         self.assertNotIn('argv', seen)
 
     def test_prepared_with_little_time_left_asks_for_a_rerun(self):
-        seen = {}
-        with mock.patch.object(self.dev, 'TEST_TIMEOUT', 60):
+        seen = {'deps_seconds': 0.6}  # the build uses time; a reused cache doesn't
+        with mock.patch.object(self.dev, 'TEST_TIMEOUT', 60), mock.patch.object(self.dev, 'TEST_MIN_SECONDS', 59.7):
             result = self.run_test(seen)
-        self.assertEqual('prepared', result['dependencies']['status'])
-        self.assertIn('Run dev_test again', result['note'])
-        self.assertNotIn('argv', seen)
-        with mock.patch.object(self.dev, 'TEST_TIMEOUT', 60):
+            self.assertEqual('prepared', result['dependencies']['status'])
+            self.assertIn('Run dev_test again', result['note'])
+            self.assertNotIn('argv', seen)
             self.assertEqual('3 runs, 5 assertions, 0 failures, 0 errors, 0 skips', self.run_test(seen)['summary'])
+
+    def deps_key(self):
+        gemfile = (self.checkout / 'Gemfile').read_bytes()
+        return hashlib.sha256(self.dev.canonical({'recipe': self.dev.DEPS_RECIPE, 'image': IMAGE_ID, 'gemfile': hashlib.sha256(gemfile).hexdigest(),
+                                                  'lockfile': hashlib.sha256(LOCKFILE.encode()).hexdigest()}).encode()).hexdigest()
+
+    def test_waiting_for_another_preparer_also_counts_against_the_test_time(self):
+        import fcntl
+        import threading
+        seen = {}
+        root = Path(self.temp.name) / 'state/converter-deps'
+        root.mkdir(parents=True)
+        key = self.deps_key()
+        holder = os.open(root / ('.lock-' + key), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+
+        def other_preparer():
+            time.sleep(1.5)
+            for name in ('gems', 'emoji_cache'):
+                (root / key / name).mkdir(parents=True)
+            (root / key / 'ready.json').write_text('{}')
+            os.close(holder)
+        thread = threading.Thread(target=other_preparer)
+        thread.start()
+        try:
+            with mock.patch.object(self.dev, 'TEST_TIMEOUT', 91), mock.patch.object(self.dev, 'TEST_MIN_SECONDS', 90):
+                result = self.run_test(seen)
+        finally:
+            thread.join()
+        self.assertEqual('ready', result['dependencies']['status'])
+        self.assertIn('Run dev_test again', result['note'])
+        self.assertNotIn('deps', seen)
+        self.assertNotIn('argv', seen)
+
+    def test_a_key_folder_without_ready_record_is_rebuilt(self):
+        seen = {}
+        broken = Path(self.temp.name) / 'state/converter-deps' / self.deps_key()
+        self.write(broken / 'gems/half-written', 'x')
+        self.assertEqual('prepared', self.run_test(seen)['dependencies']['status'])
+        self.assertFalse((broken / 'gems/half-written').exists())
+        self.assertTrue((broken / 'ready.json').is_file())
+
+    def test_a_visible_file_in_the_way_of_the_emoji_mount_is_refused_cleanly(self):
+        seen = {}
+        self.call('write', path='tmp', content='not a folder\n')
+        self.assertEqual('STANDARD_OPERATION_FAILED', self.run_test(seen)['error'])
+        self.assertNotIn('argv', seen)
+
+    def test_changed_emoji_url_is_reported(self):
+        seen = {}
+        self.call('write', path='support/emojis/discourse_emoji_data.rb', content='BASE_URI = "' + self.dev.EMOJI_BASE + '"\n')
+        self.assertNotIn('emoji_warning', self.run_test(seen)['dependencies'])
+        self.call('edit', path='support/emojis/discourse_emoji_data.rb', old_text='/main/', new_text='/abc123/')
+        result = self.run_test(seen)
+        self.assertIn('emoji URL changed', result['dependencies']['emoji_warning'])
+        self.assertEqual('3 runs, 5 assertions, 0 failures, 0 errors, 0 skips', result['summary'])
 
     def test_dependency_step_waits_for_another_preparer(self):
         import fcntl
@@ -598,10 +658,10 @@ class ConverterDevTest(unittest.TestCase):
                     check(bad if isinstance(bad, bytes) else bad.encode())
 
     def test_image_gem_env_comes_from_the_image(self):
-        self.assertEqual(['GEM_HOME=/deps', 'GEM_PATH=/deps:/opt/bundle/ruby/3.3.0:/usr/local/bundle',
+        self.assertEqual([*self.dev.BUNDLE_ENV, 'GEM_HOME=/deps', 'GEM_PATH=/deps:/opt/bundle/ruby/3.3.0:/usr/local/bundle',
                           'PATH=/deps/bin:/opt/bundle/ruby/3.3.0/bin:/usr/local/bundle/bin:/usr/bin'], self.dev.image_gem_env(IMAGE_DOCUMENT, '/deps'))
         good = ['RUBY_VERSION=3.4.1', 'GEM_HOME=/x', 'BUNDLE_PATH=/opt/b', 'PATH=/usr/bin']
-        self.assertEqual('GEM_PATH=/deps:/opt/b/ruby/3.4.0:/x', self.dev.image_gem_env({'Config': {'Env': good}}, '/deps')[1])
+        self.assertIn('GEM_PATH=/deps:/opt/b/ruby/3.4.0:/x', self.dev.image_gem_env({'Config': {'Env': good}}, '/deps'))
         for env in ([], good[:2] + good[3:], good[:2] + ['BUNDLE_PATH=/opt/b:/evil', good[3]], ['RUBY_VERSION=x'] + good[1:],
                     good[:3] + ['PATH=/usr/bin:relative'], good[:3] + ['PATH=/usr/bin:/a b']):
             with self.subTest(env=env):
