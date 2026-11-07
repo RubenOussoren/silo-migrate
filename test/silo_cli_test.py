@@ -1,6 +1,7 @@
 """`silo` node command tests (no real services). Run: python3 -I -B test/silo_cli_test.py."""
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -289,6 +290,55 @@ class SiloTest(unittest.TestCase):
         (self.home / '.config/term-llm/skills').symlink_to(self.prefix / 'current/integrations/term-llm/skills')
         check = self.statuses(self.healthy())['skills']
         self.assertEqual(('OK', '1 linked from the release'), (check['status'], check['detail']))
+
+    def test_intake_creates_the_web_ui_project_without_showing_the_token(self):
+        spec = self.home / '.config/term-llm/services/web/service.json'
+        spec.parent.mkdir(parents=True)
+        token = 'tok_' + 'x' * 40
+        real_run = self.s.run
+        def fake_run(argv, timeout=60, input=None):
+            if argv[-3:] == ['service', 'token', 'web']:
+                return subprocess.CompletedProcess(argv, 0, token + '\n', '')
+            return real_run(argv, timeout=timeout, input=input)
+        sent = []
+        class Reply(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        def fake_urlopen(request, timeout=0):
+            sent.append(request)
+            return Reply(json.dumps({'project': {'id': 'prj_1'}, 'duplicate': len(sent) > 1}).encode())
+        with mock.patch.object(self.s, 'run', side_effect=fake_run), mock.patch('urllib.request.urlopen', side_effect=fake_urlopen), \
+                mock.patch('sys.stdout', new_callable=io.StringIO) as out:
+            # Projects not on yet: the folder is made, no request is sent.
+            spec.write_text(json.dumps({'url': 'http://localhost:18800/ui/', 'args': ['--no-projects']}))
+            self.assertIn('silo update turns them on', self.s.web_project(self.entry, 'mybb-acme'))
+            self.assertEqual([], sent)
+            spec.write_text(json.dumps({'url': 'http://localhost:18800/ui/', 'args': ['--host', '127.0.0.1', '--projects']}))
+            self.s.intake(self.entry, 'mybb-acme')
+            self.assertIn('(already there)', self.s.web_project(self.entry, 'mybb-acme'))
+        folder = self.home / 'projects/mybb-acme'
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(0o700, stat.S_IMODE(folder.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(folder.parent.stat().st_mode))
+        request = sent[0]
+        self.assertEqual('http://127.0.0.1:18800/ui/v1/projects', request.full_url)
+        self.assertEqual({'name': 'mybb-acme', 'path': str(folder)}, json.loads(request.data))
+        self.assertEqual('Bearer ' + token, request.get_header('Authorization'))
+        self.assertIn('web UI project: mybb-acme (created)', out.getvalue())
+        self.assertNotIn(token, out.getvalue())
+        # A URL that isn't local is never sent the token.
+        spec.write_text(json.dumps({'url': 'https://example.test/ui/', 'args': ['--projects']}))
+        with mock.patch.object(self.s, 'run', side_effect=fake_run), mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
+            self.s.web_project(self.entry, 'mybb-acme')
+        self.assertEqual(2, len(sent))
+
+    def test_doctor_shows_whether_web_projects_are_on(self):
+        spec = self.home / '.config/term-llm/services/web/service.json'
+        spec.parent.mkdir(parents=True)
+        spec.write_text(json.dumps({'args': ['--no-projects']}))
+        self.assertEqual(('WARN', 'silo update'), (self.statuses(self.healthy())['web projects']['status'], self.statuses(self.healthy())['web projects']['fix']))
+        spec.write_text(json.dumps({'args': ['--projects']}))
+        self.assertEqual('OK', self.statuses(self.healthy())['web projects']['status'])
 
     def test_claude_link_goes_in_the_service_path_not_roots(self):
         target = self.home / '.local/bin/claude'

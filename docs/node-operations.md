@@ -21,7 +21,7 @@ account is root-equivalent through Docker anyway, but keep the release sealed (`
 | `silo shell` | (root) A login shell as the service account with the right environment. |
 | `silo prime` | Signs in to 1Password (you type the password) and warms op-cache, so Frontier works for 24 hours. The session is kept only in memory. |
 | `silo claude-login [--sso\|--console]` | Signs the service account in to Claude Code and links it as `<prefix>/bin/claude`, which is on the web service's PATH but not root's (an older `/usr/local/bin/claude` link can then be removed). |
-| `silo intake PROJECT` | Creates the project's drop folder `<prefix>/intake/PROJECT/` (private to the account). Copy export files into it; run it again as root afterwards so the files belong to the account. |
+| `silo intake PROJECT` | Creates the project's drop folder `<prefix>/intake/PROJECT/` (private to the account), its chat folder `~/projects/PROJECT` and its web UI project. Copy export files into the drop folder; run it again as root afterwards so the files belong to the account. |
 
 ## Intake
 
@@ -88,11 +88,23 @@ printf '%s' '{"op":"take","path":"forum.sql.gz","type":"mysql-dump"}' | /srv/sil
 An interrupted take or register resumes when it is run again (also when its registration
 finished after the tool gave up).
 
-**One project per chat.** Several customers' projects can live on one node and share the same
-agents. Each project's files, findings, converter checkout, branches and database are separate;
-what keeps a *chat* to one project is migration-data's instructions (the first workspace it uses
-is the chat's project). Start a new chat for another project. A later term-llm change (passing
-the chat to tools) lets the tools enforce this.
+**One project per chat (web UI projects).** Several customers share this node and its agents.
+Each project's files, findings, notes, converter checkout, branches and database are separate,
+and the web UI keeps chats apart:
+
+- The web service runs with `--projects`, so every chat belongs to a project. `silo intake PROJECT`
+  creates the folder `~/projects/PROJECT` and a web UI project of that name (if the service
+  answers; otherwise choose New project and pick that folder). Chats from before projects were
+  turned on, and server-support chats, live in the home project.
+- term-llm runs a project chat's tools in the project's folder, and a chat can't move to
+  another project. The tools use that: **migration-data works only in a project chat and only on
+  that project's workspace** (`STANDARD_CHAT_NOT_IN_PROJECT`, `STANDARD_WORKSPACE_NOT_THIS_PROJECT`);
+  the operator and converter agents are held to the project's workspace when their chat is in one.
+  The project folder itself holds nothing; customer data stays in the workspace.
+- **Project notes** are migration-data's memory: `data_notes` / `data_notes_write` keep one notes
+  file per workspace (`.silo-migrate/data/notes.md`, the last 20 versions in `notes-history/`).
+  It reads them at the start of each chat and updates them after meaningful work. term-llm's own
+  memory is kept per agent, so it would mix customers; it stays off on this node (no mining jobs).
 
 ### Free SQL: DBHub
 

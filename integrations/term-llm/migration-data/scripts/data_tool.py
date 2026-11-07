@@ -8,6 +8,7 @@ reach a shell; only the listed request keys are passed on.
 """
 import json
 import os
+import pwd
 import re
 import subprocess
 import sys
@@ -32,6 +33,8 @@ TOOLS = {
     "data_db_reset": ("db_reset", {"confirm"}, 200),
     "data_run_evidence": ("run_evidence", {"run_id"}, 60),
     "data_propose_finding": ("propose_finding", {"text", "run_id"}, 60),
+    "data_notes": ("notes", set(), 60),
+    "data_notes_write": ("notes_write", {"text"}, 60),
 }
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
 
@@ -60,6 +63,18 @@ def fail(code):
     return 0
 
 
+def chat_project():
+    """The web UI project this chat belongs to, or None. term-llm runs a project chat's tools in
+    the project's folder, ~/projects/<project> (silo intake creates it); the model can't change
+    that. SILO_PROJECTS_ROOT is for tests only."""
+    root = os.environ.get("SILO_PROJECTS_ROOT") or os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "projects")
+    try:
+        cwd, root = os.path.realpath(os.getcwd()), os.path.realpath(root)
+    except OSError:
+        return None
+    return cwd[len(root) + 1:].split(os.sep)[0] if cwd.startswith(root + os.sep) else None
+
+
 def emit(result):
     if result.returncode != 0 or not result.stdout.strip():
         match = re.search(rb"Error: ([A-Z_]+)", result.stderr)
@@ -84,6 +99,12 @@ def main():
         return fail("STANDARD_ARGUMENTS_INVALID")
     if not isinstance(args, dict) or not isinstance(args.get("workspace"), str) or not WORKSPACE.match(args["workspace"]):
         return fail("STANDARD_ARGUMENTS_INVALID")
+    # One customer per chat: the chat's web UI project decides the workspace.
+    project = chat_project()
+    if project is None:
+        return fail("STANDARD_CHAT_NOT_IN_PROJECT")
+    if args["workspace"] != project:
+        return fail("STANDARD_WORKSPACE_NOT_THIS_PROJECT")
     op, keys, timeout = TOOLS[tool]
     # "via": the host applies chat-only limits (a tool has 300 s); the agent can't set or drop it.
     request = {"op": op, **{key: value for key, value in args.items() if key in keys and value is not None}, "via": "chat"}

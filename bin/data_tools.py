@@ -1557,11 +1557,63 @@ def op_propose_finding(ws, request):
 
 # -- dispatch ------------------------------------------------------------------------------
 
+# -- project notes: migration-data's memory, one file per workspace ---------------------------
+# term-llm's own memory is kept per agent, so with one agent for every customer it would mix
+# projects. Notes live in the workspace instead and are reached only through that workspace.
+
+NOTES_JSON_BYTES = 40 * 1024  # as JSON, so a read always fits the tool output whole
+NOTES_VERSIONS = 20
+
+
+def notes_path(ws):
+    return ws.data_dir() / "notes.md"
+
+
+def op_notes(ws, request):
+    if not ws.initialized():
+        return {"notes": "", "updated_at": None, "note": "a new project: the workspace doesn't exist yet (data_create makes it)"}
+    path = notes_path(ws)
+    if path.is_symlink():
+        refuse("STANDARD_PATH_INVALID")
+    if not path.is_file():
+        return {"notes": "", "updated_at": None, "note": "no notes yet: keep them with data_notes_write"}
+    info = path.stat()
+    return {"notes": path.read_text(encoding="utf-8", errors="replace"), "bytes": info.st_size,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(info.st_mtime))}
+
+
+def op_notes_write(ws, request):
+    ws.require(standard=False)
+    text = request.get("text")
+    if not isinstance(text, str) or not text.strip() or "\x00" in text:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    if len(json.dumps(text, ensure_ascii=False).encode("utf-8")) > NOTES_JSON_BYTES:
+        refuse("STANDARD_NOTES_TOO_LARGE: keep notes under about 32 KiB; summarise older parts")
+    with ws.lock():
+        path = notes_path(ws)
+        if path.is_symlink():
+            refuse("STANDARD_PATH_INVALID")
+        history = ws.data_dir("notes-history")
+        if path.is_file():
+            # The previous version is kept, so a bad rewrite can be undone by the engineer.
+            # Nanoseconds: names sort in the order they were written.
+            os.replace(path, history / ("%020d.md" % time.time_ns()))
+            for old in sorted(history.glob("*.md"))[:-NOTES_VERSIONS]:
+                old.unlink()
+        temporary = path.with_name(".notes." + secrets.token_hex(4))
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text if text.endswith("\n") else text + "\n")
+        os.replace(temporary, path)
+    return {"bytes": path.stat().st_size, "previous_versions": len(list(history.glob("*.md")))}
+
+
 OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
-       "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "propose_finding": op_propose_finding}
+       "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "propose_finding": op_propose_finding,
+       "notes": op_notes, "notes_write": op_notes_write}
 # Logged with their arguments (minus script code and finding text, logged by hash).
-QUIET = {"status", "list", "job", "db_status"}
+QUIET = {"status", "list", "job", "db_status", "notes"}
 
 
 def fit(result):

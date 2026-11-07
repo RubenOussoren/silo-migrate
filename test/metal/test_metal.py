@@ -102,8 +102,10 @@ class InstallerTests(unittest.TestCase):
     def test_web_service_offers_only_migration_agents(self):
         args = self.m.service_args()
         self.assertNotIn("--agent", args)
-        for flag in ("--no-projects", "--disable-extensions", "--disable-widgets"):
+        for flag in ("--projects", "--disable-extensions", "--disable-widgets"):
             self.assertIn(flag, args)
+        self.assertNotIn("--no-projects", args)
+        self.assertIn("  projects:\n    enabled: true\n", self.m.fresh_config())
         self.assertEqual("prompt", args[args.index("--approval") + 1])
         fresh = self.m.fresh_config()
         self.assertIn("agents:\n  use_builtin: false\n  search_paths:\n    - " + str(self.m.P/"current/integrations/term-llm") + "\n", fresh)
@@ -214,6 +216,31 @@ class InstallerTests(unittest.TestCase):
         # installed skill, so only migration-data has skills and its list names all of them.
         self.assertEqual(names | {"+"}, set(selectors.pop("migration-data").split(",")))
         self.assertEqual({"none"}, set(selectors.values()))
+
+    def test_update_reinstalls_the_service_once_to_turn_projects_on(self):
+        spec = self.home/".config/term-llm/services/web/service.json"
+        spec.parent.mkdir(parents=True)
+        self.m.C["TERM_LLM_SERVICE"] = "install-and-start"
+        calls = []
+        with patch.object(self.m, "run", side_effect=lambda argv, **kw: calls.append(argv)):
+            self.assertFalse(self.m.refresh_service())  # no saved service: nothing to do
+            spec.write_text(json.dumps({"args": ["--host", "127.0.0.1", "--no-projects", "--disable-extensions"]}))
+            self.assertTrue(self.m.refresh_service())
+            self.assertEqual(2, len(calls))
+            self.assertIn("--dry-run", calls[0])
+            self.assertIn("--projects", calls[1])
+            self.assertNotIn("--no-projects", calls[1])
+            spec.write_text(json.dumps({"args": ["--host", "127.0.0.1", "--projects"]}))
+            self.assertFalse(self.m.refresh_service())  # already on: no re-install
+            self.assertEqual(2, len(calls))
+        spec.write_text(json.dumps({"args": ["--no-projects"]}))
+        def failing(argv, **kw):
+            self.m.refuse("METAL_SERVICE_UPDATE_FAILED", "x")
+        with patch.object(self.m, "run", side_effect=failing), patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertFalse(self.m.refresh_service())  # never fails the update itself
+        self.assertIn("METAL_SERVICE_UPDATE_SKIPPED", out.getvalue())
+        self.m.C["TERM_LLM_SERVICE"] = "skip"
+        self.assertFalse(self.m.refresh_service())
 
     def test_releases_are_sealed_read_only_and_unsealed_only_to_prune(self):
         import stat as st

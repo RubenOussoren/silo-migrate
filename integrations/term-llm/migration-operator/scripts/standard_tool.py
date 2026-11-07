@@ -6,6 +6,7 @@ mapping to approve, reset, release or private-path commands.
 """
 import json
 import os
+import pwd
 import re
 import subprocess
 import sys
@@ -68,6 +69,18 @@ def run(argv, detach=False):
     return subprocess.run(command, capture_output=True, text=True, timeout=55, env=control_env())
 
 
+def chat_project():
+    """The web UI project this chat belongs to, or None. term-llm runs a project chat's tools in
+    the project's folder, ~/projects/<project> (silo intake creates it); the model can't change
+    that. SILO_PROJECTS_ROOT is for tests only."""
+    root = os.environ.get("SILO_PROJECTS_ROOT") or os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "projects")
+    try:
+        cwd, root = os.path.realpath(os.getcwd()), os.path.realpath(root)
+    except OSError:
+        return None
+    return cwd[len(root) + 1:].split(os.sep)[0] if cwd.startswith(root + os.sep) else None
+
+
 def emit(result):
     if result.returncode == 0 or result.stdout.strip():
         print(result.stdout[:MAX_OUTPUT])
@@ -81,6 +94,9 @@ def main():
     try:
         args = json.load(sys.stdin)
         workspace = argument(args, "workspace")
+        project = chat_project()
+        if project is not None and workspace != project:
+            return fail("STANDARD_WORKSPACE_NOT_THIS_PROJECT")
         if tool == "migration_status":
             return emit(run(["status", workspace]))
         if tool == "migration_plan_propose":

@@ -213,3 +213,21 @@ tools:
           run_id: {type: string}
         required: [workspace, text]
         additionalProperties: false
+    - name: data_notes
+      description: "Read this project's notes: what earlier chats learned and decided (export shape, quirks, decisions, open questions, what's done). Read them at the start of every chat."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input: *workspace_only
+    - name: data_notes_write
+      description: "Replace this project's notes with an updated version (Markdown, under ~32 KiB). The previous version is kept. Update them at the end of meaningful work."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          text: {type: string, description: "The whole notes document, not a diff"}
+        required: [workspace, text]
+        additionalProperties: false

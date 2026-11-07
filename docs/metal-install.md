@@ -150,7 +150,7 @@ especially before any customer data. Same-user agents are not OS isolation.
 
 Confirmed against the **real 0.9.93 binary's help**: `service install web`,
 `--binary`, `--no-start`, `--dry-run`, and serve flags `--host`, `--port`,
-`--auth bearer`, `--approval prompt`, `--no-projects`, `--disable-extensions`,
+`--auth bearer`, `--approval prompt`, `--projects`, `--disable-extensions`,
 `--disable-widgets`. No startup agent is pinned: with `--agent` the web UI hides its
 agent picker. Instead the account's config sets `agents.use_builtin: false`, so the
 picker offers only `migration-operator`, `migration-data`, `server-support`,
@@ -266,7 +266,7 @@ with their own tool permissions. The [Web guide](https://term-llm.com/guides/web
 also documents an authenticated interactive shell and explicitly says a shared
 bearer token represents one operator security domain. Thus a token holder must
 be trusted as the service account, including choosing other available agents;
-prompt approval and `--no-projects` are not a security boundary against that
+prompt approval and web UI projects are not a security boundary against that
 operator. This is documentation/help evidence, **not** a live HTTP authorization
 probe. Do not distribute this token to restricted/customer users.
 

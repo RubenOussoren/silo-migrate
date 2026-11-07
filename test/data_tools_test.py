@@ -717,6 +717,33 @@ class DataToolsTest(unittest.TestCase):
         self.assertEqual(2, len(self.docker.argvs('ps')))  # swept again before the network is removed
         self.assertIn(['ps', '-aq', '--filter', 'label=silo.role=dbhub', '--filter', 'label=silo.workspace=arc'], self.docker.argvs('ps'))
 
+    # -- project notes ---------------------------------------------------------------------
+
+    def test_notes_are_the_projects_memory_with_previous_versions_kept(self):
+        self.assertIn("doesn't exist yet", self.op('notes')['note'])
+        self.create()
+        self.assertEqual('', self.op('notes')['notes'])
+        self.refused('STANDARD_ARGUMENTS_INVALID', 'notes_write', text='  ')
+        self.refused('STANDARD_NOTES_TOO_LARGE', 'notes_write', text='a\n' * 14000)  # escaped, it wouldn't fit a read
+        for version in range(1, 24):
+            self.op('notes_write', text=f'# arc\nversion {version}')
+        notes = self.op('notes')
+        self.assertEqual('# arc\nversion 23\n', notes['notes'])
+        path = self.base / 'arc/.silo-migrate/data/notes.md'
+        self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+        history = sorted((self.base / 'arc/.silo-migrate/data/notes-history').glob('*.md'))
+        self.assertEqual(20, len(history))
+        self.assertEqual('# arc\nversion 22\n', history[-1].read_text())
+        audit = (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text()
+        self.assertNotIn('version 23', audit)  # logged by hash only
+        self.assertIn('text_sha256', audit)
+        self.assertNotIn('"op": "notes"', audit)
+        # Never through a link.
+        path.unlink()
+        path.symlink_to(self.base / 'elsewhere.md')
+        self.refused('STANDARD_PATH_INVALID', 'notes')
+        self.refused('STANDARD_PATH_INVALID', 'notes_write', text='x')
+
     # -- findings and output ---------------------------------------------------------
 
     def test_findings_and_evidence_go_through_the_standard_interface(self):

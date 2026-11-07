@@ -8,7 +8,7 @@
   silo shell                       (root) a service-account shell with the right environment
   silo prime                       sign in to 1Password and warm op-cache for Frontier (24 h)
   silo claude-login [--sso|--console]   sign the service account in to Claude Code
-  silo intake PROJECT              prepare the drop folder for a project's export files
+  silo intake PROJECT              prepare the drop folder and the web UI project for a project
 
 Run as root or as the service account; account steps always run as the service account.
 """
@@ -234,6 +234,11 @@ def doctor_checks(entry, runner=run):
         count = sum(1 for path in shipped_skills.glob("*/SKILL.md"))
         add("OK" if linked else "WARN", "skills", ("%d linked from the release" % count) if linked else str(link) + " is not linked to the release",
             None if linked else "move any existing " + str(link) + " aside, then as the service account: ln -s " + target + " " + str(link) + "; silo restart")
+
+    spec = service_spec(entry)
+    on = bool(spec) and "--projects" in (spec.get("args") or []) and "--no-projects" not in (spec.get("args") or [])
+    add("OK" if on else "WARN", "web projects", "on: every chat belongs to a project" if on else "off: chats aren't grouped per project",
+        None if on else "silo update")
 
     dbhub_check(add, entry, runner)
 
@@ -520,14 +525,51 @@ def intake(entry, project):
         os.close(top)
     print("drop folder: " + str(folder))
     print("contents: %d file(s), %.1f MB" % (count, total / 1e6))
+    print(web_project(entry, project))
     if count and is_root():
-        print("These files now belong to " + entry.pw_name + ". Next: in the web UI, start a chat with migration-data and ask it to\n"
-              "take the export for workspace " + project + ". To add more files later, copy them in and run `silo intake " + project + "` again.")
+        print("These files now belong to " + entry.pw_name + ". Next: in the web UI, open project " + project + ", start a chat with\n"
+              "migration-data and ask it to take the export. To add more files later, copy them in and run `silo intake " + project + "` again.")
     elif count:
         print("Run `silo intake " + project + "` as root after copying files in, so they belong to " + entry.pw_name + ".")
     else:
         print("copy files in from your Mac with:\n  scp FILES SERVER:" + str(folder) + "/\nthen run `silo intake " + project + "` again as root to hand them to the service account.")
     return 0
+
+
+def service_spec(entry):
+    try:
+        spec = json.loads((Path(entry.pw_dir) / ".config/term-llm/services/web/service.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return spec if isinstance(spec, dict) else None
+
+
+def web_project(entry, project):
+    """The project's chat folder ~/projects/PROJECT and its web UI project (term-llm runs a project's
+    tools in its folder; migration-data's tools use that to keep a chat to one workspace)."""
+    folder = Path(entry.pw_dir) / "projects" / project
+    made = run(as_account(["install", "-d", "-m", "700", str(folder.parent), str(folder)], entry)).returncode == 0
+    if not made:
+        return "web UI project: couldn't create " + str(folder) + "; create it as " + entry.pw_name + ", then run this again"
+    manual = "web UI project: in the web UI choose New project and pick " + str(folder) + " (name it " + project + ")"
+    spec = service_spec(entry)
+    url = str((spec or {}).get("url") or "")
+    if "--projects" not in ((spec or {}).get("args") or []) or not re.fullmatch(r"http://(?:localhost|127\.0\.0\.1):\d{1,5}/[A-Za-z0-9/_-]*", url):
+        return "web UI project: projects aren't on in the web service yet (silo update turns them on); then run this again"
+    token = run(as_account([term_llm(), "service", "token", "web"], entry), timeout=30).stdout.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._~+/=-]{16,512}", token):
+        return manual
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(url.replace("localhost", "127.0.0.1").rstrip("/") + "/v1/projects", method="POST",
+                                     data=json.dumps({"name": project, "path": str(folder)}).encode(),
+                                     headers={"content-type": "application/json", "authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            reply = json.loads(response.read() or b"{}")
+    except (OSError, ValueError, urllib.error.URLError):
+        return manual + " (the web service didn't answer)"
+    return "web UI project: " + project + (" (already there)" if reply.get("duplicate") else " (created)") + ", folder " + str(folder)
 
 
 # -- main ------------------------------------------------------------------------------

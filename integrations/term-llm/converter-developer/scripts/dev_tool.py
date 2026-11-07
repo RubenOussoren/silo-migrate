@@ -8,6 +8,7 @@ outside the workspace's converter checkout. Arguments never reach a shell.
 """
 import json
 import os
+import pwd
 import re
 import subprocess
 import sys
@@ -68,6 +69,18 @@ def fail(code):
     return 0
 
 
+def chat_project():
+    """The web UI project this chat belongs to, or None. term-llm runs a project chat's tools in
+    the project's folder, ~/projects/<project> (silo intake creates it); the model can't change
+    that. SILO_PROJECTS_ROOT is for tests only."""
+    root = os.environ.get("SILO_PROJECTS_ROOT") or os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "projects")
+    try:
+        cwd, root = os.path.realpath(os.getcwd()), os.path.realpath(root)
+    except OSError:
+        return None
+    return cwd[len(root) + 1:].split(os.sep)[0] if cwd.startswith(root + os.sep) else None
+
+
 def emit(result):
     # Bytes throughout: the size check and the output don't depend on the locale.
     if result.returncode != 0 or not result.stdout.strip():
@@ -96,6 +109,9 @@ def main():
     if not isinstance(args, dict) or not isinstance(args.get("workspace"), str) or not WORKSPACE.match(args["workspace"]):
         return fail("STANDARD_ARGUMENTS_INVALID")
     workspace = args["workspace"]
+    project = chat_project()
+    if project is not None and workspace != project:
+        return fail("STANDARD_WORKSPACE_NOT_THIS_PROJECT")
     timeout = 290 if tool == "dev_test" else 55
     try:
         if tool == "dev_findings":

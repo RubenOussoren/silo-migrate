@@ -53,13 +53,15 @@ else:
         self.ids = {name: name.removesuffix('_id') + '-' + 'a' * 32
                     for name in ('dataset_id', 'plan_id', 'run_id', 'finding_id')}
 
-    def call(self, tool, args, status='approved', **overrides):
-        env = dict(self.env, TERM_LLM_TOOL_NAME=tool, PLAN_STATUS=status,
+    def call(self, tool, args, status='approved', project=None, **overrides):
+        env = dict(self.env, TERM_LLM_TOOL_NAME=tool, PLAN_STATUS=status, SILO_PROJECTS_ROOT=str(self.root / 'projects'),
                    OBSERVED_STATUSES=json.dumps(['running' if tool == 'migration_run_request' else status]))
         env.update(overrides)
+        cwd = self.root / 'projects' / project if project else self.root
+        cwd.mkdir(parents=True, exist_ok=True)
         result = subprocess.run([sys.executable, '-I', '-B', str(SCRIPT)],
                                 input=json.dumps(args), capture_output=True, text=True,
-                                env=env, timeout=10)
+                                env=env, timeout=10, cwd=cwd)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual('', result.stderr)
         return json.loads(result.stdout)
@@ -219,6 +221,11 @@ else:
         self.assertEqual('STANDARD_TOOL_UNKNOWN', self.call('migration_approve', {'workspace': 'synthetic'})['error'])
         self.assertEqual([], self.calls())
 
+    def test_in_a_web_ui_project_only_that_workspace(self):
+        self.assertEqual('approved', self.call('migration_status', {'workspace': 'synthetic'}, project='synthetic')['status'])
+        self.assertEqual('STANDARD_WORKSPACE_NOT_THIS_PROJECT', self.call('migration_status', {'workspace': 'synthetic'}, project='acme')['error'])
+        self.assertEqual('approved', self.call('migration_status', {'workspace': 'synthetic'})['status'])  # outside a project, as before
+
 
 DATA = ROOT / 'integrations/term-llm/migration-data/scripts/data_tool.py'
 
@@ -250,11 +257,17 @@ else:
         self.control.chmod(0o700)
         self.run_id = 'run-' + 'a' * 32
 
-    def call(self, tool, args, mode='ok'):
+    def call(self, tool, args, mode='ok', project='same'):
+        # term-llm runs a project chat's tools in the project's folder; by default, the workspace's own.
+        projects = self.root / 'projects'
+        if project == 'same':
+            project = args.get('workspace') if isinstance(args, dict) and isinstance(args.get('workspace'), str) and args['workspace'].isalnum() else 'arc'
+        cwd = projects / project if project else self.root
+        cwd.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, SILO_CONTROL=str(self.control), ARGV_RECORD=str(self.record), PYTHONDONTWRITEBYTECODE='1',
-                   TERM_LLM_TOOL_NAME=tool, MODE=mode)
+                   TERM_LLM_TOOL_NAME=tool, MODE=mode, SILO_PROJECTS_ROOT=str(projects))
         result = subprocess.run([sys.executable, '-I', '-B', str(DATA)], input=json.dumps(args), capture_output=True,
-                                text=True, env=env, timeout=10)
+                                text=True, env=env, timeout=10, cwd=cwd)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual('', result.stderr)
         return json.loads(result.stdout), result.stdout
@@ -268,7 +281,7 @@ else:
     def test_every_declared_tool_maps_to_one_data_request(self):
         import re
         declared = re.findall(r'(?m)^    - name: ([a-z_]+)$', (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text())
-        self.assertEqual(15, len(declared))
+        self.assertEqual(17, len(declared))
         for tool in declared:
             with self.subTest(tool=tool):
                 self.call(tool, {'workspace': 'arc', 'path': 'x', 'unexpected': 'dropped'})
@@ -285,6 +298,7 @@ else:
             'data_take': ({'path': 'dump.sql', 'type': 'mysql-dump', 'confirm': True}, {'op': 'take', 'path': 'dump.sql', 'type': 'mysql-dump'}),
             'data_script': ({'code': 'puts 1', 'into': 'xml', 'language': 'ruby'}, {'op': 'script', 'code': 'puts 1', 'into': 'xml', 'language': 'ruby'}),
             'data_db_up': ({'engine': 'postgres'}, {'op': 'db_up', 'engine': 'postgres'}),
+            'data_notes_write': ({'text': '# arc', 'path': 'x'}, {'op': 'notes_write', 'text': '# arc'}),
             'data_propose_finding': ({'text': 'schema', 'run_id': None}, {'op': 'propose_finding', 'text': 'schema'}),
             'data_run_evidence': ({'run_id': self.run_id}, {'op': 'run_evidence', 'run_id': self.run_id}),
         }
@@ -307,6 +321,22 @@ else:
                 result, _raw = self.call(tool, args)
                 self.assertIn(result['error'], ('STANDARD_ARGUMENTS_INVALID', 'STANDARD_TOOL_UNKNOWN'))
         self.assertEqual([], self.calls())
+
+    def test_a_chat_works_only_on_its_own_projects_workspace(self):
+        self.assertEqual('ok', self.call('data_status', {'workspace': 'arc'})[0]['status'])
+        self.calls()
+        cases = ((None, 'STANDARD_CHAT_NOT_IN_PROJECT'), ('acme', 'STANDARD_WORKSPACE_NOT_THIS_PROJECT'))
+        for project, code in cases:
+            with self.subTest(project=project):
+                result, _raw = self.call('data_peek', {'workspace': 'arc', 'path': 'x'}, project=project)
+                self.assertEqual({'version': 1, 'error': code}, result)
+        # A subfolder of the project still counts as the project; a link out of it doesn't fool it.
+        (self.root / 'projects/arc/sub').mkdir(parents=True)
+        self.assertEqual('ok', self.call('data_status', {'workspace': 'arc'}, project='arc/sub')[0]['status'])
+        (self.root / 'elsewhere').mkdir()
+        (self.root / 'projects/arc-link').symlink_to(self.root / 'elsewhere')
+        self.assertEqual('STANDARD_CHAT_NOT_IN_PROJECT', self.call('data_status', {'workspace': 'arc'}, project='arc-link')[0]['error'])
+        self.assertEqual(1, len(self.calls()))
 
 
 if __name__ == '__main__':

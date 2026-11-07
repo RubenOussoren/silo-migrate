@@ -28,11 +28,15 @@ print(json.dumps({'version': 1, 'ok': True}))
 ''')
         self.control.chmod(0o700)
 
-    def call(self, agent, tool, args):
-        env = dict(os.environ, SILO_CONTROL=str(self.control), RECORD=str(self.record), TERM_LLM_TOOL_NAME=tool, PYTHONDONTWRITEBYTECODE='1')
+    def call(self, agent, tool, args, project=None):
+        root = Path(self.temp.name) / 'projects'
+        env = dict(os.environ, SILO_CONTROL=str(self.control), RECORD=str(self.record), TERM_LLM_TOOL_NAME=tool, PYTHONDONTWRITEBYTECODE='1',
+                   SILO_PROJECTS_ROOT=str(root))
         env.pop('TERM_LLM_AGENT_DIR', None)
+        cwd = root / project if project else Path(self.temp.name)
+        cwd.mkdir(parents=True, exist_ok=True)
         result = subprocess.run([sys.executable, '-I', '-B', str(AGENTS / agent / 'scripts/dev_tool.py')], input=json.dumps(args),
-                                capture_output=True, text=True, env=env, timeout=20)
+                                capture_output=True, text=True, env=env, timeout=20, cwd=cwd)
         self.assertEqual(0, result.returncode, result.stderr)
         return json.loads(result.stdout)
 
@@ -96,6 +100,13 @@ print(json.dumps({'version': 1, 'ok': True}))
                     self.assertIn(self.call(agent, tool, args)['error'], ('STANDARD_TOOL_UNKNOWN', 'STANDARD_ARGUMENTS_INVALID'))
         self.assertEqual([], self.calls())
 
+    def test_in_a_web_ui_project_only_that_workspace(self):
+        for agent in ('converter-developer', 'converter-reviewer'):
+            with self.subTest(agent=agent):
+                self.assertTrue(self.call(agent, 'dev_status', {'workspace': 'arc'}, project='arc')['ok'])
+                self.assertEqual('STANDARD_WORKSPACE_NOT_THIS_PROJECT', self.call(agent, 'dev_status', {'workspace': 'arc'}, project='acme')['error'])
+                self.assertTrue(self.call(agent, 'dev_status', {'workspace': 'arc'})['ok'])
+        self.assertEqual(4, len(self.calls()))
 
 if __name__ == '__main__':
     unittest.main()
