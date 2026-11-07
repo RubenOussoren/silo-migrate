@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -643,6 +644,33 @@ class ConverterDevTest(unittest.TestCase):
         git(self.checkout, 'commit', '-qm', 'Untrack lock')
         self.assertEqual('STANDARD_DEV_DEPS_UNSUPPORTED', self.run_test(seen)['error'])
         self.assertNotIn('deps', seen)
+
+    def test_deps_command_prepares_the_cache_for_head(self):
+        seen = {}
+        patches = self.sandbox(seen)
+        for patch in patches:
+            patch.start()
+        try:
+            result = self.dev.main(['converter', 'deps', self.ws], {}, self.base, ROOT, self.host, io.StringIO(''), home=str(self.home))
+            self.assertEqual('prepared', result['dependencies']['status'])
+            self.assertEqual(git(self.checkout, 'rev-parse', 'HEAD'), result['head'])
+            self.assertEqual('ready', self.dev.main(['converter', 'deps', self.ws], {}, self.base, ROOT, self.host, io.StringIO(''))['dependencies']['status'])
+            self.assertEqual(1, len(seen['deps']))
+        finally:
+            for patch in patches:
+                patch.stop()
+        patches = self.sandbox(seen, deps_code=1)
+        for path in (Path(self.temp.name) / 'state/converter-deps').iterdir():
+            if path.is_dir():
+                shutil.rmtree(path)  # a new key must be built, and that build fails
+        for patch in patches:
+            patch.start()
+        try:
+            with self.assertRaisesRegex(self.dev.Refusal, r'\ASTANDARD_CONVERTER_DEPS_FAILED: failed \(gems\)\Z'):
+                self.dev.main(['converter', 'deps', self.ws], {}, self.base, ROOT, self.host, io.StringIO(''))
+        finally:
+            for patch in patches:
+                patch.stop()
 
     def test_lockfile_sources_and_bundler_are_checked(self):
         check = self.dev.check_lockfile

@@ -760,6 +760,54 @@ class DataToolsTest(unittest.TestCase):
         self.assertNotIn('example user_1', audit)
         self.assertIn('text_sha256', audit)
 
+    def test_plan_propose_passes_input_ids_and_prepares_dependencies_once(self):
+        self.create()
+        source, settings, checks = ('input-%032x' % n for n in (1, 2, 3))
+        calls, answers = [], ['deps-missing', 'plan']
+        plan = {'version': 1, 'plan_id': 'plan-' + 'e' * 32, 'digest': 'f' * 64, 'status': 'proposed', 'operation': 'standard_convert',
+                'platform': 'mybb', 'roles': {'source': source}, 'inputs': [], 'source_charset': 'latin1', 'converter_revision': 'a' * 40,
+                'converter_deps': 'd' * 64, 'mutations': ['load'], 'not_included': ['import into Discourse'], 'private': 'not passed on'}
+        original = self.control
+
+        def control(argv, input=None, timeout=120):
+            if argv[:3] == ['standard', 'plan', 'propose']:
+                calls.append((argv, timeout))
+                if answers.pop(0) == 'deps-missing':
+                    self.d.refuse('STANDARD_CONVERTER_DEPS_MISSING: run dev_test once on this commit')
+                return json.dumps(plan)
+            if argv[:2] == ['converter', 'deps']:
+                calls.append((argv, timeout))
+                return json.dumps({'version': 1, 'dependencies': {'status': 'prepared', 'gems_added': ['markbridge-0.5.0']}})
+            return original(argv, input=input, timeout=timeout)
+        self.control = control
+        result = self.op('plan_propose', source=source, settings=settings, reconciliation=checks, charset='latin1')
+        self.assertEqual([['standard', 'plan', 'propose', 'arc', '--operation', 'convert', '--charset', 'latin1', '--source', source,
+                           '--settings', settings, '--reconciliation', checks], ['converter', 'deps', 'arc'], calls[0][0]], [c for c, _ in calls])
+        self.assertLessEqual(sum(timeout for _, timeout in calls), 285)
+        self.assertEqual('plan-' + 'e' * 32, result['plan_id'])
+        self.assertEqual({'status': 'prepared', 'gems_added': ['markbridge-0.5.0']}, result['dependencies_prepared'])
+        self.assertNotIn('private', result)
+        self.assertIn('silo-migrate-control standard plan approve arc PLAN_ID --sha256 DIGEST', result['next'])
+        calls.clear()
+        answers.append('plan')
+        self.op('plan_propose', source=source, settings=settings)
+        self.assertEqual([['standard', 'plan', 'propose', 'arc', '--operation', 'convert', '--charset', 'utf8mb4', '--source', source, '--settings', settings]],
+                         [c for c, _ in calls])
+        for bad in ({'source': 'input-1', 'settings': settings}, {'source': source, 'settings': source + ' --x'},
+                    {'source': source, 'settings': settings, 'charset': 'koi8r'}, {'source': source}):
+            with self.subTest(bad=bad):
+                self.refused('STANDARD_ARGUMENTS_INVALID', 'plan_propose', **bad)
+
+    def test_control_refusals_keep_a_short_detail(self):
+        runner = self.d.control_runner('/bin/sh')
+        with mock.patch.object(self.d.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '',
+                               'Error: STANDARD_RECONCILIATION_INVALID: check 3: source_sql. The reconciliation input is invalid.\n')):
+            with self.assertRaisesRegex(self.d.Refusal, r'\ASTANDARD_RECONCILIATION_INVALID: check 3: source_sql\Z'):
+                runner(['standard'])
+        with mock.patch.object(self.d.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'Error: STANDARD_STALE_PLAN\n')):
+            with self.assertRaisesRegex(self.d.Refusal, r'\ASTANDARD_STALE_PLAN\Z'):
+                runner(['standard'])
+
     def test_corrupt_files_give_fixed_errors(self):
         (self.intake / 'broken.gz').write_bytes(b'\x1f\x8b\x08\x00' + b'\xff' * 64)
         (self.intake / 'broken.zip').write_bytes(b'PK\x03\x04' + b'\x00' * 30 + b'PK\x05\x06' + b'\xff' * 18)

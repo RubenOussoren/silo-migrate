@@ -25,6 +25,8 @@ module SiloMigrate
         fixture register WORKSPACE --fixture-dir DIR --snapshot NAME [--label LABEL]
         status WORKSPACE
         plan propose WORKSPACE --dataset ID [--baseline seed|BASELINE_ID] [--ports A,B] [--allow-unqualified-runtime]
+        plan propose WORKSPACE --operation convert --source INPUT_ID --settings INPUT_ID [--reconciliation INPUT_ID] [--charset NAME]
+                                                       (real data: convert and reconcile counts only; no import)
         plan show WORKSPACE PLAN_ID
         plan approve WORKSPACE PLAN_ID --sha256 DIGEST --reviewer NAME
         baseline accept WORKSPACE RUN_ID --reviewer NAME
@@ -58,6 +60,8 @@ module SiloMigrate
     HELP
 
     PARSE_ERROR = "STANDARD_ARGUMENTS_INVALID"
+    DETAILED = %w[STANDARD_SETTINGS_INVALID STANDARD_RECONCILIATION_INVALID STANDARD_CONVERTER_DEPS_MISSING
+                  STANDARD_CONVERTER_PLATFORM_MISSING STANDARD_INPUTS_INCOMPLETE].freeze
     OPERATION_ERROR = "STANDARD_OPERATION_FAILED"
     # Exit codes are per the contract: failed run returns its JSON and exits 1.
 
@@ -81,6 +85,11 @@ module SiloMigrate
       rescue StandardWorkflowError => e
         if %w[STANDARD_CONVERTER_DIRTY STANDARD_CONVERTER_CONFIG].include?(e.code)
           @error.write("Error: #{e.code}. #{Services::StandardWorkflowService::RECOVERY.fetch(e.code)}\n")
+          1
+        elsif DETAILED.include?(e.code)
+          # Fixed details written by the convert-plan checks (which check, which placeholder),
+          # never file content.
+          @error.write("Error: #{e.message}. #{Services::StandardWorkflowService::RECOVERY.fetch(e.code, '')}".rstrip + "\n")
           1
         else
           write_error(e.code)
@@ -167,6 +176,12 @@ module SiloMigrate
         workspace = positional!(args)
         invalid! if args.count("--allow-unqualified-runtime") > 1
         allow = args.delete("--allow-unqualified-runtime")
+        if args[0, 2] == %w[--operation convert]
+          args.shift(2)
+          opts = options!(args, "--source", "--settings", "--reconciliation", "--charset", optional: %w[--reconciliation --charset])
+          return service(workspace).propose_convert_plan(source: opts.fetch("--source"), settings: opts.fetch("--settings"), reconciliation: opts["--reconciliation"],
+                                                         charset: opts.fetch("--charset", "utf8mb4"), allow_unqualified_runtime: !allow.nil?)
+        end
         opts = options!(args, "--dataset", "--baseline", "--ports", optional: %w[--baseline --ports])
         service(workspace).propose_plan(dataset_id: opts.fetch("--dataset"), baseline: opts.fetch("--baseline", "seed"), ports: ports(opts["--ports"]), allow_unqualified_runtime: !allow.nil?)
       when "show"

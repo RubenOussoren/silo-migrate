@@ -29,6 +29,14 @@ What converter work needs from you, as a schema finding (`source-profile`):
 3. Settings the converter will need (table prefix, database type, upload paths, base URL).
 4. Counts to reconcile after the first run.
 
+**Settings for a convert run** are the converter's own `settings.yml` (copy its layout
+from `converters/<platform>/settings.yml`, or from the nearest converter's), registered with
+type `converter-settings`. Where it needs the source database, use the placeholders
+`${SILO_DB_HOST}`, `${SILO_DB_PORT}`, `${SILO_DB_USER}`, `${SILO_DB_PASSWORD}` and
+`${SILO_DB_NAME}`. The run connects the converter to its own private copy of the dump and
+fills them in. The rest (table prefix, site URL, ID offsets, upload paths) is yours to get
+right from the data and the engineer's decisions.
+
 You don't write converter code: converter-developer does, from the released finding,
 in the workspace's converter checkout. Converter runs on customer data are operational
 actions the engineer plans and approves.

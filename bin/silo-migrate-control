@@ -191,7 +191,7 @@ def host_data(args, values, base, self):
 
 
 def host_converter(args, values, base, self):
-    if len(args) >= 2 and args[1] in ("dev", "push", "push-show"):
+    if len(args) >= 2 and args[1] in ("dev", "push", "push-show", "deps"):
         result = converter_dev().main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin)
         # UTF-8 bytes, as converter_dev.fit measured them, whatever the locale.
         sys.stdout.buffer.write((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -352,6 +352,11 @@ def main(args):
 
     mount(repo if configured else project, repo if configured else project)
     mount(base, base, False)
+    # The converter's locked gems (bin/converter_dev.py builds them): runs check the cache is
+    # ready and mount it into the converter container, read-only.
+    deps = base.parent / "state" / "converter-deps"
+    deps.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mount(deps, deps)
     mount(gems, "/gems")
     mount("/var/run/docker.sock", "/var/run/docker.sock", False)
     mount("/usr/bin/docker", "/usr/local/bin/docker")

@@ -56,6 +56,56 @@ $C standard fixture register "$WS" --snapshot launch --label launch-snapshot --f
 $C standard plan propose "$WS" --dataset LAUNCH_DATASET_ID --baseline BASELINE_ID
 ```
 
+## Convert runs on real data
+
+A convert plan (`standard_convert`) runs only `preflight`, `convert` and `reconcile`. It
+converts a customer's registered dump into the intermediate database and counts what
+arrived. Nothing is imported into Discourse yet. migration-data prepares the inputs and
+proposes the plan (`data_plan_propose`). You approve and start it as the service account:
+
+```sh
+$C standard plan propose "$WS" --operation convert --source INPUT_ID --settings INPUT_ID \
+  [--reconciliation INPUT_ID] [--charset utf8mb4]
+$C standard plan approve "$WS" PLAN_ID --sha256 DIGEST --reviewer "Your Name"
+$C start-run "$WS" PLAN_ID
+```
+
+- **Inputs, chosen by ID** (registered inputs, bound by the digest like any plan):
+  - **source:** a MariaDB/MySQL SQL dump, plain or gzip/bzip2/xz. An archive is refused
+    (`STANDARD_DUMP_KIND_UNSUPPORTED`): extract it first.
+  - **settings:** type `converter-settings`, the platform converter's `settings.yml`. Where
+    it needs the database connection it uses `${SILO_DB_HOST}`, `${SILO_DB_PORT}`,
+    `${SILO_DB_USER}`, `${SILO_DB_PASSWORD}` and `${SILO_DB_NAME}`. The run fills them in
+    privately, so no password is ever registered. `${SILO_DB_PASSWORD}` is required; any
+    other `${SILO_…}` is refused (`STANDARD_SETTINGS_INVALID`).
+  - **reconciliation** (optional): type `reconciliation`, JSON:
+    `{"version": 1, "checks": [{"name": "users", "source_sql": "SELECT COUNT(*) FROM mybb_users WHERE …", "intermediate_sql": "SELECT COUNT(*) FROM users", "expect": "equal", "note": "why the filter"}]}`.
+    At most 100 checks. Each query is a single `SELECT`/`WITH`: no comments, no `;` in the
+    middle, no `INTO`/file or lock functions, and no `ATTACH`/`PRAGMA` on the intermediate
+    side. `expect` is `equal` (the default) or `report`.
+- **Platform:** the workspace's source platform (`mybb` for arc) selects
+  `converters/<platform>` at the bound commit; `STANDARD_CONVERTER_PLATFORM_MISSING` if
+  that commit has none.
+- **The converter's gems:** the plan binds the converter-deps key (see "Dependencies").
+  `STANDARD_CONVERTER_DEPS_MISSING` means no `dev_test` has prepared it for this commit
+  yet. `data_plan_propose`, or `silo-migrate-control converter deps WS`, prepares it.
+- **What the run does:**
+  1. Copies the inputs by content hash.
+  2. Loads the dump into a disposable MariaDB, with its data on disk under the run's
+     private folder and no network (2 CPUs, 8 GiB, 4 GiB buffer pool; load limit 6 h). The
+     load runs with `--sandbox`.
+  3. Counts the source side of each check right after the load, as a SELECT-only user.
+  4. Runs the converter (2 CPUs, 8 GiB, limit 12 h; its output goes to a private log).
+  5. Deletes the database and the dump copy, and keeps `intermediate.sqlite` as an artifact.
+- **Disk:** the run needs 3× the dump size free (12× if compressed) above the profile minimum.
+- **Reconciliation only reports.** Per-check numbers (`evidence/reconciliation.json`) are
+  derived from customer data. They stay private: migration-data reads them with
+  `data_run_evidence`, and you read them on the server. Public status (`standard status`,
+  migration-operator) shows only totals: `reconciliation_checks`, `_matched`, `_differs`
+  and `_errors`.
+- **Findings on a completed convert run are allowed:** differences are what converter work
+  fixes.
+
 ## Approvals and refusals
 
 A plan's digest covers its inputs, code identity, selected profile file SHA256, image content IDs, converter repo/branch/commit, baseline decision, target instances, ports and output names. Changing any of these makes the plan stale, and an approved plan can run only once.

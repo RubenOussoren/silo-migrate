@@ -33,6 +33,7 @@ TOOLS = {
     "data_db_reset": ("db_reset", {"confirm"}, 200),
     "data_run_evidence": ("run_evidence", {"run_id"}, 60),
     "data_propose_finding": ("propose_finding", {"text", "run_id"}, 60),
+    "data_plan_propose": ("plan_propose", {"source", "settings", "reconciliation", "charset"}, 290),
     "data_notes": ("notes", set(), 60),
     "data_notes_write": ("notes_write", {"text"}, 60),
 }

@@ -5,6 +5,7 @@ require "fileutils"
 require "json"
 require "time"
 require_relative "../standard_store"
+require_relative "standard_convert_run"
 
 module SiloMigrate
   module Services
@@ -38,6 +39,11 @@ module SiloMigrate
         /\Afinal-restore(-disable)?\z/ => "restore"
       }.freeze
 
+      def convert_run?(state, run_id)
+        plan = state.fetch("plans")[state.fetch("runs").fetch(run_id)["plan_id"]]
+        plan&.dig("body", "operation") == StandardConvertRun::CONVERT_OPERATION
+      end
+
       def self.log_stage(name)
         LOG_STAGES.find { |pattern, _stage| pattern.match?(name) }&.last
       end
@@ -47,7 +53,8 @@ module SiloMigrate
       end
 
       # Trusted analyst path. Returns only an ID: content is never echoed back.
-      # A completed run has nothing to diagnose, so it gets no finding.
+      # A completed full run has nothing to diagnose, so it gets no finding. A completed
+      # convert run does: its reconciliation differences are what converter work fixes.
       def propose(run_id:, text:, kind: "finding")
         raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless KINDS.include?(kind) && text.is_a?(String) && text.bytesize.between?(1, MAX_BYTES) && text.valid_encoding?
 
@@ -57,7 +64,7 @@ module SiloMigrate
         @store.update do |state|
           unless kind == "schema"
             raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless state.fetch("runs").key?(run_id)
-            raise StandardWorkflowError, "STANDARD_RUN_COMPLETED" if state.fetch("runs").fetch(run_id)["status"] == "completed"
+            raise StandardWorkflowError, "STANDARD_RUN_COMPLETED" if state.fetch("runs").fetch(run_id)["status"] == "completed" && !convert_run?(state, run_id)
           end
 
           @store.write_private(@store.finding_dir(id, "private", "proposal.txt"), text)
@@ -85,7 +92,7 @@ module SiloMigrate
         stages = run.fetch("stages", {})
         detail = failure_detail(File.join(directory, "private", "failure.json"))
         failed_stage = run.dig("failure", "stage") || (detail.is_a?(Hash) ? detail["stage"] : nil)
-        completed = run["status"] == "completed"
+        completed = run["status"] == "completed" && !convert_run?(@store.load, run_id)
         all_evidence = files(File.join(directory, "evidence"), "*")
         all_logs = files(File.join(directory, "logs"), "*.log")
         evidence_files = all_evidence.first(EVIDENCE_INDEX_ENTRIES).map { |path| { name: File.basename(path), bytes: File.size(path), path: path } }

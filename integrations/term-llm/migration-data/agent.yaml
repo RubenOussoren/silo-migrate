@@ -200,6 +200,21 @@ tools:
           run_id: {type: string}
         required: [workspace, run_id]
         additionalProperties: false
+    - name: data_plan_propose
+      description: "Propose a convert-only workflow run on real data (no import): the registered source dump, the converter settings (type converter-settings, with ${SILO_DB_*} placeholders) and optionally reconciliation checks (type reconciliation), by input ID. Prepares the converter's locked gems first if needed. Returns the plan ID and digest; the engineer approves and starts it."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 295
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          source: {type: string, description: "Input ID of the registered SQL dump (plain, gzip, bzip2 or xz)"}
+          settings: {type: string, description: "Input ID of the converter settings (type converter-settings)"}
+          reconciliation: {type: string, description: "Input ID of the reconciliation checks (type reconciliation); optional"}
+          charset: {type: string, enum: [utf8mb4, utf8mb3, utf8, latin1, binary], description: "Client character set for loading the dump; default utf8mb4"}
+        required: [workspace, source, settings]
+        additionalProperties: false
     - name: data_propose_finding
       description: "Propose a finding privately for the engineer. Without run_id: a schema finding (tables, columns, counts, invented example rows) for converter work. With run_id: the cause of a failed run. Never include real customer values. The engineer decides what is released to coding agents."
       script: scripts/data_tool.py

@@ -281,7 +281,7 @@ else:
     def test_every_declared_tool_maps_to_one_data_request(self):
         import re
         declared = re.findall(r'(?m)^    - name: ([a-z_]+)$', (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text())
-        self.assertEqual(17, len(declared))
+        self.assertEqual(18, len(declared))
         for tool in declared:
             with self.subTest(tool=tool):
                 self.call(tool, {'workspace': 'arc', 'path': 'x', 'unexpected': 'dropped'})
@@ -301,6 +301,8 @@ else:
             'data_notes_write': ({'text': '# arc', 'path': 'x'}, {'op': 'notes_write', 'text': '# arc'}),
             'data_propose_finding': ({'text': 'schema', 'run_id': None}, {'op': 'propose_finding', 'text': 'schema'}),
             'data_run_evidence': ({'run_id': self.run_id}, {'op': 'run_evidence', 'run_id': self.run_id}),
+            'data_plan_propose': ({'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32, 'reconciliation': None, 'plan_id': 'x'},
+                                  {'op': 'plan_propose', 'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32}),
         }
         for tool, (args, request) in cases.items():
             with self.subTest(tool=tool):

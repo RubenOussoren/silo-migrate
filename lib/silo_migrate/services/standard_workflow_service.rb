@@ -20,6 +20,7 @@ require_relative "../runtime_profiles"
 require_relative "prebuilt_stack"
 require_relative "standard_oracle"
 require_relative "discourse_archive"
+require_relative "standard_convert_run"
 
 module SiloMigrate
   module Services
@@ -32,12 +33,14 @@ module SiloMigrate
     # and a fixed recovery instruction; nothing retries or repairs itself.
     class StandardWorkflowService
       include DiscourseArchive
+      include StandardConvertRun
 
       STAGES = %w[preflight convert site_up baseline uploads import verify_site final_backup review_url restore verify_restore].freeze
 
       CAPABILITIES = {
         "standard_full_snapshot" => "supported_synthetic",
         "launch_snapshot_from_preimport_baseline" => "supported_synthetic",
+        "standard_convert" => "supported_real_data_convert_and_reconcile_only",
         "other_existing_converters" => "not_implemented_in_workbench",
         "new_converter_development" => "not_implemented_in_workbench",
         "delta_import" => "not_implemented_requires_base_lineage",
@@ -64,6 +67,10 @@ module SiloMigrate
         "STANDARD_RESTORE_FAILED" => "Restore or restore validation failed. The source backup is retained; reset and re-plan after investigation.",
         "STANDARD_CAPACITY" => "Host capacity or disk headroom was too low to continue. Reset an earlier run's retained instances or free disk, reset this run, then re-plan.",
         "STANDARD_INTERRUPTED" => "The executing process ended. The instance state is unknown: reset this run, then re-plan.",
+        "STANDARD_DUMP_KIND_UNSUPPORTED" => "The source input is an archive or an unsupported compression. Extract or convert it (migration-data), register the SQL dump, then propose a new plan.",
+        "STANDARD_CONVERTER_DEPS_MISSING" => "The converter's locked gems aren't prepared for this commit. Run dev_test once on it (converter-developer) or `silo-migrate-control converter deps WS`, then propose a new plan.",
+        "STANDARD_SETTINGS_INVALID" => "The converter settings input is not valid YAML with ${SILO_DB_*} placeholders. Register corrected settings, then propose a new plan.",
+        "STANDARD_RECONCILIATION_INVALID" => "The reconciliation input is invalid. Register a corrected one, then propose a new plan.",
         "STANDARD_INTERNAL" => "An unexpected failure occurred. Inspect private evidence, reset this run, then re-plan."
       }.freeze
 
@@ -605,6 +612,8 @@ module SiloMigrate
       end
 
       def stale_reason(plan, state)
+        return convert_stale_reason(plan, state) if convert_plan?(plan)
+
         body = plan.fetch("body")
         named = @store.named_state
         ids = body.fetch("input_binding").map { |input| input["id"] }
@@ -658,13 +667,13 @@ module SiloMigrate
           dirty = state.fetch("instances").values.select { |record| %w[creating dirty].include?(record["state"]) }
           raise StandardWorkflowError.new("STANDARD_DIRTY_INSTANCE", "reset the earlier run first") unless dirty.empty?
 
-          admission!(state)
+          admission!(state) unless convert_plan?(plan)
           state.fetch("consumed_outputs").concat(outputs)
           plan["status"] = "consumed"
           plan["run_id"] = run_id
           state.fetch("runs")[run_id] = {
             "id" => run_id, "plan_id" => plan_id, "dataset_id" => plan.dig("body", "dataset_id"), "status" => "claimed",
-            "stage" => nil, "stages" => STAGES.to_h { |stage| [stage, { "status" => "pending" }] },
+            "stage" => nil, "stages" => stages_for(plan).to_h { |stage| [stage, { "status" => "pending" }] },
             "started_at" => now, "finished_at" => nil, "failure" => nil,
             "instances" => {}, "artifacts" => {}, "results" => {}, "assertions" => {}
           }
@@ -714,7 +723,8 @@ module SiloMigrate
 
       def execute_stages(run_id)
         @store.update { |state| state.fetch("runs").fetch(run_id)["status"] = "running" }
-        STAGES.each do |stage|
+        convert = convert_plan?(plan_for(run_id))
+        stages_for(plan_for(run_id)).each do |stage|
           stage_method = "stage_#{stage}"
           begin_stage(run_id, stage)
           begin
@@ -723,7 +733,7 @@ module SiloMigrate
               raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
             end
             guard_disk!
-            admission!(nil) if stage == STAGES.first
+            admission!(nil) if stage == STAGES.first && !convert
             send(stage_method, run_id)
             finish_stage(run_id, stage, "passed")
           rescue StandardWorkflowError => error
@@ -838,6 +848,7 @@ module SiloMigrate
         # checked again by the process that will actually use it.
         stale = stale_reason(plan, @store.load)
         raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
+        return convert_preflight(run_id, plan) if convert_plan?(plan)
 
         named = @store.named_state
         resolved = lock.fetch("images").transform_values { |image| ImageIdentity.resolve(@runtime, image) }
@@ -852,10 +863,11 @@ module SiloMigrate
         raise StandardWorkflowError.new("STANDARD_INPUT_CHANGED", error.message)
       end
 
-      def materialize_inputs(run_id, body, named)
+      def materialize_inputs(run_id, body, named, layout: true)
         bound = body.fetch("input_binding").map { |binding| [named.fetch("inputs").fetch(binding.fetch("id")), binding] }
-        layout = input_layout_problem(bound.map(&:first))
-        raise StandardWorkflowError.new(layout, "input layout") if layout
+        # Convert plans name their inputs by ID instead of owning one dataset folder.
+        problem = layout && input_layout_problem(bound.map(&:first))
+        raise StandardWorkflowError.new(problem, "input layout") if problem
 
         bound.map do |input, binding|
           relative = input.fetch("path").unpack1("m0").force_encoding("UTF-8")
@@ -924,6 +936,9 @@ module SiloMigrate
       end
 
       def stage_convert(run_id)
+        plan = plan_for(run_id)
+        return convert_real(run_id, plan) if convert_plan?(plan)
+
         inputs = run_inputs(run_id)
         config = @store.load.fetch("config")
         work = @store.run_dir(run_id, "work")
@@ -1643,10 +1658,12 @@ module SiloMigrate
         result.merge(
           discourse_profile: body["discourse_profile"], runtime_profile_sha256: body["runtime_lock_sha256"],
           runtime_qualified: body["runtime_qualified"], allow_unqualified_runtime: body["allow_unqualified_runtime"], converter: body["converter"],
-          operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"].slice("mode", "baseline_id"),
+          operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
+          platform: body["platform"], roles: body["roles"], source_charset: body["source_charset"], converter_deps: body.dig("converter_deps", "key"),
+          reconciliation_policy: body["reconciliation_policy"],
           collision_policy: body["collision_policy"], inputs: body["input_binding"].map { |input| input.slice("id", "type", "bytes", "sha256") },
           app_revision: body["app_revision"], converter_revision: body["converter_revision"], code_identity: body["code_identity"],
-          instances: body["instances"].transform_values { |target| target.slice("name", "port", "hostname") },
+          instances: (body["instances"] || {}).transform_values { |target| target.slice("name", "port", "hostname") },
           outputs: body["outputs"], mutations: body["mutations"], not_included: body["not_included"], version: 1
         )
       end
@@ -1664,7 +1681,9 @@ module SiloMigrate
         result = {
           version: 1, run_id: run["id"], plan_id: run["plan_id"], dataset_id: run["dataset_id"], status: status,
           stage: run["stage"], stages: run["stages"].transform_values { |entry| entry["status"] },
-          assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments"),
+          # Never the per-check reconciliation numbers: they are derived from customer data.
+          assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments",
+                                                                       "conversion_summary", "reconciliation_checks", "reconciliation_matched", "reconciliation_differs", "reconciliation_errors"),
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
         if status == "not_started"

@@ -1539,6 +1539,40 @@ def op_run_evidence(ws, request):
     return {"evidence": json.loads(ws.control(["standard", "analyst", "evidence", ws.name, run_id]))}
 
 
+INPUT_ID = re.compile(r"input-[0-9a-f]{32}\Z")
+
+
+def op_plan_propose(ws, request):
+    """Propose a convert-only plan on real data: the registered dump, settings and (optional)
+    reconciliation checks, by input ID. Only a proposal: the engineer approves and starts it."""
+    ws.require()
+    roles = {key: request.get(key) for key in ("source", "settings", "reconciliation")}
+    charset = request.get("charset", "utf8mb4")
+    if roles["reconciliation"] is None:
+        del roles["reconciliation"]
+    if not all(isinstance(value, str) and INPUT_ID.fullmatch(value) for value in roles.values()) or charset not in CHARSETS:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    argv = ["standard", "plan", "propose", ws.name, "--operation", "convert", "--charset", charset,
+            *[flag for key, value in roles.items() for flag in ("--" + key, value)]]
+    prepared = None
+    try:
+        plan = json.loads(ws.control(argv, timeout=45))
+    except Refusal as refusal:
+        if not str(refusal).startswith("STANDARD_CONVERTER_DEPS_MISSING"):
+            raise
+        # The converter commit's locked gems aren't prepared yet: prepare them (public gems
+        # only, the same step dev_test runs), then propose again.
+        prepared = json.loads(ws.control(["converter", "deps", ws.name], timeout=190)).get("dependencies")
+        plan = json.loads(ws.control(argv, timeout=45))
+    return {"plan_id": plan.get("plan_id"), "digest": plan.get("digest"), "status": plan.get("status"), "operation": plan.get("operation"),
+            "platform": plan.get("platform"), "roles": plan.get("roles"), "inputs": plan.get("inputs"), "source_charset": plan.get("source_charset"),
+            "converter_revision": plan.get("converter_revision"), "converter_deps": plan.get("converter_deps"), "dependencies_prepared": prepared,
+            "mutations": plan.get("mutations"), "not_included": plan.get("not_included"),
+            "next": ("Tell the engineer the plan ID and digest. They approve and start it as the service account: "
+                     "silo-migrate-control standard plan approve " + ws.name + " PLAN_ID --sha256 DIGEST --reviewer \"NAME\", then "
+                     "silo-migrate-control start-run " + ws.name + " PLAN_ID. When it finishes, read it with data_run_evidence.")}
+
+
 def op_propose_finding(ws, request):
     text = request.get("text")
     run_id = request.get("run_id")
@@ -1611,6 +1645,7 @@ def op_notes_write(ws, request):
 OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
        "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "propose_finding": op_propose_finding,
+       "plan_propose": op_plan_propose,
        "notes": op_notes, "notes_write": op_notes_write}
 # Logged with their arguments (minus script code and finding text, logged by hash).
 QUIET = {"status", "list", "job", "db_status", "notes"}
@@ -1658,8 +1693,9 @@ def control_runner(path):
         except subprocess.TimeoutExpired:
             refuse("STANDARD_OPERATION_TIMEOUT")
         if result.returncode:
-            match = re.search(r"Error: ((?:STANDARD|NAMED)_[A-Z_]+)", result.stderr)
-            refuse(match[1] if match else "STANDARD_OPERATION_FAILED")
+            match = re.search(r"Error: ((?:STANDARD|NAMED)_[A-Z_]+)(: [^\n]{1,200}?)?(?:\. |\.?\n|\.?$)", result.stderr)
+            # The code, plus the short detail some refusals add ("check 3: source_sql").
+            refuse((match[1] + (match[2] or "")) if match else "STANDARD_OPERATION_FAILED")
         return result.stdout
     return call
 
