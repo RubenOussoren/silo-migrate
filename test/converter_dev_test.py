@@ -70,7 +70,9 @@ class ConverterDevTest(unittest.TestCase):
         git(base, 'clone', '-q', '--bare', str(seed), str(self.origin))
         self.checkout = self.root / 'converter'
         git(self.root, 'clone', '-q', str(self.origin), str(self.checkout))
-        self.state = {'config': {'converter_worktree': str(self.checkout), 'discourse_profile': 'profile-a', 'discourse_profile_sha256': ''}, 'runs': {}}
+        self.site_settings = self.write(base / 'site-cache/site_settings.yml', 'basic:\n  title: Synthetic\n')
+        self.state = {'config': {'converter_worktree': str(self.checkout), 'discourse_profile': 'profile-a', 'discourse_profile_sha256': '',
+                                 'site_settings': str(self.site_settings), 'site_settings_sha256': hashlib.sha256(self.site_settings.read_bytes()).hexdigest()}, 'runs': {}}
         (standard / 'state.json').write_text(json.dumps(self.state))
         # Customer-like material everywhere an agent must not reach.
         self.write(self.checkout / 'log/convert.log', MARKER + ' alice@example.test\n')
@@ -458,7 +460,9 @@ class ConverterDevTest(unittest.TestCase):
                     self.write(Path(mounts['/deps'][0]) / 'specifications/markbridge-0.5.0.gemspec', '# spec\n')
                 return deps_code, b'Fetching markbridge 0.5.0\n', b'' if deps_code == 0 else b'Could not reach rubygems.org\n'
             export = Path(mounts['/app'][0])
-            seen['files'] = sorted(str(p.relative_to(export)) for p in export.rglob('*') if p.is_file())
+            placeholder = export / 'tmp/requires/discourse/config/site_settings.yml'
+            seen['placeholder_empty'] = placeholder.is_file() and placeholder.stat().st_size == 0  # a mount point, filled by Docker
+            seen['files'] = sorted(str(p.relative_to(export)) for p in export.rglob('*') if p.is_file() and p != placeholder)
             seen['text'] = ''.join(p.read_text(errors='replace') for p in export.rglob('*') if p.is_file())
             seen['argv'] = argv
             seen['emoji'] = sorted(str(p.relative_to(mounts['/app/tmp/emoji_cache'][0])) for p in Path(mounts['/app/tmp/emoji_cache'][0]).rglob('*.json'))
@@ -493,8 +497,10 @@ class ConverterDevTest(unittest.TestCase):
         for flag in (['--network', 'none'], ['--read-only'], ['--cap-drop', 'ALL'], ['--security-opt', 'no-new-privileges'], ['--pull=never']):
             self.assertTrue(any(argv[i:i + len(flag)] == flag for i in range(len(argv))), flag)
         mounts = self.mounts(argv)
-        self.assertEqual({'/app', '/deps', '/app/tmp/emoji_cache'}, set(mounts))
-        self.assertEqual(3, sum(1 for a in argv if a.startswith('type=bind')))
+        self.assertEqual({'/app', '/deps', '/app/tmp/emoji_cache', '/app/tmp/requires/discourse/config/site_settings.yml'}, set(mounts))
+        self.assertEqual(4, sum(1 for a in argv if a.startswith('type=bind')))
+        self.assertEqual((str(self.site_settings), True), mounts['/app/tmp/requires/discourse/config/site_settings.yml'])
+        self.assertTrue(seen['placeholder_empty'])
         self.assertFalse(mounts['/app'][1])
         self.assertTrue(mounts['/deps'][1] and mounts['/app/tmp/emoji_cache'][1])
         self.assertNotIn(str(self.root), ' '.join(argv))
@@ -512,6 +518,12 @@ class ConverterDevTest(unittest.TestCase):
         self.assertEqual('STANDARD_ARGUMENTS_INVALID', self.call('test', file='lib/importer.rb')['error'])
         self.assertIsNone(self.run_test(seen, file='')['file'])
         self.assertEqual(['exec', 'rake', 'test'], seen['argv'][-3:])
+
+    def test_site_settings_cache_must_be_the_bound_file(self):
+        seen = {}
+        self.site_settings.write_text('changed: true\n')
+        self.assertEqual('STANDARD_RUNTIME_MISMATCH', self.run_test(seen)['error'])
+        self.assertNotIn('argv', seen)
 
     def test_dependency_step_sees_only_the_lockfiles_and_is_built_once(self):
         seen = {}

@@ -245,7 +245,9 @@ converter-reviewer on Claude (`claude-bin`, which must be configured and signed 
 - **Tests:** `dev_test` copies only the visible files into a temporary directory and runs
   `rake test` (or `rubocop`) in the profile's converter image, verified by content ID,
   with no network, a read-only root, no capabilities and CPU/memory/PID/time limits, and
-  with the dependency cache mounted read-only.
+  with the dependency cache mounted read-only. So is Discourse's `site_settings.yml`, the
+  workspace's bound copy (sha256 checked), at `tmp/requires/discourse/config/`, where `convert`'s
+  `SiteSetting.load_settings` finds it offline, exactly as in workflow runs.
 - **Commits:** only on `migration/WS/TOPIC` branches; built in a temporary index from the
   verified bytes of the visible changed paths (`hash-object`, `commit-tree`, compare-and-swap
   `update-ref`; no hooks), so nothing else in the working tree or the engineer's index can

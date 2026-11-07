@@ -699,7 +699,7 @@ def op_branch(checkout, request):
             checkout.save_manifest(manifest)
         checkout._tree = checkout._visible = None
     return {"branch": name, "created": not exists, "head": checkout.head(),
-            "note": "Uncommitted changes, if any, came along. The engineer runs `standard converter refresh` before planning on this branch."}
+            "note": "Uncommitted changes, if any, came along. Workflow runs use the committed head of this checkout (migration-data binds it when it proposes a run)."}
 
 
 def identity(checkout, home):
@@ -1154,6 +1154,25 @@ def prepare_dependencies(checkout, document, started, budget=None):
         os.close(descriptor)
 
 
+def site_settings_cache(checkout):
+    """The Discourse site settings the workspace bound at `standard init` (sha256 checked), or None.
+    `convert` loads them through support/remote_requires.rb, which downloads unless a cached copy
+    is in tmp/requires/discourse/config: runs place this one there, and so do tests."""
+    path, digest = checkout.config.get("site_settings"), checkout.config.get("site_settings_sha256")
+    if not path:
+        return None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        refuse("STANDARD_RUNTIME_MISMATCH")
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode) or hashlib.sha256(stream.read()).hexdigest() != digest:
+            refuse("STANDARD_RUNTIME_MISMATCH")
+    if "," in path:
+        refuse("STANDARD_OPERATION_FAILED")
+    return path
+
+
 def op_test(checkout, request, values, repo):
     suite = request.get("suite", "test")
     file = request.get("file") or None  # "" means the whole suite
@@ -1193,9 +1212,14 @@ def op_test(checkout, request, values, repo):
     try:
         os.chmod(export, 0o700)
         copied = export_visible(checkout, export)
-        # Docker would create this mount point as root inside the export: make it ours first.
+        # Docker would create these mount points as root inside the export: make them ours first.
+        settings = site_settings_cache(checkout)
+        settings_target = Path(export) / "tmp/requires/discourse/config/site_settings.yml"
         try:
             (Path(export) / "tmp/emoji_cache").mkdir(parents=True, exist_ok=True)
+            if settings:
+                settings_target.parent.mkdir(parents=True, exist_ok=True)
+                settings_target.touch()
         except OSError:
             refuse("STANDARD_OPERATION_FAILED")
         # The tool itself is killed at ~290 s: keep the container inside that, after the export.
@@ -1208,6 +1232,7 @@ def op_test(checkout, request, values, repo):
                 "--tmpfs", "/tmp:rw,exec,size=512m", "--mount", f"type=bind,src={export},dst=/app",
                 "--mount", f"type=bind,src={deps / 'gems'},dst=/deps,readonly",
                 "--mount", f"type=bind,src={deps / 'emoji_cache'},dst=/app/tmp/emoji_cache,readonly",
+                *(["--mount", f"type=bind,src={settings},dst=/app/tmp/requires/discourse/config/site_settings.yml,readonly"] if settings else []),
                 "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8",
                 *[arg for item in image_gem_env(document, "/deps") for arg in ("-e", item)], "-w", "/app",
                 "--entrypoint", "env", image, "-u", "BUNDLE_PATH", *command]
@@ -1227,7 +1252,7 @@ def op_test(checkout, request, values, repo):
     return {"suite": suite, "file": file, "exit_code": code, "timed_out": code is None, "files_exported": copied,
             "seconds": round(time.monotonic() - started), "summary": summary[-1] if summary else None, "dependencies": prepared,
             "stdout_tail": out_tail, "stdout_truncated": out_cut, "stderr_tail": err_tail, "stderr_truncated": err_cut,
-            "sandbox": "converter image, no network, read-only root, only the files your tools can see, plus the locked gems and emoji table read-only"}
+            "sandbox": "converter image, no network, read-only root, only the files your tools can see, plus the locked gems, the emoji table and Discourse's site settings (tmp/requires) read-only, as in workflow runs"}
 
 
 # -- engineer: push approval -------------------------------------------------------
