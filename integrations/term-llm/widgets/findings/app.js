@@ -160,7 +160,7 @@ async function loadList() {
     const selected = state.selected && state.selected.id === item.id;
     list.append(el('li', {}, el('button', {
       type: 'button', class: selected ? 'item selected' : 'item',
-      onclick: () => select({ workspace: item.workspace, id: item.id }),
+      onclick: () => openFinding({ workspace: item.workspace, id: item.id }),
     },
     el('span', { class: 'title' }, item.title || item.id),
     el('span', { class: 'meta' }, `${item.workspace} · ${item.kind} · `, el('span', { class: `badge ${item.status}` }, STATUS_LABEL[item.status]),
@@ -236,7 +236,7 @@ async function act(action, record, text) {
 // The open editor and the text it started with, so unsaved edits aren't thrown away silently.
 let editing = null;
 const leaveEdits = () => !editing || editing.area.value === editing.original || confirm('Discard your edits to this finding?');
-function select(next) {
+function openFinding(next) {
   if (!leaveEdits()) return false;
   editing = null;
   state.selected = next;
@@ -269,7 +269,7 @@ async function loadDetail() {
   const versions = record.versions.length > 1
     ? el('div', { class: 'versions' }, el('h3', {}, 'Versions'), el('ol', {}, record.versions.map((version) => el('li', {},
       el('a', { href: `#ws=${encodeURIComponent(record.workspace)}&id=${version.id}`, class: version.id === record.id ? 'current' : '',
-        onclick: (event) => { event.preventDefault(); select({ workspace: record.workspace, id: version.id }); } },
+        onclick: (event) => { event.preventDefault(); openFinding({ workspace: record.workspace, id: version.id }); } },
       version.id), ` · ${STATUS_LABEL[version.status]} · ${ago(version.updated_at)}`))))
     : null;
   const parts = [el('h2', { class: 'mono' }, record.id), facts, versions];
