@@ -29,6 +29,8 @@ function el(tag, attrs = {}, ...children) {
 // Section lines as migration-data writes them: two or more ALL-CAPS words first ("OPEN QUESTIONS for
 // converter work"), or one ALL-CAPS word with an optional note ("UPLOADS (open)").
 const CAPS_HEADING = /^(?:[A-Z][A-Z0-9&/'’-]+\s+[A-Z][A-Z0-9&/'’-]+\b(?![a-z]).*|[A-Z][A-Z0-9&/'’-]{3,}(?:\s*\([^)]*\))?:?)$/;
+const FENCE = /^```[\w+-]*$/;
+const TABLE_RULE = /^\s*\|?(\s*:?-{2,}:?\s*\|)*\s*:?-{2,}:?\s*\|?\s*$/;  // the whole line, nothing else on it
 const isCapsHeading = (line) => line.length <= 120 && !line.endsWith('.') && CAPS_HEADING.test(line);
 
 function inline(text) {
@@ -53,10 +55,12 @@ function markdown(text) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
-    if (trimmed.startsWith('```')) {
+    // Only a bare fence (optionally a language tag) opens or closes a block; any other text on
+    // a fence line would otherwise be hidden from the reviewer, so such lines stay plain text.
+    if (FENCE.test(trimmed)) {
       close();
       const code = [];
-      for (i++; i < lines.length && !lines[i].trim().startsWith('```'); i++) code.push(lines[i]);
+      for (i++; i < lines.length && lines[i].trim() !== '```'; i++) code.push(lines[i]);
       root.append(el('pre', {}, code.join('\n')));
       continue;
     }
@@ -67,7 +71,7 @@ function markdown(text) {
       root.append(el(heading ? `h${Math.min(6, heading[1].length + 2)}` : 'h4', {}, inline(heading ? heading[2] : trimmed)));
       continue;
     }
-    if (trimmed.startsWith('|') && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+    if (trimmed.startsWith('|') && i + 1 < lines.length && TABLE_RULE.test(lines[i + 1])) {
       close();
       const cells = (row) => row.trim().replace(/^\||\|$/g, '').split('|').map((cell) => cell.trim());
       const table = el('table', {}, el('thead', {}, el('tr', {}, cells(line).map((cell) => el('th', {}, inline(cell))))));
@@ -156,7 +160,7 @@ async function loadList() {
     const selected = state.selected && state.selected.id === item.id;
     list.append(el('li', {}, el('button', {
       type: 'button', class: selected ? 'item selected' : 'item',
-      onclick: () => { state.selected = { workspace: item.workspace, id: item.id }; writeHash(); loadList(); loadDetail(); },
+      onclick: () => select({ workspace: item.workspace, id: item.id }),
     },
     el('span', { class: 'title' }, item.title || item.id),
     el('span', { class: 'meta' }, `${item.workspace} · ${item.kind} · `, el('span', { class: `badge ${item.status}` }, STATUS_LABEL[item.status]),
@@ -201,6 +205,7 @@ function editor(label, text) {
     area.hidden = showing;
     toggle.textContent = showing ? 'Edit' : 'Preview';
   } }, 'Preview');
+  editing = { area, original: area.value };
   return { area, node: el('div', { class: 'block' }, el('h3', {}, label, ' ', toggle), area, preview, counter) };
 }
 
@@ -218,15 +223,34 @@ async function act(action, record, text) {
     if (outcome.finding_id && outcome.finding_id !== record.id) state.selected = { workspace: record.workspace, id: outcome.finding_id };
     writeHash();
   } catch (error) {
+    // Nothing changed: keep the page as it is, edits included.
     toast(ERRORS[error.message] || `Refused: ${error.message}`, true);
+    await loadList();
+    return;
   }
+  editing = null;
   await loadList();
   await loadDetail();
 }
 
+// The open editor and the text it started with, so unsaved edits aren't thrown away silently.
+let editing = null;
+const leaveEdits = () => !editing || editing.area.value === editing.original || confirm('Discard your edits to this finding?');
+function select(next) {
+  if (!leaveEdits()) return false;
+  editing = null;
+  state.selected = next;
+  writeHash();
+  loadList();
+  loadDetail();
+  return true;
+}
+window.addEventListener('beforeunload', (event) => { if (editing && editing.area.value !== editing.original) event.preventDefault(); });
+
 async function loadDetail() {
   const pane = $('detail-pane');
   views.clear();
+  editing = null;
   if (!state.selected) { pane.replaceChildren(el('p', { class: 'empty' }, 'Select a finding.')); return; }
   let record;
   try {
@@ -245,7 +269,7 @@ async function loadDetail() {
   const versions = record.versions.length > 1
     ? el('div', { class: 'versions' }, el('h3', {}, 'Versions'), el('ol', {}, record.versions.map((version) => el('li', {},
       el('a', { href: `#ws=${encodeURIComponent(record.workspace)}&id=${version.id}`, class: version.id === record.id ? 'current' : '',
-        onclick: (event) => { event.preventDefault(); state.selected = { workspace: record.workspace, id: version.id }; writeHash(); loadDetail(); } },
+        onclick: (event) => { event.preventDefault(); select({ workspace: record.workspace, id: version.id }); } },
       version.id), ` · ${STATUS_LABEL[version.status]} · ${ago(version.updated_at)}`))))
     : null;
   const parts = [el('h2', { class: 'mono' }, record.id), facts, versions];
@@ -282,7 +306,10 @@ $('search').addEventListener('input', (event) => {
 });
 $('prev').addEventListener('click', () => { state.page = Math.max(0, state.page - 1); loadList(); });
 $('next').addEventListener('click', () => { state.page += 1; loadList(); });
-window.addEventListener('hashchange', () => { readHash(); loadList(); loadDetail(); });
+window.addEventListener('hashchange', () => {
+  if (!leaveEdits()) { writeHash(); return; }
+  readHash(); loadList(); loadDetail();
+});
 readHash();
 loadList();
 loadDetail();
