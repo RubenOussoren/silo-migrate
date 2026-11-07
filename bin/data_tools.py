@@ -1019,10 +1019,10 @@ def finish(ws, job):
         except Refusal:
             checked = False
         job["read_only_user_checked"] = checked
-        state = db_state(ws)
-        if state:
-            state["ro_user"] = checked
-            ws.write_json(ws.data_dir("db") / "state.json", state)
+        db = db_state(ws)
+        if db:
+            db["ro_user"] = checked
+            ws.write_json(ws.data_dir("db") / "state.json", db)
     ws.write_json(log_dir / (job["id"] + ".json"), job)
     docker(["rm", "-f", job["container"]], timeout=60)
     return combined
@@ -1129,22 +1129,27 @@ def harden_ro_user(ws, engine):
                                             f"SELECT 'host', Host FROM mysql.user WHERE User = '{RO_USER}' AND Host <> '%';\nSHOW DATABASES;\n"))
         if listed.returncode:
             return False
-        roles, hosts, databases = [], [], []
+        roles, hosts, databases, rejected = [], [], [], False
         for line in listed.stdout.decode("utf-8", "replace").splitlines():
-            kind, _, value = line.partition("\t")
-            # Names come from the dump: only plain ones are ever put into a statement.
-            target = {"role": roles, "host": hosts}.get(kind) if _ else databases
-            name = value if _ else line
-            if target is not None and name and re.fullmatch(r"[A-Za-z0-9_$.%-]{1,64}", name):
-                target.append(name)
+            kind, tab, value = line.partition("\t")
+            # Names come from the dump: only plain ones are ever put into a statement. A role or
+            # host entry that can't be named safely can't be removed, so the check fails.
+            if tab and kind in ("role", "host"):
+                if re.fullmatch(r"[A-Za-z0-9_$.%-]{1,64}", value):
+                    (roles if kind == "role" else hosts).append(value)
+                else:
+                    rejected = True
+            elif not tab and re.fullmatch(r"[A-Za-z0-9_$-]{1,64}", line) and line not in SYSTEM_DATABASES.split("|"):
+                databases.append(line)  # no % (a wildcard in grants); _ is escaped below
         sql = (f"CREATE USER IF NOT EXISTS '{RO_USER}'@'%';\nALTER USER '{RO_USER}'@'%' IDENTIFIED BY '{password}';\n"
                + "".join(f"DROP USER IF EXISTS '{RO_USER}'@'{host}';\n" for host in hosts)
                + f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM '{RO_USER}'@'%';\nSET DEFAULT ROLE NONE FOR '{RO_USER}'@'%';\n"
+               # MariaDB 11.4 rejects revoking from a PUBLIC with no grants (ERROR 1959): give it one first.
+               + "GRANT USAGE ON *.* TO PUBLIC;\nREVOKE ALL PRIVILEGES, GRANT OPTION FROM PUBLIC;\n"
                + "".join(f"REVOKE `{role}` FROM '{RO_USER}'@'%';\n" for role in roles)
-               + "".join(f"GRANT SELECT, SHOW VIEW ON `{name}`.* TO '{RO_USER}'@'%';\n" for name in databases
-                         if name not in SYSTEM_DATABASES.split("|"))
+               + "".join("GRANT SELECT, SHOW VIEW ON `" + name.replace("_", "\\_") + f"`.* TO '{RO_USER}'@'%';\n" for name in databases)
                + "FLUSH PRIVILEGES;\n")
-        return db_exec(ws, engine, sql).returncode == 0
+        return db_exec(ws, engine, sql).returncode == 0 and not rejected
     each_schema = ("DO $$DECLARE s text; BEGIN FOR s IN SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' "
                    "AND nspname <> 'information_schema' LOOP {body} END LOOP; END$$;\n")
     sql = (f"DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{RO_USER}') THEN CREATE ROLE {RO_USER} LOGIN; END IF; END$$;\n"
@@ -1157,7 +1162,7 @@ def harden_ro_user(ws, engine):
            + each_schema.format(body=(
                f"EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM PUBLIC, {RO_USER}', s); "
                f"EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM PUBLIC, {RO_USER}', s); "
-               f"EXECUTE format('REVOKE ALL ON ALL FUNCTIONS IN SCHEMA %I FROM PUBLIC, {RO_USER}', s); "
+               f"EXECUTE format('REVOKE ALL ON ALL ROUTINES IN SCHEMA %I FROM PUBLIC, {RO_USER}', s); "
                f"EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM PUBLIC, {RO_USER}', s); "
                f"EXECUTE format('GRANT USAGE ON SCHEMA %I TO {RO_USER}', s); "
                f"EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO {RO_USER}', s);")))

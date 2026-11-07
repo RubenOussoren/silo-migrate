@@ -93,6 +93,7 @@ class FakeDocker:
         self.networks = {}  # name -> create argv
         self.volumes = set()
         self.ready = True
+        self.hostile_role = b''
         self.logs = b'converted 3 records\n'
         self.keep_volume = False
 
@@ -143,7 +144,7 @@ class FakeDocker:
                 out = b'source\t2\t1\n'
             elif input and input.startswith(b"SELECT 'role'"):
                 # As a hostile dump could leave them: an extra host entry and an injected role name.
-                out = b"role\tsafe_role\nrole\tx`; GRANT ALL ON *.* TO silo_ro@'%'; --\nhost\t172.%\ninformation_schema\nmysql\nsource\n"
+                out = b"role\tsafe_role\nhost\t172.%\ninformation_schema\nmysql\nsource\nforum_db\n%\n" + self.hostile_role
         elif argv[0] == 'rm':
             self.state.pop(argv[-1], None)
         return subprocess.CompletedProcess(argv, code, out, err)
@@ -388,8 +389,15 @@ class DataToolsTest(unittest.TestCase):
         for statement in (b'CREATE USER IF NOT EXISTS', b'REVOKE ALL PRIVILEGES, GRANT OPTION', b'SET DEFAULT ROLE NONE', b'GRANT SELECT, SHOW VIEW ON `source`',
                           b"DROP USER IF EXISTS 'silo_ro'@'172.%'", b"REVOKE `safe_role` FROM"):
             self.assertIn(statement, hardening)
-        self.assertNotIn(b'GRANT ALL', hardening)  # names from the dump are never spliced in unchecked
         self.assertNotIn(b'`mysql`', hardening)
+        self.assertNotIn(b'`%`', hardening)  # a database named % would be a wildcard grant
+        self.assertIn(b'GRANT SELECT, SHOW VIEW ON `forum\\_db`.*', hardening)
+        self.assertIn(b'REVOKE ALL PRIVILEGES, GRANT OPTION FROM PUBLIC', hardening)
+        # A role that can't be named safely is never spliced in, and the check fails.
+        self.docker.hostile_role = b"role\tx`; GRANT ALL ON *.* TO silo_ro@'%'; --\n"
+        self.docker.calls.clear()
+        self.assertFalse(self.d.harden_ro_user(self.d.Workspace(self.base, 'arc', ROOT, self.host, self.values, self.control), 'mariadb'))
+        self.assertNotIn(b'GRANT ALL', b''.join(inp for _argv, inp in self.docker.calls if inp))
         self.refused('STANDARD_DB_ENGINE_MISMATCH', 'db_up', engine='postgres')
         self.assertEqual([['source', 2]], [[s['schema'], s['tables']] for s in self.op('db_status')['schemas']])
 
@@ -448,7 +456,7 @@ class DataToolsTest(unittest.TestCase):
         hardening = b''.join(inp for argv, inp in self.docker.calls if inp)
         for statement in (b'NOSUPERUSER', b'default_transaction_read_only = on', b'GRANT SELECT ON ALL TABLES IN SCHEMA', b'REVOKE %I FROM silo_ro',
                           b'IN DATABASE source RESET ALL', b'REVOKE CREATE, TEMPORARY ON DATABASE source FROM PUBLIC',
-                          b'REVOKE ALL ON ALL FUNCTIONS IN SCHEMA %I FROM PUBLIC'):
+                          b'REVOKE ALL ON ALL ROUTINES IN SCHEMA %I FROM PUBLIC'):
             self.assertIn(statement, hardening)
 
     def test_plain_postgres_dump_runs_with_backslash_commands_restricted(self):
