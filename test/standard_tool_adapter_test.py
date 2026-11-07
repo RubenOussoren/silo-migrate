@@ -54,7 +54,7 @@ else:
                     for name in ('dataset_id', 'plan_id', 'run_id', 'finding_id')}
 
     def call(self, tool, args, status='approved', project=None, **overrides):
-        env = dict(self.env, TERM_LLM_TOOL_NAME=tool, PLAN_STATUS=status, SILO_PROJECTS_ROOT=str(self.root / 'projects'),
+        env = dict(self.env, TERM_LLM_TOOL_NAME=tool, PLAN_STATUS=status, SILO_TESTING='1', SILO_PROJECTS_ROOT=str(self.root / 'projects'),
                    OBSERVED_STATUSES=json.dumps(['running' if tool == 'migration_run_request' else status]))
         env.update(overrides)
         cwd = self.root / 'projects' / project if project else self.root
@@ -265,7 +265,7 @@ else:
         cwd = projects / project if project else self.root
         cwd.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, SILO_CONTROL=str(self.control), ARGV_RECORD=str(self.record), PYTHONDONTWRITEBYTECODE='1',
-                   TERM_LLM_TOOL_NAME=tool, MODE=mode, SILO_PROJECTS_ROOT=str(projects))
+                   TERM_LLM_TOOL_NAME=tool, MODE=mode, SILO_TESTING='1', SILO_PROJECTS_ROOT=str(projects))
         result = subprocess.run([sys.executable, '-I', '-B', str(DATA)], input=json.dumps(args), capture_output=True,
                                 text=True, env=env, timeout=10, cwd=cwd)
         self.assertEqual(0, result.returncode, result.stderr)

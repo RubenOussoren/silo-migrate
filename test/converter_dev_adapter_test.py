@@ -31,7 +31,7 @@ print(json.dumps({'version': 1, 'ok': True}))
     def call(self, agent, tool, args, project=None):
         root = Path(self.temp.name) / 'projects'
         env = dict(os.environ, SILO_CONTROL=str(self.control), RECORD=str(self.record), TERM_LLM_TOOL_NAME=tool, PYTHONDONTWRITEBYTECODE='1',
-                   SILO_PROJECTS_ROOT=str(root))
+                   SILO_TESTING='1', SILO_PROJECTS_ROOT=str(root))
         env.pop('TERM_LLM_AGENT_DIR', None)
         cwd = root / project if project else Path(self.temp.name)
         cwd.mkdir(parents=True, exist_ok=True)

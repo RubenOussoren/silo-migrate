@@ -559,15 +559,24 @@ def web_project(entry, project):
     token = run(as_account([term_llm(), "service", "token", "web"], entry), timeout=30).stdout.strip()
     if not re.fullmatch(r"[A-Za-z0-9._~+/=-]{16,512}", token):
         return manual
+    import http.client
     import urllib.error
     import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    # Straight to the local service: no proxy from root's environment, no redirect carrying the token.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     request = urllib.request.Request(url.replace("localhost", "127.0.0.1").rstrip("/") + "/v1/projects", method="POST",
                                      data=json.dumps({"name": project, "path": str(folder)}).encode(),
                                      headers={"content-type": "application/json", "authorization": "Bearer " + token})
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with opener.open(request, timeout=20) as response:
             reply = json.loads(response.read() or b"{}")
-    except (OSError, ValueError, urllib.error.URLError):
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
+        return manual + " (the web service didn't answer)"
+    if not isinstance(reply, dict):
         return manual + " (the web service didn't answer)"
     return "web UI project: " + project + (" (already there)" if reply.get("duplicate") else " (created)") + ", folder " + str(folder)
 

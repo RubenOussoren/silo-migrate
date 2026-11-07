@@ -66,8 +66,10 @@ def fail(code):
 def chat_project():
     """The web UI project this chat belongs to, or None. term-llm runs a project chat's tools in
     the project's folder, ~/projects/<project> (silo intake creates it); the model can't change
-    that. SILO_PROJECTS_ROOT is for tests only."""
-    root = os.environ.get("SILO_PROJECTS_ROOT") or os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "projects")
+    that. SILO_PROJECTS_ROOT applies only to the test suite (SILO_TESTING=1)."""
+    root = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "projects")
+    if os.environ.get("SILO_TESTING") == "1" and os.environ.get("SILO_PROJECTS_ROOT"):
+        root = os.environ["SILO_PROJECTS_ROOT"]
     try:
         cwd, root = os.path.realpath(os.getcwd()), os.path.realpath(root)
     except OSError:

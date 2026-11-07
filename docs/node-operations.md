@@ -100,11 +100,16 @@ and the web UI keeps chats apart:
   another project. The tools use that: **migration-data works only in a project chat and only on
   that project's workspace** (`STANDARD_CHAT_NOT_IN_PROJECT`, `STANDARD_WORKSPACE_NOT_THIS_PROJECT`);
   the operator and converter agents are held to the project's workspace when their chat is in one.
-  The project folder itself holds nothing; customer data stays in the workspace.
+  The project folder holds nothing and should stay empty (term-llm would read project skills from
+  it); customer data stays in the workspace. The lock doesn't reach DBHub: MCP servers start in
+  the service's home folder, not the project's, so turning on only the chat's own `db-<project>`
+  stays your job (migration-data is told to stop if another project's server is on).
 - **Project notes** are migration-data's memory: `data_notes` / `data_notes_write` keep one notes
   file per workspace (`.silo-migrate/data/notes.md`, the last 20 versions in `notes-history/`).
   It reads them at the start of each chat and updates them after meaningful work. term-llm's own
   memory is kept per agent, so it would mix customers; it stays off on this node (no mining jobs).
+  Notes are model-written: like findings, read them before trusting them (a hostile export could
+  try to steer what gets written).
 
 ### Free SQL: DBHub
 

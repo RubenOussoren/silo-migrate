@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import types
 import os
 from pathlib import Path
 import pwd
@@ -307,7 +308,12 @@ class SiloTest(unittest.TestCase):
         def fake_urlopen(request, timeout=0):
             sent.append(request)
             return Reply(json.dumps({'project': {'id': 'prj_1'}, 'duplicate': len(sent) > 1}).encode())
-        with mock.patch.object(self.s, 'run', side_effect=fake_run), mock.patch('urllib.request.urlopen', side_effect=fake_urlopen), \
+        import urllib.request
+        handlers = []
+        def fake_build_opener(*given):
+            handlers.extend(given)
+            return types.SimpleNamespace(open=fake_urlopen)
+        with mock.patch.object(self.s, 'run', side_effect=fake_run), mock.patch('urllib.request.build_opener', side_effect=fake_build_opener), \
                 mock.patch('sys.stdout', new_callable=io.StringIO) as out:
             # Projects not on yet: the folder is made, no request is sent.
             spec.write_text(json.dumps({'url': 'http://localhost:18800/ui/', 'args': ['--no-projects']}))
@@ -325,10 +331,15 @@ class SiloTest(unittest.TestCase):
         self.assertEqual({'name': 'mybb-acme', 'path': str(folder)}, json.loads(request.data))
         self.assertEqual('Bearer ' + token, request.get_header('Authorization'))
         self.assertIn('web UI project: mybb-acme (created)', out.getvalue())
+        # No proxy from root's environment and no redirects carrying the token.
+        proxy = next(h for h in handlers if isinstance(h, urllib.request.ProxyHandler))
+        self.assertEqual({}, proxy.proxies)
+        redirect = next(h for h in handlers if isinstance(h, urllib.request.HTTPRedirectHandler))
+        self.assertIsNone(redirect.redirect_request(None, None, 302, 'Found', {}, 'http://elsewhere.example/'))
         self.assertNotIn(token, out.getvalue())
         # A URL that isn't local is never sent the token.
         spec.write_text(json.dumps({'url': 'https://example.test/ui/', 'args': ['--projects']}))
-        with mock.patch.object(self.s, 'run', side_effect=fake_run), mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
+        with mock.patch.object(self.s, 'run', side_effect=fake_run), mock.patch('urllib.request.build_opener', side_effect=fake_build_opener):
             self.s.web_project(self.entry, 'mybb-acme')
         self.assertEqual(2, len(sent))
 

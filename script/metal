@@ -1102,7 +1102,8 @@ def refresh_service():
         run(service_args())
     except Refusal as refusal:
         # The new release is in place either way; doctor shows the fix.
-        print("METAL_SERVICE_UPDATE_SKIPPED: " + str(refusal).split(":")[0] + "; re-run 'silo update'", flush=True)
+        print("METAL_SERVICE_UPDATE_SKIPPED: " + str(refusal).split(":")[0] + "; web UI projects stay off, so migration-data's tools "
+              "refuse (STANDARD_CHAT_NOT_IN_PROJECT) until 'silo update' is run again", flush=True)
         return False
     return True
 

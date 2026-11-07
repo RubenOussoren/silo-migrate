@@ -1594,17 +1594,17 @@ def op_notes_write(ws, request):
         if path.is_symlink():
             refuse("STANDARD_PATH_INVALID")
         history = ws.data_dir("notes-history")
-        if path.is_file():
-            # The previous version is kept, so a bad rewrite can be undone by the engineer.
-            # Nanoseconds: names sort in the order they were written.
-            os.replace(path, history / ("%020d.md" % time.time_ns()))
-            for old in sorted(history.glob("*.md"))[:-NOTES_VERSIONS]:
-                old.unlink()
         temporary = path.with_name(".notes." + secrets.token_hex(4))
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text if text.endswith("\n") else text + "\n")
+        if path.is_file():
+            # The previous version is kept (a second name for it, so notes.md never goes missing);
+            # nanosecond names sort in the order they were written.
+            os.link(path, history / ("%020d.md" % time.time_ns()))
         os.replace(temporary, path)
+        for old in sorted(history.glob("*.md"))[:-NOTES_VERSIONS]:
+            old.unlink()
     return {"bytes": path.stat().st_size, "previous_versions": len(list(history.glob("*.md")))}
 
 
