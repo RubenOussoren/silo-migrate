@@ -474,21 +474,43 @@ class StandardConvertRunTest < SiloMigrateTest
     with_convert do
       path = File.join(@dir, 'big.sqlite')
       db = SQLite3::Database.new(path)
-      db.execute('CREATE TABLE posts (id INTEGER)')
-      db.transaction { 5000.times { |n| db.execute('INSERT INTO posts VALUES (?)', [n]) } }
+      db.execute('PRAGMA journal_mode = WAL')
+      db.execute('CREATE TABLE posts (id INTEGER, email TEXT)')
+      db.transaction { 20_000.times { |n| db.execute('INSERT INTO posts VALUES (?, ?)', [n, n.even? ? "u#{n}@example.invalid" : nil]) } }
       db.close
-      db = @service.send(:open_immutable, path)
-      db.statement_timeout = 200
-      assert_equal [5000, nil], @service.send(:intermediate_count, db, 'SELECT COUNT(*) FROM posts')
-      assert_equal [nil, 'not a single count'], @service.send(:intermediate_count, db, 'SELECT id FROM posts')
-      assert_equal [nil, 'not a single count'], @service.send(:intermediate_count, db, 'SELECT 1, 2')
+      pids = []
+      fork = Process.method(:fork)
+      count = lambda do |sql, timeout: 60|
+        Process.stub(:fork, ->(&block) { fork.call(&block).tap { |pid| pids << pid } }) do
+          @service.send(:intermediate_count, path, sql, timeout: timeout)
+        end
+      end
+      assert_equal [20_000, nil], count.call('SELECT COUNT(*) FROM posts')
+      # Regression: sqlite3 2.8.1's statement_timeout interrupted any row-scanning query within ~2,000 VM steps.
+      assert_equal [10_000, nil], count.call('SELECT COUNT(*) FROM posts WHERE email IS NOT NULL')
+      assert_equal [10_000, nil], count.call('SELECT COUNT(DISTINCT p.id) FROM posts p JOIN posts q ON q.id = p.id WHERE p.email IS NULL')
+      assert_equal [nil, 'not a single count'], count.call('SELECT id FROM posts')
+      assert_equal [nil, 'not a single count'], count.call('SELECT 1, 2')
+      assert_equal [nil, 'not a single count'], count.call('SELECT -1')
+      assert_equal [nil, 'more than one statement'], count.call('SELECT 1; SELECT 2')
+      assert_match(/\Aquery failed: no such table/, count.call('SELECT COUNT(*) FROM missing').last)
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      count, error = @service.send(:intermediate_count, db, 'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT COUNT(*) FROM c')
-      assert_nil count
-      assert_match(/\Aquery failed: /, error)
+      value, error = count.call('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT COUNT(*) FROM c', timeout: 1)
+      assert_nil value
+      assert_equal 'query failed: timed out after 1 s', error
       assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 10
-      db.close
+      # A child that dies without an answer, or fails outside SQLite, is one check's error.
+      # (If the child ran this process's at_exit handlers, minitest would run again in it.)
+      @service.stub(:intermediate_count_in, ->(_db, _sql) { exit!(1) }) do
+        assert_equal [nil, 'query failed: no result'], count.call('SELECT COUNT(*) FROM posts')
+      end
+      @service.stub(:intermediate_count_in, ->(_db, _sql) { raise 'boom' }) do
+        assert_equal [nil, 'query failed: RuntimeError'], count.call('SELECT COUNT(*) FROM posts')
+      end
+      assert_equal 11, pids.size
+      pids.each { |pid| assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) } } # all reaped
       refute File.exist?(path + '-shm')
+      refute File.exist?(path + '-wal')
     end
   end
 

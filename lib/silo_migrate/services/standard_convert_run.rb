@@ -582,11 +582,12 @@ module SiloMigrate
         source = JSON.parse(File.read(@store.run_dir(run_id, "private", "source-counts.json"))).to_h { |entry| [entry["name"], entry] }
         raise StandardWorkflowError, "STANDARD_INTERNAL" unless defined?(SQLite3::Database)
 
-        db = open_immutable(@store.run_dir(run_id, "artifacts", "intermediate.sqlite"))
-        db.statement_timeout = intermediate_query_timeout * 1000
+        path = @store.run_dir(run_id, "artifacts", "intermediate.sqlite")
+        raise StandardWorkflowError, "STANDARD_INTERNAL" unless File.file?(path)
+
         rows = checks.map do |check|
           measured = source.fetch(check["name"], {})
-          intermediate, error = intermediate_count(db, check.fetch("intermediate_sql"))
+          intermediate, error = intermediate_count(path, check.fetch("intermediate_sql"))
           problem = measured["error"] ? "source: #{measured['error']}" : (error && "intermediate: #{error}")
           status = if problem then "error"
                    elsif check["expect"] == "report" then "reported"
@@ -601,8 +602,6 @@ module SiloMigrate
                        reconciliation_matched: rows.count { |row| row["status"] == "matched" },
                        reconciliation_differs: rows.count { |row| row["status"] == "differs" },
                        reconciliation_errors: rows.count { |row| row["status"] == "error" })
-      ensure
-        db&.close
       end
 
       def intermediate_query_timeout
@@ -616,7 +615,87 @@ module SiloMigrate
         SQLite3::Database.new(uri, flags: SQLite3::Constants::Open::READONLY | SQLite3::Constants::Open::URI)
       end
 
-      def intermediate_count(db, sql)
+      # Each count runs in a forked child that is killed at the deadline. The sqlite3 gem
+      # can't time a query out in-process: 2.8.1's statement_timeout sets its deadline to
+      # the moment the query starts, so any row-scanning query is interrupted within
+      # ~2,000 VM steps, and the gem holds the GVL while stepping, so a watchdog thread
+      # calling db.interrupt never runs. The child's CPU limit also ends it if this
+      # process dies first.
+      # The child inherits the store's lock descriptors; this process always kills and
+      # reaps it before returning, and in the control container (ruby is PID 1) the
+      # child dies with it.
+      def intermediate_count(path, sql, timeout: intermediate_query_timeout)
+        limit = timeout.ceil
+        reader, writer = IO.pipe
+        pid = Process.fork do
+          # Only exit! leaves the child: no at_exit handlers or ensure blocks of the parent's stack.
+          begin
+            # No core dump: its memory holds pages of the intermediate database.
+            Process.setrlimit(Process::RLIMIT_CORE, 0, 0)
+            reader.close
+            Process.setrlimit(Process::RLIMIT_CPU, limit + 5, limit + 10)
+            result = begin
+              db = open_immutable(path)
+              intermediate_count_in(db, sql)
+            rescue SQLite3::Exception => error
+              [nil, "query failed: #{error.message.to_s.dup.force_encoding(Encoding::UTF_8).scrub[0, 300]}"]
+            rescue StandardError => error
+              [nil, "query failed: #{error.class}"]
+            ensure
+              db&.close
+            end
+            writer.write(JSON.generate(result))
+            writer.close
+          ensure
+            exit!(0)
+          end
+        end
+        writer.close
+        read_child_result(reader, limit) || [nil, "query failed: timed out after #{limit} s"]
+      rescue SystemCallError, IOError => error
+        [nil, "query failed: #{error.class}"]
+      ensure
+        reader&.close unless reader&.closed?
+        writer&.close unless writer&.closed?
+        if pid
+          begin
+            Process.kill("KILL", pid)
+          rescue Errno::ESRCH
+            nil
+          end
+          begin
+            Process.wait(pid)
+          rescue Errno::ECHILD
+            nil
+          end
+        end
+      end
+
+      # The child's [count, error] pair, [nil, error] if it died without one, or nil at the deadline.
+      def read_child_result(reader, timeout)
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+        data = +""
+        loop do
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          return nil unless remaining.positive? && IO.select([reader], nil, nil, remaining)
+
+          chunk = reader.read_nonblock(4096, exception: false)
+          break if chunk.nil?
+          next if chunk == :wait_readable
+
+          data << chunk
+          return [nil, "query failed: invalid result"] if data.bytesize > 4096
+        end
+        value, error = JSON.parse(data)
+        return [value, nil] if value.is_a?(Integer) && value >= 0 && error.nil?
+        return [nil, error] if value.nil? && error.is_a?(String)
+
+        [nil, "query failed: invalid result"]
+      rescue JSON::ParserError, TypeError
+        [nil, "query failed: no result"]
+      end
+
+      def intermediate_count_in(db, sql)
         statement = db.prepare(sql.strip.sub(/;\z/, ""))
         return [nil, "more than one statement"] unless statement.remainder.to_s.strip.empty?
 
@@ -625,8 +704,6 @@ module SiloMigrate
         # Never more than two rows read, whatever the query returns.
         value = first && first.size == 1 && results.next.nil? ? first.first : nil
         value.is_a?(Integer) && value >= 0 ? [value, nil] : [nil, "not a single count"]
-      rescue SQLite3::Exception => error
-        [nil, "query failed: #{error.message[0, 300]}"]
       ensure
         statement&.close
       end
