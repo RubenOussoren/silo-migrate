@@ -339,6 +339,32 @@ class ConverterDevTest(unittest.TestCase):
             shown = self.dev.main(['converter', 'push-show', self.ws], {}, self.base, ROOT, self.host, io.StringIO(''), home=str(self.home))
             self.assertEqual('pushed', shown['proposals'][0]['status'])
 
+    def test_a_new_proposal_supersedes_the_waiting_one_and_proposals_can_be_discarded(self):
+        self.commit_fix()
+        self.token()
+        calls = []
+        target, api = self.github(calls)
+        main = lambda *args: self.dev.main(['converter', *args], {}, self.base, ROOT, self.host, io.StringIO(''), home=str(self.home))
+        with target, api:
+            first = self.call('push-propose', title='Fix')['digest']
+            self.call('write', path='lib/later.rb', content='x\n')
+            self.call('commit', message='Later change')
+            second = self.call('push-propose', title='Fix and later change')['digest']
+            statuses = {p['digest']: p['status'] for p in main('push-show', self.ws)['proposals']}
+            self.assertEqual({first: 'superseded', second: 'proposed'}, statuses)
+            with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_PUSH_UNKNOWN'):
+                main('push', self.ws, '--sha256', first)
+            self.assertEqual('discarded', main('push-discard', self.ws, '--sha256', first)['status'])
+            with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_TRANSITION_INVALID'):
+                main('push-discard', self.ws, '--sha256', first)
+            self.assertEqual('pushed', main('push', self.ws, '--sha256', second, '--no-pr')['status'])
+            with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_TRANSITION_INVALID'):
+                main('push-discard', self.ws, '--sha256', second)
+            with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_ARGUMENTS_INVALID'):
+                main('push-discard', self.ws, '--sha256', 'x' * 64)
+        # Agents can't reach it: it isn't a dev operation.
+        self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('push-discard', digest=first)['error'])
+
     def test_push_refuses_a_stale_proposal(self):
         self.commit_fix()
         self.token()

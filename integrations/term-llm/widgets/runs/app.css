@@ -51,3 +51,4 @@ button:disabled { opacity: .4; cursor: default; }
 #toast.show { opacity: .95; } #toast.bad { background: var(--danger); }
 @media (max-width: 760px) { main { grid-template-columns: 1fr; height: auto; } #list-pane { border-right: 0; max-height: 50vh; } }
 .badge.not_pushed { color: var(--warn); }
+.badge.superseded { color: var(--warn); }

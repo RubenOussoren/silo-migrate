@@ -819,6 +819,12 @@ def op_push_propose(checkout, request):
     digest = hashlib.sha256(canonical(proposal).encode("utf-8")).hexdigest()
     record = {"digest": digest, "status": "proposed", "proposed_at": now(), "proposal": proposal}
     path = proposal_dir(checkout) / (digest + ".json")
+    # Earlier proposals for this branch still waiting are replaced by this one.
+    for older in load_proposals(checkout):
+        if older.get("status") == "proposed" and older.get("digest") != digest and (older.get("proposal") or {}).get("branch") == proposal["branch"]:
+            older_path = proposal_dir(checkout) / (str(older.get("digest")) + ".json")
+            if DIGEST.fullmatch(str(older.get("digest"))) and older_path.is_file() and not older_path.is_symlink():
+                write_record(older_path, dict(older, status="superseded", superseded_by=digest, superseded_at=now()))
     if not path.exists():
         temporary = path.with_name("." + digest + ".tmp")
         temporary.write_text(json.dumps(record, indent=2) + "\n")
@@ -1351,6 +1357,21 @@ def push(checkout, digest, home, open_pr=True):
             "repository": proposal["repository"], "pull_request": record.get("pull_request")}
 
 
+def push_discard(checkout, digest):
+    """Engineer: set aside a push proposal that will never be pushed (stale or replaced)."""
+    if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    path = checkout.standard / "converter-pushes" / (digest + ".json")
+    if path.is_symlink() or not path.is_file():
+        refuse("STANDARD_PUSH_UNKNOWN")
+    with Locked(checkout):
+        record = json.loads(path.read_text())
+        if record.get("digest") != digest or record.get("status") not in ("proposed", "superseded"):
+            refuse("STANDARD_TRANSITION_INVALID")
+        write_record(path, dict(record, status="discarded", discarded_at=now()))
+    return {"digest": digest, "status": "discarded"}
+
+
 def write_record(path, record):
     descriptor, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
     try:
@@ -1434,6 +1455,8 @@ def main(args, values, base, repo, host, stdin, home=None):
         if ready is None:
             refuse("STANDARD_CONVERTER_DEPS_FAILED: " + prepared["status"] + (" (" + prepared["step"] + ")" if prepared.get("step") else ""))
         return dict(version=1, head=checkout.head(), dependencies=prepared)
+    if len(args) == 5 and args[1] == "push-discard" and args[3] == "--sha256":
+        return dict(version=1, **push_discard(Checkout(base, args[2], host), args[4]))
     if len(args) == 3 and args[1] == "log":
         return dict(version=1, **converter_log(Checkout(base, args[2], host)))
     if len(args) == 3 and args[1] == "push-show":

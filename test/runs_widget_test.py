@@ -234,6 +234,18 @@ else:
         os.environ['RUNS_MODE'] = 'refuse'
         self.assertEqual(409, self.get('/api/converter?workspace=arc')[0])
 
+    def test_an_older_waiting_push_for_the_same_branch_shows_as_superseded(self):
+        pushes = self.base / 'arc/.silo-migrate/named/standard/converter-pushes'
+        newer = json.loads((pushes / ('d' * 64 + '.json')).read_text())
+        newer['proposed_at'] = '2026-11-07T09:00:00Z'  # pushed after 'c'*64 was proposed, same branch
+        (pushes / ('d' * 64 + '.json')).write_text(json.dumps(newer))
+        status, summary = self.get('/api/summary')
+        self.assertEqual(2, summary['waiting'])  # the two plans; the old push no longer waits
+        self.assertEqual('superseded', self.get('/api/push?workspace=arc&id=' + 'c' * 64)[1]['status'])
+        self.assertEqual(200, self.post('discard-push', digest='c' * 64)[0])
+        self.assertEqual([['converter', 'push-discard', 'arc', '--sha256', 'c' * 64]], self.calls())
+        self.assertEqual(400, self.post('discard-push', digest='c' * 63)[0])
+
     def test_actions_run_exact_control_commands(self):
         with mock.patch.object(self.w, 'reviewer_name', return_value='Ruben (web UI)'):
             self.assertEqual(200, self.post('approve', plan_id=pid(1), digest='a' * 64)[0])

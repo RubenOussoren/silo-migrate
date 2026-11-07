@@ -136,7 +136,8 @@ async function loadList() {
       ...data.pushes.filter((p) => p.status === 'proposed').map(pushItem)]],
     ['Running', runs.filter((r) => ['claimed', 'running'].includes(r.status)).map(runItem)],
     ['Runs', runs.filter((r) => !['claimed', 'running'].includes(r.status)).slice(0, 25).map(runItem)],
-    ['Pushed', data.pushes.filter((p) => p.status !== 'proposed').slice(0, 10).map(pushItem)],
+    ['Pushed', data.pushes.filter((p) => p.status === 'pushed').slice(0, 10).map(pushItem)],
+    ['Other pushes', data.pushes.filter((p) => !['proposed', 'pushed'].includes(p.status)).slice(0, 10).map(pushItem)],
     ['Other plans', plans.filter((p) => !['proposed', 'approved'].includes(p.status)).slice(0, 25).map(planItem)],
   ];
   const nodes = [];
@@ -319,11 +320,17 @@ function renderPush(push) {
     ['Digest', push.digest, true],
   ])];
   parts.push(block('PR description', el('pre', {}, push.body || '(empty)')));
-  parts.push(block(`Commits (${(push.commits || []).length})`, el('ul', {}, (push.commits || []).map((c) => el('li', { class: 'mono' }, typeof c === 'string' ? c : JSON.stringify(c))))));
+  const commitLine = (c) => (typeof c === 'string' ? c : `${short(c.sha, 10)}  ${c.subject || ''}${c.author ? ` — ${String(c.author).replace(/\s*<[^>]*>$/, '')}` : ''}`);
+  parts.push(block(`Commits (${(push.commits || []).length})`, el('ul', {}, (push.commits || []).map((c) => el('li', { class: 'mono' }, commitLine(c))))));
   parts.push(block(`Files (${push.files_total ?? (push.files || []).length})`, el('pre', {}, (push.files || []).join('\n'))));
   if (push.stat) parts.push(block('Diff stat', el('pre', {}, push.stat)));
+  if (push.status === 'superseded') parts.push(el('p', { class: 'note' }, 'Superseded: a newer proposal exists for this branch, so this one can\'t be pushed. Discard it.'));
+  const discard = el('button', { type: 'button', class: 'danger', onclick: async () => {
+    if (await act('discard-push', { digest: push.digest }, `Discard this push proposal (${short(push.digest, 12)})? It will never be pushed.`)) { toast('Discarded.'); await refreshAll(); }
+  } }, 'Discard');
+  if (push.status === 'superseded') parts.push(el('div', { class: 'actions' }, discard));
   if (push.status === 'proposed' || (push.status === 'pushed' && !(pull && pull.url))) {
-    parts.push(el('div', { class: 'actions' }, el('button', { type: 'button', class: 'primary', onclick: async () => {
+    parts.push(el('div', { class: 'actions' }, push.status === 'proposed' ? discard : null, el('button', { type: 'button', class: 'primary', onclick: async () => {
       const owner = String(push.repository || '').split('/')[0];
       const outcome = await act('push', { digest: push.digest }, `Push ${push.branch} (${short(push.head, 12)}) to ${push.repository} and open a draft PR, with the server's GitHub token for ${owner}?`);
       if (outcome) { toast(outcome.pull_request && outcome.pull_request.url ? `Pushed; draft PR #${outcome.pull_request.number}.` : 'Pushed.'); await refreshAll(); }

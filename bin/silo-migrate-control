@@ -191,7 +191,7 @@ def host_data(args, values, base, self):
 
 
 def host_converter(args, values, base, self):
-    if len(args) >= 2 and args[1] in ("dev", "push", "push-show", "deps", "log"):
+    if len(args) >= 2 and args[1] in ("dev", "push", "push-show", "push-discard", "deps", "log"):
         result = converter_dev().main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin)
         # UTF-8 bytes, as converter_dev.fit measured them, whatever the locale.
         sys.stdout.buffer.write((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))

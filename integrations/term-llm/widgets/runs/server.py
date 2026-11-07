@@ -159,6 +159,18 @@ class Store:
         return {key: run for key, run in runs.items() if RUN.fullmatch(str(key)) and isinstance(run, dict)} if isinstance(runs, dict) else {}
 
     def pushes(self, workspace):
+        """Proposals, newest first. A still-"proposed" one with a newer proposal for the same branch is
+        shown as superseded: it can't be pushed any more (the branch moved on)."""
+        records = self.push_records(workspace)
+        newest = {}
+        for record in records:
+            newest.setdefault(record["proposal"].get("branch"), record["digest"])
+        for record in records:
+            if record.get("status") == "proposed" and newest.get(record["proposal"].get("branch")) != record["digest"]:
+                record["status"] = "superseded"
+        return records
+
+    def push_records(self, workspace):
         directory = self.root(workspace) / "converter-pushes"
         if directory.is_symlink() or not directory.is_dir():
             return []
@@ -395,6 +407,8 @@ def decide(store, control, action, body):
         argv = ["standard", "run", "reset", workspace, run_id, "--yes"]
     elif action == "push" and digest_ok:
         argv = ["converter", "push", workspace, "--sha256", digest]
+    elif action == "discard-push" and digest_ok:
+        argv = ["converter", "push-discard", workspace, "--sha256", digest]
     else:
         raise Refused("STANDARD_ARGUMENTS_INVALID")
     return control_call(control, argv, TIMEOUTS.get(action, DEFAULT_TIMEOUT))
