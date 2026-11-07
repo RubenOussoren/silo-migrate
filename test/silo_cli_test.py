@@ -125,6 +125,23 @@ class SiloTest(unittest.TestCase):
         self.assertEqual(('WARN', 'silo update'), (checks['installer checkout']['status'], checks['installer checkout']['fix']))
         self.assertEqual('WARN', checks['silo command']['status'])
 
+    def test_op_cache_settings_ttl_and_display(self):
+        self.assertEqual((False, '/tmp/op-cache.sock', 86400), self.s.op_cache_settings(self.entry))
+        config = self.home / '.config/op-cache/config.yaml'
+        config.parent.mkdir(parents=True)
+        config.write_text('socket_path: /run/user/1001/op-cache.sock\nop_path: /usr/bin/op\nttl_seconds: 2592000\n')
+        self.assertEqual((True, '/run/user/1001/op-cache.sock', 2592000), self.s.op_cache_settings(self.entry))
+        self.assertEqual('30 days', self.s.duration(2592000))
+        self.assertEqual('24 hours', self.s.duration(86400))
+        checks = self.statuses(self.healthy())
+        self.assertEqual('OK', checks['op-cache config']['status'])
+        self.assertIn('30 days', checks['op-cache config']['detail'])
+        config.write_text('socket_path: /tmp/op-cache.sock\n')
+        self.assertEqual('WARN', self.statuses(self.healthy())['op-cache config']['status'])
+        self.assertEqual('term-llm service restart web',
+                         self.s.shown(['sudo', '-u', 'silomig', '--', 'env', '-i', 'HOME=/h', 'PATH=/p', 'term-llm', 'service', 'restart', 'web']))
+        self.assertEqual('git -C /opt/x pull', self.s.shown(['git', '-C', '/opt/x', 'pull']))
+
     def test_parsers(self):
         self.assertEqual((2, ['a', 'b'], False), self.s.listed_agents('Available agents (2):\n\n  [user] /x/\n    b - y\n    a - x\n'))
         self.assertEqual({'OP_SESSION_discourse': 'abc'}, self.s.op_session('export OP_SESSION_discourse="abc"\n# This command is meant to be used with your shell\'s eval function.\n'))

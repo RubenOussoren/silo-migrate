@@ -36,3 +36,20 @@ ssh SERVER silo intake mybb-acme          # hands the files to the service accou
 
 Sorting, converting and registering the files is the Frontier-only data agent's job (next
 release), guided by skills; no other agent reads customer files.
+
+## op-cache (Frontier's key)
+
+The service account needs its own `~/.config/op-cache/config.yaml` (mode 0600). Without it,
+op-cache uses a socket in the shared `/tmp` and a 24-hour cache. As root:
+
+```sh
+sudo -u silomig -H /usr/local/bin/op-cache stop        # before changing the socket
+U=$(id -u silomig)
+sudo -u silomig mkdir -p -m 700 /home/silomig/.config/op-cache
+printf 'socket_path: /run/user/%s/op-cache.sock\nop_path: /usr/bin/op\nttl_seconds: 2592000\n' "$U" \
+  | sudo -u silomig tee /home/silomig/.config/op-cache/config.yaml >/dev/null
+sudo -u silomig chmod 600 /home/silomig/.config/op-cache/config.yaml
+silo prime                                             # on its own: it asks for your password
+```
+
+`silo doctor` shows the socket and cache time. `op-cache stop` (as the account) clears the key at once.
