@@ -242,6 +242,18 @@ print(json.dumps({'version': 1, 'finding_id': 'finding-' + 'f' * 32 if action ==
         with mock.patch.object(self.w.pwd, 'getpwuid', return_value=fake):
             self.assertEqual('engineer (web UI)', self.w.reviewer_name())
 
+    def test_refuses_to_start_in_a_socket_folder_that_isnt_private(self):
+        from unittest import mock
+        shared = Path(self.temp.name) / 'shared'
+        shared.mkdir(mode=0o755)
+        shared.chmod(0o755)
+        env = {'SILO_TESTING': '1', 'SILO_FINDINGS_CONTROL': str(self.control), 'SILO_FINDINGS_BASE': str(self.base)}
+        with mock.patch.dict(os.environ, env), self.assertRaisesRegex(SystemExit, 'mode 0700'):
+            self.w.main(['server.py', str(shared / 'findings.sock')])
+        self.assertFalse((shared / 'findings.sock').exists())
+        with self.assertRaises(SystemExit):
+            self.w.main(['server.py', 'relative.sock'])
+
     def test_manifest_uses_a_socket_and_the_extension_only_reads(self):
         manifest = (WIDGET / 'widget.yaml').read_text()
         self.assertIn('"$SOCKET"', manifest)

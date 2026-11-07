@@ -614,6 +614,7 @@ def make_plan(allow=False):
         refuse("METAL_AGENTS_CONFIG", "existing term-llm config preserved; " + AGENTS_HELP + " (" + agents_path() + "), then re-plan")
     notes.append("Everyday node commands: <prefix>/current/bin/silo (doctor, update, use-github, restart, shell, prime, claude-login, intake); link it once as root: ln -sfn " + str(P/"current/bin/silo") + " /usr/local/bin/silo")
     notes.append("Web UI projects are on (--projects): every chat belongs to a project. 'silo intake PROJECT' creates the folder ~/projects/PROJECT and its web UI project; migration-data's tools work only in a chat inside that project and only on that workspace. Existing chats move to the home project. 'metal update' re-installs the service once to switch this on.")
+    notes.append("Root, every apply/update: /etc/tmpfiles.d/silo-migrate-term-llm.conf reserves /tmp/term-llm-widgets (term-llm's widget sockets; 0.9.93 doesn't check its owner) for the service account at boot, and it is created now; if another account owns it, apply/update stops for you to inspect it.")
     notes.append("Findings release gate in the web UI: the release's widget (integrations/term-llm/widgets/findings, on a Unix socket behind the web UI sign-in) and extension 'silo-findings' (a 'Findings' tab showing what waits for review). Release, reject, amend and withdraw run 'standard finding …' as the account. No other widgets or extensions are loaded.")
     notes.append("Web UI agent picker: only " + ", ".join(sorted(MIGRATION_AGENTS)) + ", from " + agents_path() + " (agents.use_builtin: false); no pinned startup agent.")
     notes.append("server-support has a shell with the account's ROOT-EQUIVALENT Docker authority and built-in file edits; each command and each write needs approval in the web UI (--approval prompt; choose 'once'). Its read tools refuse workspaces, intake drop folders, state/tmp and credential files. Approving a write to the release tree (agent definitions or tool scripts), ~/.config/term-llm (approval/agents settings) or the service unit can remove these limits: refuse such writes unless intended. Release trees are made read-only.")
@@ -717,7 +718,38 @@ def apply_roots(actions):
             secure_directory(action["path"], entry.pw_uid, entry.pw_gid)
         elif kind == "linger":
             run(["loginctl", "enable-linger", C["SILO_ACCOUNT"]], root=True)
+    if os.geteuid() == 0 and C["TERM_LLM_SERVICE"] != "skip":
+        ensure_widget_runtime()
 
+
+WIDGET_RUNTIME = Path("/tmp/term-llm-widgets")
+WIDGET_TMPFILES = Path("/etc/tmpfiles.d/silo-migrate-term-llm.conf")
+
+def ensure_widget_runtime():
+    """(root) term-llm 0.9.93 puts widget sockets in /tmp/term-llm-widgets and doesn't check who
+    owns it. Reserve it for the service account now and at every boot (systemd-tmpfiles), and
+    stop if another account got there first: it could swap in its own page under the web UI."""
+    entry = pwd.getpwnam(C["SILO_ACCOUNT"])
+    text = ("# silo-migrate: term-llm's widget sockets, private to the service account\n"
+            "d " + str(WIDGET_RUNTIME) + " 0700 " + entry.pw_name + " " + entry.pw_name + " -\n")
+    if not WIDGET_TMPFILES.is_file() or WIDGET_TMPFILES.read_text() != text:
+        atomic_write(WIDGET_TMPFILES, text, 0o644)
+    for _ in range(2):
+        try:
+            info = os.lstat(WIDGET_RUNTIME)
+        except FileNotFoundError:
+            try:
+                os.mkdir(WIDGET_RUNTIME, 0o700)
+            except FileExistsError:
+                continue  # created meanwhile: inspect what is there
+            os.lchown(WIDGET_RUNTIME, entry.pw_uid, entry.pw_gid)
+            return
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != entry.pw_uid:
+            refuse("METAL_WIDGET_DIR", str(WIDGET_RUNTIME) + " isn't a folder owned by " + entry.pw_name + "; inspect it, remove it, then re-run")
+        if info.st_mode & 0o077:
+            os.chmod(WIDGET_RUNTIME, 0o700)
+        return
+    refuse("METAL_WIDGET_DIR", str(WIDGET_RUNTIME) + " keeps changing; inspect /tmp, then re-run")
 
 def fetch_release(commit):
     global STAGE
@@ -1373,6 +1405,8 @@ def main():
         else:
             account_apply(saved)
     elif args.command in ("update", "rollback"):
+        if os.geteuid() == 0 and C["TERM_LLM_SERVICE"] != "skip":
+            ensure_widget_runtime()
         confargs = ["--config", str(Path(args.config).resolve())] if args.config else []
         opts = (["--branch", args.branch] if args.branch else []) + (["--term-llm"] if args.term_llm else [])
         result = run([SELF, "_account-" + args.command] + confargs + opts, account=True, timeout=900)

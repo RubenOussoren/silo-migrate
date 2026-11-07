@@ -369,6 +369,30 @@ class SiloTest(unittest.TestCase):
         spec.write_text(json.dumps({'args': ['--projects', '--widgets-dir', ui + '/widgets', '--extensions-dir', ui + '/extensions', '--extensions', 'silo-findings']}))
         self.assertEqual('OK', self.statuses(self.healthy())['findings widget']['status'])
 
+    def test_doctor_checks_the_widget_socket_folder_is_private(self):
+        runtime, tmpfiles = self.root / 'widgets-run', self.root / 'tmpfiles.conf'
+        with mock.patch.object(self.s, 'WIDGET_RUNTIME', runtime), mock.patch.object(self.s, 'WIDGET_TMPFILES', tmpfiles):
+            self.assertEqual(('WARN', 'silo update'), (self.statuses(self.healthy())['widget folder']['status'], self.statuses(self.healthy())['widget folder']['fix']))
+            tmpfiles.write_text('d x')
+            self.assertEqual('OK', self.statuses(self.healthy())['widget folder']['status'])
+            runtime.mkdir(mode=0o700)
+            self.assertEqual('OK', self.statuses(self.healthy())['widget folder']['status'])
+            runtime.chmod(0o755)
+            self.assertEqual('FAIL', self.statuses(self.healthy())['widget folder']['status'])
+            runtime.chmod(0o700)
+            real_lstat = os.lstat
+            def someone_elses(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if Path(path) != runtime:
+                    return info
+                fields = list(info)
+                fields[4] = os.getuid() + 4242  # st_uid: another account created it first
+                return os.stat_result(fields)
+            with mock.patch.object(self.s.os, 'lstat', side_effect=someone_elses):
+                checks = self.statuses(self.healthy())
+            self.assertEqual('FAIL', checks['widget folder']['status'])
+            self.assertIn('remove it', checks['widget folder']['fix'])
+
     def test_control_refuses_root_except_image_identity(self):
         import runpy
         config = self.root / 'control.env'

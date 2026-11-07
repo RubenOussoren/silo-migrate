@@ -161,12 +161,19 @@ until you release it. In the web UI:
 - Each decision runs `standard finding release|reject|amend|withdraw` as the account and is
   recorded with your commit identity's name plus "(web UI)" and the time.
 
+**Withdraw** stops future agent reads; it can't erase what an agent already read (earlier chats,
+code it wrote). Anyone who can open this node's web UI (directly or through the Hub) can decide
+findings, as they can already chat with every agent: keep that access to engineers.
+
 Why it's safe: the widget runs on a Unix socket that only term-llm's signed-in proxy reaches;
 term-llm accepts its POSTs only from the web UI's own origin (or with the bearer token), and the
 widget also requires its page's header. No agent has the web UI sign-in, and `read_url` refuses
 local addresses anyway. Only you see proposed text in the browser, as you already do in Frontier
 chats. The widget and extension come from the sealed release; no other widgets or extensions are
-loaded. Without the widget (doctor's "findings widget" check), use the CLI in
+loaded. term-llm 0.9.93 keeps widget sockets in the fixed folder `/tmp/term-llm-widgets` without
+checking its owner, so the installer reserves it for the service account (now and at every boot,
+`/etc/tmpfiles.d/silo-migrate-term-llm.conf`), the widget refuses to start unless the folder is the
+account's and private, and doctor's "widget folder" check fails otherwise. Without the widget (doctor's "findings widget" check), use the CLI in
 `docs/standard-workbench.md` as the service account (`silo shell`; `silo-migrate-control` refuses
 root).
 

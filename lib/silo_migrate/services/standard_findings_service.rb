@@ -138,10 +138,18 @@ module SiloMigrate
         id = @store.new_id("finding")
         decide(finding_id, reviewer, from: "released") do |record, state|
           now = Time.now.utc.iso8601
+          # A released synthetic reproduction stays with the corrected text (verified first).
+          reproduction_sha256 = record.dig("release", "reproduction_sha256")
+          if reproduction_sha256
+            reproduction = File.read(@store.finding_dir(finding_id, "released", "reproduction.txt"))
+            raise StandardWorkflowError, "STANDARD_RELEASE_TAMPERED" unless Digest::SHA256.hexdigest(reproduction) == reproduction_sha256
+
+            @store.write_private(@store.finding_dir(id, "released", "reproduction.txt"), reproduction)
+          end
           @store.write_private(@store.finding_dir(id, "released", "summary.txt"), released_text)
           state.fetch("findings")[id] = { "id" => id, "run_id" => record["run_id"], "kind" => record["kind"], "status" => "released", "proposed_at" => now,
                                           "proposal_sha256" => nil, "supersedes" => finding_id,
-                                          "release" => { "sha256" => sha256, "bytes" => released_text.bytesize, "reproduction_sha256" => nil, "reviewer" => reviewer, "released_at" => now } }
+                                          "release" => { "sha256" => sha256, "bytes" => released_text.bytesize, "reproduction_sha256" => reproduction_sha256, "reviewer" => reviewer, "released_at" => now } }
           record["status"] = "superseded"
           record["superseded_by"] = id
           record["superseded_at"] = now

@@ -60,16 +60,18 @@ def locate():
     return str(prefix / "bin/silo-migrate-control"), Path(base)
 
 
-def read_file(path, limit):
-    """A regular file, not through a link at its last component, at most `limit` bytes."""
+def read_file(path, limit, head=None):
+    """A regular file, not through a link at its last component, at most `limit` bytes
+    (only the first `head` bytes when given)."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
             raise Refused("STANDARD_FILE_INVALID", 500)
         chunks, size = [], 0
-        while size <= limit:
-            chunk = os.read(fd, 65536)
+        want = min(limit, head) if head else limit
+        while size < want:
+            chunk = os.read(fd, min(65536, want - size))
             if not chunk:
                 break
             chunks.append(chunk)
@@ -112,7 +114,7 @@ class Store:
     def records(self, workspace):
         try:
             state = json.loads(read_file(self.root(workspace) / "state.json", MAX_STATE))
-        except (OSError, ValueError):
+        except (OSError, ValueError, Refused):
             return []
         found = state.get("findings") if isinstance(state, dict) else None
         out = []
@@ -122,6 +124,10 @@ class Store:
             release = record.get("release") if isinstance(record.get("release"), dict) else {}
             decided = {"released": release.get("released_at"), "rejected": record.get("rejected_at"),
                        "superseded": record.get("superseded_at"), "withdrawn": record.get("withdrawn_at")}.get(record["status"])
+            text = lambda value: value if isinstance(value, str) else None  # noqa: E731 - odd JSON types are dropped
+            record = dict(record, proposed_at=text(record.get("proposed_at")), supersedes=text(record.get("supersedes")),
+                          superseded_by=text(record.get("superseded_by")))
+            decided = decided if isinstance(decided, str) else None
             out.append({"workspace": workspace, "id": key, "kind": str(record.get("kind") or ""), "status": record["status"],
                         "run_id": record.get("run_id"), "proposed_at": record.get("proposed_at"), "decided_at": decided,
                         "updated_at": decided or record.get("proposed_at") or "",
@@ -130,7 +136,7 @@ class Store:
                         "supersedes": record.get("supersedes"), "superseded_by": record.get("superseded_by")})
         return out
 
-    def text(self, workspace, finding_id, kind):
+    def text(self, workspace, finding_id, kind, limit=MAX_TEXT):
         part = {"proposal": ("private", "proposal.txt"), "released": ("released", "summary.txt")}[kind]
         standard = self.root(workspace)
         path = standard / "findings" / finding_id / part[0] / part[1]
@@ -139,12 +145,12 @@ class Store:
         if os.path.realpath(path.parent) != os.path.join(os.path.realpath(standard), "findings", finding_id, part[0]):
             return None
         try:
-            return read_file(path, MAX_TEXT).decode("utf-8", "replace")
+            return read_file(path, MAX_TEXT, head=limit).decode("utf-8", "replace")
         except (OSError, Refused):
             return None
 
     def title(self, record):
-        text = self.text(record["workspace"], record["id"], "proposal") or self.text(record["workspace"], record["id"], "released") or ""
+        text = (self.text(record["workspace"], record["id"], "proposal", 4096) or self.text(record["workspace"], record["id"], "released", 4096) or "")
         line = next((line.strip() for line in text.splitlines() if line.strip()), "")
         return line[:120]
 
@@ -196,7 +202,7 @@ def detail(store, workspace, finding_id):
     record = records.get(finding_id)
     if not record:
         raise Refused("STANDARD_REFERENCE_INVALID", 404)
-    chain, seen = [], set()
+    chain, seen = [], {finding_id}
     cursor = record
     while cursor.get("supersedes") in records and cursor["supersedes"] not in seen:  # older versions
         seen.add(cursor["supersedes"])
@@ -287,6 +293,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, {"error": "STANDARD_NOT_FOUND"})
         except Refused as refused:
             return self.send(refused.status, {"error": refused.code})
+        except Exception:  # noqa: BLE001 - never a traceback (it could quote customer text) in term-llm's log
+            return self.send(500, {"error": "STANDARD_OPERATION_FAILED"})
 
     def do_POST(self):
         # term-llm only forwards same-origin, signed-in POSTs; the custom header and JSON body
@@ -313,6 +321,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(400, {"error": "STANDARD_ARGUMENTS_INVALID"})
         except Refused as refused:
             return self.send(refused.status, {"error": refused.code})
+        except Exception:  # noqa: BLE001
+            return self.send(500, {"error": "STANDARD_OPERATION_FAILED"})
 
 
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -327,6 +337,12 @@ def main(argv):
     if len(argv) != 2 or not argv[1].startswith("/"):
         raise SystemExit("usage: server.py SOCKET")
     control, base = locate()
+    # term-llm 0.9.93 puts widget sockets in /tmp/term-llm-widgets without checking who owns it.
+    # If another account owned it, it could swap in its own socket and page under the web UI's
+    # origin: refuse to run unless the folder is ours and private (the installer reserves it).
+    folder = os.lstat(os.path.dirname(argv[1]))
+    if not stat.S_ISDIR(folder.st_mode) or folder.st_uid != os.geteuid() or folder.st_mode & 0o077:
+        raise SystemExit("findings widget: " + os.path.dirname(argv[1]) + " must be a folder owned by this account, mode 0700")
     os.umask(0o077)
     try:
         os.unlink(argv[1])

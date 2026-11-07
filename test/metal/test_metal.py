@@ -499,6 +499,32 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaisesRegex(self.m.Refusal, "METAL_BUSY"):
                 self.m.account_update(rollback)
 
+    def test_widget_socket_folder_is_reserved_for_the_account(self):
+        import stat as st
+        me = pwd.getpwuid(os.getuid())
+        runtime, tmpfiles = self.root/"tmp/term-llm-widgets", self.root/"etc/tmpfiles.d/silo.conf"
+        runtime.parent.mkdir(parents=True)
+        tmpfiles.parent.mkdir(parents=True)
+        chowned = []
+        with patch.object(self.m, "WIDGET_RUNTIME", runtime), patch.object(self.m, "WIDGET_TMPFILES", tmpfiles), \
+                patch.object(self.m.pwd, "getpwnam", return_value=me), patch.object(self.m.os, "lchown", side_effect=lambda *a: chowned.append(a)):
+            self.m.ensure_widget_runtime()
+            self.assertEqual("d %s 0700 %s %s -" % (runtime, me.pw_name, me.pw_name), tmpfiles.read_text().splitlines()[1])
+            self.assertEqual(0o644, st.S_IMODE(tmpfiles.stat().st_mode))
+            self.assertEqual(0o700, st.S_IMODE(runtime.stat().st_mode))
+            self.assertEqual([(runtime, me.pw_uid, me.pw_gid)], chowned)
+            runtime.chmod(0o755)
+            self.m.ensure_widget_runtime()  # already there: only the mode is tightened
+            self.assertEqual(0o700, st.S_IMODE(runtime.stat().st_mode))
+            self.assertEqual(1, len(chowned))
+            other = pwd.struct_passwd(("silomig", "x", me.pw_uid + 4242, me.pw_gid, "", "/x", "/bin/bash"))
+            with patch.object(self.m.pwd, "getpwnam", return_value=other), self.assertRaisesRegex(self.m.Refusal, "METAL_WIDGET_DIR"):
+                self.m.ensure_widget_runtime()  # owned by someone else: stop, never adopt it
+            runtime.rmdir()
+            runtime.symlink_to(self.root)
+            with self.assertRaisesRegex(self.m.Refusal, "METAL_WIDGET_DIR"):
+                self.m.ensure_widget_runtime()
+
     def test_unchanged_release_still_retries_the_service_settings(self):
         P = self.m.P
         (P/"releases").mkdir(parents=True)

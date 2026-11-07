@@ -113,7 +113,7 @@ async function act(action, record, text) {
     release: `Release this exact text (${new TextEncoder().encode(text || '').length} bytes) to the coding agents of ${record.workspace}?`,
     amend: `Release this corrected text for ${record.workspace}? It replaces ${record.id}; the coding agents will see only the new version.`,
     reject: `Reject ${record.id}? Nothing is released.`,
-    withdraw: `Withdraw ${record.id}? The coding agents will no longer see it.`,
+    withdraw: `Withdraw ${record.id}? The coding agents won't be able to read it any more. It doesn't erase what they already read (earlier chats, code they wrote).`,
   };
   if (!confirm(words[action])) return;
   try {

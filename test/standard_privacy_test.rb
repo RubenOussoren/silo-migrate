@@ -183,6 +183,20 @@ class StandardPrivacyTest < SiloMigrateTest
     end
   end
 
+  def test_amend_keeps_a_released_reproduction
+    with_standard do
+      findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
+      id = findings.propose(run_id: claim, text: 'cause')[:finding_id]
+      findings.release(finding_id: id, released_text: 'v1', sha256: Digest::SHA256.hexdigest('v1'), reviewer: 'engineer',
+        reproduction: 'repro', reproduction_sha256: Digest::SHA256.hexdigest('repro'))
+      second = findings.amend(finding_id: id, released_text: 'v2', sha256: Digest::SHA256.hexdigest('v2'), reviewer: 'engineer')[:finding_id]
+      assert_equal 'repro', findings.released_show(second)[:reproduction]
+      @service.store.write_private(@service.store.finding_dir(second, 'released', 'reproduction.txt'), MARKER)
+      standard_error('STANDARD_TRANSITION_INVALID') { findings.amend(finding_id: id, released_text: 'v3', sha256: Digest::SHA256.hexdigest('v3'), reviewer: 'engineer') }
+      standard_error('STANDARD_RELEASE_TAMPERED') { findings.amend(finding_id: second, released_text: 'v3', sha256: Digest::SHA256.hexdigest('v3'), reviewer: 'engineer') }
+    end
+  end
+
   def test_tampered_reproduction_refused
     with_standard do
       id = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env).propose(run_id: claim, text: MARKER)[:finding_id]
