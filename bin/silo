@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""silo: everyday commands for a Migrations node.
+
+  silo doctor                      check everything the node needs; print exact fixes
+  silo update [--branch BRANCH]    (root) pull the installer, update the release, restart, doctor
+  silo use-github                  (root) take updates from GitHub instead of copied bundles
+  silo restart                     restart the term-llm web service
+  silo shell                       (root) a service-account shell with the right environment
+  silo prime                       sign in to 1Password and warm op-cache for Frontier (24 h)
+  silo claude-login [--sso|--console]   sign the service account in to Claude Code
+  silo intake PROJECT              prepare the drop folder for a project's export files
+
+Run as root or as the service account; account steps always run as the service account.
+"""
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+SELF = Path(__file__).resolve()
+RELEASE = SELF.parent.parent
+PREFIX = RELEASE.parent.parent if RELEASE.parent.name == "releases" else Path(os.environ.get("SILO_PREFIX", "/srv/silo-migrate"))
+METAL_CONFIG = Path(os.environ.get("SILO_METAL_CONFIG", "/etc/silo-migrate/metal.conf"))
+INSTALLER = Path(os.environ.get("SILO_INSTALLER", "/opt/silo-migrate-installer"))
+GITHUB_SILO = "https://github.com/RubenOussoren/silo-migrate.git"
+GITHUB_CONVERTERS = "https://github.com/discourse-org/discourse-converters.git"
+PROJECT = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
+REPO = re.compile(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9_./-]+\Z")
+OP_REF = re.compile(r'op-cache read "(op://[^"]+)"(?:\s+--account\s+([A-Za-z0-9._-]+))?')
+
+
+class Stop(Exception):
+    pass
+
+
+def account():
+    for candidate in (PREFIX / "releases", PREFIX):
+        try:
+            return pwd.getpwuid(candidate.stat().st_uid)
+        except (OSError, KeyError):
+            continue
+    try:
+        return pwd.getpwnam("silomig")
+    except KeyError:
+        raise Stop("no installation at " + str(PREFIX) + " and no silomig account")
+
+
+def is_root():
+    return os.geteuid() == 0
+
+
+def account_env(entry):
+    run = "/run/user/" + str(entry.pw_uid)
+    return {"HOME": entry.pw_dir, "USER": entry.pw_name, "LOGNAME": entry.pw_name, "SHELL": "/bin/bash",
+            "PATH": str(PREFIX / "bin") + ":/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "TMPDIR": str(PREFIX / "state/tmp"),
+            "XDG_RUNTIME_DIR": run, "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + run + "/bus",
+            **({"TERM": os.environ["TERM"]} if os.environ.get("TERM") else {})}
+
+
+def as_account(argv, entry=None):
+    """argv to run as the service account with its environment, from root or the account."""
+    entry = entry or account()
+    env = account_env(entry)
+    if os.geteuid() == entry.pw_uid:
+        return ["env", *[k + "=" + v for k, v in env.items()], *argv]
+    if not is_root():
+        raise Stop("run this as root or as " + entry.pw_name)
+    return ["sudo", "-u", entry.pw_name, "--", "env", "-i", *[k + "=" + v for k, v in env.items()], *argv]
+
+
+def run(argv, timeout=60, input=None):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=input, stdin=None if input is not None else subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(argv, 124, "", str(error))
+
+
+def term_llm():
+    return str(PREFIX / "bin/term-llm")
+
+
+def need_root(what):
+    if not is_root():
+        raise Stop(what + " needs root")
+
+
+# -- doctor --------------------------------------------------------------------------
+
+def read_conf(path=None):
+    values = {}
+    for line in (path or METAL_CONFIG).read_text().splitlines():
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            values[key] = value
+    return values
+
+
+def shipped_agents(release):
+    return sorted(path.parent.name for path in (Path(release) / "integrations/term-llm").glob("*/agent.yaml"))
+
+
+def listed_agents(text):
+    names = re.findall(r"(?m)^\s{4}([a-z][a-z0-9-]*) - ", text or "")
+    count = re.search(r"Available agents \((\d+)\)", text or "")
+    return (int(count[1]) if count else 0), sorted(names), "[builtin]" in (text or "")
+
+
+def config_ref(entry):
+    try:
+        text = (Path(entry.pw_dir) / ".config/term-llm/config.yaml").read_text()
+    except OSError:
+        return None, None, ""
+    match = OP_REF.search(text)
+    return (match[1], match[2], text) if match else (None, None, text)
+
+
+def private_file(path, uid):
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return stat.S_ISREG(info.st_mode) and info.st_uid == uid and not info.st_mode & 0o077
+
+
+def doctor_checks(entry, runner=run):
+    checks = []
+
+    def add(status, name, detail, fix=None):
+        checks.append({"status": status, "name": name, "detail": detail, "fix": fix})
+
+    current = (PREFIX / "current").resolve()
+    add("OK" if current.is_dir() else "FAIL", "release", "current = " + current.name[:12] if current.is_dir() else "no current release",
+        None if current.is_dir() else "install with the installer's metal plan/apply")
+    if is_root():
+        head = runner(["git", "-C", str(INSTALLER), "rev-parse", "HEAD"]).stdout.strip()
+        if head:
+            same = head == current.name
+            add("OK" if same else "WARN", "installer checkout", head[:12] + (" (matches release)" if same else " (differs from the release)"),
+                None if same else "silo update")
+        try:
+            conf = read_conf()
+            local = [key for key in ("SILO_REPO", "CONVERTER_REPO") if conf.get(key, "").startswith("/")]
+            add("WARN" if local else "OK", "update source",
+                ("local copies for " + ", ".join(local) + ": updates need bundles") if local else "GitHub", "silo use-github" if local else None)
+        except OSError:
+            add("WARN", "update source", "can't read " + str(METAL_CONFIG))
+        link = Path("/usr/local/bin/silo")
+        good = link.is_symlink() and os.readlink(link) == str(PREFIX / "current/bin/silo")
+        add("OK" if good else "WARN", "silo command", "/usr/local/bin/silo" + (" links to the current release" if good else " is missing"),
+            None if good else "ln -sfn " + str(PREFIX / "current/bin/silo") + " /usr/local/bin/silo")
+    else:
+        add("WARN", "root checks", "skipped: run as root for installer, update-source and link checks")
+
+    status = runner(as_account([term_llm(), "service", "status"], entry), timeout=30)
+    active = "ActiveState=active" in status.stdout
+    add("OK" if active else "FAIL", "web service", "active" if active else "not active", None if active else "silo restart")
+
+    expected = shipped_agents(current)
+    count, names, builtin = listed_agents(runner(as_account([term_llm(), "agents"], entry), timeout=30).stdout)
+    good = not builtin and count == len(expected) and names == expected
+    add("OK" if good else "FAIL", "agents", (str(count) + " listed: " + ", ".join(names)) if names else "none listed",
+        None if good else "check agents.use_builtin: false and agents.search_paths in ~/.config/term-llm/config.yaml, then silo restart")
+
+    home = Path(entry.pw_dir)
+    chatgpt = (home / ".config/term-llm/chatgpt_oauth.json").is_file()
+    add("OK" if chatgpt else "FAIL", "ChatGPT sign-in", "credential present" if chatgpt else "not signed in",
+        None if chatgpt else "silo shell, then: term-llm auth login chatgpt")
+
+    reference, op_account, config_text = config_ref(entry)
+    if reference:
+        primed = runner(as_account(["op-cache", "read", reference, *(["--account", op_account] if op_account else [])], entry), timeout=20).returncode == 0
+        add("OK" if primed else "FAIL", "Frontier (op-cache)", "cache primed" if primed else "not primed or expired (24 h)", None if primed else "silo prime")
+    else:
+        add("WARN", "Frontier (op-cache)", "no op-cache reference in the term-llm config")
+
+    if "claude-bin:" in config_text:
+        claude = shutil.which("claude", path="/usr/local/bin")
+        if not claude:
+            add("FAIL", "Claude (claude-bin)", "/usr/local/bin/claude missing: the web service can't find Claude Code", "silo claude-login")
+        else:
+            out = runner(as_account([claude, "auth", "status", "--json"], entry), timeout=30).stdout
+            try:
+                logged = bool(json.loads(out).get("loggedIn"))
+            except ValueError:
+                logged = False
+            add("OK" if logged else "FAIL", "Claude (claude-bin)", "signed in" if logged else "not signed in", None if logged else "silo claude-login")
+    else:
+        add("WARN", "Claude (claude-bin)", "not configured: converter-reviewer needs it")
+
+    tokens = sorted((home / ".config/silo-migrate/github").glob("token-*"))
+    unsafe = [path.name for path in tokens if not private_file(path, entry.pw_uid)]
+    add("FAIL" if unsafe else ("OK" if tokens else "WARN"), "GitHub token",
+        ("not private: " + ", ".join(unsafe)) if unsafe else (", ".join(path.name for path in tokens) if tokens else "none: pushes and private converter clones need one"),
+        ("chmod 600 " + " ".join(str(home / ".config/silo-migrate/github" / name) for name in unsafe)) if unsafe else None)
+    identity = (home / ".config/silo-migrate/git-identity").is_file()
+    add("OK" if identity else "WARN", "commit identity", "set" if identity else "missing: converter-developer can't commit",
+        None if identity else "printf 'name=…\\nemail=…\\n' > ~/.config/silo-migrate/git-identity (as the service account)")
+
+    docker = runner(as_account(["docker", "info", "--format", "{{.ServerVersion}}"], entry), timeout=30)
+    add("OK" if docker.returncode == 0 else "FAIL", "Docker", ("server " + docker.stdout.strip()) if docker.returncode == 0 else "unreachable for the service account")
+
+    free = shutil.disk_usage(PREFIX).free / 1024**3
+    add("OK" if free >= 50 else "WARN", "disk", "%.0f GiB free on %s" % (free, PREFIX))
+
+    writable = 0
+    if current.is_dir():
+        for directory, _dirs, files in os.walk(current):
+            writable += sum(1 for name in files if not os.path.islink(os.path.join(directory, name)) and os.lstat(os.path.join(directory, name)).st_mode & 0o222)
+            if writable:
+                break
+    add("OK" if not writable else "WARN", "release read-only", "sealed" if not writable else "writable files in the current release", None if not writable else "silo update")
+    return checks
+
+
+def doctor(entry):
+    checks = doctor_checks(entry)
+    for check in checks:
+        print("%-4s %-20s %s" % (check["status"], check["name"], check["detail"]))
+        if check["fix"]:
+            print("     fix: " + check["fix"])
+    failed = sum(1 for check in checks if check["status"] == "FAIL")
+    warned = sum(1 for check in checks if check["status"] == "WARN")
+    print("\n%d failed, %d warnings" % (failed, warned))
+    return 1 if failed else 0
+
+
+# -- actions ---------------------------------------------------------------------------
+
+def stream(argv):
+    print("$ " + " ".join(argv[argv.index("--") + 1:] if "--" in argv else argv)[:200], flush=True)
+    return subprocess.call(argv)
+
+
+def restart(entry):
+    return stream(as_account([term_llm(), "service", "restart", "web"], entry))
+
+
+def update(entry, branch=None):
+    need_root("silo update")
+    if branch is None:
+        try:
+            branch = json.loads((PREFIX / "state/install-manifest.json").read_text()).get("branch")
+        except (OSError, ValueError):
+            branch = None
+    if not branch or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", branch) or ".." in branch:
+        raise Stop("pass --branch BRANCH")
+    steps = [["git", "-C", str(INSTALLER), "pull", "--ff-only"],
+             [str(INSTALLER / "script/metal"), "update", "--config", str(METAL_CONFIG), "--branch", branch]]
+    for argv in steps:
+        if stream(argv):
+            raise Stop("stopped: " + " ".join(argv[:4]) + " failed")
+    if restart(entry):
+        raise Stop("stopped: the restart failed")
+    time.sleep(2)
+    print()
+    return doctor(entry)
+
+
+def set_conf_values(path, updates):
+    """Rewrite KEY=VALUE lines in the installer config, keeping a timestamped backup."""
+    lines = path.read_text().splitlines()
+    seen = set()
+    for index, line in enumerate(lines):
+        key = line.partition("=")[0]
+        if key in updates and "=" in line and not line.startswith("#"):
+            lines[index] = key + "=" + updates[key]
+            seen.add(key)
+    lines += [key + "=" + value for key, value in updates.items() if key not in seen]
+    backup = path.with_name(path.name + ".bak-" + time.strftime("%Y%m%d%H%M%S"))
+    shutil.copy2(path, backup)
+    temporary = path.with_name("." + path.name + ".tmp")
+    temporary.write_text("\n".join(lines) + "\n")
+    info = path.stat()
+    os.chmod(temporary, stat.S_IMODE(info.st_mode))
+    if is_root():
+        os.chown(temporary, info.st_uid, info.st_gid)
+    os.replace(temporary, path)
+    return backup
+
+
+def use_github(silo_repo=GITHUB_SILO, converter_repo=GITHUB_CONVERTERS):
+    need_root("silo use-github")
+    for value in (silo_repo, converter_repo):
+        if not REPO.fullmatch(value):
+            raise Stop("repositories must be credential-free HTTPS URLs")
+    conf = read_conf()
+    branch = conf.get("SILO_BRANCH", "mvp/metal-installer")
+    if run(["git", "ls-remote", "--heads", silo_repo, "refs/heads/" + branch], timeout=60).returncode:
+        raise Stop("can't reach " + silo_repo + " branch " + branch + ": nothing changed")
+    backup = set_conf_values(METAL_CONFIG, {"SILO_REPO": silo_repo, "CONVERTER_REPO": converter_repo})
+    print("config: SILO_REPO and CONVERTER_REPO now GitHub (backup " + str(backup) + ")")
+    if (INSTALLER / ".git").exists() and stream(["git", "-C", str(INSTALLER), "remote", "set-url", "origin", silo_repo]):
+        raise Stop("couldn't set the installer checkout's origin")
+    print("installer checkout now pulls from " + silo_repo + "\nnext: silo update")
+    return 0
+
+
+def shell(entry):
+    need_root("silo shell")
+    argv = as_account(["bash", "-l"], entry)
+    os.chdir(entry.pw_dir)
+    os.execvp(argv[0], argv)
+
+
+def op_session(output):
+    """Session variables from `op signin` output (what `eval "$(op signin)"` would export)."""
+    return dict(re.findall(r'export (OP_SESSION_[A-Za-z0-9_]+)="([^"]*)"', output))
+
+
+def prime(entry):
+    if os.geteuid() != entry.pw_uid:
+        argv = as_account([str(SELF), "prime"], entry)
+        os.execvp(argv[0], argv)
+    reference, op_account, _ = config_ref(entry)
+    if not reference:
+        raise Stop("no op-cache reference in ~/.config/term-llm/config.yaml")
+    signin = subprocess.run(["op", "signin", *(["--account", op_account] if op_account else [])], stdout=subprocess.PIPE, text=True)
+    session = op_session(signin.stdout)
+    if signin.returncode or not session:
+        raise Stop("1Password sign-in failed")
+    primed = subprocess.run(["op-cache", "read", reference, *(["--account", op_account] if op_account else [])],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=dict(os.environ, **session))
+    if primed.returncode:
+        raise Stop("op-cache read failed: " + primed.stderr.strip()[:200])
+    print("PRIMED: Frontier's key is cached for 24 hours")
+    return 0
+
+
+def claude_login(entry, flags):
+    target = Path(entry.pw_dir) / ".local/bin/claude"
+    link = Path("/usr/local/bin/claude")
+    if is_root() and target.exists() and not link.exists():
+        link.symlink_to(target)
+        print("linked /usr/local/bin/claude -> " + str(target))
+    if not target.exists():
+        raise Stop("Claude Code isn't installed for " + entry.pw_name + ": silo shell, then curl -fsSL https://claude.ai/install.sh | bash")
+    mode = ["--console"] if "--console" in flags else ["--claudeai", *(["--sso"] if "--sso" in flags else [])]
+    argv = as_account([str(target), "auth", "login", *mode], entry)
+    status = subprocess.call(argv)
+    subprocess.call(as_account([str(target), "auth", "status", "--text"], entry))
+    return status
+
+
+def intake(entry, project):
+    if not isinstance(project, str) or not PROJECT.fullmatch(project):
+        raise Stop("project names: letters, digits, - and _ (max 63)")
+    base = PREFIX / "intake"
+    folder = base / project
+    for path, mode in ((base, 0o700), (folder, 0o700)):
+        if path.is_symlink():
+            raise Stop(str(path) + " is a symlink")
+        if not path.exists():
+            path.mkdir(mode=mode)
+            if is_root():
+                os.chown(path, entry.pw_uid, entry.pw_gid)
+    if is_root():
+        # Files copied in as root become the account's, so the data agent can sort them.
+        for directory, dirs, files in os.walk(folder):
+            for name in dirs + files:
+                path = os.path.join(directory, name)
+                if os.lstat(path).st_uid != entry.pw_uid:
+                    os.lchown(path, entry.pw_uid, entry.pw_gid)
+    files = [p for p in folder.rglob("*") if p.is_file() and not p.is_symlink()]
+    total = sum(p.stat().st_size for p in files)
+    print("drop folder: " + str(folder))
+    print("contents: %d file(s), %.1f MB" % (len(files), total / 1e6))
+    print("copy files in from your Mac with:\n  scp FILES SERVER:" + str(folder) + "/\nthen run `silo intake " + project + "` again as root to hand them to the service account.")
+    return 0
+
+
+# -- main ------------------------------------------------------------------------------
+
+def main(args):
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    command, rest = args[0], args[1:]
+    known = {"doctor", "update", "use-github", "restart", "shell", "prime", "claude-login", "intake"}
+    if command not in known:
+        raise Stop("unknown command; see silo --help")
+    entry = account()
+    if command == "doctor" and not rest:
+        return doctor(entry)
+    if command == "update":
+        if rest and (len(rest) != 2 or rest[0] != "--branch"):
+            raise Stop("usage: silo update [--branch BRANCH]")
+        return update(entry, rest[1] if rest else None)
+    if command == "use-github" and not rest:
+        return use_github()
+    if command == "restart" and not rest:
+        return restart(entry)
+    if command == "shell" and not rest:
+        return shell(entry)
+    if command == "prime" and not rest:
+        return prime(entry)
+    if command == "claude-login" and set(rest) <= {"--sso", "--console"}:
+        return claude_login(entry, rest)
+    if command == "intake" and len(rest) == 1:
+        return intake(entry, rest[0])
+    raise Stop("wrong arguments; see silo --help")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Stop as stop:
+        print("silo: " + str(stop), file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)

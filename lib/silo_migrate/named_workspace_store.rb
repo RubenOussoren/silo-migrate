@@ -15,8 +15,10 @@ module SiloMigrate
   class NamedWorkspaceStore
     VERSION = 1
     ROOT = ".silo-migrate/named"
-    MAX_BYTES = 16 * 1024 * 1024
-    MAX_TOTAL_BYTES = 64 * 1024 * 1024
+    # Real exports: a forum SQL dump is hundreds of MB and uploads can be many GB. Disk
+    # capacity is checked when a run is admitted; these only stop absurd registrations.
+    MAX_BYTES = 64 * 1024 * 1024 * 1024
+    MAX_TOTAL_BYTES = 256 * 1024 * 1024 * 1024
     MAX_STATE_BYTES = 1024 * 1024
     MAX_RECORDS = 128
     MAX_METADATA_BYTES = 1024

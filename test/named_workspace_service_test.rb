@@ -161,7 +161,31 @@ class NamedWorkspaceServiceTest < SiloMigrateTest
     end
   end
 
+  # Total-budget accounting with small limits: the real limits are tens of GiB.
+  def with_named_limits(bytes, total)
+    saved = [Store::MAX_BYTES, Store::MAX_TOTAL_BYTES]
+    [[:MAX_BYTES, bytes], [:MAX_TOTAL_BYTES, total]].each do |name, value|
+      Store.send(:remove_const, name)
+      Store.const_set(name, value)
+    end
+    yield
+  ensure
+    [[:MAX_BYTES, saved[0]], [:MAX_TOTAL_BYTES, saved[1]]].each do |name, value|
+      Store.send(:remove_const, name)
+      Store.const_set(name, value)
+    end
+  end
+
+  def test_real_export_sizes_are_accepted
+    assert_operator Store::MAX_BYTES, :>=, 32 * 1024**3
+    assert_operator Store::MAX_TOTAL_BYTES, :>=, 4 * Store::MAX_BYTES
+  end
+
   def test_count_metadata_state_and_total_byte_budgets
+    with_named_limits(16 * 1024 * 1024, 64 * 1024 * 1024) { count_metadata_state_and_total_byte_budgets }
+  end
+
+  def count_metadata_state_and_total_byte_budgets
     setup_workspace do |service, env, root, _source, dataset, _initial|
       named_error("NAMED_ARGUMENT_INVALID") { service.add_source("synthetic", platform: "x" * (Store::MAX_METADATA_BYTES + 1)) }
       (Store::MAX_RECORDS - 1).times { service.add_source("synthetic", platform: "x") }

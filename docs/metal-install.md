@@ -1,5 +1,7 @@
 # Debian metal installer (single account; synthetic MVP)
 
+Day-to-day operation after installing (updates, checks, sign-ins, intake): see `docs/node-operations.md` and the `silo` command.
+
 `script/metal` installs the containerised control runtime, not host Ruby, Node or
 compilers. It is a Bash `set -euo pipefail` entry point with an isolated Python
 stdlib engine (`python3 -I`), shared with the package/identity tools. Debian 12
