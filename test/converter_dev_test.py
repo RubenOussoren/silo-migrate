@@ -16,6 +16,11 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKER = 'CUSTOMER-CANARY-7d1f0a'
+LOCKFILE = ('GEM\n  remote: https://rubygems.org/\n  specs:\n    markbridge (0.5.0)\n\nPLATFORMS\n  ruby\n  x86_64-linux\n\n'
+            'DEPENDENCIES\n  markbridge (~> 0.5.0)\n\nBUNDLED WITH\n   2.6.3\n')
+IMAGE_ID = 'sha256:' + 'b' * 64
+IMAGE_DOCUMENT = {'Id': IMAGE_ID, 'Config': {'Env': ['PATH=/usr/local/bundle/bin:/usr/bin', 'RUBY_VERSION=3.3.13', 'GEM_HOME=/usr/local/bundle',
+                                                     'BUNDLE_PATH=/opt/bundle', 'BUNDLE_FROZEN=true']}}
 
 
 def load_dev():
@@ -57,6 +62,8 @@ class ConverterDevTest(unittest.TestCase):
         self.write(seed / 'test/importer_test.rb', 'require "minitest/autorun"\n')
         self.write(seed / '.gitignore', 'log/\n*.sqlite\ntmp/\n')
         self.write(seed / '.github/workflows/ci.yml', 'name: CI\n')
+        self.write(seed / 'Gemfile', 'source "https://rubygems.org"\ngem "markbridge", "~> 0.5.0"\n')
+        self.write(seed / 'Gemfile.lock', LOCKFILE)
         git(seed, 'add', '-A')
         git(seed, 'commit', '-q', '-m', 'Seed')
         git(base, 'clone', '-q', '--bare', str(seed), str(self.origin))
@@ -153,7 +160,7 @@ class ConverterDevTest(unittest.TestCase):
 
     def test_listing_and_reading_show_only_git_visible_files(self):
         names = {entry['name'] for entry in self.call('list')['entries']}
-        self.assertEqual({'.github', 'lib', 'test', '.gitignore', 'README.md'}, names)
+        self.assertEqual({'.github', 'lib', 'test', '.gitignore', 'README.md', 'Gemfile', 'Gemfile.lock'}, names)
         self.assertEqual(['importer.rb'], [entry['name'] for entry in self.call('list', path='lib')['entries']])
         self.assertIn('downcase', self.call('read', path='lib/importer.rb')['text'])
         for path in ('log/convert.log', 'customer.sqlite', 'exports/customer-users.csv', 'exports', 'inputs-link', 'lib/linked-dir/source.sql', '../inputs/source.sql',
@@ -404,33 +411,224 @@ class ConverterDevTest(unittest.TestCase):
 
     # -- tests in the sandbox ------------------------------------------------------
 
-    def test_test_runner_exports_only_visible_files_into_a_sealed_container(self):
-        seen = {}
+    @staticmethod
+    def mounts(argv):
+        """{dst: (src, readonly)} of every --mount."""
+        found = {}
+        for value in argv:
+            if value.startswith('type=bind,'):
+                fields = dict(part.partition('=')[::2] for part in value.split(','))
+                found[fields['dst']] = (fields['src'], 'readonly' in value.split(','))
+        return found
 
+    def sandbox(self, seen, deps_code=0, test_output=b'Run options\n3 runs, 5 assertions, 0 failures, 0 errors, 0 skips\n'):
+        """Patches standing in for Docker and the emoji download, recording what each container got."""
         def fake_docker(argv, timeout):
-            mount = next(a for a in argv if a.startswith('type=bind,src='))
-            export = Path(mount.split('src=', 1)[1].split(',', 1)[0])
+            mounts = self.mounts(argv)
+            if 'install' in argv:
+                seen.setdefault('deps', []).append(argv)
+                lock = Path(mounts['/lock'][0])
+                seen['lock_files'] = sorted(p.name for p in lock.iterdir())
+                if deps_code == 0:
+                    self.write(Path(mounts['/deps'][0]) / 'specifications/markbridge-0.5.0.gemspec', '# spec\n')
+                return deps_code, b'Fetching markbridge 0.5.0\n', b'' if deps_code == 0 else b'Could not reach rubygems.org\n'
+            export = Path(mounts['/app'][0])
             seen['files'] = sorted(str(p.relative_to(export)) for p in export.rglob('*') if p.is_file())
             seen['text'] = ''.join(p.read_text(errors='replace') for p in export.rglob('*') if p.is_file())
             seen['argv'] = argv
-            return 0, b'Run options\n3 runs, 5 assertions, 0 failures, 0 errors, 0 skips\n', b''
+            seen['emoji'] = sorted(str(p.relative_to(mounts['/app/tmp/emoji_cache'][0])) for p in Path(mounts['/app/tmp/emoji_cache'][0]).rglob('*.json'))
+            return 0, test_output, b''
 
+        def fake_emoji(destination, deadline):
+            seen['emoji_fetches'] = seen.get('emoji_fetches', 0) + 1
+            for name in self.dev.EMOJI_FILES:
+                self.write(Path(destination) / self.dev.emoji_repo_key() / name, '[]')
+
+        return [mock.patch.object(self.dev, 'converter_image_document', return_value=IMAGE_DOCUMENT),
+                mock.patch.object(self.dev, 'docker', side_effect=fake_docker), mock.patch.object(self.dev, 'fetch_emoji', side_effect=fake_emoji)]
+
+    def run_test(self, seen, role='developer', **kwargs):
+        patches = self.sandbox(seen, **{k: kwargs.pop(k) for k in ('deps_code', 'test_output') if k in kwargs})
+        for patch in patches:
+            patch.start()
+        try:
+            return self.call('test', role=role, **kwargs)
+        finally:
+            for patch in patches:
+                patch.stop()
+
+    def test_test_runner_exports_only_visible_files_into_a_sealed_container(self):
+        seen = {}
         self.call('write', path='lib/new.rb', content='# new\n')
-        with mock.patch.object(self.dev, 'converter_image', return_value='sha256:' + 'b' * 64), mock.patch.object(self.dev, 'docker', side_effect=fake_docker):
-            result = self.call('test', role='reviewer')
+        result = self.run_test(seen, role='reviewer')
         self.assertEqual('3 runs, 5 assertions, 0 failures, 0 errors, 0 skips', result['summary'])
-        self.assertEqual(['.github/workflows/ci.yml', '.gitignore', 'README.md', 'lib/importer.rb', 'lib/new.rb', 'test/importer_test.rb'], seen['files'])
+        self.assertEqual(['.github/workflows/ci.yml', '.gitignore', 'Gemfile', 'Gemfile.lock', 'README.md', 'lib/importer.rb', 'lib/new.rb', 'test/importer_test.rb'], seen['files'])
         self.assertNotIn(MARKER, seen['text'])
         argv = seen['argv']
         for flag in (['--network', 'none'], ['--read-only'], ['--cap-drop', 'ALL'], ['--security-opt', 'no-new-privileges'], ['--pull=never']):
             self.assertTrue(any(argv[i:i + len(flag)] == flag for i in range(len(argv))), flag)
-        self.assertEqual(1, sum(1 for a in argv if a.startswith('type=bind')))
+        mounts = self.mounts(argv)
+        self.assertEqual({'/app', '/deps', '/app/tmp/emoji_cache'}, set(mounts))
+        self.assertEqual(3, sum(1 for a in argv if a.startswith('type=bind')))
+        self.assertFalse(mounts['/app'][1])
+        self.assertTrue(mounts['/deps'][1] and mounts['/app/tmp/emoji_cache'][1])
         self.assertNotIn(str(self.root), ' '.join(argv))
-        self.assertEqual(['sha256:' + 'b' * 64, 'exec', 'rake', 'test'], argv[argv.index('sha256:' + 'b' * 64):][:1] + argv[-3:])
+        self.assertIn('GEM_PATH=/deps:/opt/bundle/ruby/3.3.0:/usr/local/bundle', argv)
+        self.assertIn('PATH=/deps/bin:/opt/bundle/ruby/3.3.0/bin:/usr/local/bundle/bin:/usr/bin', argv)
+        self.assertIn('GEM_HOME=/deps', argv)
+        self.assertEqual([IMAGE_ID, '-u', 'BUNDLE_PATH', 'bundle', '_2.6.3_', 'exec', 'rake', 'test'], argv[argv.index(IMAGE_ID):])
+        self.assertEqual('env', argv[argv.index('--entrypoint') + 1])
+        self.assertEqual(['raw_githubusercontent_com_discourse_discourse-emojis_main_/dist/aliases.json',
+                          'raw_githubusercontent_com_discourse_discourse-emojis_main_/dist/emojis.json',
+                          'raw_githubusercontent_com_discourse_discourse-emojis_main_/dist/tonable_emojis.json'], seen['emoji'])
         self.assertEqual('STANDARD_ARGUMENTS_INVALID', self.call('test', file='lib/importer.rb')['error'])
-        with mock.patch.object(self.dev, 'converter_image', return_value='sha256:' + 'b' * 64), mock.patch.object(self.dev, 'docker', side_effect=fake_docker):
-            self.assertIsNone(self.call('test', file='')['file'])
+        self.assertIsNone(self.run_test(seen, file='')['file'])
         self.assertEqual(['exec', 'rake', 'test'], seen['argv'][-3:])
+
+    def test_dependency_step_sees_only_the_lockfiles_and_is_built_once(self):
+        seen = {}
+        self.call('write', path='lib/new.rb', content='AGENT-CODE\n')  # agent code never reaches the networked step
+        first = self.run_test(seen)
+        self.assertEqual('prepared', first['dependencies']['status'])
+        self.assertEqual(['markbridge-0.5.0'], first['dependencies']['gems_added'])
+        self.assertEqual(1, len(seen['deps']))
+        argv = seen['deps'][0]
+        mounts = self.mounts(argv)
+        self.assertEqual({'/lock', '/deps'}, set(mounts))
+        self.assertTrue(mounts['/lock'][1])
+        self.assertFalse(mounts['/deps'][1])
+        self.assertEqual(['Gemfile', 'Gemfile.lock'], seen['lock_files'])
+        for flag in (['--network', 'bridge'], ['--read-only'], ['--cap-drop', 'ALL'], ['--security-opt', 'no-new-privileges'], ['--pull=never']):
+            self.assertTrue(any(argv[i:i + len(flag)] == flag for i in range(len(argv))), flag)
+        self.assertNotIn(str(self.root), ' '.join(argv))
+        self.assertEqual([IMAGE_ID, '-u', 'BUNDLE_PATH', 'bundle', '_2.6.3_', 'install', '--no-cache'], argv[argv.index(IMAGE_ID):])
+        self.assertIn('BUNDLE_FROZEN=true', argv)
+        cache = Path(self.temp.name) / 'state/converter-deps'
+        ready = [p for p in cache.iterdir() if not p.name.startswith('.')]
+        self.assertEqual(1, len(ready))
+        self.assertEqual(['emoji_cache', 'gems', 'ready.json'], sorted(p.name for p in ready[0].iterdir()))
+        self.assertFalse(list(cache.glob('.build-*')))
+        record = json.loads((ready[0] / 'ready.json').read_text())
+        self.assertEqual(hashlib.sha256(LOCKFILE.encode()).hexdigest(), record['lockfile_sha256'])
+        # Second call (and the reviewer's): reused, nothing networked runs again.
+        self.assertEqual('ready', self.run_test(seen, role='reviewer')['dependencies']['status'])
+        self.assertEqual(1, len(seen['deps']))
+        self.assertEqual(1, seen['emoji_fetches'])
+        # A new upstream lockfile is a new key.
+        seed = Path(self.temp.name) / 'seed'
+        self.write(seed / 'Gemfile.lock', LOCKFILE.replace('0.5.0)\n\nPLATFORMS', '0.5.1)\n\nPLATFORMS'))
+        git(seed, 'commit', '-qam', 'Bump')
+        git(seed, 'push', '-q', str(self.origin), 'main')
+        git(self.checkout, 'pull', '-q', '--ff-only')
+        self.assertEqual('prepared', self.run_test(seen)['dependencies']['status'])
+        self.assertEqual(2, len(seen['deps']))
+
+    def test_failed_dependency_step_runs_no_tests_and_leaves_no_cache(self):
+        seen = {}
+        result = self.run_test(seen, deps_code=1)
+        self.assertEqual('failed', result['dependencies']['status'])
+        self.assertEqual('gems', result['dependencies']['step'])
+        self.assertIsNone(result['exit_code'])
+        self.assertNotIn('argv', seen)
+        self.assertIn('engineer', result['note'])
+        cache = Path(self.temp.name) / 'state/converter-deps'
+        self.assertEqual([], [p.name for p in cache.iterdir() if not p.name.startswith('.lock-')])
+
+    def test_emoji_failure_fails_the_step(self):
+        seen = {}
+        with mock.patch.object(self.dev, 'converter_image_document', return_value=IMAGE_DOCUMENT), \
+                mock.patch.object(self.dev, 'docker', side_effect=lambda argv, timeout: (0, b'', b'')), \
+                mock.patch.object(self.dev.urllib.request, 'urlopen', side_effect=OSError('no route')):
+            result = self.call('test')
+        self.assertEqual({'status': 'failed', 'step': 'emoji', 'error': 'OSError'}, result['dependencies'])
+        self.assertNotIn('argv', seen)
+
+    def test_prepared_with_little_time_left_asks_for_a_rerun(self):
+        seen = {}
+        with mock.patch.object(self.dev, 'TEST_TIMEOUT', 60):
+            result = self.run_test(seen)
+        self.assertEqual('prepared', result['dependencies']['status'])
+        self.assertIn('Run dev_test again', result['note'])
+        self.assertNotIn('argv', seen)
+        with mock.patch.object(self.dev, 'TEST_TIMEOUT', 60):
+            self.assertEqual('3 runs, 5 assertions, 0 failures, 0 errors, 0 skips', self.run_test(seen)['summary'])
+
+    def test_dependency_step_waits_for_another_preparer(self):
+        import fcntl
+        seen = {}
+        with mock.patch.object(self.dev, 'converter_image_document', return_value=IMAGE_DOCUMENT):
+            checkout = self.dev.Checkout(self.base, self.ws, self.host)
+        gemfile = (self.checkout / 'Gemfile').read_bytes()
+        key = hashlib.sha256(self.dev.canonical({'recipe': self.dev.DEPS_RECIPE, 'image': IMAGE_ID, 'gemfile': hashlib.sha256(gemfile).hexdigest(),
+                                                 'lockfile': hashlib.sha256(LOCKFILE.encode()).hexdigest()}).encode()).hexdigest()
+        root = self.dev.deps_root(checkout)
+        holder = os.open(root / ('.lock-' + key), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with mock.patch.object(self.dev, 'DEPS_TIMEOUT', 2):
+            result = self.run_test(seen)
+        self.assertEqual('busy', result['dependencies']['status'])
+        self.assertNotIn('deps', seen)
+
+    def test_dependency_files_must_be_the_committed_upstream_ones(self):
+        seen = {}
+        self.write(self.checkout / 'Gemfile', 'source "https://example.invalid"\n')  # a person editing it, not an agent
+        self.assertEqual('STANDARD_DEV_DEPS_UNSUPPORTED', self.run_test(seen)['error'])
+        self.assertNotIn('deps', seen)
+        git(self.checkout, 'checkout', '--', 'Gemfile')
+        for path in ('Gemfile', 'Gemfile.lock'):
+            self.assertEqual('STANDARD_DEV_PATH_PROTECTED', self.call('write', path=path, content='gem "x"\n')['error'])
+        # A Gemfile.lock the agent could have recorded (not at HEAD) is refused too.
+        git(self.checkout, 'rm', '-q', '--cached', 'Gemfile.lock')
+        git(self.checkout, 'commit', '-qm', 'Untrack lock')
+        self.assertEqual('STANDARD_DEV_DEPS_UNSUPPORTED', self.run_test(seen)['error'])
+        self.assertNotIn('deps', seen)
+
+    def test_lockfile_sources_and_bundler_are_checked(self):
+        check = self.dev.check_lockfile
+        check(LOCKFILE.encode())
+        for bad in (LOCKFILE.replace('https://rubygems.org/', 'https://gems.example.invalid/'),
+                    'GIT\n  remote: https://github.com/example/gem.git\n  revision: abc\n  specs:\n    x (1)\n\n' + LOCKFILE,
+                    'PATH\n  remote: ../local\n  specs:\n    y (1)\n\n' + LOCKFILE,
+                    'PLUGIN SOURCE\n  remote: https://rubygems.org/\n\n' + LOCKFILE,
+                    LOCKFILE.replace('GEM\n  remote: https://rubygems.org/\n', 'GEM\n  remote: https://rubygems.org/\n  remote: https://gems.example.invalid/\n'),
+                    LOCKFILE.replace('2.6.3', '2.7.1'), LOCKFILE.replace('BUNDLED WITH\n   2.6.3\n', ''), b'\xff'):
+            with self.subTest(bad=bad[:40]):
+                with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_DEV_DEPS_UNSUPPORTED'):
+                    check(bad if isinstance(bad, bytes) else bad.encode())
+
+    def test_image_gem_env_comes_from_the_image(self):
+        self.assertEqual(['GEM_HOME=/deps', 'GEM_PATH=/deps:/opt/bundle/ruby/3.3.0:/usr/local/bundle',
+                          'PATH=/deps/bin:/opt/bundle/ruby/3.3.0/bin:/usr/local/bundle/bin:/usr/bin'], self.dev.image_gem_env(IMAGE_DOCUMENT, '/deps'))
+        good = ['RUBY_VERSION=3.4.1', 'GEM_HOME=/x', 'BUNDLE_PATH=/opt/b', 'PATH=/usr/bin']
+        self.assertEqual('GEM_PATH=/deps:/opt/b/ruby/3.4.0:/x', self.dev.image_gem_env({'Config': {'Env': good}}, '/deps')[1])
+        for env in ([], good[:2] + good[3:], good[:2] + ['BUNDLE_PATH=/opt/b:/evil', good[3]], ['RUBY_VERSION=x'] + good[1:],
+                    good[:3] + ['PATH=/usr/bin:relative'], good[:3] + ['PATH=/usr/bin:/a b']):
+            with self.subTest(env=env):
+                with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_RUNTIME_MISMATCH'):
+                    self.dev.image_gem_env({'Config': {'Env': env}}, '/deps')
+
+    def test_emoji_fetch_validates_and_bounds(self):
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        destination = Path(self.temp.name) / 'emoji'
+        with mock.patch.object(self.dev.urllib.request, 'urlopen', side_effect=lambda request, timeout: Response(b'{"a": 1}')) as opened:
+            self.dev.fetch_emoji(destination, time.monotonic() + 60)
+        self.assertEqual([self.dev.EMOJI_BASE + name for name in self.dev.EMOJI_FILES], [call.args[0].full_url for call in opened.call_args_list])
+        self.assertEqual(3, len(list(destination.rglob('*.json'))))
+        with mock.patch.object(self.dev.urllib.request, 'urlopen', side_effect=lambda request, timeout: Response(b'<html>')):
+            with self.assertRaises(ValueError):
+                self.dev.fetch_emoji(destination, time.monotonic() + 60)
+        with mock.patch.object(self.dev, 'EMOJI_MAX_BYTES', 4), mock.patch.object(self.dev.urllib.request, 'urlopen', side_effect=lambda request, timeout: Response(b'[1,2,3]')):
+            with self.assertRaises(ValueError):
+                self.dev.fetch_emoji(destination, time.monotonic() + 60)
+        with self.assertRaises(TimeoutError):
+            self.dev.fetch_emoji(destination, time.monotonic() + 1)
 
     def test_converter_image_is_verified_against_the_bound_profile(self):
         repo = Path(self.temp.name) / 'release'

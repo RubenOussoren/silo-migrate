@@ -128,10 +128,24 @@ converter-reviewer on Claude (`claude-bin`, which must be configured and signed 
   come through `standard agent`.
 - **What the developer may change:** those files, except `.gitignore`, `.gitattributes`,
   `.gitmodules`, `.git/`, `.github/workflows/`, `Gemfile`, `Gemfile.lock` and `.bundle/`
-  (the converter image's gem bundle is fixed by the runtime profile).
+  (dependencies come from upstream's committed lockfile).
+- **Dependencies:** the converter image's bundle was frozen when it was built, and upstream's
+  lockfile keeps moving. Before tests, `dev_test` makes sure a cache in
+  `<prefix>/state/converter-deps/<key>` exists for (image, committed `Gemfile`, committed
+  `Gemfile.lock`). Building it is the only step with network: one container, the same limits
+  as tests, that sees only copies of those two files and the cache folder (no agent code,
+  no workspace content). It runs `bundle install` for just the gems the image lacks, layered over
+  the image's own bundle. It also fetches Discourse's emoji table (three public JSON files from
+  `raw.githubusercontent.com/discourse/discourse-emojis`), which the converter otherwise downloads
+  at run time. The lockfile must use only `https://rubygems.org/` (no git, path or plugin
+  sources) and Bundler 2.6.3; otherwise `STANDARD_DEV_DEPS_UNSUPPORTED` (a new converter image
+  is needed). Upstream's lockfile has no checksums, so gems are pinned by version and trusted
+  from rubygems.org over TLS. Built once per key (about 4 s and 1 MB for a markbridge bump);
+  other workspaces with the same lockfile reuse it. Old keys aren't pruned yet.
 - **Tests:** `dev_test` copies only the visible files into a temporary directory and runs
   `rake test` (or `rubocop`) in the profile's converter image, verified by content ID,
-  with no network, a read-only root, no capabilities and CPU/memory/PID/time limits.
+  with no network, a read-only root, no capabilities and CPU/memory/PID/time limits, and
+  with the dependency cache mounted read-only.
 - **Commits:** only on `migration/WS/TOPIC` branches; built in a temporary index from the
   verified bytes of the visible changed paths (`hash-object`, `commit-tree`, compare-and-swap
   `update-ref`; no hooks), so nothing else in the working tree or the engineer's index can

@@ -51,8 +51,8 @@ TEST_TIMEOUT = 240
 # Paths an agent may never write: they change what Git ignores or how it treats
 # files, or (workflows) need a token permission the engineer did not grant.
 PROTECTED_NAMES = {".gitignore", ".gitattributes", ".gitmodules", ".git"}
-# The converter image's gem bundle is fixed by the runtime profile: dependency changes
-# need a new image (an engineer process), so agents can't edit what selects gems.
+# Agents can't edit what selects gems: the dependency step (see prepare_dependencies)
+# installs exactly what the checkout's committed Gemfile.lock pins, with network.
 PROTECTED_PATHS = {"Gemfile", "Gemfile.lock", ".bundle/config"}
 ROLES = {
     "developer": {"list", "read", "search", "status", "diff", "test", "push-show",
@@ -838,6 +838,10 @@ def op_push_show(checkout, request, full=False):
 # -- the test runner ---------------------------------------------------------------
 
 def converter_image(checkout, values, repo):
+    return converter_image_document(checkout, values, repo)["Id"]
+
+
+def converter_image_document(checkout, values, repo):
     config = checkout.config
     name = config["discourse_profile"]
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", name):
@@ -857,7 +861,7 @@ def converter_image(checkout, values, repo):
         document = host.inspect("silo-migrate/loaded:" + image["content_id"][7:])
     if host.identity(document) != image["content_id"] or not re.fullmatch(r"sha256:[0-9a-f]{64}", document.get("Id", "")):
         refuse("STANDARD_RUNTIME_MISMATCH")
-    return document["Id"]
+    return document
 
 
 def export_visible(checkout, destination):
@@ -920,6 +924,185 @@ def clean_stale_exports(directory):
             pass
 
 
+# -- dependencies: the checkout's locked gems and Discourse's emoji table ------------
+# The converter image carries a gem bundle frozen when it was built; upstream's lockfile
+# keeps moving. Before tests, one container *with network* installs only the gems the
+# checkout's committed Gemfile.lock pins that the image lacks, into a cache shared by
+# workspaces and keyed by (image, Gemfile, Gemfile.lock). It sees those two files and
+# the cache, never agent code or workspace content. The converter also downloads
+# Discourse's emoji table at run time (support/emojis/discourse_emoji_data.rb); the same
+# step fetches it so offline tests find it in tmp/emoji_cache. Tests stay network-none
+# and mount both read-only. Everything cached is public.
+
+DEPS_RECIPE = 1
+DEPS_TIMEOUT = 180
+# Below this many seconds left after preparing, ask for a rerun instead of a cut-off test.
+TEST_MIN_SECONDS = 90
+BUNDLER_VERSION = "2.6.3"
+EMOJI_BASE = "https://raw.githubusercontent.com/discourse/discourse-emojis/main/"
+EMOJI_FILES = ("dist/emojis.json", "dist/aliases.json", "dist/tonable_emojis.json")
+EMOJI_MAX_BYTES = 8 * 1024 * 1024
+LOCK_SECTIONS = {"GEM", "PLATFORMS", "DEPENDENCIES", "RUBY VERSION", "BUNDLED WITH", "CHECKSUMS"}
+
+
+def emoji_repo_key():
+    # As discourse_emoji_data.rb names its cache folder.
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", re.sub(r"^https?://", "", EMOJI_BASE))
+
+
+def committed(checkout, relative):
+    """Bytes of a file only as committed at HEAD (agents can't write these paths)."""
+    try:
+        data, _ = checkout.load(relative)
+    except Refusal:
+        refuse("STANDARD_DEV_DEPS_UNSUPPORTED")
+    entry = checkout.tree().get(relative)
+    if not entry or entry[0] != "100644" or checkout.blob_id(data) != entry[1]:
+        refuse("STANDARD_DEV_DEPS_UNSUPPORTED")
+    return data
+
+
+def check_lockfile(data):
+    """rubygems.org only (no git, path or plugin sources) and the image's Bundler."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        refuse("STANDARD_DEV_DEPS_UNSUPPORTED")
+    section, remotes, bundler = None, [], None
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            section = line.strip()
+            if section not in LOCK_SECTIONS:
+                refuse("STANDARD_DEV_DEPS_UNSUPPORTED")
+        elif section == "GEM" and line.strip().startswith("remote:"):
+            remotes.append(line.split(":", 1)[1].strip())
+        elif section == "BUNDLED WITH" and line.strip():
+            bundler = line.strip()
+    if remotes != ["https://rubygems.org/"] or bundler != BUNDLER_VERSION:
+        refuse("STANDARD_DEV_DEPS_UNSUPPORTED")
+
+
+def image_gem_env(document, overlay):
+    """Environment that layers the overlay over the image's own bundle (BUNDLE_PATH/ruby/ABI),
+    as Bundler's BUNDLE_PATH mode would set it up: gems, then executables (rubocop...)."""
+    env = dict(item.split("=", 1) for item in document.get("Config", {}).get("Env") or [] if "=" in item)
+    bundle, home, version, path = env.get("BUNDLE_PATH", ""), env.get("GEM_HOME", ""), env.get("RUBY_VERSION", ""), env.get("PATH", "")
+    match = re.fullmatch(r"(\d+)\.(\d+)\.\d+", version)
+    safe = re.compile(r"/[A-Za-z0-9/._-]+")
+    if not (match and safe.fullmatch(bundle) and safe.fullmatch(home) and all(safe.fullmatch(part) for part in path.split(":"))):
+        refuse("STANDARD_RUNTIME_MISMATCH")
+    gems = f"{bundle.rstrip('/')}/ruby/{match[1]}.{match[2]}.0"
+    return ["GEM_HOME=" + overlay, "GEM_PATH=" + ":".join((overlay, gems, home)), "PATH=" + ":".join((overlay + "/bin", gems + "/bin", path))]
+
+
+def deps_root(checkout):
+    # <prefix>/state/converter-deps beside <prefix>/workspaces (as intake is).
+    root = checkout.root.parent.parent / "state" / "converter-deps"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if root.is_symlink() or not root.is_dir() or root.stat().st_uid != os.getuid():
+        refuse("STANDARD_OPERATION_FAILED")
+    return root
+
+
+def fetch_emoji(destination, deadline):
+    folder = Path(destination) / emoji_repo_key()
+    for name in EMOJI_FILES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 5:
+            raise TimeoutError("emoji")
+        request = urllib.request.Request(EMOJI_BASE + name, headers={"User-Agent": "silo-migrate"})
+        with urllib.request.urlopen(request, timeout=min(30, remaining)) as response:
+            data = response.read(EMOJI_MAX_BYTES + 1)
+        if len(data) > EMOJI_MAX_BYTES:
+            raise ValueError("emoji file too large")
+        json.loads(data)  # what the converter will parse
+        target = folder / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        os.chmod(target, 0o644)
+
+
+def clean_stale_builds(root):
+    for path in root.glob(".build-*"):
+        try:
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and time.time() - info.st_mtime > 3600:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def prepare_dependencies(checkout, document, started):
+    """(ready directory, result dict) or (None, failure dict). Builds once per key."""
+    import fcntl
+    gemfile, lockfile = committed(checkout, "Gemfile"), committed(checkout, "Gemfile.lock")
+    check_lockfile(lockfile)
+    key = hashlib.sha256(canonical({"recipe": DEPS_RECIPE, "image": document["Id"], "gemfile": hashlib.sha256(gemfile).hexdigest(),
+                                    "lockfile": hashlib.sha256(lockfile).hexdigest()}).encode()).hexdigest()
+    root = deps_root(checkout)
+    if "," in str(root):  # --mount separates its fields with commas
+        refuse("STANDARD_OPERATION_FAILED")
+    ready = root / key
+    if (ready / "ready.json").is_file():
+        return ready, {"status": "ready", "key": key[:12]}
+    deadline = started + DEPS_TIMEOUT
+    descriptor = os.open(root / (".lock-" + key), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        while True:  # another tool call may be preparing the same key: wait for it
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    return None, {"status": "busy", "key": key[:12]}
+                time.sleep(1)
+        if (ready / "ready.json").is_file():
+            return ready, {"status": "ready", "key": key[:12]}
+        clean_stale_builds(root)
+        build = Path(tempfile.mkdtemp(prefix=".build-", dir=root))
+        try:
+            (build / "gems").mkdir()
+            (build / "emoji_cache").mkdir()
+            (build / "lock").mkdir()
+            (build / "lock/Gemfile").write_bytes(gemfile)
+            (build / "lock/Gemfile.lock").write_bytes(lockfile)
+            for path in (build, build / "gems", build / "emoji_cache", build / "lock"):
+                os.chmod(path, 0o755)
+            name = "silo-devdeps-" + secrets.token_hex(6)
+            argv = ["docker", "run", "--rm", "--name", name, "--pull=never", "--network", "bridge", "--read-only", "--stop-timeout", "5",
+                    "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                    "--cpus", "2", "--memory", "2g", "--memory-swap", "2g", "--pids-limit", "512", "--log-opt", "max-size=1m",
+                    "--tmpfs", "/tmp:rw,exec,size=1g",
+                    "--mount", f"type=bind,src={build / 'lock'},dst=/lock,readonly", "--mount", f"type=bind,src={build / 'gems'},dst=/deps",
+                    "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8",
+                    "-e", "BUNDLE_GEMFILE=/lock/Gemfile", "-e", "BUNDLE_FROZEN=true", "-e", "BUNDLE_APP_CONFIG=/tmp/bundle-config",
+                    "-e", "BUNDLE_USER_HOME=/tmp/bundle-home", *[arg for item in image_gem_env(document, "/deps") for arg in ("-e", item)],
+                    "-w", "/tmp", "--entrypoint", "env", document["Id"], "-u", "BUNDLE_PATH",
+                    "bundle", "_" + BUNDLER_VERSION + "_", "install", "--no-cache"]
+            code, stdout, stderr = docker(argv, max(10, int(deadline - time.monotonic())))
+            if code is None:
+                subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
+            if code != 0:
+                return None, {"status": "failed", "step": "gems", "exit_code": code, "timed_out": code is None,
+                              "stdout_tail": stdout[-4096:].decode("utf-8", "replace"), "stderr_tail": stderr[-4096:].decode("utf-8", "replace")}
+            added = sorted(path.name[:-len(".gemspec")] for path in (build / "gems/specifications").glob("*.gemspec"))
+            try:
+                fetch_emoji(build / "emoji_cache", deadline)
+            except (OSError, ValueError, TimeoutError) as error:
+                return None, {"status": "failed", "step": "emoji", "error": type(error).__name__}
+            shutil.rmtree(build / "lock")
+            record = {"recipe": DEPS_RECIPE, "image": document["Id"], "gemfile_sha256": hashlib.sha256(gemfile).hexdigest(),
+                      "lockfile_sha256": hashlib.sha256(lockfile).hexdigest(), "gems_added": added, "emoji_base": EMOJI_BASE, "prepared_at": now()}
+            (build / "ready.json").write_text(canonical(record) + "\n")
+            os.rename(build, ready)
+            return ready, {"status": "prepared", "key": key[:12], "gems_added": added[:50], "seconds": round(time.monotonic() - started)}
+        finally:
+            if build.exists():
+                shutil.rmtree(build, ignore_errors=True)
+    finally:
+        os.close(descriptor)
+
+
 def op_test(checkout, request, values, repo):
     suite = request.get("suite", "test")
     file = request.get("file") or None  # "" means the whole suite
@@ -939,14 +1122,25 @@ def op_test(checkout, request, values, repo):
             command.append(file)
     else:
         refuse("STANDARD_ARGUMENTS_INVALID")
-    image = converter_image(checkout, values, repo)
+    started = time.monotonic()
+    document = converter_image_document(checkout, values, repo)
+    image = document["Id"]
+    deps, prepared = prepare_dependencies(checkout, document, started)
+    if deps is None:
+        return {"suite": suite, "file": file, "exit_code": None, "timed_out": False, "summary": None, "dependencies": prepared,
+                "note": "Tests did not run: the step that installs the checkout's locked gems (and the emoji table) didn't finish. "
+                        "Retry once; if it fails again, stop and tell the engineer: dev_test, dependencies " + prepared["status"] + "."}
+    if prepared["status"] == "prepared" and TEST_TIMEOUT - (time.monotonic() - started) < TEST_MIN_SECONDS:
+        return {"suite": suite, "file": file, "exit_code": None, "timed_out": False, "summary": None, "dependencies": prepared,
+                "note": "Dependencies are now installed; tests did not run yet. Run dev_test again."}
     clean_stale_exports(tempfile.gettempdir())
     export = tempfile.mkdtemp(prefix="silo-devtest-")
     name = "silo-devtest-" + secrets.token_hex(6)
-    started = time.monotonic()
     try:
         os.chmod(export, 0o700)
         copied = export_visible(checkout, export)
+        # Docker would create this mount point as root inside the export: make it ours first.
+        (Path(export) / "tmp/emoji_cache").mkdir(parents=True, exist_ok=True)
         # The tool itself is killed at ~290 s: keep the container inside that, after the export.
         budget = max(30, TEST_TIMEOUT - int(time.monotonic() - started))
         if "," in export:
@@ -955,8 +1149,11 @@ def op_test(checkout, request, values, repo):
                 "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--cpus", "2", "--memory", "2g", "--memory-swap", "2g", "--pids-limit", "512", "--log-opt", "max-size=1m",
                 "--tmpfs", "/tmp:rw,exec,size=512m", "--mount", f"type=bind,src={export},dst=/app",
-                "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8", "-w", "/app",
-                "--entrypoint", command[0], image, *command[1:]]
+                "--mount", f"type=bind,src={deps / 'gems'},dst=/deps,readonly",
+                "--mount", f"type=bind,src={deps / 'emoji_cache'},dst=/app/tmp/emoji_cache,readonly",
+                "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8",
+                *[arg for item in image_gem_env(document, "/deps") for arg in ("-e", item)], "-w", "/app",
+                "--entrypoint", "env", image, "-u", "BUNDLE_PATH", *command]
         code, stdout, stderr = docker(argv, budget)
         if code is None:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
@@ -971,9 +1168,9 @@ def op_test(checkout, request, values, repo):
     out_tail, out_cut = tail(out, 20 * 1024)
     err_tail, err_cut = tail(err, 4 * 1024)
     return {"suite": suite, "file": file, "exit_code": code, "timed_out": code is None, "files_exported": copied,
-            "seconds": round(time.monotonic() - started), "summary": summary[-1] if summary else None,
+            "seconds": round(time.monotonic() - started), "summary": summary[-1] if summary else None, "dependencies": prepared,
             "stdout_tail": out_tail, "stdout_truncated": out_cut, "stderr_tail": err_tail, "stderr_truncated": err_cut,
-            "sandbox": "converter image, no network, read-only root, only the files your tools can see"}
+            "sandbox": "converter image, no network, read-only root, only the files your tools can see, plus the locked gems and emoji table read-only"}
 
 
 # -- engineer: push approval -------------------------------------------------------
