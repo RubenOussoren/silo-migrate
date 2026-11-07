@@ -64,7 +64,24 @@ each is a fixed operation of `silo-migrate-control data WS`) can:
 
 Every operation is logged in `workspaces/WS/.silo-migrate/data/audit.jsonl` (script code and
 finding text by hash); moved and derived files in `provenance.jsonl`. Database passwords stay
-in `.silo-migrate/data/db/secret.env` (0600) and never appear in tool output or Docker argv.
+in `.silo-migrate/data/db/` (0600): `secret.env` (administrator, given to the database and
+loader containers) and `ro.env` (read-only user, host side only). They never appear in Docker
+argv, and job logs are scrubbed of them.
+
+Dumps are untrusted: the MariaDB client runs with `--sandbox` and psql under a random
+`\restrict` key, so a dump can't run shell commands; after every load the read-only user is
+reset to read-only, whatever the dump did. The project network is `--internal` and gives the
+host no address on it (`inhibit_ipv4`): containers can't reach the internet or host services.
+Jobs stop, and new ones are refused, when the disk's free space drops below 20 GiB or 10%.
+
+A file over 16 GiB is too big to take or register within a chat tool's 300 s. Run the same
+request as the service account from a shell instead (no time limit), for example:
+
+```sh
+printf '%s' '{"op":"take","path":"forum.sql.gz","type":"mysql-dump"}' | /srv/silo-migrate/bin/silo-migrate-control data arc
+```
+
+An interrupted take or register resumes when it is run again.
 
 Free SQL queries come with DBHub once term-llm can attach an MCP server to one agent only
 (in term-llm 0.9.93 any chat can switch on any configured MCP server).

@@ -20,6 +20,17 @@ import zipfile
 MAX_ENTRIES = 500_000
 MAX_TOTAL = 512 * 1024 ** 3
 CHUNK = 1024 * 1024
+# Stop before the disk every service on the node shares runs low: a zip bomb, or simply a
+# bigger export than the disk can hold, must not break the node.
+RESERVE_MIN = 20 * 1024 ** 3
+CHECK_EVERY = 64 * 1024 * 1024
+
+
+def disk_low(root):
+    info = os.statvfs(root)
+    override = os.environ.get("SILO_DATA_RESERVE_BYTES")  # tests only; the sandbox never sets it
+    reserve = int(override) if override and override.isdigit() else max(RESERVE_MIN, info.f_blocks * info.f_frsize // 10)
+    return info.f_bavail * info.f_frsize < reserve
 
 
 def safe_parts(name):
@@ -43,6 +54,8 @@ def ensure_dirs(root, parts):
 
 
 def write_stream(root, parts, stream, totals):
+    if disk_low(root):
+        raise ValueError("stopped: the disk reached its free-space reserve")
     directory = ensure_dirs(root, parts[:-1])
     target = os.path.join(directory, parts[-1])
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -51,9 +64,12 @@ def write_stream(root, parts, stream, totals):
             chunk = stream.read(CHUNK)
             if not chunk:
                 break
+            before = totals["bytes"]
             totals["bytes"] += len(chunk)
             if totals["bytes"] > MAX_TOTAL:
                 raise ValueError("total size limit reached")
+            if before // CHECK_EVERY != totals["bytes"] // CHECK_EVERY and disk_low(root):
+                raise ValueError("stopped: the disk reached its free-space reserve")
             out.write(chunk)
     totals["files"] += 1
 

@@ -90,19 +90,44 @@ class FakeDocker:
     def __init__(self):
         self.calls = []
         self.state = {}  # container -> State dict
+        self.networks = {}  # name -> create argv
+        self.volumes = set()
         self.ready = True
+        self.logs = b'converted 3 records\n'
+        self.keep_volume = False
 
     def __call__(self, argv, timeout=120, input=None):
         self.calls.append((argv, input))
-        out, code = b'', 0
+        out, code, err = b'', 0, b''
         if argv[0] == 'run':
             name = argv[argv.index('--name') + 1]
             self.state[name] = {'Running': True, 'Status': 'running', 'ExitCode': 0}
+            for arg in argv:
+                if arg.startswith('type=volume,src='):
+                    self.volumes.add(arg.split('src=')[1].split(',')[0])
             out = b'cid\n'
+        elif argv[0] == 'network' and argv[1] == 'create':
+            self.networks[argv[-1]] = argv
+        elif argv[0] == 'network' and argv[1] == 'inspect':
+            create = self.networks.get(argv[-1])
+            if create is None:
+                code, err = 1, b'Error response from daemon: network x not found'
+            else:
+                options = {'com.docker.network.bridge.inhibit_ipv4': 'true'} if 'com.docker.network.bridge.inhibit_ipv4=true' in create else {}
+                out = json.dumps({'Internal': '--internal' in create, 'Options': options}).encode()
+        elif argv[0] == 'network' and argv[1] == 'rm':
+            self.networks.pop(argv[-1], None)
+        elif argv[0] == 'volume' and argv[1] == 'inspect':
+            code = 0 if argv[-1] in self.volumes else 1
+        elif argv[0] == 'volume' and argv[1] == 'rm':
+            if not self.keep_volume:
+                self.volumes.discard(argv[-1])
         elif argv[0] == 'inspect':
             name = argv[-1]
             if name not in self.state:
-                code = 1
+                code, err = 1, b'Error: No such object: ' + name.encode()
+            elif len(argv) == 2:
+                out = b'[{}]'
             elif '{{json .State}}' in argv:
                 out = json.dumps(self.state[name]).encode()
             elif '{{.State.Running}}' in argv:
@@ -110,17 +135,17 @@ class FakeDocker:
             else:
                 out = self.state[name]['Status'].encode()
         elif argv[0] == 'logs':
-            out = b'converted 3 records\n'
-        elif argv[0] == 'network' and argv[1] == 'inspect':
-            code = 1
+            out = self.logs
         elif argv[0] == 'exec':
             if any(arg in ('mariadb-admin', 'pg_isready') for arg in argv):
                 code = 0 if self.ready else 1
             elif input and b'information_schema.tables' in input:
                 out = b'source\t2\t1\n'
+            elif input == b'SHOW DATABASES;':
+                out = b'information_schema\nmysql\nsource\n'
         elif argv[0] == 'rm':
             self.state.pop(argv[-1], None)
-        return subprocess.CompletedProcess(argv, code, out, b'')
+        return subprocess.CompletedProcess(argv, code, out, err)
 
     def argvs(self, verb):
         return [argv for argv, _ in self.calls if argv[0] == verb]
@@ -141,6 +166,10 @@ class DataToolsTest(unittest.TestCase):
         patcher = mock.patch.object(self.d, 'docker', side_effect=self.docker)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # /tmp may be a small tmpfs; the reserve itself is tested separately.
+        disk = mock.patch.object(self.d, 'low_disk', return_value=False)
+        disk.start()
+        self.addCleanup(disk.stop)
         self.host = types.SimpleNamespace(inspect=lambda ref: {'Id': 'sha256:' + '1' * 64, 'ref': ref},
                                           identity=lambda document: self.content_id(document['ref']))
         self.values = {'SILO_CONTROL_GEMS': str(top / 'gems')}
@@ -338,10 +367,13 @@ class DataToolsTest(unittest.TestCase):
         self.assertTrue(result['ready'])
         self.assertEqual('silo_ro', result['read_only_user'])
         secret = self.base / 'arc/.silo-migrate/data/db/secret.env'
-        self.assertEqual(0o600, stat.S_IMODE(secret.stat().st_mode))
-        passwords = [line.split('=', 1)[1] for line in secret.read_text().splitlines() if 'PASSWORD' in line]
-        self.assertEqual(2, len(passwords))
-        self.assertIn(['network', 'create', '--internal', '--label', 'silo.workspace=arc', 'silo-src-arc'], self.docker.argvs('network'))
+        ro = self.base / 'arc/.silo-migrate/data/db/ro.env'
+        self.assertEqual((0o600, 0o600), (stat.S_IMODE(secret.stat().st_mode), stat.S_IMODE(ro.stat().st_mode)))
+        self.assertNotIn('SILO_RO_PASSWORD', secret.read_text())  # containers never get the read-only password
+        passwords = self.passwords()
+        self.assertEqual(2, len(passwords))  # MariaDB root + the read-only user
+        self.assertIn(['network', 'create', '--internal', '-o', 'com.docker.network.bridge.inhibit_ipv4=true', '--label', 'silo.workspace=arc', 'silo-src-arc'],
+                      self.docker.argvs('network'))
         (run,) = self.docker.argvs('run')
         self.assertNotIn('-p', run)
         self.assertNotIn('--publish', run)
@@ -351,10 +383,18 @@ class DataToolsTest(unittest.TestCase):
         for joined in self.all_docker_argv():
             for password in passwords:
                 self.assertNotIn(password, joined)
-        ro = [inp for argv, inp in self.docker.calls if inp and b'CREATE USER' in inp]
-        self.assertTrue(ro and b'GRANT SELECT, SHOW VIEW' in ro[0])
+        hardening = b''.join(inp for argv, inp in self.docker.calls if inp)
+        for statement in (b'CREATE USER IF NOT EXISTS', b'REVOKE ALL PRIVILEGES, GRANT OPTION', b'SET DEFAULT ROLE NONE', b'GRANT SELECT, SHOW VIEW ON `source`'):
+            self.assertIn(statement, hardening)
         self.refused('STANDARD_DB_ENGINE_MISMATCH', 'db_up', engine='postgres')
         self.assertEqual([['source', 2]], [[s['schema'], s['tables']] for s in self.op('db_status')['schemas']])
+
+    def passwords(self):
+        values = []
+        for name in ('secret.env', 'ro.env'):
+            path = self.base / 'arc/.silo-migrate/data/db' / name
+            values += [line.split('=', 1)[1] for line in path.read_text().splitlines() if 'PASSWORD=' in line]
+        return values
 
     def test_db_load_streams_a_registered_input_from_a_read_only_loader(self):
         self.create()
@@ -371,13 +411,24 @@ class DataToolsTest(unittest.TestCase):
         self.assertEqual('silo-src-arc', loader[loader.index('--network') + 1])
         for expected in ('--read-only', '--cap-drop ALL', 'dst=/in/dump,readonly', '--env-file'):
             self.assertIn(expected, joined)
-        self.assertIn('gzip -dc /in/dump | MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -h source-db', loader[-1])
-        self.assertIn('GRANT SELECT, SHOW VIEW', loader[-1])
-        passwords = [line.split('=', 1)[1] for line in (self.base / 'arc/.silo-migrate/data/db/secret.env').read_text().splitlines() if 'PASSWORD' in line]
-        self.assertFalse(any(password in joined for password in passwords))
+        self.assertIn('gzip -dc /in/dump | MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -h source-db -uroot --sandbox', loader[-1])
+        self.assertTrue(loader[-1].endswith('source; code=$?; echo LOAD_DONE; exit $code'), loader[-1])  # a failed load fails the job
+        self.assertFalse(any(password in joined for password in self.passwords()))
         self.assertEqual(started['job_id'], self.op('db_status')['loads'][0]['job_id'])
         self.refused('STANDARD_CONFIRMATION_REQUIRED', 'db_reset')
         self.refused('STANDARD_BUSY', 'db_reset', confirm=True)
+        # A dump that runs `env` would print the root password: it never reaches the agent.
+        root = self.passwords()[0]
+        self.docker.logs = ('ERROR 1064 near ' + root + '\n').encode()
+        self.docker.state[loader[loader.index('--name') + 1]] = {'Running': False, 'Status': 'exited', 'ExitCode': 1}
+        self.docker.calls.clear()
+        done = self.op('job', job_id=started['job_id'])
+        self.assertEqual(('failed', 1), (done['status'], done['exit_code']))
+        self.assertNotIn(root, json.dumps(done))
+        self.assertIn('[redacted]', done['log_tail'])
+        self.assertNotIn(root.encode(), (self.base / 'arc/.silo-migrate/data/jobs' / (started['job_id'] + '.log')).read_bytes())
+        self.assertTrue(done['read_only_user_checked'])  # re-asserted after the dump ran as root
+        self.assertTrue(any(inp and b'REVOKE ALL PRIVILEGES' in inp for _argv, inp in self.docker.calls))
 
     def test_postgres_custom_dump_uses_pg_restore_and_grants_read_only(self):
         self.create()
@@ -390,7 +441,115 @@ class DataToolsTest(unittest.TestCase):
         script = self.docker.argvs('run')[-1][-1]
         self.assertIn('pg_restore --no-owner --no-privileges', script)
         self.assertNotIn('--exit-on-error', script)
-        self.assertIn('GRANT SELECT ON ALL TABLES IN SCHEMA', script)
+        hardening = b''.join(inp for argv, inp in self.docker.calls if inp)
+        for statement in (b'NOSUPERUSER', b'default_transaction_read_only = on', b'GRANT SELECT ON ALL TABLES IN SCHEMA', b'REVOKE %I FROM silo_ro'):
+            self.assertIn(statement, hardening)
+
+    def test_plain_postgres_dump_runs_with_backslash_commands_restricted(self):
+        self.create()
+        (self.intake / 'dump.sql.gz').write_bytes(gzip.compress(b'--\n-- PostgreSQL database dump\n--\n\\! env\nSELECT 1;\n'))
+        self.op('take', path='dump.sql.gz', type='postgres-dump')
+        self.op('db_up', engine='postgres')
+        self.op('db_load', path='inputs/dump.sql.gz')
+        script = self.docker.argvs('run')[-1][-1]
+        # bash then sees: printf "%s\n" "\\restrict KEY" (one backslash after quoting) and the
+        # sed pattern ^\\(un)?restrict (a literal backslash), as run for real in the smoke test.
+        self.assertRegex(script, r'printf "%s\\n" "\\\\restrict [0-9a-f]{32}"; gzip -dc /in/dump \| ')
+        self.assertIn(r'sed -E "/^\\\\(un)?restrict /d"; } | ', script)
+        self.assertIn('ON_ERROR_STOP=1; code=$?; echo LOAD_DONE; exit $code', script)
+
+    def test_unsupported_dumps_and_unregistered_inputs_are_refused(self):
+        self.create()
+        (self.intake / 'forum.sql').write_text(DUMP)
+        self.op('take', path='forum.sql', type='mysql-dump')
+        self.op('db_up', engine='postgres')
+        self.refused('STANDARD_DUMP_KIND_UNSUPPORTED', 'db_load', path='inputs/forum.sql')  # MySQL dump into PostgreSQL
+        (self.base / 'arc/inputs/stray.sql').write_text(DUMP)
+        self.refused('STANDARD_INPUT_NOT_REGISTERED', 'db_load', path='inputs/stray.sql')
+        self.refused('STANDARD_INPUT_NOT_REGISTERED', 'extract', path='inputs/stray.sql', into='x')
+
+    def test_db_network_without_a_host_address_is_required(self):
+        self.create()
+        self.docker.networks['silo-src-arc'] = ['network', 'create', '--internal', 'silo-src-arc']  # an older, plain internal network
+        self.refused('STANDARD_DB_NETWORK_UNSAFE', 'db_up', engine='mariadb')
+
+    def test_db_state_missing_or_reset_incomplete_keeps_passwords(self):
+        self.create()
+        self.op('db_up', engine='mariadb')
+        before = self.passwords()
+        self.docker.keep_volume = True
+        self.refused('STANDARD_DB_RESET_INCOMPLETE', 'db_reset', confirm=True)
+        self.assertEqual(before, self.passwords())
+        (self.base / 'arc/.silo-migrate/data/db/state.json').unlink()
+        self.refused('STANDARD_DB_STATE_MISSING', 'db_up', engine='mariadb')
+
+    def test_jobs_are_lost_only_when_docker_says_so_and_low_disk_stops_them(self):
+        self.create()
+        started = self.op('script', code='puts 1', into='a')
+        name = self.docker.argvs('run')[-1][self.docker.argvs('run')[-1].index('--name') + 1]
+        real = self.docker.__call__
+        flaky = lambda argv, timeout=120, input=None: subprocess.CompletedProcess(argv, 1, b'', b'Cannot connect to the Docker daemon') if argv[0] == 'inspect' else real(argv, timeout, input)
+        with mock.patch.object(self.d, 'docker', side_effect=flaky):
+            self.assertEqual('running', self.op('job', job_id=started['job_id'])['status'])
+        with mock.patch.object(self.d, 'low_disk', return_value=True):
+            self.op('job', job_id=started['job_id'])
+            self.assertIn(['kill', name], self.docker.argvs('kill'))
+            self.refused('STANDARD_BUSY', 'script', code='puts 2', into='b')
+        self.docker.state[name] = {'Running': False, 'Status': 'exited', 'ExitCode': 137}
+        self.assertEqual('stopped_low_disk', self.op('job', job_id=started['job_id'])['status'])
+        with mock.patch.object(self.d, 'low_disk', return_value=True):
+            self.refused('STANDARD_DISK_LOW', 'script', code='puts 2', into='b')
+        self.docker.state.clear()
+        second = self.op('script', code='puts 3', into='c')
+        self.docker.state.clear()  # the container vanished
+        self.assertEqual('lost', self.op('job', job_id=second['job_id'])['status'])
+
+    def test_take_refuses_files_not_yet_handed_to_the_account_and_resumes_after_interruption(self):
+        self.create()
+        (self.intake / 'big.sql').write_text(DUMP)
+        real_register = self.d.register
+        with mock.patch.object(self.d, 'register', side_effect=self.d.Refusal('STANDARD_OPERATION_TIMEOUT')):
+            self.refused('STANDARD_OPERATION_TIMEOUT', 'take', path='big.sql', type='mysql-dump')
+        self.assertFalse((self.intake / 'big.sql').exists())
+        self.assertEqual(0o400, stat.S_IMODE((self.base / 'arc/inputs/big.sql').stat().st_mode))
+        resumed = self.op('take', path='big.sql', type='mysql-dump')
+        self.assertEqual(('resumed', 'inputs/big.sql'), (resumed['how'], resumed['path']))
+        self.assertEqual([], list((self.base / 'arc/.silo-migrate/data/pending').iterdir()))
+        (self.intake / 'root-owned.sql').write_text(DUMP)
+        real_open = self.d.open_regular
+        def as_root(root, parts):
+            fd, info = real_open(root, parts)
+            fields = list(info)
+            fields[4] = 0
+            return fd, os.stat_result(fields)
+        with mock.patch.object(self.d, 'open_regular', side_effect=as_root):
+            self.refused('STANDARD_PATH_INVALID', 'take', path='root-owned.sql', type='mysql-dump')
+        self.assertTrue((self.intake / 'root-owned.sql').exists())
+        with mock.patch.object(self.d, 'MAX_TOOL_INPUT', 10):
+            self.refused('STANDARD_INPUT_TOO_LARGE_FOR_TOOL', 'take', path='root-owned.sql', type='mysql-dump')
+
+    def test_search_keeps_memory_bounded_on_one_huge_line(self):
+        line = b'INSERT INTO t VALUES ' + b'(1,"x"),' * (600 * 1024) + b'(2,"NEEDLE");\nnext line\n'
+        (self.intake / 'one-line.sql.gz').write_bytes(gzip.compress(line))
+        reads = []
+        real_reader = self.d.reader
+        def spy(fd, decompress=True):
+            stream, kind = real_reader(fd, decompress)
+            original = stream.readline
+            def readline(size=-1):
+                self.assertGreater(size, 0)  # never an unbounded line read
+                data = original(size)
+                reads.append(len(data))
+                return data
+            stream.readline = readline
+            return stream, kind
+        with mock.patch.object(self.d, 'reader', side_effect=spy):
+            found = self.op('peek', area='intake', path='one-line.sql.gz', mode='search', pattern='NEEDLE')
+        self.assertEqual(1, len(found['matches']))
+        self.assertEqual(1, found['matches'][0]['line'])
+        self.assertLessEqual(max(reads), 1024 * 1024)
+        boundary = self.op('peek', area='intake', path='one-line.sql.gz', mode='search', pattern='next line')
+        self.assertEqual(2, boundary['matches'][0]['line'])
 
     def test_db_reset_removes_only_the_database(self):
         self.create()
@@ -460,9 +619,11 @@ class ExtractorTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.out = self.root / 'out'
         self.out.mkdir()
+        self.reserve = 0
 
     def run_extract(self, archive):
-        result = subprocess.run(['python3', '-I', '-B', str(ROOT / 'bin/data_extract.py'), str(archive), str(self.out)], capture_output=True, text=True, timeout=30)
+        env = dict(os.environ, SILO_DATA_RESERVE_BYTES=str(self.reserve))
+        result = subprocess.run(['python3', '-I', '-B', str(ROOT / 'bin/data_extract.py'), str(archive), str(self.out)], capture_output=True, text=True, timeout=30, env=env)
         return result.returncode, json.loads(result.stdout)
 
     def test_unsafe_entries_are_skipped(self):
@@ -481,6 +642,15 @@ class ExtractorTest(unittest.TestCase):
         self.assertEqual(b'a', (self.out / 'ok/a.txt').read_bytes())
         self.assertFalse((self.root / 'escape.txt').exists())
         self.assertFalse((self.out / 'ok/link').exists())
+
+    def test_extraction_stops_at_the_disk_reserve(self):
+        archive = self.root / 'big.zip'
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('a.bin', b'x' * 10)
+        self.reserve = 10 ** 18
+        code, summary = self.run_extract(archive)
+        self.assertEqual((1, 'failed'), (code, summary['status']))
+        self.assertIn('reserve', summary['error'])
 
     def test_zip_and_single_compressed_file(self):
         archive = self.root / 'export.zip'

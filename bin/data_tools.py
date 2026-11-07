@@ -51,6 +51,8 @@ SCAN_SECONDS = 40
 MAX_SCRIPT = 256 * 1024
 MAX_FINDING = 256 * 1024
 LOG_TAIL = 16 * 1024
+CHUNK = 1024 * 1024
+OVERLAP = 512
 JOB_DEFAULT_MINUTES = 30
 JOB_MAX_MINUTES = 360
 SANDBOX = {"cpus": "2", "memory": "4g", "pids": "256", "tmp": "1g"}
@@ -58,6 +60,10 @@ DB_LIMITS = {"cpus": "2", "memory": "4g", "pids": "512"}
 CHARSETS = ("utf8mb4", "utf8mb3", "utf8", "latin1", "binary")
 ENGINES = {"mariadb": "source_db", "postgres": "db"}
 RO_USER = "silo_ro"
+DISK_RESERVE = 20 * 1024 ** 3
+# A chat tool has 300 s; checksumming twice (here and in the registry) fits comfortably below
+# this. Larger files: the engineer runs the same request from a shell (no time limit).
+MAX_TOOL_INPUT = 16 * 1024 ** 3
 SYSTEM_DATABASES = "mysql|information_schema|performance_schema|sys"
 
 
@@ -466,13 +472,16 @@ def op_peek(ws, request):
             if not isinstance(offset, int) or offset < 0:
                 refuse("STANDARD_ARGUMENTS_INVALID")
             stream, compressed = reader(fd, decompress)
+            deadline = time.monotonic() + SCAN_SECONDS
             try:
                 skipped = 0
                 while skipped < offset:
-                    chunk = stream.read(min(1024 * 1024, offset - skipped))
+                    chunk = stream.read(min(CHUNK, offset - skipped))
                     if not chunk:
                         break
                     skipped += len(chunk)
+                    if time.monotonic() > deadline:
+                        refuse("STANDARD_OFFSET_TOO_FAR")
                 data = stream.read(limit)
             finally:
                 stream.close()
@@ -507,30 +516,39 @@ def search(fd, request, decompress):
     if not isinstance(wanted, int) or not 1 <= wanted <= MAX_MATCHES:
         refuse("STANDARD_ARGUMENTS_INVALID")
     stream, compressed = reader(fd, decompress)
-    matches, scanned, number, complete = [], 0, 0, True
+    matches, scanned, number, complete = [], 0, 1, True
     deadline = time.monotonic() + SCAN_SECONDS
+    tail = b""  # the end of the previous piece of a long line, so matches across pieces are found
     try:
-        for line in stream:
-            number += 1
-            # Lines can be huge (one INSERT per table); match on a bounded window per line.
-            window = line[:1024 * 1024]
+        while True:
+            # Never more than one bounded piece in memory: lines can be gigabytes (one INSERT
+            # per table, or no newline at all in binary or hostile input).
+            piece = stream.readline(CHUNK)
+            if not piece:
+                break
+            window = tail + piece
             found = matcher.search(window)
-            if found:
+            if found and found.end() > len(tail):
                 start = max(0, found.start() - 80)
-                matches.append({"line": number, "offset": scanned + found.start(), "text": text_of(window[start:start + MAX_LINE])})
+                matches.append({"line": number, "offset": scanned - len(tail) + found.start(), "text": text_of(window[start:start + MAX_LINE])})
                 if len(matches) >= wanted:
                     complete = False
-                    scanned += len(line)
+                    scanned += len(piece)
                     break
-            scanned += len(line)
-            if number % 512 == 0 and time.monotonic() > deadline:
+            scanned += len(piece)
+            if piece.endswith(b"\n"):
+                number += 1
+                tail = b""
+            else:
+                tail = piece[-OVERLAP:]
+            if time.monotonic() > deadline:
                 complete = False
                 break
     except (OSError, EOFError, lzma.LZMAError):
         return {"matches": matches, "scanned_bytes": scanned, "complete": False, "error": "STANDARD_READ_FAILED"}
     finally:
         stream.close()
-    return {"pattern": pattern, "matches": matches, "scanned_bytes": scanned, "lines_scanned": number, "decompressed": bool(compressed),
+    return {"pattern": pattern, "matches": matches, "scanned_bytes": scanned, "lines_scanned": number - 1, "decompressed": bool(compressed),
             "complete": complete, "note": None if complete else "stopped early (match limit or time); search again with a narrower pattern"}
 
 
@@ -579,9 +597,14 @@ def op_create(ws, request):
     if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}", branch) or ".." in branch:
         refuse("STANDARD_ARGUMENTS_INVALID")
     done = []
-    if not ws.initialized():
-        ws.control(["named", "init", ws.name])
-        done.append("workspace")
+    with Locked(ws.base / ".silo-data-create.lock"):
+        if not ws.initialized():
+            ws.control(["named", "init", ws.name])
+            done.append("workspace")
+        return create_steps(ws, platform, repo, branch, done)
+
+
+def create_steps(ws, platform, repo, branch, done):
     with ws.lock():
         meta = ws.meta()
         if meta.get("platform") and meta["platform"] != platform:
@@ -660,6 +683,74 @@ def place(ws, src_fd, src_dir_fd, src_name, dest_dir_fd, name):
     return copied, "copied"
 
 
+def settle(ws, meta, dest_fd, name, relative, kind, pending, record):
+    """Make a placed file read-only, checksum it, register it and record provenance. A retry after
+    an interruption (the tool's time limit, a failed registration) resumes here from the pending
+    record written before the move, instead of finding the destination taken."""
+    placed = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dest_fd)
+    try:
+        info = os.fstat(placed)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (info.st_dev, info.st_ino) != (record["dev"], record["ino"]):
+            refuse("STANDARD_INPUT_CHANGED")
+        os.fchmod(placed, 0o400)
+        digest = sha256_fd(placed)
+        size = os.fstat(placed).st_size
+    finally:
+        os.close(placed)
+    input_id = register(ws, meta, relative, digest, size, kind)
+    ws.append("provenance.jsonl", dict(record["provenance"], at=now(), input_id=input_id, path=relative, sha256=digest, bytes=size, type=kind))
+    pending.unlink()
+    return {"input_id": input_id, "path": relative, "sha256": digest, "bytes": size, "type": kind}
+
+
+def pending_for(ws, relative):
+    return ws.data_dir("pending") / (hashlib.sha256(relative.encode("utf-8")).hexdigest()[:32] + ".json")
+
+
+def move_in(ws, meta, src_root, parts, dest_fd, name, relative, kind, provenance, owner_check=True):
+    """Move one regular file into place, then settle it; resume a pending move of the same file."""
+    pending = pending_for(ws, relative)
+    record = ws.read_json(pending, None)
+    if record:
+        try:
+            os.stat(name, dir_fd=dest_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pending.unlink()  # interrupted before the move: start again
+        else:
+            return dict(settle(ws, meta, dest_fd, name, relative, kind, pending, record), how="resumed")
+    fd, info = open_regular(src_root, parts)
+    parent = walk_dirs(src_root, parts[:-1])
+    try:
+        if info.st_nlink != 1 or (owner_check and info.st_uid != os.getuid()):
+            # Not yet handed to the account (run `silo intake` as root) or linked elsewhere.
+            refuse("STANDARD_PATH_INVALID")
+        if info.st_size > MAX_TOOL_INPUT:
+            refuse("STANDARD_INPUT_TOO_LARGE_FOR_TOOL")
+        try:
+            os.stat(name, dir_fd=dest_fd, follow_symlinks=False)
+            refuse("STANDARD_INPUT_EXISTS")
+        except FileNotFoundError:
+            pass
+        record = {"dev": info.st_dev, "ino": info.st_ino, "provenance": provenance}
+        ws.write_json(pending, record)
+        try:
+            placed, how = place(ws, fd, parent, parts[-1], dest_fd, name)
+        except BaseException:
+            pending.unlink()
+            raise
+        new = os.fstat(placed)
+        os.close(placed)
+        if (new.st_dev, new.st_ino) != (record["dev"], record["ino"]):  # a copy across filesystems
+            record.update(dev=new.st_dev, ino=new.st_ino)
+            ws.write_json(pending, record)
+    finally:
+        os.close(fd)
+        os.close(parent)
+    record["provenance"]["how"] = how
+    ws.write_json(pending, record)
+    return dict(settle(ws, meta, dest_fd, name, relative, kind, pending, record), how=how)
+
+
 def op_take(ws, request):
     """Move one file from the drop folder into inputs/, make it read-only, register it."""
     ws.require()
@@ -672,34 +763,16 @@ def op_take(ws, request):
         meta = ws.meta()
         if not meta.get("dataset_id"):
             refuse("STANDARD_NOT_INITIALIZED")
-        root = ws.open_area("intake")
+        root, inputs = ws.open_area("intake"), None
         try:
-            fd, info = open_regular(root, parts)
-            parent = walk_dirs(root, parts[:-1])
+            inputs = ws.open_area("inputs")
+            result = move_in(ws, meta, root, parts, inputs, name, "inputs/" + name, kind,
+                             {"event": "take", "from": "intake/" + "/".join(parts)})
         finally:
             os.close(root)
-        inputs = ws.open_area("inputs")
-        try:
-            if info.st_nlink != 1:
-                refuse("STANDARD_PATH_INVALID")
-            placed, how = place(ws, fd, parent, parts[-1], inputs, name)
-        finally:
-            os.close(fd)
-            os.close(parent)
-            os.close(inputs)
-        try:
-            os.fchmod(placed, 0o400)
-            digest = sha256_fd(placed)
-            size = os.fstat(placed).st_size
-        finally:
-            os.close(placed)
-        relative = "inputs/" + name
-        input_id = register(ws, meta, relative, digest, size, kind)
-        record = {"at": now(), "event": "take", "input_id": input_id, "path": relative, "from": "intake/" + "/".join(parts),
-                  "sha256": digest, "bytes": size, "type": kind, "how": how}
-        ws.append("provenance.jsonl", record)
-    return {"input_id": input_id, "path": relative, "sha256": digest, "bytes": size, "type": kind, "how": how,
-            "note": "the original bytes are now read-only in inputs/; nothing was changed"}
+            if inputs is not None:
+                os.close(inputs)
+    return dict(result, note="the original bytes are now read-only in inputs/; nothing was changed")
 
 
 def op_register(ws, request):
@@ -712,46 +785,26 @@ def op_register(ws, request):
     name = dest_name(request.get("name"), parts[0] + "-" + parts[-1])
     with ws.lock():
         meta = ws.meta()
-        if any(job.get("into") == parts[0] and job.get("status") == "running" for job in jobs_of(ws)):
+        jobs = refresh_jobs(ws)
+        if any(job.get("into") == parts[0] and job.get("status") == "running" for job in jobs):
             refuse("STANDARD_BUSY")
-        root = ws.open_area("work")
+        producer = next((job for job in reversed(jobs) if job.get("into") == parts[0]), None)
+        root, inputs, derived = ws.open_area("work"), None, None
         try:
-            fd, info = open_regular(root, parts)
-            parent = walk_dirs(root, parts[:-1])
-        finally:
-            os.close(root)
-        inputs = ws.open_area("inputs")
-        try:
-            if info.st_nlink != 1 or info.st_uid != os.getuid():
-                refuse("STANDARD_PATH_INVALID")
+            inputs = ws.open_area("inputs")
             try:
                 os.mkdir("derived", 0o700, dir_fd=inputs)
             except FileExistsError:
                 pass
             derived = os.open("derived", DIR_FLAGS, dir_fd=inputs)
-            try:
-                placed, how = place(ws, fd, parent, parts[-1], derived, name)
-            finally:
-                os.close(derived)
+            result = move_in(ws, meta, root, parts, derived, name, "inputs/derived/" + name, kind,
+                             {"event": "derived", "from": "work/" + "/".join(parts),
+                              "job": producer and {key: producer.get(key) for key in ("id", "kind", "script_sha256", "inputs", "source")}})
         finally:
-            os.close(fd)
-            os.close(parent)
-            os.close(inputs)
-        try:
-            os.fchmod(placed, 0o400)
-            digest = sha256_fd(placed)
-            size = os.fstat(placed).st_size
-        finally:
-            os.close(placed)
-        relative = "inputs/derived/" + name
-        input_id = register(ws, meta, relative, digest, size, kind)
-        producer = next((job for job in reversed(jobs_of(ws)) if job.get("into") == parts[0]), None)
-        record = {"at": now(), "event": "derived", "input_id": input_id, "path": relative, "from": "work/" + "/".join(parts),
-                  "sha256": digest, "bytes": size, "type": kind,
-                  "job": producer and {key: producer.get(key) for key in ("id", "kind", "script_sha256", "inputs", "source")}}
-        ws.append("provenance.jsonl", record)
-    return {"input_id": input_id, "path": relative, "sha256": digest, "bytes": size, "type": kind,
-            "produced_by": producer and producer.get("id")}
+            for fd in (root, inputs, derived):
+                if fd is not None:
+                    os.close(fd)
+    return dict(result, produced_by=producer and producer.get("id"))
 
 
 # -- sandboxed jobs ----------------------------------------------------------------------
@@ -823,6 +876,8 @@ def sandbox_argv(ws, name, out, extra_mounts, command):
 def start_job(ws, kind, into, argv_for, extra=None):
     if any(job.get("status") == "running" for job in refresh_jobs(ws)):
         refuse("STANDARD_BUSY")
+    if low_disk(ws):
+        refuse("STANDARD_DISK_LOW")
     job_id = "job-" + secrets.token_hex(6)
     container = "silo-data-" + ws.name + "-" + job_id[4:]
     argv = argv_for(container)
@@ -869,10 +924,10 @@ def op_extract(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID")
     limit = minutes(request)
     with ws.lock():
+        digest = registered(ws, "/".join(parts))["sha256"]
         root = ws.open_area("inputs")
         try:
             fd, _info = open_regular(root, parts[1:])
-            digest = sha256_fd(fd)
             os.close(fd)
         finally:
             os.close(root)
@@ -891,28 +946,87 @@ def refresh_jobs(ws):
     return jobs
 
 
-def finish(ws, job, keep_logs=False):
+def secret_values(ws):
+    """Every password this workspace's database uses, to keep them out of anything shown."""
+    values = []
+    for name in ("secret.env", "ro.env"):
+        path = ws.data / "db" / name
+        if path.is_file() and not path.is_symlink():
+            values += [line.split("=", 1)[1].encode() for line in path.read_text().splitlines() if "PASSWORD=" in line]
+    return [value for value in values if len(value) >= 16]
+
+
+def redact(ws, data):
+    for value in secret_values(ws):
+        data = data.replace(value, b"[redacted]")
+    return data
+
+
+def free_bytes(path):
+    info = os.statvfs(path)
+    return info.f_bavail * info.f_frsize
+
+
+def low_disk(ws):
+    """True when the disk holding the workspace is below the reserve every service needs."""
+    try:
+        info = os.statvfs(ws.root)
+    except OSError:
+        return False
+    total = info.f_blocks * info.f_frsize
+    return free_bytes(ws.root) < max(DISK_RESERVE, total // 10)
+
+
+def finish(ws, job):
     """Update a running job from its container; when it has exited, keep its log tail and remove it."""
     result = docker(["inspect", "--format", "{{json .State}}", job["container"]], timeout=30)
     if result.returncode:
+        # Only a container Docker says is gone is lost; any other failure leaves the job running.
+        if b"No such" not in result.stderr:
+            return None
+        docker(["rm", "-f", job["container"]], timeout=60)
         job.update(status="lost", finished_at=now())
         ws.write_json(ws.data_dir("jobs") / (job["id"] + ".json"), job)
         return None
     state = json.loads(result.stdout)
     if state.get("Running") or state.get("Status") in ("created", "running", "restarting"):
+        if job.get("kind") != "db_load" and low_disk(ws):
+            docker(["kill", job["container"]], timeout=60)
+            job["stopped_for_disk"] = True
+            ws.write_json(ws.data_dir("jobs") / (job["id"] + ".json"), job)
         return None
     logs = docker(["logs", "--tail", "400", job["container"]], timeout=60)
-    combined = logs.stdout + (b"\n--- stderr ---\n" + logs.stderr if logs.stderr else b"")
+    combined = redact(ws, logs.stdout + (b"\n--- stderr ---\n" + logs.stderr if logs.stderr else b""))
     log_dir = ws.data_dir("jobs")
     fd = os.open(log_dir / (job["id"] + ".log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(combined[-256 * 1024:])
     code = state.get("ExitCode")
-    job.update(status="succeeded" if code == 0 else ("timed_out" if code == 137 and not state.get("OOMKilled") else "failed"),
-               exit_code=code, oom_killed=bool(state.get("OOMKilled")), finished_at=now())
+    status = "succeeded" if code == 0 else ("timed_out" if code == 137 and not state.get("OOMKilled") else "failed")
+    if job.get("stopped_for_disk"):
+        status = "stopped_low_disk"
+    job.update(status=status, exit_code=code, oom_killed=bool(state.get("OOMKilled")), finished_at=now())
+    if job.get("kind") == "db_load":
+        # The dump ran as the database administrator and may have changed the read-only user.
+        job["read_only_user_checked"] = harden_ro_user(ws, job.get("engine"))
     ws.write_json(log_dir / (job["id"] + ".json"), job)
     docker(["rm", "-f", job["container"]], timeout=60)
     return combined
+
+
+def output_listing(directory, limit=50, seconds=20):
+    """Files a job wrote: names and sizes only, never following links, bounded in count and time."""
+    files, total, deadline = [], 0, time.monotonic() + seconds
+    for top, _dirs, names, dirfd in os.fwalk(str(directory), follow_symlinks=False):
+        for name in names:
+            info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            if stat.S_ISREG(info.st_mode):
+                total += 1
+                if len(files) < limit:
+                    files.append({"path": os.path.relpath(os.path.join(top, name), directory.parent), "bytes": info.st_size})
+        if time.monotonic() > deadline:
+            return files, total, False
+    return sorted(files, key=lambda entry: entry["path"]), total, True
 
 
 def op_job(ws, request):
@@ -928,21 +1042,16 @@ def op_job(ws, request):
         with ws.lock():
             finish(ws, job)
     result = {key: job.get(key) for key in ("id", "kind", "status", "exit_code", "oom_killed", "started_at", "finished_at", "into",
-                                             "script_sha256", "timeout_minutes", "source", "error")}
+                                             "script_sha256", "timeout_minutes", "source", "error", "read_only_user_checked")}
     if job.get("status") == "running":
         logs = docker(["logs", "--tail", "200", job["container"]], timeout=60)
-        result["log_tail"], result["log_truncated"] = tail_text(logs.stdout + logs.stderr)
+        result["log_tail"], result["log_truncated"] = tail_text(redact(ws, logs.stdout + logs.stderr))
     else:
         log = ws.data / "jobs" / (job_id + ".log")
         result["log_tail"], result["log_truncated"] = tail_text(log.read_bytes() if log.is_file() else b"")
-    if job.get("into") and (ws.root / "work" / job["into"]).is_dir():
-        files, total = [], 0
-        for path in sorted((ws.root / "work" / job["into"]).rglob("*")):
-            if path.is_file() and not path.is_symlink():
-                total += 1
-                if len(files) < 50:
-                    files.append({"path": str(path.relative_to(ws.root / "work")), "bytes": path.stat().st_size})
-        result["outputs"], result["outputs_total"] = files, total
+    work = ws.root / "work" / (job.get("into") or "")
+    if job.get("into") and work.is_dir() and not work.is_symlink():
+        result["outputs"], result["outputs_total"], result["outputs_complete"] = output_listing(work)
     return result
 
 
@@ -957,14 +1066,18 @@ def db_state(ws):
 
 
 def db_secret(ws, engine=None):
+    """secret.env: the server's administrator password, given to the server and loader containers.
+    ro.env: the read-only user's password, used only from the host (and later DBHub), so a dump
+    that runs commands in a client container can't see it."""
     path = ws.data_dir("db") / "secret.env"
     if engine:
         root, ro = secrets.token_hex(24), secrets.token_hex(24)
         lines = {"mariadb": ["MARIADB_ROOT_PASSWORD=" + root, "MARIADB_DATABASE=source"],
                  "postgres": ["POSTGRES_PASSWORD=" + root, "DB_PASSWORD=" + root, "DB_USER=postgres", "POSTGRES_DB=source"]}[engine]
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write("\n".join(lines + ["SILO_RO_USER=" + RO_USER, "SILO_RO_PASSWORD=" + ro]) + "\n")
+        for name, content in (("secret.env", lines), ("ro.env", ["SILO_RO_USER=" + RO_USER, "SILO_RO_PASSWORD=" + ro])):
+            fd = os.open(ws.data_dir("db") / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write("\n".join(content) + "\n")
     return path
 
 
@@ -973,31 +1086,52 @@ def db_exec(ws, engine, sql=None, query=None, timeout=60):
     container = db_names(ws)["container"]
     if engine == "mariadb":
         argv = ["exec", "-i", "--env-file", str(db_secret(ws)), container, "bash", "-c",
-                'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot -N -B --protocol=socket']
+                'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot -N -B --protocol=socket --sandbox']
     else:
         argv = ["exec", "-i", container, "psql", "-U", "postgres", "-d", "source", "-v", "ON_ERROR_STOP=1", "-q", "-At"]
     return docker(argv, timeout=timeout, input=(sql or query).encode("utf-8"))
 
 
-def ensure_ro_user(ws, engine):
-    password = next(line.split("=", 1)[1] for line in db_secret(ws).read_text().splitlines() if line.startswith("SILO_RO_PASSWORD="))
+def ro_password(ws):
+    path = ws.data / "db" / "ro.env"
+    password = next((line.split("=", 1)[1] for line in path.read_text().splitlines() if line.startswith("SILO_RO_PASSWORD=")), "") if path.is_file() else ""
     if not re.fullmatch(r"[0-9a-f]{48}", password):
-        refuse("STANDARD_OPERATION_FAILED")
+        refuse("STANDARD_DB_STATE_MISSING")
+    return password
+
+
+def harden_ro_user(ws, engine):
+    """(Re)create the read-only user and reduce it to reading, whatever a loaded dump did to it."""
+    if engine not in ENGINES:
+        return False
+    password = ro_password(ws)
     if engine == "mariadb":
-        sql = (f"CREATE USER IF NOT EXISTS '{RO_USER}'@'%' IDENTIFIED BY '{password}';\n"
-               f"GRANT SELECT, SHOW VIEW ON `source`.* TO '{RO_USER}'@'%';\n")
-    else:
-        sql = (f"DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{RO_USER}') THEN "
-               f"CREATE ROLE {RO_USER} LOGIN PASSWORD '{password}'; END IF; END$$;\n"
-               f"ALTER ROLE {RO_USER} SET default_transaction_read_only = on;\n"
-               f"GRANT CONNECT ON DATABASE source TO {RO_USER};\n" + pg_grants())
+        sql = (f"CREATE USER IF NOT EXISTS '{RO_USER}'@'%';\nALTER USER '{RO_USER}'@'%' IDENTIFIED BY '{password}';\n"
+               f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM '{RO_USER}'@'%';\nSET DEFAULT ROLE NONE FOR '{RO_USER}'@'%';\n"
+               "SELECT CONCAT('REVOKE `', Role, '` FROM `', User, '`@`', Host, '`;') FROM mysql.roles_mapping "
+               f"WHERE User = '{RO_USER}' AND Role <> '';\n")
+        first = db_exec(ws, engine, sql)
+        if first.returncode:
+            return False
+        revokes = first.stdout.decode("utf-8", "replace")
+        databases = db_exec(ws, engine, query="SHOW DATABASES;")
+        if databases.returncode:
+            return False
+        grants = "".join(f"GRANT SELECT, SHOW VIEW ON `{name}`.* TO '{RO_USER}'@'%';\n"
+                         for name in databases.stdout.decode("utf-8", "replace").splitlines()
+                         if name and name not in SYSTEM_DATABASES.split("|") and "`" not in name)
+        return db_exec(ws, engine, revokes + grants + "FLUSH PRIVILEGES;\n").returncode == 0
+    sql = (f"DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{RO_USER}') THEN CREATE ROLE {RO_USER} LOGIN; END IF; END$$;\n"
+           f"ALTER ROLE {RO_USER} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD '{password}';\n"
+           f"ALTER ROLE {RO_USER} SET default_transaction_read_only = on;\n"
+           f"DO $$DECLARE r text; BEGIN FOR r IN SELECT b.rolname FROM pg_auth_members m JOIN pg_roles b ON b.oid = m.roleid "
+           f"JOIN pg_roles u ON u.oid = m.member WHERE u.rolname = '{RO_USER}' LOOP EXECUTE format('REVOKE %I FROM {RO_USER}', r); END LOOP; END$$;\n"
+           f"GRANT CONNECT ON DATABASE source TO {RO_USER};\n"
+           "DO $$DECLARE s text; BEGIN FOR s IN SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' "
+           f"AND nspname <> 'information_schema' LOOP EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM {RO_USER}', s); "
+           f"EXECUTE format('GRANT USAGE ON SCHEMA %I TO {RO_USER}', s); "
+           f"EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO {RO_USER}', s); END LOOP; END$$;\n")
     return db_exec(ws, engine, sql).returncode == 0
-
-
-def pg_grants():
-    return ("DO $$DECLARE s text; BEGIN FOR s IN SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' "
-            f"AND nspname <> 'information_schema' LOOP EXECUTE format('GRANT USAGE ON SCHEMA %I TO {RO_USER}', s); "
-            f"EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO {RO_USER}', s); END LOOP; END$$;\n")
 
 
 def db_ready(ws, engine):
@@ -1007,6 +1141,16 @@ def db_ready(ws, engine):
     else:
         result = docker(["exec", container, "pg_isready", "-q", "-h", "127.0.0.1", "-U", "postgres"], timeout=20)
     return result.returncode == 0
+
+
+def network_safe(ws):
+    """The project network must be internal and give the host no address on it: a plain
+    --internal bridge still lets containers reach host services through its gateway."""
+    result = docker(["network", "inspect", "--format", "{{json .}}", db_names(ws)["network"]], timeout=30)
+    if result.returncode:
+        return None
+    network = json.loads(result.stdout)
+    return bool(network.get("Internal")) and (network.get("Options") or {}).get("com.docker.network.bridge.inhibit_ipv4") == "true"
 
 
 def op_db_up(ws, request):
@@ -1020,14 +1164,22 @@ def op_db_up(ws, request):
         if state and state["engine"] != engine:
             refuse("STANDARD_DB_ENGINE_MISMATCH")
         image = ws.image(ENGINES[engine])
+        safe = network_safe(ws)
+        if safe is False:
+            refuse("STANDARD_DB_NETWORK_UNSAFE")
         inspected = docker(["inspect", "--format", "{{.State.Running}}", names["container"]], timeout=30)
         if inspected.returncode == 0:
+            if not state:
+                refuse("STANDARD_DB_STATE_MISSING")
             if inspected.stdout.strip() != b"true":
                 docker_ok(["start", names["container"]])
         else:
-            if docker(["network", "inspect", names["network"]], timeout=30).returncode:
-                docker_ok(["network", "create", "--internal", "--label", "silo.workspace=" + ws.name, names["network"]])
+            if safe is None:
+                docker_ok(["network", "create", "--internal", "-o", "com.docker.network.bridge.inhibit_ipv4=true",
+                           "--label", "silo.workspace=" + ws.name, names["network"]])
             if not state:
+                if docker(["volume", "inspect", names["volume"]], timeout=30).returncode == 0:
+                    refuse("STANDARD_DB_STATE_MISSING")
                 db_secret(ws, engine)
             command = (["--innodb-buffer-pool-size=1G", "--max-allowed-packet=1G", "--innodb-flush-log-at-trx-commit=2", "--skip-name-resolve"]
                        if engine == "mariadb" else
@@ -1040,19 +1192,31 @@ def op_db_up(ws, request):
                        "--memory-swap", DB_LIMITS["memory"], "--pids-limit", DB_LIMITS["pids"], "--log-opt", "max-size=4m",
                        "--log-opt", "max-file=1", "--shm-size", "256m", "--mount", f"type=volume,src={names['volume']},dst={data}",
                        "--env-file", str(db_secret(ws)), image, *command])
-            state = {"engine": engine, "image": image, "created_at": now(), "loads": [], "ro_user": False}
-            ws.write_json(ws.data_dir("db") / "state.json", state)
+            if not state:
+                state = {"engine": engine, "image": image, "created_at": now(), "loads": [], "ro_user": False}
+                ws.write_json(ws.data_dir("db") / "state.json", state)
         deadline = time.monotonic() + 90
         ready = db_ready(ws, engine)
         while not ready and time.monotonic() < deadline:
             time.sleep(2)
             ready = db_ready(ws, engine)
         if ready and not state.get("ro_user"):
-            state["ro_user"] = ensure_ro_user(ws, engine)
+            state["ro_user"] = harden_ro_user(ws, engine)
             ws.write_json(ws.data_dir("db") / "state.json", state)
-    return {"engine": engine, "ready": ready, "network": names["network"] + " (internal: no outside access)",
+    return {"engine": engine, "ready": ready, "network": names["network"] + " (internal: no outside access, no host address)",
             "read_only_user": RO_USER if state.get("ro_user") else None,
             "next": "data_db_load with a registered input" if ready else "still starting; check data_db_status"}
+
+
+def registered(ws, relative):
+    """The registry record of an input path: its checksum stands for the bytes (inputs are read-only)."""
+    for record in ws.named_state().get("inputs", {}).values():
+        if base64.b64decode(record["path"]).decode("utf-8", "replace") == relative:
+            return record
+    refuse("STANDARD_INPUT_NOT_REGISTERED")
+
+
+SQL_KINDS = {"mariadb": ("mysql-dump", "sql", "text"), "postgres": ("postgres-dump", "sql", "text")}
 
 
 def op_db_load(ws, request):
@@ -1073,33 +1237,39 @@ def op_db_load(ws, request):
         engine = state["engine"]
         if not db_ready(ws, engine):
             refuse("STANDARD_DB_NOT_READY")
-        if not state.get("ro_user"):
-            state["ro_user"] = ensure_ro_user(ws, engine)
+        if network_safe(ws) is not True:
+            refuse("STANDARD_DB_NETWORK_UNSAFE")
+        record = registered(ws, "/".join(parts))
         root = ws.open_area("inputs")
         try:
-            fd, _info = open_regular(root, parts[1:])
+            fd, info = open_regular(root, parts[1:])
             kind = describe(fd)
-            digest = sha256_fd(fd)
             os.close(fd)
         finally:
             os.close(root)
+        if info.st_size != record["bytes"] or info.st_mode & 0o222:
+            refuse("STANDARD_INPUT_CHANGED")
+        compressed, inner = (kind["kind"], kind["inner"]) if "inner" in kind else (None, kind["kind"])
+        custom = engine == "postgres" and inner == "postgres-custom-dump" and compressed is None
+        if not custom and (compressed not in (None, "gzip", "bzip2", "xz") or inner not in SQL_KINDS[engine]):
+            # e.g. an archive (extract it first), zstd, a MySQL dump for PostgreSQL or the reverse.
+            refuse("STANDARD_DUMP_KIND_UNSUPPORTED")
         source = ws.root / "inputs" / "/".join(parts[1:])
-        decompress = {"gzip": "gzip -dc", "bzip2": "bzip2 -dc", "xz": "xz -dc"}.get(kind["kind"], "cat")
+        decompress = {"gzip": "gzip -dc", "bzip2": "bzip2 -dc", "xz": "xz -dc"}.get(compressed, "cat")
         if engine == "mariadb":
-            script = (f'set -o pipefail; {decompress} /in/dump | MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -h source-db -uroot '
-                      f'--default-character-set={charset} {"" if stop_on_error else "--force "}source && '
-                      f'for d in $(MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -h source-db -uroot -N -B -e "SHOW DATABASES" | grep -vxE "{SYSTEM_DATABASES}"); do '
-                      f'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -h source-db -uroot -e "GRANT SELECT, SHOW VIEW ON \\`$d\\`.* TO \'{RO_USER}\'@\'%\'"; done; echo LOAD_DONE')
-        elif kind.get("kind") == "postgres-custom-dump":
+            # --sandbox: the client refuses \! and system, so the dump can't run commands here.
+            script = (f'set -o pipefail; {decompress} /in/dump | MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -h source-db -uroot --sandbox '
+                      f'--default-character-set={charset} {"" if stop_on_error else "--force "}source; code=$?; echo LOAD_DONE; exit $code')
+        elif custom:
             script = (f'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore --no-owner --no-privileges -h source-db -U postgres -d source '
-                      f'{"--exit-on-error " if stop_on_error else ""}/in/dump; code=$?; '
-                      f'PGPASSWORD="$POSTGRES_PASSWORD" psql -h source-db -U postgres -d source -q <<\'SQL\'\n{pg_grants()}SQL\n'
-                      'echo LOAD_DONE; exit $code')
+                      f'{"--exit-on-error " if stop_on_error else ""}/in/dump; code=$?; echo LOAD_DONE; exit $code')
         else:
-            script = (f'set -o pipefail; {decompress} /in/dump | PGPASSWORD="$POSTGRES_PASSWORD" psql -h source-db -U postgres -d source -q '
-                      f'-v ON_ERROR_STOP={1 if stop_on_error else 0}; code=$?; '
-                      f'PGPASSWORD="$POSTGRES_PASSWORD" psql -h source-db -U postgres -d source -q <<\'SQL\'\n{pg_grants()}SQL\n'
-                      'echo LOAD_DONE; exit $code')
+            # psql runs backslash commands from the dump (\! runs a shell). A random \restrict key,
+            # with the dump's own \restrict/\unrestrict lines dropped, refuses all of them.
+            key = secrets.token_hex(16)
+            script = (f'set -o pipefail; {{ printf "%s\\n" "\\\\restrict {key}"; {decompress} /in/dump | sed -E "/^\\\\\\\\(un)?restrict /d"; }} | '
+                      f'PGPASSWORD="$POSTGRES_PASSWORD" psql -h source-db -U postgres -d source -q -v ON_ERROR_STOP={1 if stop_on_error else 0}; '
+                      'code=$?; echo LOAD_DONE; exit $code')
 
         def argv(name):
             return ["run", "-d", "--name", name, "--label", "silo.workspace=" + ws.name, "--label", "silo.role=data-job",
@@ -1109,9 +1279,9 @@ def op_db_load(ws, request):
                     "--log-opt", "max-file=1", "--tmpfs", "/tmp:rw,size=64m", "-e", "HOME=/tmp", *mount(source, "/in/dump"),
                     "--env-file", str(db_secret(ws)), "--entrypoint", "timeout", state["image"], "-s", "KILL", str(limit * 60),
                     "bash", "-c", script]
-        record = start_job(ws, "db_load", None, argv, {"source": {"path": "/".join(parts), "sha256": digest, "kind": kind},
+        record = start_job(ws, "db_load", None, argv, {"source": {"path": "/".join(parts), "sha256": record["sha256"], "kind": kind},
                                                         "engine": engine, "charset": charset, "timeout_minutes": limit})
-        state["loads"].append({"job_id": record["id"], "path": "/".join(parts), "sha256": digest, "started_at": record["started_at"]})
+        state["loads"].append({"job_id": record["id"], "path": "/".join(parts), "sha256": record["source"]["sha256"], "started_at": record["started_at"]})
         ws.write_json(ws.data_dir("db") / "state.json", state)
     return {"job_id": record["id"], "status": "running", "engine": engine, "source_kind": kind,
             "next": "poll data_job; then data_db_status"}
@@ -1127,7 +1297,7 @@ def op_db_status(ws, request):
     running = inspected.returncode == 0 and inspected.stdout.strip() == b"running"
     result = {"engine": state["engine"], "container": inspected.stdout.decode().strip() if inspected.returncode == 0 else "missing",
               "ready": running and db_ready(ws, state["engine"]), "read_only_user": RO_USER if state.get("ro_user") else None,
-              "loads": state.get("loads", []), "network": names["network"] + " (internal)"}
+              "loads": state.get("loads", [])[-20:], "network": names["network"] + " (internal)"}
     if result["ready"]:
         if state["engine"] == "mariadb":
             query = (f"SELECT table_schema, COUNT(*), ROUND(SUM(data_length + index_length) / 1048576) FROM information_schema.tables "
@@ -1137,7 +1307,7 @@ def op_db_status(ws, request):
                      "WHERE table_schema NOT IN ('pg_catalog','information_schema') GROUP BY table_schema;")
         out = db_exec(ws, state["engine"], query=query)
         rows = [line.split("\t" if state["engine"] == "mariadb" else "|") for line in out.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
-        result["schemas"] = [{"schema": row[0], "tables": int(row[1]), "approx_mb": row[2]} for row in rows[:20] if len(row) == 3]
+        result["schemas"] = [{"schema": row[0], "tables": int(row[1]), "approx_mb": row[2]} for row in rows[:20] if len(row) == 3 and row[1].isdigit()]
         result["queries"] = "free queries: through DBHub once term-llm can attach an MCP server to migration-data only"
     return result
 
@@ -1152,8 +1322,11 @@ def op_db_reset(ws, request):
             refuse("STANDARD_BUSY")
         docker(["rm", "-f", names["container"]], timeout=120)
         docker(["volume", "rm", "-f", names["volume"]], timeout=120)
+        # Passwords stay with the data: forget them only once the container and volume are gone.
+        if docker(["inspect", names["container"]], timeout=30).returncode == 0 or docker(["volume", "inspect", names["volume"]], timeout=30).returncode == 0:
+            refuse("STANDARD_DB_RESET_INCOMPLETE")
         docker(["network", "rm", names["network"]], timeout=60)
-        for name in ("state.json", "secret.env"):
+        for name in ("state.json", "secret.env", "ro.env"):
             path = ws.data / "db" / name
             if path.is_file() and not path.is_symlink():
                 path.unlink()
