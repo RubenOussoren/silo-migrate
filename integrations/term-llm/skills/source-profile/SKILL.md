@@ -6,8 +6,9 @@ description: Profile a migration source (forum database, export or another Disco
 # Source profile and schema finding
 
 ## Gather (from the loaded database, the dump and sandbox scripts)
-With DBHub on (`db-<project>`): `search_objects` for tables and columns (`detail_level:
-summary`), then `execute_sql` for exact counts and value shapes, e.g. `SELECT visible,
+With DBHub on (`db-<project>`): `search_objects` for tables, then **a table's columns before
+you query it** (`object_type: column`, `schema`, `table`; guessed column names just fail),
+then `execute_sql` for exact counts and value shapes, e.g. `SELECT visible,
 COUNT(*) FROM mybb_posts GROUP BY visible`, `SELECT MIN(dateline), MAX(dateline) …`,
 `SELECT LENGTH(message) …`. At most 50 rows come back: aggregate, don't page through rows.
 Without DBHub: `data_db_status`, `CREATE TABLE` from the dump, and sandbox scripts.

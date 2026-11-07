@@ -25,7 +25,9 @@ MyBB 1.8 needs MySQL 5.x+; 1.6 is very old (expect latin1 tables).
   `disporder`, `linkto` = link forum, `active`, `open`).
 - `threads` (`tid`, `fid`, `subject`, `uid`, `dateline`, `firstpost`, `views`,
   `replies`, `sticky`, `closed` (may hold `moved|<tid>` for redirects), `visible`: 1
-  visible, 0 unapproved, -1 soft-deleted; `prefix` → `threadprefixes`).
+  visible, 0 unapproved, -1 soft-deleted, -2 a user's saved **draft** (1.8; a draft
+  thread has the thread and its first post at -2; never published, normally not migrated);
+  `prefix` → `threadprefixes`).
 - `posts` (`pid`, `tid`, `replyto`, `uid`, `username` for guests, `dateline`,
   `message` MyCode, `visible` as threads, `ipaddress` binary, `edituid`/`edittime`).
 - `attachments` (`aid`, `pid`, `uid`, `filename` original name, `attachname` stored path
