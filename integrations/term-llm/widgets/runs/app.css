@@ -50,3 +50,4 @@ button:disabled { opacity: .4; cursor: default; }
 #toast { position: fixed; right: 18px; bottom: 18px; max-width: 440px; padding: 10px 14px; border-radius: 8px; background: #222; color: #fff; opacity: 0; transition: opacity .2s; pointer-events: none; }
 #toast.show { opacity: .95; } #toast.bad { background: var(--danger); }
 @media (max-width: 760px) { main { grid-template-columns: 1fr; height: auto; } #list-pane { border-right: 0; max-height: 50vh; } }
+.badge.not_pushed { color: var(--warn); }

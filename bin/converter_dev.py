@@ -444,6 +444,33 @@ def op_status(checkout, request):
             "migration_branch_prefix": checkout.migration_prefix()}
 
 
+def converter_log(checkout, limit=30):
+    """Engineer view (the Runs widget): where the checkout is, what is committed and what has
+    reached GitHub. Commits are pushed when an origin branch contains them."""
+    unpushed_shas = {commit["sha"] for commit in unpushed(checkout)}
+    commits = []
+    for line in checkout.out("log", "--format=%H%x00%an%x00%aI%x00%s", "-n", str(limit), "HEAD").splitlines():
+        sha, name, date, subject = (line.split("\0") + ["", "", "", ""])[:4]
+        if re.fullmatch(r"[0-9a-f]{40}", sha):
+            commits.append({"sha": sha, "author": name[:120], "date": date[:40], "subject": subject[:200], "pushed": sha not in unpushed_shas})
+    branches = []
+    refs = checkout.out("for-each-ref", "--format=%(refname:short)%00%(objectname)%00%(committerdate:iso-strict)",
+                        "refs/heads/" + checkout.migration_prefix())
+    for line in refs.splitlines()[:50]:
+        name, sha, date = (line.split("\0") + ["", "", ""])[:3]
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            continue
+        ahead = checkout.out("rev-list", "--count", sha, "--not", "--remotes=origin").strip()
+        on_remote = checkout.git("show-ref", "--verify", "--quiet", "refs/remotes/origin/" + name, ok=(0, 1)).returncode == 0
+        branches.append({"name": name, "head": sha, "date": date[:40], "not_pushed": int(ahead) if ahead.isdigit() else None, "on_github": on_remote})
+    base = checkout.git("show-ref", "--verify", "--quiet", "refs/remotes/origin/main", ok=(0, 1)).returncode == 0
+    ahead_of_main = checkout.out("rev-list", "--count", "HEAD", "--not", "refs/remotes/origin/main").strip() if base else ""
+    shown, hidden = changes(checkout)
+    return {"workspace": checkout.workspace, "branch": checkout.branch(), "head": checkout.head(), "uncommitted": len(shown) + hidden,
+            "ahead_of_main": int(ahead_of_main) if ahead_of_main.isdigit() else None, "not_pushed": len(unpushed_shas),
+            "commits": commits, "branches": branches}
+
+
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
@@ -1335,7 +1362,7 @@ def fit(result):
 
 def main(args, values, base, repo, host, stdin, home=None):
     """`converter dev WS --role ROLE` (JSON request on stdin), `converter push WS --sha256 D [--no-pr]`,
-    `converter push-show WS`, `converter deps WS`."""
+    `converter push-show WS`, `converter deps WS`, `converter log WS`."""
     home = home or os.path.expanduser("~")
     if len(args) >= 3 and args[1] == "dev":
         workspace, rest = args[2], args[3:]
@@ -1382,6 +1409,8 @@ def main(args, values, base, repo, host, stdin, home=None):
         if ready is None:
             refuse("STANDARD_CONVERTER_DEPS_FAILED: " + prepared["status"] + (" (" + prepared["step"] + ")" if prepared.get("step") else ""))
         return dict(version=1, head=checkout.head(), dependencies=prepared)
+    if len(args) == 3 and args[1] == "log":
+        return dict(version=1, **converter_log(Checkout(base, args[2], host)))
     if len(args) == 3 and args[1] == "push-show":
         # The engineer's view: full PR text, files and diff stat of every proposal.
         return dict(version=1, **op_push_show(Checkout(base, args[2], host), {}, full=True))

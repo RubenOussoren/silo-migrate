@@ -84,6 +84,10 @@ elif args[:3] == ['standard', 'plan', 'show']:
 elif args[:3] == ['standard', 'run', 'show']:
     print(json.dumps({'version': 1, 'run_id': args[4], 'status': 'completed', 'stages': {'convert': 'passed'},
                       'results': {'reconciliation_checks': 1, 'reconciliation_matched': 0, 'reconciliation_differs': 1, 'reconciliation_errors': 0}}))
+elif args[:2] == ['converter', 'log']:
+    print(json.dumps({'version': 1, 'workspace': args[2], 'branch': 'migration/arc/mybb-core-conversion', 'head': '7' * 40, 'uncommitted': 2,
+                      'not_pushed': 2, 'ahead_of_main': 2, 'commits': [{'sha': '7' * 40, 'subject': 'Add validated MyBB converter foundations', 'pushed': False}],
+                      'branches': [{'name': 'migration/arc/mybb-converter', 'head': '7' * 40, 'not_pushed': 2, 'on_github': False}]}))
 elif args[0] == 'start-run':
     print(json.dumps({'version': 1, 'plan_id': args[2], 'run_id': 'run-' + 'e' * 32, 'status': 'claimed'}))
     print('detached')
@@ -185,7 +189,9 @@ else:
     def test_overview_joins_control_status_with_disk(self):
         status, data = self.get('/api/overview?workspace=arc')
         self.assertEqual(200, status)
-        self.assertEqual([['standard', 'status', 'arc']], self.calls())
+        self.assertEqual([['standard', 'status', 'arc'], ['converter', 'log', 'arc']], self.calls())
+        self.assertEqual({'branch': 'migration/arc/mybb-core-conversion', 'head': '7' * 40, 'uncommitted': 2, 'not_pushed': 2, 'ahead_of_main': 2},
+                         data['converter'])
         self.assertEqual(['proposed', 'stale'], [p['status'] for p in data['plans']])
         self.assertEqual(['standard_convert', 'standard_convert'], [p['operation'] for p in data['plans']])
         self.assertEqual('mybb', data['plans'][0]['platform'])
@@ -218,6 +224,15 @@ else:
         self.assertIsNone(self.get('/api/push?workspace=arc&id=' + 'f' * 64)[1]['pull_request']['url'])
         self.assertEqual(404, self.get('/api/push?workspace=arc&id=' + 'e' * 64)[0])
         self.assertEqual(400, self.get('/api/run?workspace=arc&id=run-1')[0])
+
+    def test_converter_view_is_read_only_and_survives_a_refusal(self):
+        status, data = self.get('/api/converter?workspace=arc&id=arc')
+        self.assertEqual(200, status)
+        self.assertEqual('Add validated MyBB converter foundations', data['commits'][0]['subject'])
+        self.assertEqual([['converter', 'log', 'arc']], self.calls())
+        self.assertEqual(404, self.get('/api/converter?workspace=notes')[0])
+        os.environ['RUNS_MODE'] = 'refuse'
+        self.assertEqual(409, self.get('/api/converter?workspace=arc')[0])
 
     def test_actions_run_exact_control_commands(self):
         with mock.patch.object(self.w, 'reviewer_name', return_value='Ruben (web UI)'):

@@ -73,7 +73,7 @@ function readHash() {
   const params = new URLSearchParams(location.hash.slice(1));
   if (params.get('ws')) state.workspace = params.get('ws');
   const kind = params.get('kind');
-  state.selected = ['plan', 'run', 'push'].includes(kind) && params.get('id') ? { kind, id: params.get('id') } : null;
+  state.selected = ['plan', 'run', 'push', 'converter'].includes(kind) && params.get('id') ? { kind, id: params.get('id') } : null;
 }
 
 function writeHash() {
@@ -126,7 +126,12 @@ async function loadList() {
   const runItem = (run) => entry('run', run.run_id, `Run ${short(run.run_id, 12)}`,
     [badge(run.status), ` ${run.stage ? `${run.stage} · ` : ''}${ago(run.started_at)}`]);
   const pushItem = (push) => entry('push', push.digest, push.title || 'Converter push', [badge(push.status), ` ${push.branch || ''} · ${ago(push.proposed_at)}`]);
+  const conv = data.converter || {};
+  const converterItem = entry('converter', data.workspace, conv.error ? 'Converter' : `Converter · ${conv.branch || '?'}`,
+    conv.error ? [badge('error'), ` ${conv.error}`]
+      : [`${short(conv.head, 8)} · ${conv.not_pushed ?? '?'} not on GitHub`, conv.uncommitted ? ` · ${conv.uncommitted} uncommitted` : '']);
   const sections = [
+    ['Converter', [converterItem]],
     ['Waiting for you', [...plans.filter((p) => p.status === 'proposed' || p.status === 'approved').map(planItem),
       ...data.pushes.filter((p) => p.status === 'proposed').map(pushItem)]],
     ['Running', runs.filter((r) => ['claimed', 'running'].includes(r.status)).map(runItem)],
@@ -286,6 +291,25 @@ function renderRun(run) {
   return parts;
 }
 
+function renderConverter(log) {
+  const parts = [el('h2', {}, `Converter checkout · ${log.workspace}`), facts([
+    ['Branch', log.branch, true], ['Head', log.head, true],
+    ['Not on GitHub', `${log.not_pushed} commit(s)`],
+    ['Ahead of main', log.ahead_of_main == null ? null : `${log.ahead_of_main} commit(s)`],
+    ['Uncommitted', log.uncommitted ? `${log.uncommitted} change(s): converter-developer is working, or files were left behind` : 'none'],
+  ])];
+  parts.push(el('p', { class: 'note' }, 'Commits reach GitHub only when converter-developer proposes a push (dev_push_propose) and you approve it here. Runs use the committed head of this checkout, not GitHub.'));
+  parts.push(block('Recent commits', table(['Commit', 'Subject', 'Author', 'Date', 'GitHub'],
+    (log.commits || []).map((c) => [el('span', { class: 'mono', title: c.sha }, short(c.sha, 10)), c.subject, c.author, (c.date || '').slice(0, 16).replace('T', ' '),
+      badge(c.pushed ? 'pushed' : 'not_pushed')]))));
+  if ((log.branches || []).length) {
+    parts.push(block('Migration branches', table(['Branch', 'Head', 'Not on GitHub', 'On GitHub'],
+      log.branches.map((b) => [el('span', { class: `mono${b.name === log.branch ? ' current' : ''}` }, b.name + (b.name === log.branch ? ' (current)' : '')),
+        el('span', { class: 'mono' }, short(b.head, 10)), b.not_pushed == null ? '' : String(b.not_pushed), b.on_github ? 'yes' : 'no']), [2])));
+  }
+  return parts;
+}
+
 function renderPush(push) {
   const pull = push.pull_request;
   const parts = [el('h2', {}, push.title || 'Converter push'), facts([
@@ -324,7 +348,8 @@ async function loadDetail() {
     return;
   }
   if (ticket !== tickets.detail || workspace !== state.workspace || !state.selected || state.selected.id !== id) return;  // something newer was opened
-  pane.replaceChildren(...(kind === 'plan' ? renderPlan(data) : kind === 'run' ? renderRun(data) : renderPush(data)).filter(Boolean));
+  const render = { plan: renderPlan, run: renderRun, push: renderPush, converter: renderConverter }[kind];
+  pane.replaceChildren(...render(data).filter(Boolean));
   if (kind === 'run' && ['claimed', 'running'].includes(data.status)) {
     pollTimer = setTimeout(() => { if (!document.hidden) refreshAll(); }, 10000);
   }

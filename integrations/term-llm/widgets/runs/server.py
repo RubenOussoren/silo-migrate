@@ -11,6 +11,8 @@ the service account:
           see them), reset and recover
   pushes  converter-developer proposes; here the engineer reads the PR text, commits and files
           and pushes it as a draft PR (exact digest)
+  converter  read-only: the checkout's branch, uncommitted changes, recent commits (pushed to
+          GitHub or not) and the project's migration branches
 
 Every decision runs through `silo-migrate-control …`, which locks, validates and records it,
 exactly as on the command line. The tab's counts are read straight from disk (cheap to poll);
@@ -309,7 +311,12 @@ def overview(store, control, workspace):
         body = (bodies.get(plan.get("plan_id")) or {}).get("body") or {}
         plan["operation"] = text_or_none(body.get("operation"))
         plan["platform"] = text_or_none(body.get("platform"))
-    return {"workspace": workspace, "workspaces": store.workspaces(), "plans": plans,
+    try:
+        log = control_call(control, ["converter", "log", workspace], 30)
+        converter = {key: log.get(key) for key in ("branch", "head", "uncommitted", "not_pushed", "ahead_of_main")}
+    except Refused as refused:
+        converter = {"error": refused.code}
+    return {"workspace": workspace, "workspaces": store.workspaces(), "plans": plans, "converter": converter,
             "runs": [run for run in status.get("runs", []) if isinstance(run, dict)],
             "pushes": [push_summary(record) for record in store.pushes(workspace)][:20]}
 
@@ -346,6 +353,11 @@ def run_detail(store, control, workspace, run_id):
     reconciliation = results.get("reconciliation") if isinstance(results.get("reconciliation"), list) else None
     return dict(shown, workspace=workspace, reconciliation=reconciliation,
                 conversion_summary=store.evidence(workspace, run_id, "conversion-summary.txt"))
+
+
+def converter_detail(store, control, workspace):
+    store.root(workspace)
+    return dict(control_call(control, ["converter", "log", workspace], 30), workspace=workspace)
 
 
 def push_detail(store, workspace, digest):
@@ -423,6 +435,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, plan_detail(store, control, query.get("workspace"), query.get("id")))
             if url.path == "/api/run":
                 return self.send(200, run_detail(store, control, query.get("workspace"), query.get("id")))
+            if url.path == "/api/converter":
+                return self.send(200, converter_detail(store, control, query.get("workspace")))
             if url.path == "/api/push":
                 return self.send(200, push_detail(store, query.get("workspace"), query.get("id")))
             return self.send(404, {"error": "STANDARD_NOT_FOUND"})

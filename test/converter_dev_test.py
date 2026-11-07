@@ -229,6 +229,29 @@ class ConverterDevTest(unittest.TestCase):
         self.call('edit', path='lib/importer.rb', old_text='row[:login].downcase', new_text='row[:login].to_s.downcase')
         return self.call('commit', message='Handle Khoros users without a login\n\n## Why\nDeleted accounts have no login.\n')
 
+    def test_converter_log_shows_branch_commits_and_what_reached_github(self):
+        log = lambda: self.dev.main(['converter', 'log', self.ws], {}, self.base, ROOT, self.host, io.StringIO(''))
+        before = log()
+        self.assertEqual('main', before['branch'])
+        self.assertEqual([True], [c['pushed'] for c in before['commits']])
+        self.assertEqual((0, 0, []), (before['not_pushed'], before['ahead_of_main'], before['branches']))
+        self.commit_fix()
+        after = log()
+        self.assertEqual('migration/example-forum/null-login-users', after['branch'])
+        self.assertEqual([False, True], [c['pushed'] for c in after['commits']])
+        self.assertEqual('Handle Khoros users without a login', after['commits'][0]['subject'])
+        # The fixture leaves three untracked customer-like files in the checkout: counted, never named.
+        self.assertEqual((1, 1, 3), (after['not_pushed'], after['ahead_of_main'], after['uncommitted']))
+        self.assertEqual([('migration/example-forum/null-login-users', 1, False)], [(b['name'], b['not_pushed'], b['on_github']) for b in after['branches']])
+        self.call('write', path='lib/work_in_progress.rb', content='# wip\n')
+        self.assertEqual(4, log()['uncommitted'])
+        self.assertNotIn('customer-users', json.dumps(log()))
+        # Nothing an agent wrote outside the visible files shows up as text: only counts.
+        self.assertNotIn(MARKER, json.dumps(log()))
+        git(self.checkout, 'config', 'core.pager', 'sh -c id')
+        with self.assertRaisesRegex(ValueError, 'STANDARD_CONVERTER_CONFIG'):
+            log()
+
     def test_commit_as_engineer_with_trailer_never_stages_ignored_files(self):
         self.assertEqual('STANDARD_DEV_NOT_MIGRATION_BRANCH', self.call('commit', message='x')['error'])
         self.call('branch', topic='fix')
