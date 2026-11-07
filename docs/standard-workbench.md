@@ -248,6 +248,14 @@ converter-reviewer on Claude (`claude-bin`, which must be configured and signed 
   with the dependency cache mounted read-only. So is Discourse's `site_settings.yml`, the
   workspace's bound copy (sha256 checked), at `tmp/requires/discourse/config/`, where `convert`'s
   `SiteSetting.load_settings` finds it offline, exactly as in workflow runs.
+- **CI parity:** suite `lint` runs Rubocop and `stree check` on Gemfile and `*.rb`/`*.rake`/`*.thor`,
+  as `.github/workflows/ci.yml` does, and reports `syntax_tree` and the unformatted files. `dev_format`
+  (developer) runs `stree write` (the repository's `.streerc`) in the same sandbox. It writes the
+  results back through the recorded write path, reading the export without following any symlink:
+  code in the container could plant one.
+- **One branch per project:** `dev_branch` refuses to create a second `migration/WS/*` branch
+  (`STANDARD_DEV_ONE_BRANCH`) unless `new_pr: true` (the engineer asked for a separate PR), so each
+  push updates the project's one draft PR.
 - **Commits:** only on `migration/WS/TOPIC` branches; built in a temporary index from the
   verified bytes of the visible changed paths (`hash-object`, `commit-tree`, compare-and-swap
   `update-ref`; no hooks), so nothing else in the working tree or the engineer's index can

@@ -29,7 +29,8 @@ TOOLS = {
     "dev_write": ("write", {"path", "content"}),
     "dev_edit": ("edit", {"path", "old_text", "new_text", "replace_all"}),
     "dev_delete": ("delete", {"path"}),
-    "dev_branch": ("branch", {"topic"}),
+    "dev_branch": ("branch", {"topic", "new_pr"}),
+    "dev_format": ("format", {"path"}),
     "dev_commit": ("commit", {"message"}),
     "dev_push_propose": ("push-propose", {"title", "body", "base"}),
 }
@@ -118,7 +119,7 @@ def main():
         return fail("STANDARD_CHAT_NOT_IN_PROJECT")
     if project is not None and workspace != project:
         return fail("STANDARD_WORKSPACE_NOT_THIS_PROJECT")
-    timeout = 290 if tool == "dev_test" else 55
+    timeout = 290 if tool in ("dev_test", "dev_format") else 55
     try:
         if tool == "dev_findings":
             result = subprocess.run([control_path(), "standard", "agent", "findings", workspace], capture_output=True, timeout=timeout, env=control_env())

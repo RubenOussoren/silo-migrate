@@ -80,7 +80,7 @@ tools:
         required: [workspace]
         additionalProperties: false
     - name: dev_test
-      description: "Run the converter's tests (suite test; omit file for the full suite, or one test/..._test.rb file) or rubocop (suite lint; omit file for all, or one .rb file) in a sandbox: converter image, no network, no customer data. Takes up to a few minutes."
+      description: "Run the converter's tests (suite test; omit file for the full suite, or one test/..._test.rb file) or lint (suite lint: Rubocop and syntax_tree `stree check`, as GitHub CI runs them; omit file for all, or one Ruby file) in a sandbox: converter image, no network, no customer data. Takes up to a few minutes."
       script: scripts/dev_tool.py
       call: json
       timeout_seconds: 300

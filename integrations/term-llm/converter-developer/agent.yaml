@@ -89,7 +89,7 @@ tools:
         required: [workspace]
         additionalProperties: false
     - name: dev_test
-      description: "Run the converter's tests (suite test; omit file for the full suite, or one test/..._test.rb file) or rubocop (suite lint; omit file for all, or one .rb file) in a sandbox: converter image, no network, no customer data. Takes up to a few minutes."
+      description: "Run the converter's tests (suite test; omit file for the full suite, or one test/..._test.rb file) or lint (suite lint: Rubocop and syntax_tree `stree check`, as GitHub CI runs them; omit file for all, or one Ruby file) in a sandbox: converter image, no network, no customer data. Takes up to a few minutes."
       script: scripts/dev_tool.py
       call: json
       timeout_seconds: 300
@@ -176,7 +176,7 @@ tools:
         required: [workspace, path]
         additionalProperties: false
     - name: dev_branch
-      description: "Create or switch to the branch migration/<workspace>/<topic>. Uncommitted changes come along."
+      description: "Switch to (or, for a project's first change, create) the branch migration/<workspace>/<topic>. One branch per project: creating a second one is refused (STANDARD_DEV_ONE_BRANCH) unless new_pr is true because the engineer asked for a separate PR. Uncommitted changes come along."
       script: scripts/dev_tool.py
       call: json
       timeout_seconds: 60
@@ -184,8 +184,21 @@ tools:
         type: object
         properties:
           workspace: {type: string, description: "Migration workspace name"}
-          topic: {type: string, description: "Lowercase, e.g. null-login-users"}
+          topic: {type: string, description: "Lowercase, e.g. mybb-converter"}
+          new_pr: {type: boolean, description: "Only when the engineer asked for a separate pull request"}
         required: [workspace, topic]
+        additionalProperties: false
+    - name: dev_format
+      description: "Format Ruby files with syntax_tree and the repository's .streerc (what GitHub CI checks), in the sandbox, and write the result back like dev_write. path: a file or folder; omit it for your uncommitted Ruby files. Takes up to a few minutes."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 300
+      input:
+        type: object
+        properties:
+          workspace: {type: string, description: "Migration workspace name"}
+          path: {type: string, description: "A Ruby file or a folder, e.g. converters/mybb"}
+        required: [workspace]
         additionalProperties: false
     - name: dev_commit
       description: "Commit all visible changes on the current migration branch, built from their verified content, authored as the engineer, with an Assisted-by trailer. Nothing else in the checkout is committed."

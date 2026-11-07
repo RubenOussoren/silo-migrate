@@ -56,7 +56,7 @@ PROTECTED_NAMES = {".gitignore", ".gitattributes", ".gitmodules", ".git"}
 PROTECTED_PATHS = {"Gemfile", "Gemfile.lock", ".bundle/config"}
 ROLES = {
     "developer": {"list", "read", "search", "status", "diff", "test", "push-show",
-                  "write", "edit", "delete", "branch", "commit", "push-propose"},
+                  "write", "edit", "delete", "branch", "commit", "push-propose", "format"},
     "reviewer": {"list", "read", "search", "status", "diff", "test", "push-show"},
 }
 TRAILER = {"developer": "Assisted-by: converter-developer (term-llm agent)"}
@@ -618,7 +618,7 @@ def op_delete(checkout, request):
 
 # Operations that change the checkout or the manifest of what the agent wrote. Models often send
 # several tool calls at once; these run one at a time per workspace (reads don't wait).
-MUTATING = {"write", "edit", "delete", "branch", "commit", "push-propose"}
+MUTATING = {"write", "edit", "delete", "branch", "commit", "push-propose", "format"}
 DEV_LOCK_WAIT = 25  # the adapter gives a call 55 s; leave the operation itself ~30 s
 
 
@@ -686,6 +686,13 @@ def op_branch(checkout, request):
     checkout.git("check-ref-format", "--branch", name)
     with Locked(checkout):
         exists = checkout.git("show-ref", "--verify", "--quiet", "refs/heads/" + name, ok=(0, 1)).returncode == 0
+        # One branch (one PR) per project: each push then updates the same draft PR. A second
+        # branch only when the engineer asked for a separate PR.
+        others = [ref for ref in checkout.out("for-each-ref", "--format=%(refname:short)", "refs/heads/" + checkout.migration_prefix()).split()
+                  if ref != name]
+        if not exists and others and request.get("new_pr") is not True:
+            refuse("STANDARD_DEV_ONE_BRANCH: this project already has " + others[0] + (" and others" if len(others) > 1 else "") +
+                   "; keep committing there (dev_branch with its topic switches to it). Only if the engineer asks for a separate PR, pass new_pr: true.")
         manifest = checkout.manifest()
         if exists and name != checkout.branch() and name not in manifest["branches"]:
             # Switching makes that branch's HEAD tree visible: only branches this agent
@@ -1179,25 +1186,18 @@ def site_settings_cache(checkout):
     return path
 
 
-def op_test(checkout, request, values, repo):
-    suite = request.get("suite", "test")
-    file = request.get("file") or None  # "" means the whole suite
-    if suite == "test":
-        command = ["bundle", "_2.6.3_", "exec", "rake", "test"]
-        if file is not None:
-            file = relative_path(file)
-            if not re.fullmatch(r"test/[A-Za-z0-9_./-]+_test\.rb", file) or file not in checkout.visible(file):
-                refuse("STANDARD_ARGUMENTS_INVALID")
-            command.append("TEST=" + file)
-    elif suite == "lint":
-        command = ["bundle", "_2.6.3_", "exec", "rubocop", "--format", "simple", "--no-color"]
-        if file is not None:
-            file = relative_path(file)
-            if not file.endswith(".rb") or file not in checkout.visible(file):
-                refuse("STANDARD_ARGUMENTS_INVALID")
-            command.append(file)
-    else:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+RUBY_SOURCES = (".rb", ".rake", ".thor")
+
+
+def ruby_files(checkout, prefix=""):
+    """Visible Ruby sources, as CI's syntax_tree step selects them (Gemfile + *.rb, *.rake, *.thor)."""
+    return [name for name in checkout.visible(prefix) if name.endswith(RUBY_SOURCES) or name == "Gemfile"]
+
+
+def run_in_sandbox(checkout, values, repo, command, collect=None, tool="dev_test"):
+    """Run command in the converter image on an export of the visible files: no network, read-only
+    root, the locked gems, emoji table and site settings read-only. Returns ("early", result) when
+    dependencies aren't ready, else ("ran", details). collect(export) reads files back afterwards."""
     started = time.monotonic()
     document = converter_image_document(checkout, values, repo)
     image = document["Id"]
@@ -1206,15 +1206,16 @@ def op_test(checkout, request, values, repo):
     if warning:
         prepared = dict(prepared, emoji_warning=warning)
     if deps is None:
-        return {"suite": suite, "file": file, "exit_code": None, "timed_out": False, "summary": None, "dependencies": prepared,
-                "note": "Tests did not run: the step that installs the checkout's locked gems (and the emoji table) didn't finish. "
-                        "Retry once; if it fails again, stop and tell the engineer: dev_test, dependencies " + prepared["status"] + "."}
+        return "early", {"exit_code": None, "timed_out": False, "summary": None, "dependencies": prepared,
+                         "note": "Nothing ran: the step that installs the checkout's locked gems (and the emoji table) didn't finish. "
+                                 "Retry once; if it fails again, stop and tell the engineer: dependencies " + prepared["status"] + "."}
     if TEST_TIMEOUT - (time.monotonic() - started) < TEST_MIN_SECONDS:
-        return {"suite": suite, "file": file, "exit_code": None, "timed_out": False, "summary": None, "dependencies": prepared,
-                "note": "Dependencies are ready, but not enough time is left for tests in this call. Run dev_test again."}
+        return "early", {"exit_code": None, "timed_out": False, "summary": None, "dependencies": prepared,
+                         "note": "Dependencies are ready, but not enough time is left in this call. Run " + tool + " again."}
     clean_stale_exports(tempfile.gettempdir())
     export = tempfile.mkdtemp(prefix="silo-devtest-")
     name = "silo-devtest-" + secrets.token_hex(6)
+    collected = None
     try:
         os.chmod(export, 0o700)
         copied = export_visible(checkout, export)
@@ -1245,20 +1246,151 @@ def op_test(checkout, request, values, repo):
         code, stdout, stderr = docker(argv, budget)
         if code is None:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
+        elif collect is not None:
+            collected = collect(Path(export))
     finally:
         shutil.rmtree(export, ignore_errors=True)
-    out, err = stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace")
-    summary = re.findall(r"\d+ (?:runs|tests), \d+ assertions, \d+ failures, \d+ errors, \d+ skips|\d+ files? inspected, (?:no|\d+) offenses? detected", out)
+    return "ran", {"code": code, "out": stdout.decode("utf-8", "replace"), "err": stderr.decode("utf-8", "replace"),
+                   "copied": copied, "prepared": prepared, "started": started, "collected": collected}
 
-    def tail(text, limit):
-        data = text.encode("utf-8")
-        return data[-limit:].decode("utf-8", "ignore"), len(data) > limit
-    out_tail, out_cut = tail(out, 20 * 1024)
-    err_tail, err_cut = tail(err, 4 * 1024)
-    return {"suite": suite, "file": file, "exit_code": code, "timed_out": code is None, "files_exported": copied,
-            "seconds": round(time.monotonic() - started), "summary": summary[-1] if summary else None, "dependencies": prepared,
-            "stdout_tail": out_tail, "stdout_truncated": out_cut, "stderr_tail": err_tail, "stderr_truncated": err_cut,
-            "sandbox": "converter image, no network, read-only root, only the files your tools can see, plus the locked gems, the emoji table and Discourse's site settings (tmp/requires) read-only, as in workflow runs"}
+
+def tail_text(text, limit):
+    data = text.encode("utf-8")
+    return data[-limit:].decode("utf-8", "ignore"), len(data) > limit
+
+
+SANDBOX_NOTE = ("converter image, no network, read-only root, only the files your tools can see, plus the locked gems, the emoji table "
+                "and Discourse's site settings (tmp/requires) read-only. GitHub CI has network but none of these caches: don't make a "
+                "test depend on them while blocking the network.")
+# CI (.github/workflows/ci.yml) runs rubocop and `stree check` on Gemfile + *.rb/*.rake/*.thor; lint does both.
+LINT_SCRIPT = ('if [ "$1" = "-" ]; then bundle _2.6.3_ exec rubocop --format simple --no-color; else bundle _2.6.3_ exec rubocop --format simple '
+               '--no-color "$1"; fi; r=$?; shift; echo "== syntax_tree =="; bundle _2.6.3_ exec stree check "$@"; s=$?; '
+               'echo "== exit rubocop=$r syntax_tree=$s =="; [ "$r" -eq 0 ] && [ "$s" -eq 0 ]')
+STREE_WARN = re.compile(r"^(?:\x1b\[[0-9;]*m)*\[(?:\x1b\[[0-9;]*m)*warn(?:\x1b\[[0-9;]*m)*\] (\S+)", re.M)  # colours optional
+
+
+def op_test(checkout, request, values, repo):
+    suite = request.get("suite", "test")
+    file = request.get("file") or None  # "" means the whole suite
+    if suite == "test":
+        command = ["bundle", "_2.6.3_", "exec", "rake", "test"]
+        if file is not None:
+            file = relative_path(file)
+            if not re.fullmatch(r"test/[A-Za-z0-9_./-]+_test\.rb", file) or file not in checkout.visible(file):
+                refuse("STANDARD_ARGUMENTS_INVALID")
+            command.append("TEST=" + file)
+    elif suite == "lint":
+        if file is not None:
+            file = relative_path(file)
+            if not (file.endswith(RUBY_SOURCES) or file in ("Gemfile", "convert")) or file not in checkout.visible(file):
+                refuse("STANDARD_ARGUMENTS_INVALID")
+            targets = [file] if file != "convert" else []
+        else:
+            targets = ruby_files(checkout)
+        command = ["sh", "-c", LINT_SCRIPT, "lint", file or "-", *(targets or ["Gemfile"])]
+    else:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    kind, ran = run_in_sandbox(checkout, values, repo, command)
+    if kind == "early":
+        return dict(suite=suite, file=file, **ran)
+    out, err, code = ran["out"], ran["err"], ran["code"]
+    summary = re.findall(r"\d+ (?:runs|tests), \d+ assertions, \d+ failures, \d+ errors, \d+ skips|\d+ files? inspected, (?:no|\d+) offenses? detected", out)
+    result = {"suite": suite, "file": file, "exit_code": code, "timed_out": code is None, "files_exported": ran["copied"],
+              "seconds": round(time.monotonic() - ran["started"]), "summary": summary[-1] if summary else None, "dependencies": ran["prepared"]}
+    if suite == "lint":
+        # stree prints its [warn] lines on stderr (rubocop's report is on stdout).
+        unformatted = list(dict.fromkeys(STREE_WARN.findall(out.split("== syntax_tree ==", 1)[-1]) + STREE_WARN.findall(err)))
+        exits = re.search(r"== exit rubocop=(\d+) syntax_tree=(\d+) ==", out)
+        result["syntax_tree"] = ("not run" if not exits else "all files formatted" if exits[2] == "0" and not unformatted
+                                 else f"{len(unformatted)} file(s) not formatted: run dev_format on them" if unformatted else "failed (see stdout_tail)")
+        result["syntax_tree_unformatted"] = unformatted[:100]
+    out_tail, out_cut = tail_text(out, 20 * 1024)
+    err_tail, err_cut = tail_text(err, 4 * 1024)
+    return dict(result, stdout_tail=out_tail, stdout_truncated=out_cut, stderr_tail=err_tail, stderr_truncated=err_cut, sandbox=SANDBOX_NOTE)
+
+
+MAX_FORMAT_FILES = 300
+
+
+def read_export(export, relative):
+    """A file the container left in the export, read without following any symlink on the way.
+    Code in the container (an agent's) could swap a folder for a link to a host path."""
+    directory = os.open(export, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parts = relative.split("/")
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            except OSError:
+                return None
+            os.close(directory)
+            directory = child
+        try:
+            descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except OSError:
+            return None
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_WRITE_BYTES:
+                return None
+            return stream.read(MAX_WRITE_BYTES + 1)
+    finally:
+        os.close(directory)
+
+
+def op_format(checkout, request, values, repo):
+    """Format Ruby files with syntax_tree (the repository's .streerc), as CI checks them, and write the
+    result through the same recorded path as dev_write. path: a file or a folder; none means the
+    uncommitted changed Ruby files."""
+    raw = request.get("path")
+    if raw:
+        prefix = relative_path(raw)
+        targets = [name for name in ruby_files(checkout, prefix) if name != "Gemfile"]
+    else:
+        shown, _ = changes(checkout)
+        visible = set(checkout.visible())
+        targets = [entry["path"] for entry in shown if entry["path"] in visible and entry["path"].endswith(RUBY_SOURCES)]
+    targets = sorted(set(targets))
+    if not targets:
+        return {"formatted": [], "unchanged": 0, "note": "No Ruby files to format there."}
+    if len(targets) > MAX_FORMAT_FILES:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    for name in targets:
+        writable(checkout, name, must_exist=True)
+
+    def collect(export):
+        return {name: data for name in targets if (data := read_export(export, name)) is not None}
+    kind, ran = run_in_sandbox(checkout, values, repo, ["bundle", "_2.6.3_", "exec", "stree", "write", *targets], collect, tool="dev_format")
+    if kind == "early":
+        return dict(formatted=[], **ran)
+    if ran["code"] != 0 or ran["collected"] is None:
+        err_tail, _ = tail_text(ran["err"] + ran["out"], 4 * 1024)
+        return {"formatted": [], "exit_code": ran["code"], "timed_out": ran["code"] is None, "error_tail": err_tail,
+                "note": "syntax_tree couldn't format these files (a syntax error?). Nothing was changed."}
+    formatted, diffs = [], []
+    for name in targets:
+        after = ran["collected"].get(name)
+        if after is None or len(after) > MAX_WRITE_BYTES:
+            continue
+        before, info = checkout.load(name)
+        if after == before:
+            continue
+        target, _ = writable(checkout, name, must_exist=True)
+        mode = stat.S_IMODE(info.st_mode) & 0o755
+        atomic_write(target, after, mode)
+        try:
+            checkout.record_write(name, after)
+        except Exception:
+            try:
+                atomic_write(target, before, mode)
+            except OSError:
+                pass
+            raise
+        formatted.append(name)
+        if len(diffs) < 5:
+            diffs.append(small_diff(name, before.decode("utf-8", "replace"), after.decode("utf-8", "replace")))
+    return {"formatted": formatted, "unchanged": len(targets) - len(formatted), "diffs": bounded("\n".join(diffs), 16 * 1024)[0],
+            "note": "Formatted with the repository's .streerc. Review the changes (dev_diff), run the tests, then commit."}
 
 
 # -- engineer: push approval -------------------------------------------------------
@@ -1430,7 +1562,12 @@ def main(args, values, base, repo, host, stdin, home=None):
             result = op_test(checkout, request, values, repo)
         elif op in MUTATING:
             with DevLock(checkout):
-                result = op_commit(checkout, request, home) if op == "commit" else handlers[op](checkout, request)
+                if op == "commit":
+                    result = op_commit(checkout, request, home)
+                elif op == "format":
+                    result = op_format(checkout, request, values, repo)
+                else:
+                    result = handlers[op](checkout, request)
         else:
             result = handlers[op](checkout, request)
         return fit(dict(version=1, **result))

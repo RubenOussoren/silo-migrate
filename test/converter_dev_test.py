@@ -231,6 +231,127 @@ class ConverterDevTest(unittest.TestCase):
         self.call('edit', path='lib/importer.rb', old_text='row[:login].downcase', new_text='row[:login].to_s.downcase')
         return self.call('commit', message='Handle Khoros users without a login\n\n## Why\nDeleted accounts have no login.\n')
 
+    def test_one_branch_per_project_unless_the_engineer_asks_for_a_separate_pr(self):
+        self.assertTrue(self.call('branch', topic='mybb-converter')['created'])
+        self.assertTrue(self.call('branch', topic='mybb-staged-activation')['error'].startswith('STANDARD_DEV_ONE_BRANCH'))
+        self.assertTrue(self.call('branch', topic='other', new_pr='yes')['error'].startswith('STANDARD_DEV_ONE_BRANCH'))
+        git(self.checkout, 'switch', '-q', 'main')
+        self.assertFalse(self.call('branch', topic='mybb-converter')['created'])  # switching back is fine
+        self.assertTrue(self.call('branch', topic='separate-pr', new_pr=True)['created'])
+        self.assertEqual(['migration/example-forum/mybb-converter', 'migration/example-forum/separate-pr'],
+                         git(self.checkout, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/migration/').split())
+
+    def test_lint_runs_rubocop_and_syntax_tree_like_ci(self):
+        seen = {}
+        self.call('write', path='lib/new.rb', content='x = 1\n')
+        out = (b'2 files inspected, no offenses detected\n== syntax_tree ==\n\x1b[33m[\x1b[0m\x1b[33mwarn\x1b[0m] lib/new.rb\n'
+               b'[warn] lib/importer.rb\nThe listed files did not match the expected format.\n== exit rubocop=0 syntax_tree=1 ==\n')
+        result = self.run_test(seen, suite='lint', test_output=out)
+        argv = seen['argv']
+        tail = argv[argv.index(IMAGE_ID):]
+        self.assertEqual([IMAGE_ID, '-u', 'BUNDLE_PATH', 'sh', '-c', self.dev.LINT_SCRIPT, 'lint', '-'], tail[:8])
+        self.assertEqual(['Gemfile', 'lib/importer.rb', 'lib/new.rb', 'test/importer_test.rb'], sorted(tail[8:]))
+        self.assertEqual('2 files inspected, no offenses detected', result['summary'])
+        self.assertEqual(['lib/importer.rb'], result['syntax_tree_unformatted'][-1:])
+        self.assertTrue(result['syntax_tree'].startswith('2 file(s) not formatted'))
+        # As stree really prints them: [warn] lines on stderr.
+        with mock.patch.object(self.dev, 'docker', side_effect=lambda argv, timeout: (1, b'1 file inspected, no offenses detected\n== syntax_tree ==\n== exit rubocop=0 syntax_tree=1 ==\n',
+                                                                                     b'[\x1b[33mwarn\x1b[0m] lib/new.rb\nThe listed files did not match the expected format.\n')), \
+                mock.patch.object(self.dev, 'converter_image_document', return_value=IMAGE_DOCUMENT), \
+                mock.patch.object(self.dev, 'prepare_dependencies', return_value=(Path(self.temp.name), {'status': 'ready'})):
+            result = self.call('test', suite='lint', file='lib/new.rb')
+        self.assertEqual(['lib/new.rb'], result['syntax_tree_unformatted'])
+        self.assertTrue(result['syntax_tree'].startswith('1 file(s) not formatted'))
+        clean = b'1 file inspected, no offenses detected\n== syntax_tree ==\nAll files matched expected format.\n== exit rubocop=0 syntax_tree=0 ==\n'
+        result = self.run_test(seen, suite='lint', file='lib/new.rb', test_output=clean)
+        self.assertEqual(['lint', 'lib/new.rb', 'lib/new.rb'], seen['argv'][-3:])
+        self.assertEqual('all files formatted', result['syntax_tree'])
+        self.assertEqual('STANDARD_ARGUMENTS_INVALID', self.run_test(seen, suite='lint', file='README.md')['error'])
+
+    def test_format_writes_syntax_tree_output_through_the_recorded_write_path(self):
+        seen = {}
+        self.call('write', path='lib/new.rb', content='def  x;1;end\n')
+        formatted = b'def x = 1\n'
+
+        def fake_docker(argv, timeout):
+            mounts = self.mounts(argv)
+            if 'install' in argv:
+                (Path(mounts['/deps'][0]) / 'specifications').mkdir(parents=True, exist_ok=True)
+                return 0, b'', b''
+            seen['format_argv'] = argv
+            export = Path(mounts['/app'][0])
+            (export / 'lib/new.rb').write_bytes(formatted)            # changed by stree
+            (export / 'lib/importer.rb').write_bytes((export / 'lib/importer.rb').read_bytes())  # unchanged
+            return 0, b'', b''
+
+        def fake_emoji(destination, deadline):
+            for name in self.dev.EMOJI_FILES:
+                self.write(Path(destination) / self.dev.emoji_repo_key() / name, '[]')
+        with mock.patch.object(self.dev, 'converter_image_document', return_value=IMAGE_DOCUMENT), \
+                mock.patch.object(self.dev, 'docker', side_effect=fake_docker), mock.patch.object(self.dev, 'fetch_emoji', side_effect=fake_emoji):
+            result = self.call('format', path='lib')
+            self.assertEqual(['lib/new.rb'], result['formatted'])
+            self.assertEqual(1, result['unchanged'])
+            self.assertEqual(['bundle', '_2.6.3_', 'exec', 'stree', 'write', 'lib/importer.rb', 'lib/new.rb'],
+                             seen['format_argv'][seen['format_argv'].index(IMAGE_ID) + 3:])
+            self.assertEqual(formatted, (self.checkout / 'lib/new.rb').read_bytes())
+            self.assertEqual('def x = 1\n', self.call('read', path='lib/new.rb')['text'])  # still visible: recorded
+            self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('format', role='reviewer', path='lib')['error'])
+            self.assertEqual('No Ruby files to format there.', self.call('format', path='README.md')['note'])
+            # Nothing uncommitted after this commit: the default (changed files) has nothing to do.
+            self.set_identity()
+            self.call('branch', topic='fmt')
+            self.call('commit', message='Format')
+            self.assertEqual([], self.call('format')['formatted'])
+
+    def test_format_never_reads_back_through_a_link_the_container_made(self):
+        outside = Path(self.temp.name) / 'host-secret'
+        self.write(outside / 'new.rb', MARKER + ' token\n')
+        self.call('write', path='lib/new.rb', content='def  x;1;end\n')
+        def fake_docker(argv, timeout):
+            mounts = self.mounts(argv)
+            if 'install' in argv:
+                (Path(mounts['/deps'][0]) / 'specifications').mkdir(parents=True, exist_ok=True)
+                return 0, b'', b''
+            export = Path(mounts['/app'][0])
+            # What code in the container could do: swap the folder for a link to a host path.
+            import shutil as sh
+            sh.rmtree(export / 'lib')
+            (export / 'lib').symlink_to(outside)
+            return 0, b'', b''
+        with mock.patch.object(self.dev, 'converter_image_document', return_value=IMAGE_DOCUMENT), \
+                mock.patch.object(self.dev, 'docker', side_effect=fake_docker), mock.patch.object(self.dev, 'fetch_emoji', side_effect=lambda d, t: None):
+            result = self.call('format', path='lib/new.rb')
+        self.assertEqual([], result['formatted'])
+        self.assertNotIn(MARKER, json.dumps(result))
+        self.assertEqual(b'def  x;1;end\n', (self.checkout / 'lib/new.rb').read_bytes())
+        # A link as the file itself, or anywhere on the way, reads as nothing.
+        export = Path(self.temp.name) / 'export'
+        (export / 'a').mkdir(parents=True)
+        (export / 'a/file.rb').symlink_to(outside / 'new.rb')
+        (export / 'b').symlink_to(outside)
+        (export / 'c').mkdir()
+        (export / 'c/ok.rb').write_text('ok')
+        self.assertEqual((None, None, b'ok'), (self.dev.read_export(export, 'a/file.rb'), self.dev.read_export(export, 'b/new.rb'),
+                                               self.dev.read_export(export, 'c/ok.rb')))
+
+    def test_format_failure_changes_nothing(self):
+        seen = {}
+        self.call('write', path='lib/new.rb', content='def broken(\n')
+        def fake_docker(argv, timeout):
+            mounts = self.mounts(argv)
+            if 'install' in argv:
+                (Path(mounts['/deps'][0]) / 'specifications').mkdir(parents=True, exist_ok=True)
+                return 0, b'', b''
+            (Path(mounts['/app'][0]) / 'lib/new.rb').write_bytes(b'garbage')
+            return 1, b'', b'Syntax error'
+        with mock.patch.object(self.dev, 'converter_image_document', return_value=IMAGE_DOCUMENT), \
+                mock.patch.object(self.dev, 'docker', side_effect=fake_docker), mock.patch.object(self.dev, 'fetch_emoji', side_effect=lambda d, t: None):
+            result = self.call('format', path='lib/new.rb')
+        self.assertEqual([], result['formatted'])
+        self.assertIn('Syntax error', result['error_tail'])
+        self.assertEqual(b'def broken(\n', (self.checkout / 'lib/new.rb').read_bytes())
+
     def test_converter_log_shows_branch_commits_and_what_reached_github(self):
         log = lambda: self.dev.main(['converter', 'log', self.ws], {}, self.base, ROOT, self.host, io.StringIO(''))
         before = log()
@@ -256,7 +377,7 @@ class ConverterDevTest(unittest.TestCase):
 
     def test_commit_as_engineer_with_trailer_never_stages_ignored_files(self):
         self.assertEqual('STANDARD_DEV_NOT_MIGRATION_BRANCH', self.call('commit', message='x')['error'])
-        self.call('branch', topic='fix')
+        self.call('branch', topic='null-login-users')
         self.call('write', path='lib/x.rb', content='x\n')
         self.assertEqual('STANDARD_DEV_IDENTITY_MISSING', self.call('commit', message='x')['error'])
         self.call('branch', topic='null-login-users')
@@ -440,7 +561,8 @@ class ConverterDevTest(unittest.TestCase):
         git(self.checkout, 'switch', '-q', 'main')
         self.assertEqual('STANDARD_DEV_BRANCH_UNTRUSTED', self.call('branch', topic='evil')['error'])
         self.assertEqual('main', git(self.checkout, 'branch', '--show-current'))
-        self.call('branch', topic='mine')
+        self.assertTrue(self.call('branch', topic='mine')['error'].startswith('STANDARD_DEV_ONE_BRANCH'))  # 'evil' already exists
+        self.call('branch', topic='mine', new_pr=True)
         git(self.checkout, 'switch', '-q', 'main')
         self.assertEqual('migration/example-forum/mine', self.call('branch', topic='mine')['branch'])  # its own branch
 
@@ -504,10 +626,11 @@ class ConverterDevTest(unittest.TestCase):
 
     def run_test(self, seen, role='developer', **kwargs):
         patches = self.sandbox(seen, **{k: kwargs.pop(k) for k in ('deps_code', 'test_output') if k in kwargs})
+        op = kwargs.pop('op', 'test')
         for patch in patches:
             patch.start()
         try:
-            return self.call('test', role=role, **kwargs)
+            return self.call(op, role=role, **kwargs)
         finally:
             for patch in patches:
                 patch.stop()

@@ -9,7 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / 'integrations/term-llm'
-WRITE_TOOLS = {'dev_write', 'dev_edit', 'dev_delete', 'dev_branch', 'dev_commit', 'dev_push_propose'}
+WRITE_TOOLS = {'dev_write', 'dev_edit', 'dev_delete', 'dev_branch', 'dev_commit', 'dev_push_propose', 'dev_format'}
 
 
 class ConverterDevAdapterTest(unittest.TestCase):
@@ -70,7 +70,8 @@ print(json.dumps({'version': 1, 'ok': True}))
             'dev_write': ({'path': 'a.rb', 'content': 'x'}, {'op': 'write', 'path': 'a.rb', 'content': 'x'}),
             'dev_edit': ({'path': 'a.rb', 'old_text': 'a', 'new_text': 'b'}, {'op': 'edit', 'path': 'a.rb', 'old_text': 'a', 'new_text': 'b'}),
             'dev_delete': ({'path': 'a.rb'}, {'op': 'delete', 'path': 'a.rb'}),
-            'dev_branch': ({'topic': 'fix'}, {'op': 'branch', 'topic': 'fix'}),
+            'dev_branch': ({'topic': 'fix', 'new_pr': True}, {'op': 'branch', 'topic': 'fix', 'new_pr': True}),
+            'dev_format': ({'path': 'converters/mybb', 'content': 'dropped'}, {'op': 'format', 'path': 'converters/mybb'}),
             'dev_commit': ({'message': 'Fix'}, {'op': 'commit', 'message': 'Fix'}),
             'dev_push_propose': ({'title': 'T', 'body': 'B'}, {'op': 'push-propose', 'title': 'T', 'body': 'B'}),
         }
