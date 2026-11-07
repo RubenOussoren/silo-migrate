@@ -18,6 +18,10 @@ const RUN_DONE = new Set(['completed', 'failed', 'interrupted']);
 const state = { workspace: '', selected: null, overview: null };
 const $ = (id) => document.getElementById(id);
 let pollTimer = null;
+// Each list or detail load gets a ticket; only the latest one may draw. Answers take seconds
+// (each is a control call), so switching projects quickly would otherwise let an older,
+// slower answer overwrite the newer one.
+const tickets = { list: 0, detail: 0 };
 
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
@@ -102,12 +106,18 @@ function entry(kind, id, title, meta) {
 
 async function loadList() {
   const list = $('items');
-  if (!state.workspace) { list.replaceChildren(el('li', { class: 'none' }, 'No projects yet.')); return; }
+  const ticket = ++tickets.list;
+  const workspace = state.workspace;
+  if (!workspace) { list.replaceChildren(el('li', { class: 'none' }, 'No projects yet.')); return; }
+  // A different project: say so at once instead of leaving the previous project's list up.
+  if (!state.overview || state.overview.workspace !== workspace) list.replaceChildren(el('li', { class: 'none' }, `Loading ${workspace}…`));
   let data;
-  try { data = await api(`api/overview?${new URLSearchParams({ workspace: state.workspace })}`); } catch (error) {
+  try { data = await api(`api/overview?${new URLSearchParams({ workspace })}`); } catch (error) {
+    if (ticket !== tickets.list) return;
     list.replaceChildren(el('li', { class: 'none' }, `Couldn't load: ${explain(error)}`));
     return;
   }
+  if (ticket !== tickets.list || workspace !== state.workspace) return;  // a newer load is under way
   state.overview = data;
   const plans = data.plans.slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   const runs = data.runs.slice().sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
@@ -128,7 +138,8 @@ async function loadList() {
   for (const [title, items] of sections) {
     if (!items.length && title !== 'Waiting for you') continue;
     nodes.push(el('li', { class: 'section-title' }, title));
-    nodes.push(...(items.length ? items : [el('li', { class: 'none' }, 'Nothing waits for you here.')]));
+    nodes.push(...(items.length ? items : [el('li', { class: 'none' },
+      'Nothing waits for you here. Plans appear when migration-data proposes a run (data_plan_propose); pushes when converter-developer proposes one (dev_push_propose).')]));
   }
   list.replaceChildren(...nodes);
 }
@@ -300,16 +311,19 @@ function renderPush(push) {
 async function loadDetail() {
   clearTimeout(pollTimer);
   const pane = $('detail-pane');
+  const ticket = ++tickets.detail;
   if (!state.selected || !state.workspace) { pane.replaceChildren(el('p', { class: 'empty' }, 'Select a plan, run or push.')); return; }
   const { kind, id } = state.selected;
+  const workspace = state.workspace;
   let data;
   try {
-    data = await api(`api/${kind}?${new URLSearchParams({ workspace: state.workspace, id })}`);
+    data = await api(`api/${kind}?${new URLSearchParams({ workspace, id })}`);
   } catch (error) {
+    if (ticket !== tickets.detail) return;
     pane.replaceChildren(el('p', { class: 'empty' }, `Couldn't load it: ${explain(error)}`));
     return;
   }
-  if (!state.selected || state.selected.id !== id) return;  // another item was opened meanwhile
+  if (ticket !== tickets.detail || workspace !== state.workspace || !state.selected || state.selected.id !== id) return;  // something newer was opened
   pane.replaceChildren(...(kind === 'plan' ? renderPlan(data) : kind === 'run' ? renderRun(data) : renderPush(data)).filter(Boolean));
   if (kind === 'run' && ['claimed', 'running'].includes(data.status)) {
     pollTimer = setTimeout(() => { if (!document.hidden) refreshAll(); }, 10000);
@@ -330,7 +344,7 @@ async function refreshAll() {
   await loadDetail();
 }
 
-$('workspace').addEventListener('change', (event) => { state.workspace = event.target.value; state.selected = null; writeHash(); refreshAll(); });
+$('workspace').addEventListener('change', (event) => { state.workspace = event.target.value; state.selected = null; state.overview = null; writeHash(); refreshAll(); });
 $('refresh').addEventListener('click', () => refreshAll());
 window.addEventListener('hashchange', () => { readHash(); refreshAll(); });
 readHash();
