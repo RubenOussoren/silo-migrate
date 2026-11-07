@@ -102,9 +102,17 @@ class InstallerTests(unittest.TestCase):
     def test_web_service_offers_only_migration_agents(self):
         args = self.m.service_args()
         self.assertNotIn("--agent", args)
-        for flag in ("--projects", "--disable-extensions", "--disable-widgets"):
+        for flag in ("--projects", "--widgets-dir", "--extensions-dir", "--extensions"):
             self.assertIn(flag, args)
-        self.assertNotIn("--no-projects", args)
+        for flag in ("--no-projects", "--disable-extensions", "--disable-widgets"):
+            self.assertNotIn(flag, args)
+        # Only the release's own widget and extension, named explicitly.
+        self.assertEqual(str(self.m.P/"current/integrations/term-llm/widgets"), args[args.index("--widgets-dir") + 1])
+        self.assertEqual(str(self.m.P/"current/integrations/term-llm/extensions"), args[args.index("--extensions-dir") + 1])
+        self.assertEqual("silo-findings", args[args.index("--extensions") + 1])
+        shipped = Path(__file__).resolve().parents[2]/"integrations/term-llm"
+        self.assertTrue((shipped/"widgets/findings/widget.yaml").is_file())
+        self.assertTrue((shipped/"extensions/silo-findings/extension.yaml").is_file())
         self.assertIn("  projects:\n    enabled: true\n", self.m.fresh_config())
         self.assertEqual("prompt", args[args.index("--approval") + 1])
         fresh = self.m.fresh_config()
@@ -230,9 +238,13 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("--dry-run", calls[0])
             self.assertIn("--projects", calls[1])
             self.assertNotIn("--no-projects", calls[1])
-            spec.write_text(json.dumps({"args": ["--host", "127.0.0.1", "--projects"]}))
-            self.assertFalse(self.m.refresh_service())  # already on: no re-install
-            self.assertEqual(2, len(calls))
+            spec.write_text(json.dumps({"args": ["--host", "127.0.0.1", "--projects", "--disable-widgets"]}))
+            self.assertTrue(self.m.refresh_service())  # projects on, but no Findings widget yet
+            self.assertEqual(4, len(calls))
+            current = self.m.service_args()
+            spec.write_text(json.dumps({"args": current[current.index("--") + 1:]}))
+            self.assertFalse(self.m.refresh_service())  # already as wanted: no re-install
+            self.assertEqual(4, len(calls))
         spec.write_text(json.dumps({"args": ["--no-projects"]}))
         def failing(argv, **kw):
             self.m.refuse("METAL_SERVICE_UPDATE_FAILED", "x")

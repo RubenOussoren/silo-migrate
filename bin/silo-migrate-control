@@ -295,6 +295,10 @@ def main(args):
     self = Path(__file__).resolve()
     repo = self.parent.parent
     values, configured = settings()
+    # As root, the control container (all capabilities dropped) can't read the account's
+    # private gems, and anything created would belong to root. image-identity is host-only.
+    if configured and os.geteuid() == 0 and args[:1] != ["image-identity"]:
+        refuse("STANDARD_RUN_AS_ACCOUNT: run this as the service account: silo shell, then the same command")
     # Identity inspection is host-only, including on machines without Ruby.
     if args[:1] == ["image-identity"]:
         if len(args) != 2:

@@ -142,6 +142,34 @@ the link `~/.config/term-llm/skills` → `<prefix>/current/integrations/term-llm
 `skills:` decides what it sees: migration-data gets all of them, the others none (term-llm
 0.9.93 can't give an agent a subset).
 
+## Releasing findings (web UI)
+
+migration-data proposes findings (schemas, a run's cause); nothing reaches the coding agents
+until you release it. In the web UI:
+
+- A **Findings** tab on the right edge (the `silo-findings` extension) shows how many wait for
+  review; click it for the list, and a link opens one in the **Findings** widget (also under
+  Widgets in the sidebar).
+- The widget lists findings per project: **To review**, **Released**, **Rejected**, **Replaced**,
+  **Withdrawn**, **All**, newest first, 25 per page, with a project filter and search (ID, kind,
+  reviewer, first line). Lists are read straight from the projects' stores, so they stay quick
+  with thousands of findings.
+- **To review:** the proposal (read-only) and an editor prefilled with it. Edit it (only invented
+  examples), then **Release** (exactly that text, its SHA-256 computed from it) or **Reject**.
+- **Released:** **Amend…** releases corrected text as a new version that replaces it (the coding
+  agents then see only the new one; the widget shows the versions); **Withdraw** takes it back.
+- Each decision runs `standard finding release|reject|amend|withdraw` as the account and is
+  recorded with your commit identity's name plus "(web UI)" and the time.
+
+Why it's safe: the widget runs on a Unix socket that only term-llm's signed-in proxy reaches;
+term-llm accepts its POSTs only from the web UI's own origin (or with the bearer token), and the
+widget also requires its page's header. No agent has the web UI sign-in, and `read_url` refuses
+local addresses anyway. Only you see proposed text in the browser, as you already do in Frontier
+chats. The widget and extension come from the sealed release; no other widgets or extensions are
+loaded. Without the widget (doctor's "findings widget" check), use the CLI in
+`docs/standard-workbench.md` as the service account (`silo shell`; `silo-migrate-control` refuses
+root).
+
 ## op-cache (Frontier's key)
 
 The service account needs its own `~/.config/op-cache/config.yaml` (mode 0600). Without it,

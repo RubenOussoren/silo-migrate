@@ -1,0 +1,5 @@
+title: Findings
+description: Review migration-data's proposed findings and release, reject, amend or withdraw them. Only released text reaches the coding agents.
+mount: findings
+# A Unix socket, not a TCP port: only term-llm's signed-in proxy can reach it.
+command: ["python3", "-I", "-B", "server.py", "$SOCKET"]

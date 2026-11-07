@@ -113,14 +113,49 @@ module SiloMigrate
       # Engineer path: the private proposal, plus exact-digest gated release.
       def review_text(finding_id)
         record!(finding_id)
-        File.read(@store.finding_dir(finding_id, "private", "proposal.txt"))
+        path = @store.finding_dir(finding_id, "private", "proposal.txt")
+        # An amendment has no proposal of its own: it is the engineer's text.
+        raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless File.file?(path)
+
+        File.read(path)
       end
 
       def reject(finding_id:, reviewer:)
         decide(finding_id, reviewer) do |record|
           record["status"] = "rejected"
           record["rejected_by"] = reviewer
+          record["rejected_at"] = Time.now.utc.iso8601
           { version: 1, finding_id: finding_id, status: "rejected" }
+        end
+      end
+
+      # Correct a released finding: the engineer's new text is released as a new finding
+      # that replaces it. Coding agents then see only the replacement; the old one is
+      # kept, marked superseded, for the record.
+      def amend(finding_id:, released_text:, sha256:, reviewer:)
+        raise StandardWorkflowError, "STANDARD_APPROVAL_MISMATCH" unless released_text.is_a?(String) && released_text.bytesize.between?(1, MAX_BYTES) && released_text.valid_encoding? && Digest::SHA256.hexdigest(released_text) == sha256
+
+        id = @store.new_id("finding")
+        decide(finding_id, reviewer, from: "released") do |record, state|
+          now = Time.now.utc.iso8601
+          @store.write_private(@store.finding_dir(id, "released", "summary.txt"), released_text)
+          state.fetch("findings")[id] = { "id" => id, "run_id" => record["run_id"], "kind" => record["kind"], "status" => "released", "proposed_at" => now,
+                                          "proposal_sha256" => nil, "supersedes" => finding_id,
+                                          "release" => { "sha256" => sha256, "bytes" => released_text.bytesize, "reproduction_sha256" => nil, "reviewer" => reviewer, "released_at" => now } }
+          record["status"] = "superseded"
+          record["superseded_by"] = id
+          record["superseded_at"] = now
+          { version: 1, finding_id: id, status: "released", supersedes: finding_id, sha256: sha256 }
+        end
+      end
+
+      # Take a released finding back without a replacement (e.g. it should never have gone out).
+      def withdraw(finding_id:, reviewer:)
+        decide(finding_id, reviewer, from: "released") do |record|
+          record["status"] = "withdrawn"
+          record["withdrawn_by"] = reviewer
+          record["withdrawn_at"] = Time.now.utc.iso8601
+          { version: 1, finding_id: finding_id, status: "withdrawn" }
         end
       end
 
@@ -144,7 +179,7 @@ module SiloMigrate
       # Coding-context views. Unreleased findings are not even enumerated.
       def released_list
         findings = @store.load.fetch("findings").values.select { |record| record["status"] == "released" }
-        { version: 1, findings: findings.map { |record| { finding_id: record["id"], run_id: record["run_id"], kind: record["kind"], sha256: record.dig("release", "sha256"), released_at: record.dig("release", "released_at") } } }
+        { version: 1, findings: findings.map { |record| { finding_id: record["id"], run_id: record["run_id"], kind: record["kind"], sha256: record.dig("release", "sha256"), released_at: record.dig("release", "released_at"), supersedes: record["supersedes"] } } }
       end
 
       def released_show(finding_id)
@@ -160,7 +195,7 @@ module SiloMigrate
           reproduction = File.read(repro_path)
           raise StandardWorkflowError, "STANDARD_RELEASE_TAMPERED" unless Digest::SHA256.hexdigest(reproduction) == record.dig("release", "reproduction_sha256")
         end
-        { version: 1, finding_id: finding_id, kind: record["kind"], run_id: record["run_id"], summary: summary, reproduction: reproduction, sha256: record.dig("release", "sha256") }
+        { version: 1, finding_id: finding_id, kind: record["kind"], run_id: record["run_id"], summary: summary, reproduction: reproduction, sha256: record.dig("release", "sha256"), supersedes: record["supersedes"] }
       end
 
       private
@@ -280,15 +315,15 @@ module SiloMigrate
         @store.load.fetch("findings")[finding_id] || raise(StandardWorkflowError, "STANDARD_REFERENCE_INVALID")
       end
 
-      def decide(finding_id, reviewer)
+      def decide(finding_id, reviewer, from: "proposed")
         raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless reviewer.is_a?(String) && reviewer.match?(/\A[[:print:]]{1,120}\z/)
 
         @store.update do |state|
           record = state.fetch("findings")[finding_id]
           raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless record
-          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless record["status"] == "proposed"
+          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless record["status"] == from
 
-          yield record
+          yield record, state
         end
       end
     end

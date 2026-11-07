@@ -142,6 +142,47 @@ class StandardPrivacyTest < SiloMigrateTest
     end
   end
 
+  def test_amend_replaces_a_release_and_withdraw_takes_one_back
+    with_standard do
+      findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
+      first = findings.propose(run_id: nil, text: 'schema v1', kind: 'schema')[:finding_id]
+      digest = ->(text) { Digest::SHA256.hexdigest(text) }
+      # Only a released finding can be amended or withdrawn.
+      standard_error('STANDARD_TRANSITION_INVALID') { findings.amend(finding_id: first, released_text: 'x', sha256: digest.('x'), reviewer: 'engineer') }
+      standard_error('STANDARD_TRANSITION_INVALID') { findings.withdraw(finding_id: first, reviewer: 'engineer') }
+      findings.release(finding_id: first, released_text: 'released v1', sha256: digest.('released v1'), reviewer: 'engineer')
+      standard_error('STANDARD_APPROVAL_MISMATCH') { findings.amend(finding_id: first, released_text: 'v2', sha256: digest.('other'), reviewer: 'engineer') }
+      amended = findings.amend(finding_id: first, released_text: 'released v2: -2 are drafts', sha256: digest.('released v2: -2 are drafts'), reviewer: 'engineer')
+      second = amended[:finding_id]
+      assert_equal first, amended[:supersedes]
+      state = @service.store.load.fetch('findings')
+      assert_equal 'superseded', state.fetch(first)['status']
+      assert_equal second, state.fetch(first)['superseded_by']
+      assert_equal 'released', state.fetch(second)['status']
+      # Coding agents see only the replacement, which says what it replaces.
+      assert_equal [[second, first]], findings.released_list[:findings].map { |entry| [entry[:finding_id], entry[:supersedes]] }
+      assert_equal 'released v2: -2 are drafts', findings.released_show(second)[:summary]
+      standard_error('STANDARD_NOT_RELEASED') { findings.released_show(first) }
+      standard_error('STANDARD_TRANSITION_INVALID') { findings.amend(finding_id: first, released_text: 'v3', sha256: digest.('v3'), reviewer: 'engineer') }
+      standard_error('STANDARD_REFERENCE_INVALID') { findings.review_text(second) }
+      # Withdraw: gone from the agents' view, kept on record.
+      assert_equal 'withdrawn', findings.withdraw(finding_id: second, reviewer: 'engineer')[:status]
+      assert_empty findings.released_list[:findings]
+      standard_error('STANDARD_NOT_RELEASED') { findings.released_show(second) }
+      assert @service.store.load.fetch('findings').fetch(second)['withdrawn_at']
+      rejected = findings.propose(run_id: nil, text: 'other', kind: 'schema')[:finding_id]
+      findings.reject(finding_id: rejected, reviewer: 'engineer')
+      assert @service.store.load.fetch('findings').fetch(rejected)['rejected_at']
+      # The CLI grammar for both.
+      code, out, _err = cli('finding', 'withdraw', 'synthetic', rejected, '--reviewer', 'engineer')
+      assert_equal 1, code
+      assert_empty out
+      code, _out, err = cli('finding', 'amend', 'synthetic', rejected, '--file', '-', '--reviewer', 'engineer')
+      assert_equal 1, code
+      assert_includes err, 'STANDARD_ARGUMENTS_INVALID'
+    end
+  end
+
   def test_tampered_reproduction_refused
     with_standard do
       id = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env).propose(run_id: claim, text: MARKER)[:finding_id]

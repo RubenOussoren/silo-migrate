@@ -38,6 +38,8 @@ module SiloMigrate
         finding review WORKSPACE FINDING_ID
         finding release WORKSPACE FINDING_ID --file PATH --sha256 DIGEST --reviewer NAME [--reproduction PATH --reproduction-sha256 DIGEST]
         finding reject WORKSPACE FINDING_ID --reviewer NAME
+        finding amend WORKSPACE FINDING_ID --file PATH|- --sha256 DIGEST --reviewer NAME   (replace a released finding)
+        finding withdraw WORKSPACE FINDING_ID --reviewer NAME                            (take a released finding back)
 
       Trusted analyst path (separate private investigation session only):
         analyst evidence WORKSPACE RUN_ID
@@ -231,6 +233,14 @@ module SiloMigrate
         identifier = positional!(args)
         opts = options!(args, "--reviewer")
         findings(workspace).reject(finding_id: identifier, reviewer: opts.fetch("--reviewer"))
+      when "amend"
+        identifier = positional!(args)
+        opts = options!(args, "--file", "--sha256", "--reviewer")
+        findings(workspace).amend(finding_id: identifier, released_text: read_bounded(opts.fetch("--file")), sha256: opts.fetch("--sha256"), reviewer: opts.fetch("--reviewer"))
+      when "withdraw"
+        identifier = positional!(args)
+        opts = options!(args, "--reviewer")
+        findings(workspace).withdraw(finding_id: identifier, reviewer: opts.fetch("--reviewer"))
       else invalid!
       end
     end

@@ -360,6 +360,27 @@ class SiloTest(unittest.TestCase):
         spec.write_text(json.dumps({'args': ['--projects']}))
         self.assertEqual('OK', self.statuses(self.healthy())['web projects']['status'])
 
+    def test_doctor_shows_whether_the_findings_widget_is_on(self):
+        spec = self.home / '.config/term-llm/services/web/service.json'
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        ui = str(self.prefix / 'current/integrations/term-llm')
+        spec.write_text(json.dumps({'args': ['--projects', '--disable-extensions', '--disable-widgets']}))
+        self.assertEqual(('WARN', 'silo update'), (self.statuses(self.healthy())['findings widget']['status'], self.statuses(self.healthy())['findings widget']['fix']))
+        spec.write_text(json.dumps({'args': ['--projects', '--widgets-dir', ui + '/widgets', '--extensions-dir', ui + '/extensions', '--extensions', 'silo-findings']}))
+        self.assertEqual('OK', self.statuses(self.healthy())['findings widget']['status'])
+
+    def test_control_refuses_root_except_image_identity(self):
+        import runpy
+        config = self.root / 'control.env'
+        config.write_text('SILO_MIGRATE_BASE_PATH=/x\nSILO_CONTROL_GEMS=/x\nSILO_CONTROL_SITE_CACHE=/x\n')
+        control = types.SimpleNamespace(**runpy.run_path(str(Path(__file__).resolve().parents[1] / 'bin/silo-migrate-control')))
+        with mock.patch.dict(os.environ, {'SILO_CONTROL_CONFIG': str(config)}), mock.patch('os.geteuid', return_value=0):
+            with self.assertRaisesRegex(ValueError, 'STANDARD_RUN_AS_ACCOUNT'):
+                control.main(['standard', 'finding', 'review', 'arc', 'finding-' + 'a' * 32])
+            with mock.patch.dict(control.main.__globals__, {'inspect': lambda ref: {'x': 1}, 'identity': lambda doc: 'sha256:' + '0' * 64}), \
+                    mock.patch('sys.stdout', new_callable=io.StringIO):
+                self.assertEqual(0, control.main(['image-identity', 'ruby@sha256:' + 'a' * 64]))
+
     def test_claude_link_goes_in_the_service_path_not_roots(self):
         target = self.home / '.local/bin/claude'
         target.parent.mkdir(parents=True)

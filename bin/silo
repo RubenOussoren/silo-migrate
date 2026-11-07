@@ -239,6 +239,12 @@ def doctor_checks(entry, runner=run):
     on = bool(spec) and "--projects" in (spec.get("args") or []) and "--no-projects" not in (spec.get("args") or [])
     add("OK" if on else "WARN", "web projects", "on: every chat belongs to a project" if on else "off: chats aren't grouped per project",
         None if on else "silo update")
+    args = (spec or {}).get("args") or []
+    ui = str(PREFIX / "current/integrations/term-llm")
+    findings = (spec is not None and "--disable-widgets" not in args and "--disable-extensions" not in args
+                and ui + "/widgets" in args and ui + "/extensions" in args and "silo-findings" in args)
+    add("OK" if findings else "WARN", "findings widget", "on: the Findings tab and widget in the web UI" if findings else "off: release findings from the terminal",
+        None if findings else "silo update")
 
     dbhub_check(add, entry, runner)
 

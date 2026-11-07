@@ -440,7 +440,14 @@ def service_args(dry=False):
     hub = (["--hub-url", C["HUB_URL"], "--hub-node-id", C["HUB_NODE_ID"]] + (["--hub-node-name", C["HUB_NODE_NAME"]] if C["HUB_NODE_NAME"] else [])
            + ["--hub-connect", "reverse", "--hub-register"]) if C["HUB_URL"] else []
     return ([str(P/"bin/term-llm"), "service", "install", "web", "--binary", str(P/"bin/term-llm"), "--no-start"] + (["--dry-run"] if dry else []) + secrets
-            + ["--", "--host", "127.0.0.1", "--port", C["TERM_LLM_PORT"], "--auth", "bearer", "--approval", "prompt", "--projects", "--disable-extensions", "--disable-widgets"] + hub)
+            + ["--", "--host", "127.0.0.1", "--port", C["TERM_LLM_PORT"], "--auth", "bearer", "--approval", "prompt", "--projects"]
+            + web_ui_args() + hub)
+
+def web_ui_args():
+    # Only the release's own widget and extension (sealed read-only), named explicitly: the
+    # Findings release gate. Nothing from ~/.config/term-llm/{widgets,extensions}.
+    ui = P/"current/integrations/term-llm"
+    return ["--widgets-dir", str(ui/"widgets"), "--extensions-dir", str(ui/"extensions"), "--extensions", "silo-findings"]
 
 def hub_secrets_state(entry):
     # Metadata only: the file holds TERM_LLM_HUB_REGISTRATION_TOKEN and is never read or hashed here.
@@ -607,6 +614,7 @@ def make_plan(allow=False):
         refuse("METAL_AGENTS_CONFIG", "existing term-llm config preserved; " + AGENTS_HELP + " (" + agents_path() + "), then re-plan")
     notes.append("Everyday node commands: <prefix>/current/bin/silo (doctor, update, use-github, restart, shell, prime, claude-login, intake); link it once as root: ln -sfn " + str(P/"current/bin/silo") + " /usr/local/bin/silo")
     notes.append("Web UI projects are on (--projects): every chat belongs to a project. 'silo intake PROJECT' creates the folder ~/projects/PROJECT and its web UI project; migration-data's tools work only in a chat inside that project and only on that workspace. Existing chats move to the home project. 'metal update' re-installs the service once to switch this on.")
+    notes.append("Findings release gate in the web UI: the release's widget (integrations/term-llm/widgets/findings, on a Unix socket behind the web UI sign-in) and extension 'silo-findings' (a 'Findings' tab showing what waits for review). Release, reject, amend and withdraw run 'standard finding …' as the account. No other widgets or extensions are loaded.")
     notes.append("Web UI agent picker: only " + ", ".join(sorted(MIGRATION_AGENTS)) + ", from " + agents_path() + " (agents.use_builtin: false); no pinned startup agent.")
     notes.append("server-support has a shell with the account's ROOT-EQUIVALENT Docker authority and built-in file edits; each command and each write needs approval in the web UI (--approval prompt; choose 'once'). Its read tools refuse workspaces, intake drop folders, state/tmp and credential files. Approving a write to the release tree (agent definitions or tool scripts), ~/.config/term-llm (approval/agents settings) or the service unit can remove these limits: refuse such writes unless intended. Release trees are made read-only.")
     notes.append("migration-data (Frontier only) is the only agent with customer data: intake from <prefix>/intake/<ws>, sandboxed scripts (no network, inputs read-only, one output folder), a per-project source database (MariaDB or PostgreSQL) on an internal Docker network with a read-only user. Its tools run without approval. Skills: ~/.config/term-llm/skills links to the release's skills; each agent's skills: setting decides which it sees.")
@@ -786,7 +794,7 @@ def install_term():
     for flag in ("--binary", "--no-start", "--dry-run"):
         if flag not in install_help:
             refuse("METAL_TERM_FLAGS", "pinned service help does not support required flags")
-    for flag in ("--host", "--port", "--auth", "--approval", "--agent", "--projects", "--disable-extensions", "--disable-widgets"):
+    for flag in ("--host", "--port", "--auth", "--approval", "--agent", "--projects", "--widgets-dir", "--extensions-dir", "--extensions"):
         if flag not in serve_help:
             refuse("METAL_TERM_FLAGS", "pinned serve help does not support required flags")
 
@@ -1089,12 +1097,19 @@ def service_spec_args():
         return None
     return args if isinstance(args, list) else None
 
+def service_current(args):
+    """The saved service arguments already have web UI projects and the Findings widget/extension."""
+    wanted = web_ui_args()
+    pairs = {wanted[i]: wanted[i + 1] for i in range(0, len(wanted), 2)}
+    return ("--projects" in args and not {"--no-projects", "--disable-widgets", "--disable-extensions"} & set(args)
+            and all(flag in args and args.index(flag) + 1 < len(args) and args[args.index(flag) + 1] == value for flag, value in pairs.items()))
+
 def refresh_service():
-    """Re-install the web service when its saved arguments predate web UI projects (--no-projects).
+    """Re-install the web service when its saved arguments predate web UI projects or the Findings widget.
     Keeps the unit's directory, environment and secrets (term-llm reuses them); silo update restarts."""
     global STAGE
     args = service_spec_args()
-    if C["TERM_LLM_SERVICE"] == "skip" or args is None or ("--projects" in args and "--no-projects" not in args):
+    if C["TERM_LLM_SERVICE"] == "skip" or args is None or service_current(args):
         return False
     STAGE = "SERVICE_UPDATE"
     try:
