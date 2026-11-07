@@ -12,6 +12,7 @@ const ERRORS = {
   STANDARD_PUSH_REJECTED: 'GitHub rejected the push (the branch moved on GitHub). Nothing was changed there.',
   STANDARD_PUSH_TOKEN_MISSING: 'No GitHub token for this repository owner on the server.',
   STANDARD_REQUEST_REFUSED: 'The request was refused. Reload the page.',
+  STANDARD_OPERATION_TIMEOUT: 'No answer in time. It may still have happened: press Refresh before trying again.',
 };
 const RUN_DONE = new Set(['completed', 'failed', 'interrupted']);
 const state = { workspace: '', selected: null, overview: null };
@@ -67,7 +68,8 @@ const explain = (error) => ERRORS[String(error.message).split(':')[0]] || `Refus
 function readHash() {
   const params = new URLSearchParams(location.hash.slice(1));
   if (params.get('ws')) state.workspace = params.get('ws');
-  state.selected = params.get('kind') && params.get('id') ? { kind: params.get('kind'), id: params.get('id') } : null;
+  const kind = params.get('kind');
+  state.selected = ['plan', 'run', 'push'].includes(kind) && params.get('id') ? { kind, id: params.get('id') } : null;
 }
 
 function writeHash() {
@@ -145,10 +147,15 @@ function table(headers, rows, numeric = []) {
 
 async function act(action, body, question) {
   if (!confirm(question)) return null;
+  // One decision at a time: no second click while this one runs (a push can take minutes).
+  const buttons = [...document.querySelectorAll('#detail-pane .actions button')];
+  for (const button of buttons) button.disabled = true;
+  toast(action === 'push' ? 'Pushing… this can take a few minutes.' : 'Working…');
   let outcome;
   try {
     outcome = await api(`api/${action}`, { workspace: state.workspace, ...body });
   } catch (error) {
+    for (const button of buttons) button.disabled = false;
     toast(explain(error), true);
     await loadList();
     await loadDetail();
@@ -200,9 +207,13 @@ function renderPlan(plan) {
   parts.push(block('What it does', el('ul', {}, (plan.mutations || []).map((m) => el('li', {}, m)))),
     block('Not included', el('p', {}, (plan.not_included || []).join(', '))));
   const actions = [];
+  const unseen = convert && ((plan.texts || {}).settings == null || ((plan.roles || {}).reconciliation && (plan.texts || {}).reconciliation == null));
   if (plan.status === 'proposed') {
+    const question = unseen
+      ? `Approve plan ${plan.plan_id}?\nDigest ${plan.digest}\nThe settings or checks could NOT be shown here: you approve them by hash only.`
+      : `Approve plan ${plan.plan_id}?\nDigest ${plan.digest}\nIt runs exactly what this page shows.`;
     actions.push(el('button', { type: 'button', class: 'primary', onclick: async () => {
-      if (await act('approve', { plan_id: plan.plan_id, digest: plan.digest }, `Approve plan ${plan.plan_id}?\nDigest ${plan.digest}\nIt runs exactly what this page shows.`)) {
+      if (await act('approve', { plan_id: plan.plan_id, digest: plan.digest }, question)) {
         toast('Approved. Start it when you are ready.');
         await refreshAll();
       }
@@ -278,7 +289,8 @@ function renderPush(push) {
   if (push.stat) parts.push(block('Diff stat', el('pre', {}, push.stat)));
   if (push.status === 'proposed' || (push.status === 'pushed' && !(pull && pull.url))) {
     parts.push(el('div', { class: 'actions' }, el('button', { type: 'button', class: 'primary', onclick: async () => {
-      const outcome = await act('push', { digest: push.digest }, `Push ${push.branch} (${short(push.head, 12)}) to ${push.repository} and open a draft PR as you?`);
+      const owner = String(push.repository || '').split('/')[0];
+      const outcome = await act('push', { digest: push.digest }, `Push ${push.branch} (${short(push.head, 12)}) to ${push.repository} and open a draft PR, with the server's GitHub token for ${owner}?`);
       if (outcome) { toast(outcome.pull_request && outcome.pull_request.url ? `Pushed; draft PR #${outcome.pull_request.number}.` : 'Pushed.'); await refreshAll(); }
     } }, push.status === 'proposed' ? 'Push and open draft PR' : 'Open draft PR')));
   }

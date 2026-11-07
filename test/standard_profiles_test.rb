@@ -84,6 +84,7 @@ class StandardProfilesTest < SiloMigrateTest
       standard_error('STANDARD_CONVERTER_DIRTY') { propose }
       standard_error('STANDARD_CONVERTER_DIRTY') { @service.claim(plan_id: plan[:plan_id]) }
       standard_error('STANDARD_CONVERTER_DIRTY') { @service.converter_refresh }
+      standard_error('STANDARD_CONVERTER_DIRTY') { @service.converter_refresh(if_changed: true) }
       @runtime.converter_dirty = false
       @runtime.converter_head = 'b' * 40
       assert_equal 'stale', @service.show_plan(plan[:plan_id])[:status]

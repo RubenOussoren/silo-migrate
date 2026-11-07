@@ -89,7 +89,7 @@ export function activate(ui) {
       text: `${item.workspace} · ${item.kind}`, hash: hashFor(item.workspace, `&id=${encodeURIComponent(item.id)}`), at: item.proposed_at })),
     more: (data, n) => (n > ((data && data.latest.length) || 0) ? 'All findings to review…' : 'Open findings and history…'),
   });
-  const WHAT = { plan: { proposed: 'plan to approve', approved: 'approved: start it' }, push: { proposed: 'push to approve' } };
+  const WHAT = { plan: { proposed: 'plan to approve (or discard)', approved: 'approved: start it' }, push: { proposed: 'push to approve' } };
   edgeTab(ui, {
     mount: 'runs', className: 'silo-runs', label: 'Runs',
     count: (data) => (data ? data.waiting : 0),

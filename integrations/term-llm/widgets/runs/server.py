@@ -26,7 +26,9 @@ import os
 from pathlib import Path
 import pwd
 import re
+import signal
 import socketserver
+import unicodedata
 import stat
 import subprocess
 import sys
@@ -41,6 +43,8 @@ MAX_STATE = 4 * 1024 * 1024     # the stores' limit for state.json
 MAX_INPUT_TEXT = 256 * 1024     # settings and reconciliation inputs shown in a plan
 MAX_EVIDENCE = 64 * 1024
 MAX_BODY = 4096                 # POST bodies are a few IDs
+STAGE_NAMES = ("preflight", "convert", "reconcile", "site_up", "baseline", "uploads", "import", "verify_site",
+               "final_backup", "review_url", "restore", "verify_restore")
 HERE = Path(__file__).resolve().parent
 INSTALLED = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/widgets/[a-z0-9-]+")
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -207,10 +211,22 @@ class Store:
 def control_call(control, argv, timeout=DEFAULT_TIMEOUT):
     """Run silo-migrate-control; its JSON (the first line, for start-run), or a refusal with its
     code and the short fixed detail some refusals add."""
+    # Its own process group: on a timeout everything it started (git push, the PR request,
+    # the control container's client) is stopped with it, not left to finish unseen.
+    process = subprocess.Popen([control, *argv], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:
-        result = subprocess.run([control, *argv], capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=5)  # something that left the group may still hold a pipe
+        except subprocess.TimeoutExpired:
+            pass
         raise Refused("STANDARD_OPERATION_TIMEOUT", 504)
+    result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     if result.returncode != 0:
         match = re.search(rb"Error: ((?:STANDARD|NAMED)_[A-Z_]+)([^\n]*)", result.stderr)
         if not match:
@@ -233,7 +249,8 @@ def reviewer_name():
                 name = line.split("=", 1)[1].strip()
     except OSError:
         pass
-    name = name if re.fullmatch(r"[^\x00-\x1f\x7f]{1,80}", name) else "engineer"
+    printable = 1 <= len(name) <= 80 and all(unicodedata.category(c)[0] != "C" for c in name)  # no control/format chars (e.g. U+202E)
+    name = name if printable else "engineer"
     return name + " (web UI)"
 
 
@@ -258,14 +275,14 @@ def waiting(store, workspace):
     items = []
     for plan_id, plan in store.plans(workspace).items():
         if plan.get("status") in ("proposed", "approved"):
-            body = plan.get("body") if isinstance(plan.get("body"), dict) else {}
             items.append({"kind": "plan", "workspace": workspace, "id": plan_id, "status": plan["status"],
-                          "operation": text_or_none(body.get("operation")), "at": text_or_none(plan.get("created_at")) or ""})
+                          "at": text_or_none(plan.get("created_at")) or ""})
     for record in store.pushes(workspace):
         if record.get("status") == "proposed":
             items.append({"kind": "push", "workspace": workspace, "id": record["digest"], "status": "proposed",
-                          "title": text_or_none(record["proposal"].get("title")), "at": text_or_none(record.get("proposed_at")) or ""})
-    running = [{"kind": "run", "workspace": workspace, "id": run_id, "status": run.get("status"), "stage": text_or_none(run.get("stage")),
+                          "at": text_or_none(record.get("proposed_at")) or ""})
+    running = [{"kind": "run", "workspace": workspace, "id": run_id, "status": run.get("status"),
+                "stage": run.get("stage") if run.get("stage") in STAGE_NAMES else None,
                 "at": text_or_none(run.get("started_at")) or ""}
                for run_id, run in store.runs(workspace).items() if run.get("status") in ("claimed", "running")]
     return items, running

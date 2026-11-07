@@ -67,6 +67,11 @@ if mode == 'refuse':
     print('Error: STANDARD_RECONCILIATION_INVALID: check 3: source_sql. The reconciliation input is invalid.', file=sys.stderr); sys.exit(1)
 if mode == 'garbage':
     print('Traceback (most recent call last): ' + os.environ['RUNS_MARKER'], file=sys.stderr); sys.exit(1)
+if mode == 'slow':
+    import subprocess, time
+    # A grandchild that would finish the job later: it must be stopped with the call.
+    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2); open(%r, "w").write("finished")' % os.environ['RUNS_LATE']])
+    time.sleep(30)
 if args[:2] == ['standard', 'status']:
     print(json.dumps({'version': 1, 'plans': [
         {'plan_id': 'plan-%032x' % 1, 'digest': 'a' * 64, 'status': 'proposed', 'created_at': '2026-11-07T10:00:00Z'},
@@ -168,8 +173,12 @@ else:
         self.assertEqual(1, data['running'])
         self.assertEqual([{'workspace': 'arc', 'waiting': 3, 'running': 1}], data['workspaces'])
         self.assertEqual({('plan', 'proposed'), ('plan', 'approved'), ('push', 'proposed')}, {(i['kind'], i['status']) for i in data['latest']})
+        for item in data['latest']:
+            self.assertEqual({'kind', 'workspace', 'id', 'status', 'at'}, set(item))
+        self.assertEqual([{'kind': 'run', 'workspace': 'arc', 'id': rid(2), 'status': 'running', 'stage': 'convert', 'at': '2026-11-07T11:00:00Z'}], data['active'])
         raw = json.dumps(data)
         self.assertNotIn(MARKER, raw)
+        self.assertNotIn('Add MyBB users step', raw)
         self.assertNotIn('1234', raw)
         self.assertEqual([], self.calls())
 
@@ -249,6 +258,30 @@ else:
         status, raw, _ = self.request('GET', '/api/overview?workspace=arc')
         self.assertEqual(409, status)
         self.assertNotIn(MARKER, raw.decode())
+
+    def test_a_call_that_runs_out_of_time_stops_everything_it_started(self):
+        late = Path(self.temp.name) / 'late'
+        os.environ.update(RUNS_MODE='slow', RUNS_LATE=str(late))
+        self.addCleanup(os.environ.pop, 'RUNS_LATE', None)
+        with mock.patch.dict(self.w.TIMEOUTS, {'push': 1}):
+            status, data = self.post('push', digest='c' * 64)
+        self.assertEqual((504, 'STANDARD_OPERATION_TIMEOUT'), (status, data['error']))
+        import time
+        time.sleep(3)
+        self.assertFalse(late.exists(), 'a process the timed-out call started kept running')
+        self.assertIn('STANDARD_OPERATION_TIMEOUT', (WIDGET / 'app.js').read_text())
+
+    def test_reviewer_name_refuses_control_and_format_characters(self):
+        home = Path(self.temp.name) / 'home'
+        (home / '.config/silo-migrate').mkdir(parents=True)
+        import pwd as pwd_module
+        real = pwd_module.getpwuid(os.getuid())
+        fake = pwd_module.struct_passwd((real.pw_name, 'x', real.pw_uid, real.pw_gid, '', str(home), '/bin/bash'))
+        for name, expected in (('Ruben Example', 'Ruben Example (web UI)'), ('Rub\u202eneb', 'engineer (web UI)'), ('x\x1b[31m', 'engineer (web UI)'),
+                               ('Zoë Ølsen', 'Zoë Ølsen (web UI)'), ('', 'engineer (web UI)')):
+            (home / '.config/silo-migrate/git-identity').write_text('name=' + name + '\n')
+            with mock.patch.object(self.w.pwd, 'getpwuid', return_value=fake):
+                self.assertEqual(expected, self.w.reviewer_name(), repr(name))
 
     def test_links_are_refused_not_followed(self):
         outside = Path(self.temp.name) / 'outside'

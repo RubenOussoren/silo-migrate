@@ -19,6 +19,7 @@ import socketserver
 import stat
 import subprocess
 import sys
+import unicodedata
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
 
@@ -227,7 +228,8 @@ def reviewer_name():
                 name = line.split("=", 1)[1].strip()
     except OSError:
         pass
-    name = name if re.fullmatch(r"[^\x00-\x1f\x7f]{1,80}", name) else "engineer"
+    printable = 1 <= len(name) <= 80 and all(unicodedata.category(c)[0] != "C" for c in name)  # no control/format chars (e.g. U+202E)
+    name = name if printable else "engineer"
     return name + " (web UI)"
 
 
