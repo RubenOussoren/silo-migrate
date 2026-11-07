@@ -540,11 +540,11 @@ def op_write(checkout, request):
     try:
         checkout.record_write(relative, content.encode("utf-8"))
     except Exception:
-        if not exists:  # never leave a file the agent wrote but can't see
-            try:
-                os.unlink(target)
-            except OSError:
-                pass
+        # Never leave a file the agent wrote but can't see: remove it, or put the old bytes back.
+        try:
+            atomic_write(target, data, mode) if exists else os.unlink(target)
+        except OSError:
+            pass
         raise
     return {"path": relative, "created": not exists, "bytes": len(content.encode("utf-8")), "diff": small_diff(relative, before, content)}
 
@@ -568,7 +568,14 @@ def op_edit(checkout, request):
     if len(after.encode("utf-8")) > MAX_WRITE_BYTES:
         refuse("STANDARD_ARGUMENTS_INVALID")
     atomic_write(target, after.encode("utf-8"), stat.S_IMODE(info.st_mode) & 0o755)
-    checkout.record_write(relative, after.encode("utf-8"))
+    try:
+        checkout.record_write(relative, after.encode("utf-8"))
+    except Exception:
+        try:
+            atomic_write(target, raw, stat.S_IMODE(info.st_mode) & 0o755)  # back to the visible version
+        except OSError:
+            pass
+        raise
     return {"path": relative, "replacements": count, "diff": small_diff(relative, before, after)}
 
 
@@ -585,7 +592,7 @@ def op_delete(checkout, request):
 # Operations that change the checkout or the manifest of what the agent wrote. Models often send
 # several tool calls at once; these run one at a time per workspace (reads don't wait).
 MUTATING = {"write", "edit", "delete", "branch", "commit", "push-propose"}
-DEV_LOCK_WAIT = 45  # the adapter gives a call 55 s
+DEV_LOCK_WAIT = 25  # the adapter gives a call 55 s; leave the operation itself ~30 s
 
 
 class DevLock:
@@ -1066,10 +1073,15 @@ def push(checkout, digest, home, open_pr=True):
 
 
 def write_record(path, record):
-    temporary = path.with_name("." + path.name + ".tmp")
-    temporary.write_text(json.dumps(record, indent=2) + "\n")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    descriptor, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(json.dumps(record, indent=2) + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # -- dispatch ------------------------------------------------------------------------

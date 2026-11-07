@@ -103,6 +103,16 @@ class ConverterDevTest(unittest.TestCase):
                 self.dev.main(['converter', 'dev', self.ws, '--role', 'developer'], {}, self.base, ROOT, self.host,
                               io.StringIO(json.dumps({'op': 'write', 'path': 'lib/orphan.rb', 'content': 'x\n'})), home=str(self.home))
         self.assertFalse((self.checkout / 'lib/orphan.rb').exists())
+        # Overwriting or editing a visible file: the old, still-vouched bytes come back.
+        before = (self.checkout / 'lib/importer.rb').read_text()
+        for request in ({'op': 'write', 'path': 'lib/importer.rb', 'content': 'replaced\n'},
+                        {'op': 'edit', 'path': 'lib/importer.rb', 'old_text': 'downcase', 'new_text': 'upcase'}):
+            with self.subTest(op=request['op']), mock.patch.object(self.dev.Checkout, 'record_write', side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):
+                    self.dev.main(['converter', 'dev', self.ws, '--role', 'developer'], {}, self.base, ROOT, self.host,
+                                  io.StringIO(json.dumps(request)), home=str(self.home))
+            self.assertEqual(before, (self.checkout / 'lib/importer.rb').read_text())
+            self.assertIn('downcase', self.call('read', path='lib/importer.rb')['text'])
 
     def test_branch_works_in_a_workspace_that_never_ran_anything(self):
         # migration-data creates workspaces fresh: no op.lock until something takes it.
