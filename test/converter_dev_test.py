@@ -654,7 +654,10 @@ class ConverterDevTest(unittest.TestCase):
             result = self.dev.main(['converter', 'deps', self.ws], {}, self.base, ROOT, self.host, io.StringIO(''), home=str(self.home))
             self.assertEqual('prepared', result['dependencies']['status'])
             self.assertEqual(git(self.checkout, 'rev-parse', 'HEAD'), result['head'])
-            self.assertEqual('ready', self.dev.main(['converter', 'deps', self.ws], {}, self.base, ROOT, self.host, io.StringIO(''))['dependencies']['status'])
+            self.assertEqual('ready', self.dev.main(['converter', 'deps', self.ws, '--budget', '150'], {}, self.base, ROOT, self.host, io.StringIO(''))['dependencies']['status'])
+            for bad in (['--budget', '29'], ['--budget', '181'], ['--budget', 'x'], ['--timeout', '150']):
+                with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_ARGUMENTS_INVALID'):
+                    self.dev.main(['converter', 'deps', self.ws, *bad], {}, self.base, ROOT, self.host, io.StringIO(''))
             self.assertEqual(1, len(seen['deps']))
         finally:
             for patch in patches:

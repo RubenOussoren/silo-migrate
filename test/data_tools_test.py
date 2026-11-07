@@ -782,7 +782,7 @@ class DataToolsTest(unittest.TestCase):
         self.control = control
         result = self.op('plan_propose', source=source, settings=settings, reconciliation=checks, charset='latin1')
         self.assertEqual([['standard', 'plan', 'propose', 'arc', '--operation', 'convert', '--charset', 'latin1', '--source', source,
-                           '--settings', settings, '--reconciliation', checks], ['converter', 'deps', 'arc'], calls[0][0]], [c for c, _ in calls])
+                           '--settings', settings, '--reconciliation', checks], ['converter', 'deps', 'arc', '--budget', '150'], calls[0][0]], [c for c, _ in calls])
         self.assertLessEqual(sum(timeout for _, timeout in calls), 285)
         self.assertEqual('plan-' + 'e' * 32, result['plan_id'])
         self.assertEqual({'status': 'prepared', 'gems_added': ['markbridge-0.5.0']}, result['dependencies_prepared'])
@@ -807,6 +807,11 @@ class DataToolsTest(unittest.TestCase):
         with mock.patch.object(self.d.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'Error: STANDARD_STALE_PLAN\n')):
             with self.assertRaisesRegex(self.d.Refusal, r'\ASTANDARD_STALE_PLAN\Z'):
                 runner(['standard'])
+        # A long or multi-line detail is cut, never passed on whole.
+        with mock.patch.object(self.d.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'Error: STANDARD_SETTINGS_INVALID: ' + 'x' * 500 + '\nsecond line\n')):
+            with self.assertRaises(self.d.Refusal) as caught:
+                runner(['standard'])
+            self.assertEqual('STANDARD_SETTINGS_INVALID', str(caught.exception))
 
     def test_corrupt_files_give_fixed_errors(self):
         (self.intake / 'broken.gz').write_bytes(b'\x1f\x8b\x08\x00' + b'\xff' * 64)

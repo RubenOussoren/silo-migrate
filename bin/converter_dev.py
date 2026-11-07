@@ -1052,8 +1052,9 @@ def clean_stale_builds(root):
             pass
 
 
-def prepare_dependencies(checkout, document, started):
-    """(ready directory, result dict) or (None, failure dict). Builds once per key."""
+def prepare_dependencies(checkout, document, started, budget=None):
+    """(ready directory, result dict) or (None, failure dict). Builds once per key, within
+    budget seconds of started (plus up to ~35 s to remove a container that ran out of time)."""
     import fcntl
     gemfile, lockfile = committed(checkout, "Gemfile"), committed(checkout, "Gemfile.lock")
     check_lockfile(lockfile)
@@ -1065,7 +1066,7 @@ def prepare_dependencies(checkout, document, started):
     ready = root / key
     if (ready / "ready.json").is_file():
         return ready, {"status": "ready", "key": key[:12]}
-    deadline = started + DEPS_TIMEOUT
+    deadline = started + (DEPS_TIMEOUT if budget is None else budget)
     descriptor = os.open(root / (".lock-" + key), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         while True:  # another tool call may be preparing the same key: wait for it
@@ -1367,11 +1368,17 @@ def main(args, values, base, repo, host, stdin, home=None):
         if len(rest) != 2 or rest[0] != "--sha256":
             refuse("STANDARD_ARGUMENTS_INVALID")
         return dict(version=1, **push(Checkout(base, workspace, host), rest[1], home, open_pr))
-    if len(args) == 3 and args[1] == "deps":
+    if len(args) in (3, 5) and args[1] == "deps":
         # Engineer or migration-data: prepare the locked gems for the checkout's HEAD (the
-        # step dev_test runs first), e.g. before proposing a convert plan.
+        # step dev_test runs first), e.g. before proposing a convert plan. `--budget S`
+        # keeps it inside a caller's own time limit.
+        budget = None
+        if len(args) == 5:
+            if args[3] != "--budget" or not args[4].isdigit() or not 30 <= int(args[4]) <= DEPS_TIMEOUT:
+                refuse("STANDARD_ARGUMENTS_INVALID")
+            budget = int(args[4])
         checkout = Checkout(base, args[2], host)
-        ready, prepared = prepare_dependencies(checkout, converter_image_document(checkout, values, repo), time.monotonic())
+        ready, prepared = prepare_dependencies(checkout, converter_image_document(checkout, values, repo), time.monotonic(), budget)
         if ready is None:
             refuse("STANDARD_CONVERTER_DEPS_FAILED: " + prepared["status"] + (" (" + prepared["step"] + ")" if prepared.get("step") else ""))
         return dict(version=1, head=checkout.head(), dependencies=prepared)

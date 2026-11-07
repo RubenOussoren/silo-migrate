@@ -72,7 +72,10 @@ $C start-run "$WS" PLAN_ID
 
 - **Inputs, chosen by ID** (registered inputs, bound by the digest like any plan):
   - **source:** a MariaDB/MySQL SQL dump, plain or gzip/bzip2/xz. An archive is refused
-    (`STANDARD_DUMP_KIND_UNSUPPORTED`): extract it first.
+    when the plan is proposed (`STANDARD_DUMP_KIND_UNSUPPORTED`): extract it first. The
+    dump must create its tables in the current database. A dump that creates and `USE`s
+    its own (`mysqldump --databases`) fails with `STANDARD_SOURCE_EMPTY`: remove those
+    lines first.
   - **settings:** type `converter-settings`, the platform converter's `settings.yml`. Where
     it needs the database connection it uses `${SILO_DB_HOST}`, `${SILO_DB_PORT}`,
     `${SILO_DB_USER}`, `${SILO_DB_PASSWORD}` and `${SILO_DB_NAME}`. The run fills them in
@@ -92,12 +95,24 @@ $C start-run "$WS" PLAN_ID
 - **What the run does:**
   1. Copies the inputs by content hash.
   2. Loads the dump into a disposable MariaDB, with its data on disk under the run's
-     private folder and no network (2 CPUs, 8 GiB, 4 GiB buffer pool; load limit 6 h). The
-     load runs with `--sandbox`.
-  3. Counts the source side of each check right after the load, as a SELECT-only user.
-  4. Runs the converter (2 CPUs, 8 GiB, limit 12 h; its output goes to a private log).
-  5. Deletes the database and the dump copy, and keeps `intermediate.sqlite` as an artifact.
-- **Disk:** the run needs 3× the dump size free (12× if compressed) above the profile minimum.
+     private folder and no network (load limit 6 h). The load runs as root with the client
+     in `--sandbox`. File reads and writes are confined to an empty run folder
+     (`--secure-file-priv`).
+  3. Creates the converter's and the counting user's accounts after the load, so the dump
+     can't change them.
+  4. Counts the source side of each check right after that, as a SELECT-only user, inside a
+     scalar subquery (one value at most).
+  5. Runs the converter (limit 12 h; its output goes to a private log, read after the
+     container is gone).
+  6. Deletes the database, the dump copy and the generated passwords (the kept settings
+     copy shows `[removed]`), and keeps `intermediate.sqlite` as an artifact.
+     `run reset` does the same after a killed run.
+- **Size:** each container gets up to 2 CPUs and 8 GiB, at most a quarter of the host's
+  memory (the DB's buffer pool is half of that), fixed when the plan is proposed.
+  Admission refuses (`STANDARD_CAPACITY`) when these memory limits plus those of running
+  managed containers exceed three quarters of the host's memory.
+- **Disk:** the run checks before copying that the copy plus the database fit: dump × (1 + 3),
+  or × (1 + 12) if compressed, above the profile minimum.
 - **Reconciliation only reports.** Per-check numbers (`evidence/reconciliation.json`) are
   derived from customer data. They stay private: migration-data reads them with
   `data_run_evidence`, and you read them on the server. Public status (`standard status`,

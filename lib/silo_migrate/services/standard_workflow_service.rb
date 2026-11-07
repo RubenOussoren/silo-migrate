@@ -69,6 +69,7 @@ module SiloMigrate
         "STANDARD_INTERRUPTED" => "The executing process ended. The instance state is unknown: reset this run, then re-plan.",
         "STANDARD_DUMP_KIND_UNSUPPORTED" => "The source input is an archive or an unsupported compression. Extract or convert it (migration-data), register the SQL dump, then propose a new plan.",
         "STANDARD_CONVERTER_DEPS_MISSING" => "The converter's locked gems aren't prepared for this commit. Run dev_test once on it (converter-developer) or `silo-migrate-control converter deps WS`, then propose a new plan.",
+        "STANDARD_SOURCE_EMPTY" => "The dump put no tables in the run's database: it probably creates and uses its own (mysqldump --databases). Have migration-data remove its CREATE DATABASE and USE lines, register the result, then propose a new plan.",
         "STANDARD_SETTINGS_INVALID" => "The converter settings input is not valid YAML with ${SILO_DB_*} placeholders. Register corrected settings, then propose a new plan.",
         "STANDARD_RECONCILIATION_INVALID" => "The reconciliation input is invalid. Register a corrected one, then propose a new plan.",
         "STANDARD_INTERNAL" => "An unexpected failure occurred. Inspect private evidence, reset this run, then re-plan."
@@ -466,6 +467,7 @@ module SiloMigrate
           # Persist "removed" only after the sweep, so a failed reset stays dirty and
           # keeps blocking new runs. Retrying is safe: absent resources are skipped.
           sweep_run_resources(run_id)
+          convert_leftovers!(run_id) if convert_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
           @store.update do |current|
             stacks.each { |stack| current.fetch("instances")[stack.name] = stack.record }
           end
@@ -667,7 +669,7 @@ module SiloMigrate
           dirty = state.fetch("instances").values.select { |record| %w[creating dirty].include?(record["state"]) }
           raise StandardWorkflowError.new("STANDARD_DIRTY_INSTANCE", "reset the earlier run first") unless dirty.empty?
 
-          admission!(state) unless convert_plan?(plan)
+          convert_plan?(plan) ? convert_admission!(plan.fetch("body")) : admission!(state)
           state.fetch("consumed_outputs").concat(outputs)
           plan["status"] = "consumed"
           plan["run_id"] = run_id
@@ -733,7 +735,9 @@ module SiloMigrate
               raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
             end
             guard_disk!
-            admission!(nil) if stage == STAGES.first && !convert
+            if stage == STAGES.first
+              convert ? convert_admission!(plan_for(run_id).fetch("body")) : admission!(nil)
+            end
             send(stage_method, run_id)
             finish_stage(run_id, stage, "passed")
           rescue StandardWorkflowError => error

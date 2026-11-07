@@ -1562,7 +1562,9 @@ def op_plan_propose(ws, request):
             raise
         # The converter commit's locked gems aren't prepared yet: prepare them (public gems
         # only, the same step dev_test runs), then propose again.
-        prepared = json.loads(ws.control(["converter", "deps", ws.name], timeout=190)).get("dependencies")
+        # 150 s to build (+ up to ~35 s to remove a container that ran out of time) fits in
+        # this call's 190, and 45 + 190 + 45 stays inside the tool's 290.
+        prepared = json.loads(ws.control(["converter", "deps", ws.name, "--budget", "150"], timeout=190)).get("dependencies")
         plan = json.loads(ws.control(argv, timeout=45))
     return {"plan_id": plan.get("plan_id"), "digest": plan.get("digest"), "status": plan.get("status"), "operation": plan.get("operation"),
             "platform": plan.get("platform"), "roles": plan.get("roles"), "inputs": plan.get("inputs"), "source_charset": plan.get("source_charset"),
@@ -1693,9 +1695,13 @@ def control_runner(path):
         except subprocess.TimeoutExpired:
             refuse("STANDARD_OPERATION_TIMEOUT")
         if result.returncode:
-            match = re.search(r"Error: ((?:STANDARD|NAMED)_[A-Z_]+)(: [^\n]{1,200}?)?(?:\. |\.?\n|\.?$)", result.stderr)
-            # The code, plus the short detail some refusals add ("check 3: source_sql").
-            refuse((match[1] + (match[2] or "")) if match else "STANDARD_OPERATION_FAILED")
+            match = re.search(r"Error: ((?:STANDARD|NAMED)_[A-Z_]+)([^\n]*)", result.stderr)
+            if not match:
+                refuse("STANDARD_OPERATION_FAILED")
+            # The code, plus the short detail some refusals add ("check 3: source_sql"): the text
+            # after ": " up to the recovery sentence, kept only when it is short.
+            detail = re.fullmatch(r": (.{1,200}?)(?:\. .*|\.)?", match[2])
+            refuse(match[1] + (": " + detail[1] if detail else ""))
         return result.stdout
     return call
 

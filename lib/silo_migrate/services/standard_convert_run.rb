@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "etc"
+
 module SiloMigrate
   module Services
     # Convert-only runs on real data (operation "standard_convert"): a registered source
@@ -19,11 +21,11 @@ module SiloMigrate
       CONVERT_OPERATION = "standard_convert"
       CONVERT_STAGES = %w[preflight convert reconcile].freeze
       CONVERT_IMAGE_ROLES = %w[converter source_db].freeze
-      # Real dumps need far more than the synthetic profile's conversion limits.
-      CONVERT_LIMITS = {
-        "db" => { "cpus" => 2.0, "memory_mib" => 8192, "pids" => 512, "buffer_pool" => "4G" },
-        "converter" => { "cpus" => 2.0, "memory_mib" => 8192, "pids" => 512 }
-      }.freeze
+      # Real dumps need far more than the synthetic profile's conversion limits: up to this
+      # per container, at most a quarter of the host's memory each (see convert_limits).
+      CONVERT_MAX_CPUS = 2.0
+      CONVERT_MAX_MEMORY_MIB = 8192
+      CONVERT_MIN_MEMORY_MIB = 1024
       LOAD_TIMEOUT = 6 * 3600
       CONVERT_TIMEOUT = 12 * 3600
       QUERY_TIMEOUT = 1800
@@ -65,6 +67,7 @@ module SiloMigrate
         end
         raise StandardWorkflowError, "STANDARD_INPUT_CHANGED" unless inputs_unchanged?(inputs.values)
 
+        dump_kind(File.join(@store.workspace_root, inputs.fetch("source").fetch("path").unpack1("m0")))
         if inputs["reconciliation"]
           spec = read_registered_small(inputs["reconciliation"], MAX_SPEC_BYTES)
           reconciliation_spec(spec)
@@ -102,7 +105,7 @@ module SiloMigrate
           "converter_revision" => revision,
           "converter_deps" => deps,
           "site_settings_sha256" => config["site_settings_sha256"],
-          "limits" => CONVERT_LIMITS,
+          "limits" => convert_limits,
           "reconciliation_policy" => "report",
           "instances" => {},
           "outputs" => {},
@@ -200,7 +203,8 @@ module SiloMigrate
         dir = deps_dir(deps)
         record = JSON.parse(File.read(File.join(dir, "ready.json")))
         !File.symlink?(dir) && record["image"] == deps["image"] && record["lockfile_sha256"] == deps["lockfile_sha256"] &&
-          record["gemfile_sha256"] == deps["gemfile_sha256"] && File.directory?(File.join(dir, "gems")) && File.directory?(File.join(dir, "emoji_cache"))
+          record["gemfile_sha256"] == deps["gemfile_sha256"] &&
+          %w[gems emoji_cache].all? { |name| File.directory?(File.join(dir, name)) && !File.symlink?(File.join(dir, name)) }
       rescue Errno::ENOENT, Errno::ENOTDIR, JSON::ParserError, TypeError
         false
       end
@@ -238,7 +242,7 @@ module SiloMigrate
 
         names = text.scan(PLACEHOLDER).flatten.uniq
         unknown = names - settings_values("x").keys
-        raise StandardWorkflowError.new("STANDARD_SETTINGS_INVALID", "unknown placeholder #{unknown.first}") unless unknown.empty?
+        raise StandardWorkflowError.new("STANDARD_SETTINGS_INVALID", "unknown placeholder #{unknown.first[0, 32]}") unless unknown.empty?
         raise StandardWorkflowError.new("STANDARD_SETTINGS_INVALID", "missing ${SILO_DB_PASSWORD}") unless names.include?("SILO_DB_PASSWORD")
 
         filled = text.gsub(PLACEHOLDER) { |_match| settings_values("p0").fetch(Regexp.last_match(1)) }
@@ -303,6 +307,11 @@ module SiloMigrate
         @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["resolved_image_ids"] = resolved }
         evidence(run_id, "runtime-images.json", JSON.pretty_generate(resolved) + "\n")
         deps_ready!(body.fetch("converter_deps"))
+        source = named.fetch("inputs").fetch(body.dig("roles", "source"))
+        @store.named.verify_input_identity(source)
+        _decompress, kind = dump_kind(File.join(@store.workspace_root, source.fetch("path").unpack1("m0")))
+        # The copy, then the database it becomes: refuse before copying anything.
+        disk_headroom!((1 + DISK_FACTOR.fetch(kind)) * source.fetch("bytes"))
         manifest = materialize_inputs(run_id, body, named, layout: false)
         manifest.each { |input| input["role"] = body.fetch("roles").key(input.fetch("id")) }
         @store.write_private(@store.run_dir(run_id, "work", "inputs.json"), JSON.pretty_generate(manifest) + "\n")
@@ -310,6 +319,40 @@ module SiloMigrate
         record_results(run_id, input_count: manifest.size, input_bytes: manifest.sum { |input| input["bytes"] })
       rescue NamedError => error
         raise StandardWorkflowError.new("STANDARD_INPUT_CHANGED", error.message)
+      end
+
+      # Sized for this host when the plan is proposed, then bound by its digest.
+      def convert_limits
+        host_cpus, host_memory = host_capacity
+        memory = [CONVERT_MAX_MEMORY_MIB, host_memory / 4].min
+        cpus = [CONVERT_MAX_CPUS, host_cpus / 2.0].min
+        raise StandardWorkflowError.new("STANDARD_CAPACITY", "host too small for a convert run") if memory < CONVERT_MIN_MEMORY_MIB || cpus < 0.5
+
+        { "db" => { "cpus" => cpus, "memory_mib" => memory, "pids" => 512, "buffer_pool" => "#{memory / 2}M" },
+          "converter" => { "cpus" => cpus, "memory_mib" => memory, "pids" => 512 } }
+      end
+
+      def disk_headroom!(needed)
+        minimum = lock.dig("limits", "host_free_min_gib") * 1024**3
+        raise StandardWorkflowError.new("STANDARD_CAPACITY", "disk for the source database") if @disk_free.call < minimum + needed
+      end
+
+      # Convert runs aren't sized by the profile's synthetic stack envelope: their memory caps,
+      # added to those of the managed containers already running, must fit in three quarters
+      # of the host's memory. CPU quotas reserve nothing; each must only exist on this host.
+      def convert_admission!(body)
+        _used_cpus, used_memory = measured_usage
+        limits = body.fetch("limits").values_at("db", "converter")
+        host_cpus, host_memory = host_capacity
+        if limits.any? { |limit| limit["cpus"] > host_cpus } || used_memory + limits.sum { |limit| limit["memory_mib"] } > host_memory * 3 / 4
+          raise StandardWorkflowError.new("STANDARD_CAPACITY", "reset an earlier run's retained instances first")
+        end
+      end
+
+      # The host's, as the control container sees /proc (Docker limits don't change these).
+      def host_capacity
+        memory = File.read("/proc/meminfo")[/^MemTotal:\s+(\d+) kB/, 1].to_i / 1024
+        [Etc.nprocessors, memory]
       end
 
       def role_input(inputs, role)
@@ -341,17 +384,44 @@ module SiloMigrate
         dump = input_path(run_id, source)
         convert_on_source_db(run_id, body, inputs, config, source, dump, [code, output, secrets, db_data, db_tmp])
       ensure
-        # The database copy and the dump copy are the run's largest files: never kept.
-        [db_data, db_tmp, dump].compact.each { |path| FileUtils.rm_rf(path) }
+        begin
+          convert_leftovers!(run_id) if run_id
+        rescue SystemCallError => error
+          # Never hide the run's own failure behind a cleanup error; reset retries it.
+          @store.write_private(@store.run_dir(run_id, "private", "cleanup-error.txt"), "#{error.class}\n")
+        end
+      end
+
+      # The database copy and the dump copy are the run's largest files, and the generated
+      # passwords die with the database: none is kept. Also called by `run reset` (after a
+      # killed run). Settings stay for investigation, with the password removed.
+      def convert_leftovers!(run_id)
+        private_dir = @store.run_dir(run_id, "private")
+        %w[source-db source-db-tmp].each { |name| FileUtils.rm_rf(File.join(private_dir, name)) }
+        %w[root-password root.cnf count.cnf bootstrap.sql users.sql].each { |name| FileUtils.rm_f(File.join(private_dir, "converter", name)) }
+        settings = File.join(private_dir, "converter", "settings.yml")
+        if File.file?(settings) && !File.symlink?(settings)
+          @store.write_private(settings, File.read(settings).gsub(/\bp[0-9a-f]{62}\b/, "[removed]"))
+        end
+        manifest = @store.run_dir(run_id, "work", "inputs.json")
+        return unless File.file?(manifest)
+
+        JSON.parse(File.read(manifest)).each do |input|
+          FileUtils.rm_f(input_path(run_id, input)) if input["role"] == "source"
+        end
+      rescue JSON::ParserError
+        nil
       end
 
       def convert_on_source_db(run_id, body, inputs, config, source, dump, dirs)
         code, output, secrets, db_data, db_tmp = dirs
         dirs.each { |dir| FileUtils.mkdir_p(dir, mode: 0o700) }
         decompress, kind = dump_kind(dump)
-        minimum = lock.dig("limits", "host_free_min_gib") * 1024**3
-        needed = DISK_FACTOR.fetch(kind) * source.fetch("bytes")
-        raise StandardWorkflowError.new("STANDARD_CAPACITY", "disk for the source database") if @disk_free.call < minimum + needed
+        disk_headroom!(DISK_FACTOR.fetch(kind) * source.fetch("bytes"))
+        # Defence in depth: both reach a shell string below (bound and checked at proposal).
+        unless CHARSETS.include?(body.fetch("source_charset")) && body.fetch("platform").match?(PLATFORM)
+          raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID"
+        end
 
         materialize_converter(run_id, config, code)
         FileUtils.mkdir_p(File.join(code, "tmp", "emoji_cache"))
@@ -366,8 +436,10 @@ module SiloMigrate
         @store.write_private(File.join(secrets, "root-password"), root_password)
         @store.write_private(File.join(secrets, "root.cnf"), "[client]\nuser=root\nsocket=/run/mysqld/mysqld.sock\npassword=#{root_password}\n")
         @store.write_private(File.join(secrets, "count.cnf"), "[client]\nuser=silo_count\nsocket=/run/mysqld/mysqld.sock\npassword=#{count_password}\n")
-        @store.write_private(File.join(secrets, "bootstrap.sql"), <<~SQL)
-          CREATE DATABASE source CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+        @store.write_private(File.join(secrets, "bootstrap.sql"), "CREATE DATABASE source CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n")
+        # Created after the load, so nothing in the dump can change or drop them.
+        @store.write_private(File.join(secrets, "users.sql"), <<~SQL)
+          DROP USER IF EXISTS 'silo_convert'@'127.0.0.1', 'silo_count'@'localhost';
           CREATE USER 'silo_convert'@'127.0.0.1' IDENTIFIED BY '#{converter_password}';
           GRANT ALL PRIVILEGES ON source.* TO 'silo_convert'@'127.0.0.1';
           CREATE USER 'silo_count'@'localhost' IDENTIFIED BY '#{count_password}';
@@ -393,11 +465,13 @@ module SiloMigrate
             "-v", "#{File.join(secrets, 'root.cnf')}:/run-fixture/root.cnf:ro",
             "-v", "#{File.join(secrets, 'count.cnf')}:/run-fixture/count.cnf:ro",
             "-v", "#{File.join(secrets, 'bootstrap.sql')}:/run-fixture/bootstrap.sql:ro",
+            "-v", "#{File.join(secrets, 'users.sql')}:/run-fixture/users.sql:ro",
             "-v", "#{dump}:/run-fixture/dump:ro",
             "-e", "MARIADB_ROOT_PASSWORD_FILE=/run-fixture/root-password", "-e", "MARIADB_ROOT_HOST=localhost",
             image_id(run_id, "source_db"), "mariadbd", "--bind-address=127.0.0.1", "--skip-name-resolve", "--event-scheduler=DISABLED",
             "--innodb-buffer-pool-size=#{db_limits['buffer_pool']}", "--innodb-log-file-size=512M", "--innodb-flush-log-at-trx-commit=2",
-            "--max-allowed-packet=1G", "--max-connections=20", "--tmpdir=/var/lib/mysql-tmp"], timeout: 60).stdout.strip
+            # LOAD DATA / INTO OUTFILE only inside the (empty, run-owned) tmp folder.
+            "--max-allowed-packet=1G", "--max-connections=20", "--tmpdir=/var/lib/mysql-tmp", "--secure-file-priv=/var/lib/mysql-tmp"], timeout: 60).stdout.strip
           created << db_id
           wait_source_db(db_id)
           client = "mariadb --defaults-extra-file=/run-fixture/root.cnf --batch"
@@ -406,6 +480,14 @@ module SiloMigrate
           checked(run_id, "conversion-db-load", ["docker", "exec", db_id, "bash", "-c",
             "set -o pipefail; #{decompress} /run-fixture/dump | mariadb --defaults-extra-file=/run-fixture/root.cnf --sandbox " \
             "--default-character-set=#{body.fetch('source_charset')} source > /dev/null"], timeout: LOAD_TIMEOUT)
+          # A dump made with `mysqldump --databases` creates and USEs its own database: its
+          # tables would be outside `source` and the converter would see nothing.
+          tables = @runtime.run(["docker", "exec", db_id, "/bin/sh", "-c", "exec #{client} --skip-column-names -e " \
+                                 "\"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'source'\""], capture: true, timeout: 120)
+          raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "source check") unless tables.success? && single_count(tables.stdout)
+          raise StandardWorkflowError.new("STANDARD_SOURCE_EMPTY", "no tables in source") unless single_count(tables.stdout).positive?
+
+          checked(run_id, "conversion-db-users", ["docker", "exec", db_id, "/bin/sh", "-c", "exec #{client} < /run-fixture/users.sql"], timeout: 60)
           # Measured before the converter runs: converters may add indexes or tables.
           source_counts = checks.map { |check| source_count(db_id, check) }
           @store.write_private(@store.run_dir(run_id, "private", "source-counts.json"), JSON.pretty_generate(source_counts) + "\n")
@@ -427,21 +509,16 @@ module SiloMigrate
                                   'exec env -u BUNDLE_PATH bundle _2.6.3_ exec ruby ./convert --from="$1" --settings=/run-fixture/settings.yml ' \
                                   '--output-db=intermediate.sqlite --reset > /app/output/convert.log 2>&1', "convert", body.fetch("platform")],
                                  capture: true, timeout: CONVERT_TIMEOUT)
-          converted_log = File.join(output, "convert.log")
-          readable = File.file?(converted_log) && !File.symlink?(converted_log)
-          tail = readable ? File.open(converted_log, "rb") { |file| file.seek([file.size - CONVERT_LOG_TAIL, 0].max); file.read } : ""
-          log(run_id, "convert", SiloMigrate::Runtime::CommandResult.new(success?: convert.success?, stdout: tail, stderr: convert.stderr.to_s, status: convert.status))
-          # The whole output stays private, beside the bounded tail above.
-          FileUtils.mv(converted_log, @store.run_dir(run_id, "logs", "conversion-output.log")) if readable
-          raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "converter exit") unless convert.success?
-
-          summary = tail.to_s.dup.force_encoding("UTF-8").scrub.split("== Run Summary ==", 2)[1]
-          evidence(run_id, "conversion-summary.txt", summary[0, 8192]) if summary
-          record_results(run_id, conversion_summary: summary ? "present" : "missing")
         ensure
           # Anything that survives this is removed by the run's reset, via its label.
           created.reverse_each { |id| @runtime.run(["docker", "rm", "--force", "--volumes", id], capture: true, timeout: 120) }
         end
+        tail = converter_log!(run_id, output, convert)
+        raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "converter exit") unless convert.success?
+
+        summary = tail.to_s.dup.force_encoding("UTF-8").scrub.split("== Run Summary ==", 2)[1]
+        evidence(run_id, "conversion-summary.txt", summary[0, 8192]) if summary
+        record_results(run_id, conversion_summary: summary ? "present" : "missing")
         produced = File.join(output, "intermediate.sqlite")
         raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "no output database") unless File.file?(produced) && !File.symlink?(produced)
 
@@ -454,8 +531,33 @@ module SiloMigrate
         @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["intermediate"] = artifact_identity(intermediate) }
       end
 
+      # Read once the container is gone; never through a symlink. The whole output stays
+      # private (logs/conversion-output.log) beside a bounded tail in logs/convert.log.
+      def converter_log!(run_id, output, convert)
+        path = File.join(output, "convert.log")
+        tail = ""
+        begin
+          # NONBLOCK: a FIFO left in its place must not hang the run (stat.file? refuses it).
+          File.open(path, File::RDONLY | File::NOFOLLOW | File::NONBLOCK) do |file|
+            raise Errno::ENOENT unless file.stat.file?
+
+            file.seek([file.size - CONVERT_LOG_TAIL, 0].max)
+            tail = file.read.to_s
+          end
+          FileUtils.mv(path, @store.run_dir(run_id, "logs", "conversion-output.log.tmp"))
+        rescue SystemCallError
+          tail = ""
+        end
+        log(run_id, "convert", SiloMigrate::Runtime::CommandResult.new(success?: convert.success?, stdout: tail, stderr: convert.stderr.to_s, status: convert.status))
+        moved = @store.run_dir(run_id, "logs", "conversion-output.log.tmp")
+        File.rename(moved, @store.run_dir(run_id, "logs", "conversion-output.log")) if File.file?(moved)
+        tail
+      end
+
       def source_count(db_id, check)
-        sql = "SET SESSION max_statement_time=#{QUERY_TIMEOUT};\n#{check.fetch('source_sql').strip.sub(/;\z/, '')};\n"
+        # A scalar subquery: MariaDB itself refuses more than one row or column, so a query
+        # that isn't a count can't stream a table into this process.
+        sql = "SET SESSION max_statement_time=#{QUERY_TIMEOUT};\nSELECT (#{check.fetch('source_sql').strip.sub(/;\z/, '')});\n"
         result = @runtime.run(["docker", "exec", "-i", db_id, "mariadb", "--defaults-extra-file=/run-fixture/count.cnf", "--batch", "--skip-column-names",
                                "--sandbox", "source"], capture: true, timeout: QUERY_TIMEOUT + 60, stdin_data: sql)
         value = single_count(result.success? ? result.stdout.to_s : nil)
@@ -481,6 +583,7 @@ module SiloMigrate
         raise StandardWorkflowError, "STANDARD_INTERNAL" unless defined?(SQLite3::Database)
 
         db = open_immutable(@store.run_dir(run_id, "artifacts", "intermediate.sqlite"))
+        db.statement_timeout = intermediate_query_timeout * 1000
         rows = checks.map do |check|
           measured = source.fetch(check["name"], {})
           intermediate, error = intermediate_count(db, check.fetch("intermediate_sql"))
@@ -502,6 +605,10 @@ module SiloMigrate
         db&.close
       end
 
+      def intermediate_query_timeout
+        QUERY_TIMEOUT
+      end
+
       # Read-only and immutable: a plain read-only open of a WAL database still creates
       # -shm/-wal files beside the artifact.
       def open_immutable(path)
@@ -513,8 +620,10 @@ module SiloMigrate
         statement = db.prepare(sql.strip.sub(/;\z/, ""))
         return [nil, "more than one statement"] unless statement.remainder.to_s.strip.empty?
 
-        rows = statement.execute.to_a
-        value = rows.size == 1 && rows.first.size == 1 ? rows.first.first : nil
+        results = statement.execute
+        first = results.next
+        # Never more than two rows read, whatever the query returns.
+        value = first && first.size == 1 && results.next.nil? ? first.first : nil
         value.is_a?(Integer) && value >= 0 ? [value, nil] : [nil, "not a single count"]
       rescue SQLite3::Exception => error
         [nil, "query failed: #{error.message[0, 300]}"]

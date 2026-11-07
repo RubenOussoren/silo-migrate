@@ -2,6 +2,7 @@
 require_relative 'standard_workflow_test'
 require 'sqlite3'
 require 'zlib'
+require 'timeout'
 require 'silo_migrate/services/standard_findings_service'
 require 'silo_migrate/standard_cli'
 
@@ -15,7 +16,7 @@ class ConvertScriptedRuntime < StandardScriptedRuntime
     'Config' => { 'Env' => ['PATH=/usr/local/bundle/bin:/usr/bin:/bin', 'RUBY_VERSION=3.3.13', 'GEM_HOME=/usr/local/bundle',
                             'BUNDLE_PATH=/opt/bundle', 'BUNDLE_FROZEN=true'], 'User' => '1001:1001', 'WorkingDir' => '/app' }
   }.freeze
-  attr_accessor :service, :platform_missing, :convert_failure, :source_counts, :log_lines
+  attr_accessor :service, :platform_missing, :convert_failure, :source_counts, :log_lines, :source_empty, :table_check_fails, :log_fifo
   attr_reader :calls, :stdins
 
   def initialize
@@ -54,13 +55,21 @@ class ConvertScriptedRuntime < StandardScriptedRuntime
       return ok(cmd.include?('mariadbd') ? "source-db-id\n" : "converter-id\n")
     elsif cmd[0, 2] == %w[docker exec] && cmd.last.to_s.include?('SELECT 1')
       return ok("1\n")
+    elsif cmd[0, 2] == %w[docker exec] && cmd.last.to_s.include?("information_schema.tables WHERE table_schema = 'source'")
+      return ok('', success: false, stderr: 'ERROR 2002') if table_check_fails
+
+      return ok(source_empty ? "0\n" : "4\n")
     elsif cmd[0, 2] == %w[docker exec] && cmd.include?('--defaults-extra-file=/run-fixture/count.cnf')
       sql = options[:stdin_data].to_s
       key = source_counts.keys.find { |table| sql.include?(table) }
       return key ? ok(source_counts[key]) : ok('', success: false, stderr: 'ERROR 1146: no such table')
     elsif cmd[0, 2] == %w[docker exec] && cmd.include?('./convert') || cmd.any? { |arg| arg.to_s.include?('./convert') }
       output = run_dir('work', 'converter-output')
-      File.write(File.join(output, 'convert.log'), (log_lines || ['converting', '== Run Summary ==', 'Errors : 0 (conversion) + 0 (setup)']).join("\n") + "\n")
+      if log_fifo
+        File.mkfifo(File.join(output, 'convert.log'))
+      else
+        File.write(File.join(output, 'convert.log'), (log_lines || ['converting', '== Run Summary ==', 'Errors : 0 (conversion) + 0 (setup)']).join("\n") + "\n")
+      end
       return ok('', success: false, stderr: 'converter failed') if convert_failure
 
       db = SQLite3::Database.new(File.join(output, 'intermediate.sqlite'))
@@ -127,6 +136,7 @@ class StandardConvertRunTest < SiloMigrateTest
       write(File.join(@code_root, 'lib', 'identity.rb'), '# synthetic code identity')
       @runtime = ConvertScriptedRuntime.new
       @service = new_standard
+      @service.define_singleton_method(:host_capacity) { [8, 64 * 1024] }
       @runtime.service = @service
       site = write(File.join(dir, 'site-settings.yml'), "title: Synthetic\n")
       converter = File.join(dir, 'converter')
@@ -261,7 +271,7 @@ class StandardConvertRunTest < SiloMigrateTest
       assert_equal 'none', db_run[db_run.index('--network') + 1]
       assert_includes db_run, "type=bind,src=#{@service.store.run_dir(run_id, 'private', 'source-db')},dst=/var/lib/mysql"
       refute(db_run.any? { |arg| arg.start_with?('-p') || arg == '--publish' })
-      assert_includes db_run, '--innodb-buffer-pool-size=4G'
+      assert_includes db_run, '--innodb-buffer-pool-size=4096M'
       assert_equal '8192m', db_run[db_run.index('--memory') + 1]
 
       load = @runtime.calls.find { |cmd| cmd.last.to_s.include?('/run-fixture/dump |') }
@@ -281,12 +291,18 @@ class StandardConvertRunTest < SiloMigrateTest
       # Source counts come before the converter can touch the database.
       counted = @runtime.calls.index { |cmd| cmd.include?('--defaults-extra-file=/run-fixture/count.cnf') }
       assert_operator counted, :<, @runtime.calls.index(converter_run)
-      @runtime.stdins.each { |sql| assert_match(/\ASET SESSION max_statement_time=1800;\nSELECT COUNT\(\*\) FROM src_[a-z]+[^;]*;\n\z/, sql) }
+      @runtime.stdins.each { |sql| assert_match(/\ASET SESSION max_statement_time=1800;\nSELECT \(SELECT COUNT\(\*\) FROM src_[a-z]+[^;]*\);\n\z/, sql) }
+      # Users are created after the load, so the dump can't change them.
+      users = @runtime.calls.index { |cmd| cmd.last.to_s.include?('/run-fixture/users.sql') }
+      assert_operator @runtime.calls.index(load), :<, users
+      assert_operator users, :<, counted
 
       settings = File.read(@service.store.run_dir(run_id, 'private', 'converter', 'settings.yml'))
       refute_includes settings, '${SILO_'
-      assert_match(/password: "p[0-9a-f]{62}"/, settings)
+      assert_includes settings, 'password: "[removed]"'
       assert_includes settings, 'port: 3306'
+      assert_equal ['settings.yml'], Dir.children(@service.store.run_dir(run_id, 'private', 'converter'))
+      assert_includes db_run, '--secure-file-priv=/var/lib/mysql-tmp'
       registered = File.read(File.join(@root, 'inputs/derived/settings.yml'))
       assert_includes registered, '${SILO_DB_PASSWORD}'
 
@@ -307,7 +323,15 @@ class StandardConvertRunTest < SiloMigrateTest
       public = @service.show_run(run_id)
       assert_equal({ 'input_count' => 3, 'input_bytes' => public.dig(:results, 'input_bytes'), 'conversion_summary' => 'present',
                      'reconciliation_checks' => 3, 'reconciliation_matched' => 1, 'reconciliation_differs' => 1, 'reconciliation_errors' => 1 }, public[:results])
-      refute_includes JSON.generate(@service.status), '"source":5'
+      [JSON.generate(@service.status), JSON.generate(public)].each do |text|
+        refute_match(/"reconciliation":/, text)
+        refute_includes text, '1146'
+        refute_includes text, 'src_users'
+      end
+      out = StringIO.new
+      SiloMigrate::StandardCLI.new(env: @env, output: out, error: StringIO.new, runtime: @runtime, code_root: @code_root).run(['agent', 'run-show', 'synthetic', run_id])
+      refute_match(/"reconciliation":|1146|src_users/, out.string)
+      assert_includes out.string, '"reconciliation_differs":1'
 
       evidence = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env).private_evidence(run_id)
       assert_equal 'may_propose', evidence[:finding]
@@ -344,10 +368,8 @@ class StandardConvertRunTest < SiloMigrateTest
       assert load.last.start_with?('set -o pipefail; gzip -dc /run-fixture/dump |')
     end
     with_convert(dump: "PK\x03\x04zipped".b) do
-      result = run_convert
-      assert_equal 'failed', result[:status]
-      assert_equal 'STANDARD_DUMP_KIND_UNSUPPORTED', result.dig(:failure, 'code')
-      assert_equal 'convert', result.dig(:failure, 'stage')
+      # Refused at proposal: migration-data hears it before anyone approves anything.
+      standard_error('STANDARD_DUMP_KIND_UNSUPPORTED') { propose_convert }
       refute(@runtime.calls.any? { |cmd| cmd[0, 3] == %w[docker run -d] })
     end
   end
@@ -363,6 +385,110 @@ class StandardConvertRunTest < SiloMigrateTest
       refute File.exist?(@service.store.run_dir(run_id, 'private', 'source-db'))
       refute File.exist?(@service.store.run_dir(run_id, 'work', 'inputs', 'dump.sql'))
       assert_includes File.read(@service.store.run_dir(run_id, 'logs', 'convert.log')), 'converting'
+    end
+  end
+
+  def test_dump_with_its_own_database_fails_clearly
+    with_convert do
+      @runtime.source_empty = true
+      result = run_convert
+      assert_equal 'STANDARD_SOURCE_EMPTY', result.dig(:failure, 'code')
+      refute(@runtime.calls.any? { |cmd| cmd.include?('exec sleep infinity') })
+      refute File.exist?(@service.store.run_dir(result[:run_id], 'private', 'source-db'))
+    end
+  end
+
+  def test_failed_table_check_is_not_reported_as_an_empty_source
+    with_convert do
+      @runtime.table_check_fails = true
+      assert_equal 'STANDARD_CONVERSION_FAILED', run_convert.dig(:failure, 'code')
+    end
+  end
+
+  def test_a_fifo_in_place_of_the_converter_log_cannot_hang_the_run
+    with_convert do
+      @runtime.log_fifo = true
+      result = Timeout.timeout(30) { run_convert }
+      assert_equal 'completed', result[:status]
+      assert_equal 'missing', result.dig(:results, 'conversion_summary')
+    end
+  end
+
+  def test_convert_admission_counts_running_containers
+    with_convert do
+      plan = approve_convert
+      @runtime.high_usage = true
+      standard_error('STANDARD_CAPACITY') { @service.claim(plan_id: plan[:plan_id]) }
+      @runtime.high_usage = false
+      @service.define_singleton_method(:host_capacity) { [1, 64 * 1024] }
+      standard_error('STANDARD_CAPACITY') { @service.claim(plan_id: plan[:plan_id]) }
+      @service.define_singleton_method(:host_capacity) { [8, 20 * 1024] }
+      standard_error('STANDARD_CAPACITY') { @service.claim(plan_id: plan[:plan_id]) }
+      @service.define_singleton_method(:host_capacity) { [2, 22 * 1024] }
+      assert @service.claim(plan_id: plan[:plan_id])[:run_id]
+    end
+  end
+
+  def test_limits_are_sized_for_the_host_at_proposal
+    with_convert do
+      @service.define_singleton_method(:host_capacity) { [4, 11 * 1024] }
+      plan_id = propose_convert[:plan_id]
+      limits = @service.store.load.dig('plans', plan_id, 'body', 'limits')
+      assert_equal({ 'cpus' => 2.0, 'memory_mib' => 2816, 'pids' => 512, 'buffer_pool' => '1408M' }, limits['db'])
+      assert_equal 2816, limits.dig('converter', 'memory_mib')
+      @service.define_singleton_method(:host_capacity) { [1, 2 * 1024] }
+      standard_error('STANDARD_CAPACITY') { propose_convert }
+    end
+  end
+
+  def test_disk_is_checked_before_the_dump_is_copied
+    with_convert do
+      plan = approve_convert
+      @service.instance_variable_set(:@disk_free, -> { 8 * 1024**3 + 100 })
+      result = @service.run_plan(plan_id: plan[:plan_id])
+      assert_equal %w[STANDARD_CAPACITY preflight], result[:failure].values_at('code', 'stage')
+      refute File.exist?(@service.store.run_dir(result[:run_id], 'work', 'inputs', 'dump.sql'))
+    end
+  end
+
+  def test_reset_removes_what_a_killed_convert_run_left
+    with_convert do
+      plan = approve_convert
+      run_id = @service.claim(plan_id: plan[:plan_id]).fetch(:run_id)
+      private_dir = @service.store.run_dir(run_id, 'private')
+      write(File.join(private_dir, 'source-db', 'ibdata1'), 'x')
+      write(File.join(private_dir, 'converter', 'root.cnf'), 'password=secret')
+      write(File.join(private_dir, 'converter', 'settings.yml'), "password: \"p#{'a' * 62}\"\n")
+      write(@service.store.run_dir(run_id, 'work', 'inputs', 'dump.sql'), 'dump')
+      write(@service.store.run_dir(run_id, 'work', 'inputs.json'), JSON.generate([{ 'id' => @ids['source'], 'role' => 'source', 'relative' => 'inputs/dump.sql' }]))
+      @service.recover(run_id: run_id)
+      @service.reset_run(run_id: run_id, yes: true)
+      refute File.exist?(File.join(private_dir, 'source-db'))
+      refute File.exist?(File.join(private_dir, 'converter', 'root.cnf'))
+      refute File.exist?(@service.store.run_dir(run_id, 'work', 'inputs', 'dump.sql'))
+      assert_equal "password: \"[removed]\"\n", File.read(File.join(private_dir, 'converter', 'settings.yml'))
+    end
+  end
+
+  def test_intermediate_counts_read_at_most_two_rows_and_time_out
+    with_convert do
+      path = File.join(@dir, 'big.sqlite')
+      db = SQLite3::Database.new(path)
+      db.execute('CREATE TABLE posts (id INTEGER)')
+      db.transaction { 5000.times { |n| db.execute('INSERT INTO posts VALUES (?)', [n]) } }
+      db.close
+      db = @service.send(:open_immutable, path)
+      db.statement_timeout = 200
+      assert_equal [5000, nil], @service.send(:intermediate_count, db, 'SELECT COUNT(*) FROM posts')
+      assert_equal [nil, 'not a single count'], @service.send(:intermediate_count, db, 'SELECT id FROM posts')
+      assert_equal [nil, 'not a single count'], @service.send(:intermediate_count, db, 'SELECT 1, 2')
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      count, error = @service.send(:intermediate_count, db, 'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT COUNT(*) FROM c')
+      assert_nil count
+      assert_match(/\Aquery failed: /, error)
+      assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 10
+      db.close
+      refute File.exist?(path + '-shm')
     end
   end
 
