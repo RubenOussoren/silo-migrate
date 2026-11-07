@@ -74,6 +74,19 @@ class ConverterDevTest(unittest.TestCase):
         (self.checkout / 'lib/linked-dir').symlink_to(self.root / 'inputs')
         self.outputs = []
 
+    def test_branch_works_in_a_workspace_that_never_ran_anything(self):
+        # migration-data creates workspaces fresh: no op.lock until something takes it.
+        lock = self.root / '.silo-migrate/named/standard/op.lock'
+        lock.unlink()
+        result = self.call('branch', topic='fresh-workspace')
+        self.assertEqual('migration/example-forum/fresh-workspace', result.get('branch'), result)
+        self.assertTrue(lock.is_file())
+        self.assertEqual(0o600, lock.stat().st_mode & 0o777)
+        lock.unlink()
+        lock.symlink_to(self.root / 'inputs/source.sql')  # never followed
+        self.assertIn('error', self.call('branch', topic='through-a-link'))
+        self.assertEqual(MARKER, (self.root / 'inputs/source.sql').read_text())
+
     def write(self, path, text):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)

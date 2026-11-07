@@ -233,8 +233,8 @@ def host_converter(args, values, base, self):
     if len(args) != 3 or checkout.is_symlink() or not checkout.is_dir():
         refuse("STANDARD_ARGUMENTS_INVALID")
     standard = root / ".silo-migrate/named/standard"
-    # Match StandardStore's op.lock. Never create/truncate it or follow a link.
-    fd = os.open(standard / "op.lock", os.O_RDONLY | os.O_NOFOLLOW)
+    # Match StandardStore's op.lock: created if missing, never truncated, never through a link.
+    fd = os.open(standard / "op.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

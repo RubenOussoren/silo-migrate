@@ -576,7 +576,14 @@ class Locked:
 
     def __enter__(self):
         import fcntl
-        self.fd = os.open(self.checkout.standard / "op.lock", os.O_RDONLY | os.O_NOFOLLOW)
+        # As StandardStore opens it: created if missing (a workspace that never ran anything has
+        # none yet), never through a link, never truncated.
+        try:
+            self.fd = os.open(self.checkout.standard / "op.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except FileNotFoundError:
+            refuse("STANDARD_NOT_INITIALIZED")
+        except OSError:  # a link (ELOOP) or anything else odd: refuse, never follow
+            refuse("STANDARD_PATH_INVALID")
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
