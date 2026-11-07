@@ -107,9 +107,12 @@ To use it, in a **migration-data** chat for that project open the MCP button and
 `db-<project>`. term-llm then starts DBHub 1.5.1 (`bytebase/dbhub`, pinned by digest, pulled on
 first use) for that chat only: a container on the project's internal network, no other
 network, read-only root, signed in as `silo_ro` (password from `ro.env` through the
-environment, never argv or the config file). Its tools: `search_objects`, `execute_sql`
-(read-only transactions, at most 50 rows) and `explain_sql`. `data_db_reset` stops it and
-removes the entry.
+environment, never argv or the config file; like any container environment it shows in
+`docker inspect`, which needs the account's Docker access anyway). Its tools: `search_objects`,
+`execute_sql` (DBHub's statement filter plus `READ ONLY` transactions, at most 50 rows) and
+`explain_sql`. The container ends with the chat (also when term-llm kills it). `data_db_reset`
+stops it and removes the entry; an `mcp.json` entry named `db-<project>` that silo-migrate
+didn't write is left alone.
 
 **Until term-llm enforces `agents:`** (SamSaffron/term-llm#1332; 0.9.93 ignores the field, and
 its web UI drops it when it rewrites `mcp.json`), any chat's MCP button can turn on a `db-*`

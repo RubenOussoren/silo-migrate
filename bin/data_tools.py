@@ -985,7 +985,7 @@ def low_disk(ws):
 
 def finish(ws, job):
     """Update a running job from its container; when it has exited, keep its log tail and remove it."""
-    result = docker(["inspect", "--format", "{{json .State}}", job["container"]], timeout=30)
+    result = docker(["inspect", "--type", "container", "--format", "{{json .State}}", job["container"]], timeout=30)
     if result.returncode:
         # Only a container Docker says is gone is lost; any other failure leaves the job running.
         if b"No such" not in result.stderr:
@@ -1202,7 +1202,7 @@ def op_db_up(ws, request):
         safe = network_safe(ws)
         if safe is False:
             refuse("STANDARD_DB_NETWORK_UNSAFE")
-        inspected = docker(["inspect", "--format", "{{.State.Running}}", names["container"]], timeout=30)
+        inspected = docker(["inspect", "--type", "container", "--format", "{{.State.Running}}", names["container"]], timeout=30)
         if inspected.returncode == 0:
             if not state:
                 refuse("STANDARD_DB_STATE_MISSING")
@@ -1334,7 +1334,7 @@ def op_db_status(ws, request):
     if not state:
         return {"source_db": None, "next": "data_db_up with engine mariadb or postgres"}
     names = db_names(ws)
-    inspected = docker(["inspect", "--format", "{{.State.Status}}", names["container"]], timeout=30)
+    inspected = docker(["inspect", "--type", "container", "--format", "{{.State.Status}}", names["container"]], timeout=30)
     running = inspected.returncode == 0 and inspected.stdout.strip() == b"running"
     result = {"engine": state["engine"], "container": inspected.stdout.decode().strip() if inspected.returncode == 0 else "missing",
               "ready": running and db_ready(ws, state["engine"]), "read_only_user": RO_USER if state.get("ro_user") else None,
@@ -1349,7 +1349,7 @@ def op_db_status(ws, request):
         out = db_exec(ws, state["engine"], query=query)
         rows = [line.split("\t" if state["engine"] == "mariadb" else "|") for line in out.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
         result["schemas"] = [{"schema": row[0], "tables": int(row[1]), "approx_mb": row[2]} for row in rows[:20] if len(row) == 3 and row[1].isdigit()]
-        result["queries"] = dbhub_info(ws, pull_seconds=45)
+        result["queries"] = dbhub_info(ws)
     return result
 
 
@@ -1361,18 +1361,24 @@ def op_db_reset(ws, request):
     with ws.lock():
         if any(job.get("status") == "running" and job.get("kind") == "db_load" for job in refresh_jobs(ws)):
             refuse("STANDARD_BUSY")
-        # Chats' DBHub processes for this project go first, then its MCP entry.
-        running = docker(["ps", "-aq", "--filter", "label=silo.role=dbhub", "--filter", "label=silo.workspace=" + ws.name], timeout=30)
-        for container in running.stdout.decode().split():
-            docker(["rm", "-f", container], timeout=60)
+        # Its MCP entry goes first, then chats' DBHub processes (again before the network goes).
         mcp_register(ws, present=False)
+        stop_dbhub(ws)
         docker(["rm", "-f", names["container"]], timeout=120)
         docker(["volume", "rm", "-f", names["volume"]], timeout=120)
         # Passwords stay with the data: forget them only once the container and volume are gone.
-        if docker(["inspect", names["container"]], timeout=30).returncode == 0 or docker(["volume", "inspect", names["volume"]], timeout=30).returncode == 0:
+        if docker(["inspect", "--type", "container", names["container"]], timeout=30).returncode == 0 or docker(["volume", "inspect", names["volume"]], timeout=30).returncode == 0:
             refuse("STANDARD_DB_RESET_INCOMPLETE")
-        docker(["network", "rm", names["network"]], timeout=60)
-        for name in ("state.json", "secret.env", "ro.env"):
+        # A DBHub container a chat just closed (or started meanwhile) can hold the network briefly.
+        for attempt in range(5):
+            stop_dbhub(ws)
+            if docker(["network", "rm", names["network"]], timeout=60).returncode == 0 or \
+                    docker(["network", "inspect", names["network"]], timeout=30).returncode != 0:
+                break
+            time.sleep(2)
+        else:
+            refuse("STANDARD_DB_RESET_INCOMPLETE: the network is still in use; run data_db_reset again")
+        for name in ("state.json", "secret.env", "ro.env", "dbhub.toml"):
             path = ws.data / "db" / name
             if path.is_file() and not path.is_symlink():
                 path.unlink()
@@ -1411,36 +1417,53 @@ def mcp_entry(ws):
 
 
 def mcp_register(ws, present=True):
-    """Put this project's entry in mcp.json (or take it out), leaving everything else as it is."""
+    """Put this project's entry in mcp.json (or take it out), leaving everything else as it is.
+    Returns "added", "registered" (already right), "removed", "absent" or why nothing changed."""
     path = mcp_config_path()
-    try:
-        if not stat.S_ISREG(os.lstat(path).st_mode):
-            return "not changed: mcp.json is not a plain file"
-        config = json.loads(path.read_text())
-    except FileNotFoundError:
-        config = {}
-    except (OSError, ValueError):
-        return "not changed: mcp.json can't be read"
-    servers = config.setdefault("servers", {}) if isinstance(config, dict) else None
-    if not isinstance(servers, dict):
-        return "not changed: mcp.json has an unexpected shape"
-    name, entry = mcp_name(ws), mcp_entry(ws)
-    if present and servers.get(name) == entry:
-        return "registered"
-    if not present and name not in servers:
-        return "absent"
-    if present:
-        servers[name] = entry
-    else:
-        del servers[name]
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_name("." + path.name + ".silo-" + secrets.token_hex(4))
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        json.dump(config, handle, indent=2)
-        handle.write("\n")
-    os.replace(temporary, path)
-    return "registered" if present else "removed"
+    # Serialises silo's own writers (term-llm's web UI can't be coordinated; status repairs it).
+    lock = os.open(path.parent / ".mcp.json.silo-lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                return "not changed: mcp.json is not a plain file"
+            config = json.loads(path.read_text())
+        except FileNotFoundError:
+            config = {}
+        except (OSError, ValueError):
+            return "not changed: mcp.json can't be read"
+        servers = config.setdefault("servers", {}) if isinstance(config, dict) else None
+        if not isinstance(servers, dict):
+            return "not changed: mcp.json has an unexpected shape"
+        name, entry = mcp_name(ws), mcp_entry(ws)
+        existing = servers.get(name)
+        if existing is not None and not (isinstance(existing, dict) and (existing.get("args") or [None])[0] == "dbhub"):
+            return "not changed: an existing " + name + " server isn't silo-migrate's; rename it"
+        if present and existing == entry:
+            return "registered"
+        if not present and existing is None:
+            return "absent"
+        if present:
+            servers[name] = entry
+        else:
+            del servers[name]
+        temporary = path.with_name("." + path.name + ".silo-" + secrets.token_hex(4))
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(config, handle, indent=2)
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        os.close(lock)
+    ws.append("audit.jsonl", {"at": now(), "op": "mcp_register", "server": name, "result": "added" if present else "removed"})
+    return "added" if present else "removed"
+
+
+def stop_dbhub(ws):
+    running = docker(["ps", "-aq", "--filter", "label=silo.role=dbhub", "--filter", "label=silo.workspace=" + ws.name], timeout=30)
+    for container in running.stdout.decode().split():
+        docker(["rm", "-f", container], timeout=60)
 
 
 def dbhub_image(pull_seconds=0):
@@ -1457,7 +1480,7 @@ def dbhub_info(ws, pull_seconds=0):
         return {"mcp_server": None, "note": "available once the source database is up with its read-only user"}
     registration = mcp_register(ws)
     image = dbhub_image(pull_seconds)
-    return {"mcp_server": mcp_name(ws), "registration": registration, "image": "ready" if image else "missing: docker pull " + DBHUB_IMAGE,
+    return {"mcp_server": mcp_name(ws), "registration": registration, "image": "ready" if image else "missing: run data_db_up again to fetch it",
             "how": ("The engineer turns on MCP server " + mcp_name(ws) + " in this chat (MCP button). Its tools: execute_sql (read-only, "
                     "at most " + str(DBHUB_MAX_ROWS) + " rows: select only the columns you need and shorten long text), search_objects "
                     "(tables, columns, indexes) and explain_sql. Use only the server for this chat's project.")}

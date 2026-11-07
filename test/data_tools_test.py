@@ -127,7 +127,10 @@ class FakeDocker:
                 self.volumes.discard(argv[-1])
         elif argv[0] == 'inspect':
             name = argv[-1]
-            if name not in self.state:
+            # Like Docker: without --type, a network of the same name matches too.
+            if '--type' not in argv and name in self.networks:
+                out = b'[{}]'
+            elif name not in self.state:
                 code, err = 1, b'Error: No such object: ' + name.encode()
             elif len(argv) == 2:
                 out = b'[{}]'
@@ -627,7 +630,8 @@ class DataToolsTest(unittest.TestCase):
         self.assertIsNone(self.op('db_status')['source_db'])
         self.assertNotIn('db-arc', self.mcp()['servers'])  # nothing before the database exists
         queries = self.op('db_up', engine='mariadb')['queries']
-        self.assertEqual(('db-arc', 'registered', 'ready'), (queries['mcp_server'], queries['registration'], queries['image']))
+        self.assertEqual(('db-arc', 'added', 'ready'), (queries['mcp_server'], queries['registration'], queries['image']))
+        self.assertEqual('registered', self.op('db_status')['queries']['registration'])  # unchanged: nothing written
         self.assertIn(['pull', '--quiet', self.d.DBHUB_IMAGE], self.docker.argvs('pull'))
         config = self.mcp()
         self.assertEqual(mine, config['servers']['mine'])
@@ -640,8 +644,26 @@ class DataToolsTest(unittest.TestCase):
         # term-llm 0.9.93 drops `agents` when its web UI rewrites mcp.json: status puts it back.
         del config['servers']['db-arc']['agents']
         (self.config_home / 'term-llm/mcp.json').write_text(json.dumps(config))
-        self.assertEqual('registered', self.op('db_status')['queries']['registration'])
+        self.docker.image_present = False
+        self.docker.calls.clear()
+        repaired = self.op('db_status')['queries']
+        self.assertEqual('added', repaired['registration'])
         self.assertEqual(['migration-data'], self.mcp()['servers']['db-arc']['agents'])
+        self.assertEqual([], self.docker.argvs('pull'))  # status never pulls
+        self.assertIn('data_db_up', repaired['image'])
+        audit = [json.loads(line) for line in (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text().splitlines()]
+        self.assertEqual(2, sum(1 for entry in audit if entry['op'] == 'mcp_register'))
+        # Someone else's server with that name is left alone.
+        config = self.mcp()
+        config['servers']['db-arc'] = {'command': 'npx', 'args': ['my-db']}
+        (self.config_home / 'term-llm/mcp.json').write_text(json.dumps(config))
+        self.assertIn("isn't silo-migrate's", self.op('db_status')['queries']['registration'])
+        self.assertEqual(['my-db'], self.mcp()['servers']['db-arc']['args'])
+        self.op('db_reset', confirm=True)
+        self.assertEqual(['my-db'], self.mcp()['servers']['db-arc']['args'])
+        self.op('db_up', engine='mariadb')
+        del config['servers']['db-arc']
+        (self.config_home / 'term-llm/mcp.json').write_text(json.dumps(config))
         # Never written through a link or into a file it can't parse.
         (self.config_home / 'term-llm/mcp.json').write_text('{not json')
         self.assertIn('not changed', self.op('db_status')['queries']['registration'])
@@ -692,6 +714,7 @@ class DataToolsTest(unittest.TestCase):
         self.assertNotIn('db-arc', self.mcp()['servers'])
         removed = [argv[-1] for argv in self.docker.argvs('rm')]
         self.assertEqual(['abc123', 'def456'], removed[:2])
+        self.assertEqual(2, len(self.docker.argvs('ps')))  # swept again before the network is removed
         self.assertIn(['ps', '-aq', '--filter', 'label=silo.role=dbhub', '--filter', 'label=silo.workspace=arc'], self.docker.argvs('ps'))
 
     # -- findings and output ---------------------------------------------------------
