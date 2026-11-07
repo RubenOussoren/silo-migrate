@@ -275,6 +275,8 @@ def update(entry, branch=None):
 
 def set_conf_values(path, updates):
     """Rewrite KEY=VALUE lines in the installer config, keeping a timestamped backup."""
+    if os.path.islink(path):
+        raise Stop(str(path) + " must be a regular file, not a symlink")
     lines = path.read_text().splitlines()
     seen = set()
     for index, line in enumerate(lines):
@@ -364,7 +366,8 @@ def claude_login(entry, flags):
     # so root never runs the account's claude by typing `claude`.
     link = PREFIX / "bin/claude"
     if not link.is_symlink() or os.readlink(link) != str(target):
-        subprocess.call(as_account(["ln", "-sfn", str(target), str(link)], entry))
+        if subprocess.call(as_account(["ln", "-sfn", str(target), str(link)], entry)):
+            raise Stop("couldn't link " + str(link))
         print("linked " + str(link) + " -> " + str(target))
     mode = ["--console"] if "--console" in flags else ["--claudeai", *(["--sso"] if "--sso" in flags else [])]
     argv = as_account([str(target), "auth", "login", *mode], entry)
@@ -378,32 +381,54 @@ def intake(entry, project):
         raise Stop("project names: letters, digits, - and _ (max 63)")
     base = PREFIX / "intake"
     folder = base / project
-    for path, mode in ((base, 0o700), (folder, 0o700)):
-        if path.is_symlink():
-            raise Stop(str(path) + " is a symlink")
-        if not path.exists():
-            path.mkdir(mode=mode)
-            if is_root():
-                os.chown(path, entry.pw_uid, entry.pw_gid)
-    # Opened once without following symlinks; everything below is reached through that
-    # descriptor, so swapping a directory for a symlink can't redirect the walk.
+    # Every level is opened without following symlinks and the next is reached through the
+    # parent's descriptor, so swapping any of them for a symlink can't redirect this.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    created = False
     try:
-        top = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        prefix_fd = os.open(PREFIX, flags)
     except OSError:
-        raise Stop(str(folder) + " is not a plain directory")
+        raise Stop(str(PREFIX) + " is not a plain directory")
+    try:
+        try:
+            os.mkdir("intake", 0o700, dir_fd=prefix_fd)
+            if is_root():
+                os.chown("intake", entry.pw_uid, entry.pw_gid, dir_fd=prefix_fd, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        try:
+            base_fd = os.open("intake", flags, dir_fd=prefix_fd)
+        except OSError:
+            raise Stop(str(base) + " is not a plain directory")
+    finally:
+        os.close(prefix_fd)
+    try:
+        try:
+            os.mkdir(project, 0o700, dir_fd=base_fd)
+            created = True
+        except FileExistsError:
+            pass
+        try:
+            top = os.open(project, flags, dir_fd=base_fd)
+        except OSError:
+            raise Stop(str(folder) + " is not a plain directory (symlinks are refused)")
+    finally:
+        os.close(base_fd)
     count = total = 0
     try:
-        if os.fstat(top).st_uid not in (0, entry.pw_uid):
+        owner = os.fstat(top).st_uid
+        if owner != entry.pw_uid and not (created and owner == 0):
             raise Stop(str(folder) + " has an unexpected owner")
         if is_root():
             os.fchown(top, entry.pw_uid, entry.pw_gid)
         for _path, dirs, files, dirfd in os.fwalk(".", dir_fd=top, follow_symlinks=False):
+            regular = set(files)
             for name in dirs + files:
                 info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
                 # Files copied in as root become the account's, so the data agent can sort them.
                 if is_root() and info.st_uid != entry.pw_uid:
                     os.chown(name, entry.pw_uid, entry.pw_gid, dir_fd=dirfd, follow_symlinks=False)
-                if name in files and stat.S_ISREG(info.st_mode):
+                if name in regular and stat.S_ISREG(info.st_mode):
                     count += 1
                     total += info.st_size
     finally:

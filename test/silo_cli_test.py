@@ -201,13 +201,16 @@ class SiloTest(unittest.TestCase):
         chowned = []
         real_chown = os.chown
         real_fstat = os.fstat
-        as_root = lambda fd: os.stat_result((stat.S_IFDIR | 0o700, 0, 0, 1, 0, 0, 0, 0, 0, 0))  # root-created folder
+        as_root = lambda fd: os.stat_result((stat.S_IFDIR | 0o700, 0, 0, 1, 99999, 99999, 0, 0, 0, 0))  # the account's folder
         with mock.patch.object(self.s, 'is_root', return_value=True), mock.patch.object(self.s.os, 'fchown'), mock.patch.object(self.s.os, 'fstat', side_effect=as_root), \
                 mock.patch.object(self.s.os, 'chown', side_effect=lambda *a, **k: chowned.append((a, k))):
             self.s.intake(pwd.struct_passwd(('silomig', 'x', 99999, 99999, '', '/x', '/bin/bash')), 'mybb-acme')
         names = sorted(a[0] for a, k in chowned)
         self.assertEqual(['a.png', 'attachments', 'dump.sql', 'escape'], names)  # the link itself, never its target
         self.assertTrue(all(k.get('follow_symlinks') is False and 'dir_fd' in k for a, k in chowned))
+        stranger = lambda fd: os.stat_result((stat.S_IFDIR | 0o700, 0, 0, 1, 0, 0, 0, 0, 0, 0))  # pre-existing root folder
+        with mock.patch.object(self.s.os, 'fstat', side_effect=stranger), self.assertRaisesRegex(self.s.Stop, 'unexpected owner'):
+            self.s.intake(pwd.struct_passwd(('silomig', 'x', 99999, 99999, '', '/x', '/bin/bash')), 'mybb-acme')
         os.rename(folder, self.root / 'moved')
         (self.prefix / 'intake/mybb-acme').symlink_to(outside)
         with self.assertRaisesRegex(self.s.Stop, 'symlink|plain directory'):

@@ -869,16 +869,21 @@ module SiloMigrate
           # size are exactly the plan's.
           digest = Digest::SHA256.new
           copied = 0
-          File.open(source, File::RDONLY | File::NOFOLLOW) do |input_file|
-            File.open(target, File::WRONLY | File::CREAT | File::EXCL, 0o400) do |output|
-              input_file.binmode
-              output.binmode
-              while (chunk = input_file.read(1024 * 1024))
-                digest.update(chunk)
-                copied += chunk.bytesize
-                output.write(chunk)
+          begin
+            File.open(source, File::RDONLY | File::NOFOLLOW) do |input_file|
+              File.open(target, File::WRONLY | File::CREAT | File::EXCL, 0o400) do |output|
+                input_file.binmode
+                output.binmode
+                while (chunk = input_file.read(1024 * 1024))
+                  digest.update(chunk)
+                  copied += chunk.bytesize
+                  output.write(chunk)
+                end
               end
             end
+          rescue StandardError
+            FileUtils.rm_f(target) # e.g. disk full mid-copy: leave no truncated input behind
+            raise
           end
           unless digest.hexdigest == binding.fetch("sha256") && copied == binding.fetch("bytes")
             FileUtils.rm_f(target)
