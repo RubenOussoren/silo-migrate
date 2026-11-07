@@ -20,7 +20,7 @@ spawn:
   allowed_agents: [converter-reviewer]
   max_parallel: 1
   max_depth: 1
-  timeout: 600
+  timeout: 1200
 tools:
   enabled: [update_plan, spawn_agent, wait_agent]
   custom:

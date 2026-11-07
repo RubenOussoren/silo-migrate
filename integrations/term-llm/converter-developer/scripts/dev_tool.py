@@ -112,6 +112,10 @@ def main():
         return fail("STANDARD_ARGUMENTS_INVALID")
     workspace = args["workspace"]
     project = chat_project()
+    # The reviewer is often started by the developer (spawn_agent), which could point it at any
+    # folder: it works only inside a web UI project, and only on that project's workspace.
+    if project is None and role() == "reviewer":
+        return fail("STANDARD_CHAT_NOT_IN_PROJECT")
     if project is not None and workspace != project:
         return fail("STANDARD_WORKSPACE_NOT_THIS_PROJECT")
     timeout = 290 if tool == "dev_test" else 55

@@ -28,7 +28,11 @@ print(json.dumps({'version': 1, 'ok': True}))
 ''')
         self.control.chmod(0o700)
 
-    def call(self, agent, tool, args, project=None):
+    def call(self, agent, tool, args, project='auto'):
+        # As in real use, the reviewer runs in its workspace's web UI project unless a test says otherwise.
+        if project == 'auto':
+            workspace = args.get('workspace') if isinstance(args, dict) else None
+            project = workspace if agent == 'converter-reviewer' and isinstance(workspace, str) and workspace.replace('-', '').isalnum() else None
         root = Path(self.temp.name) / 'projects'
         env = dict(os.environ, SILO_CONTROL=str(self.control), RECORD=str(self.record), TERM_LLM_TOOL_NAME=tool, PYTHONDONTWRITEBYTECODE='1',
                    SILO_TESTING='1', SILO_PROJECTS_ROOT=str(root))
@@ -105,8 +109,10 @@ print(json.dumps({'version': 1, 'ok': True}))
             with self.subTest(agent=agent):
                 self.assertTrue(self.call(agent, 'dev_status', {'workspace': 'arc'}, project='arc')['ok'])
                 self.assertEqual('STANDARD_WORKSPACE_NOT_THIS_PROJECT', self.call(agent, 'dev_status', {'workspace': 'arc'}, project='acme')['error'])
-                self.assertTrue(self.call(agent, 'dev_status', {'workspace': 'arc'})['ok'])
-        self.assertEqual(4, len(self.calls()))
+        # Outside a project: the developer works as before; the reviewer (often a sub-agent) refuses.
+        self.assertTrue(self.call('converter-developer', 'dev_status', {'workspace': 'arc'}, project=None)['ok'])
+        self.assertEqual('STANDARD_CHAT_NOT_IN_PROJECT', self.call('converter-reviewer', 'dev_status', {'workspace': 'arc'}, project=None)['error'])
+        self.assertEqual(3, len(self.calls()))
 
     def test_only_the_developer_may_start_an_agent_and_only_the_reviewer(self):
         import re

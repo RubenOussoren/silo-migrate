@@ -142,6 +142,16 @@ the link `~/.config/term-llm/skills` → `<prefix>/current/integrations/term-llm
 `skills:` decides what it sees: migration-data gets all of them, the others none (term-llm
 0.9.93 can't give an agent a subset).
 
+## Converter review (agents)
+
+converter-developer starts converter-reviewer itself (`spawn_agent`, only that agent, one at a
+time, which can't start agents in turn) after committing, fixes what it finds, and tells you the
+verdict and must-fix list word for word; at most two rounds per change. The review runs on Claude
+whatever is asked (the reviewer's model rule always applies), in the same project; the reviewer
+refuses to work outside a project chat. Both see only converter code and released findings.
+Keep converter-developer on ChatGPT: Claude is in its allowed models only so it can start the
+reviewer (term-llm checks a sub-agent against its parent's model rule too). Pushing stays yours.
+
 ## Releasing findings (web UI)
 
 migration-data proposes findings (schemas, a run's cause); nothing reaches the coding agents
