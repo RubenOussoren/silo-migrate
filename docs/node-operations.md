@@ -9,6 +9,8 @@ ln -sfn /srv/silo-migrate/current/bin/silo /usr/local/bin/silo
 
 Run it as root or as the service account. Steps that belong to the service account always
 run as that account with its environment (no `sudo -u … env HOME=… XDG_RUNTIME_DIR=…` lines).
+Root running `silo` runs release code the account owns; that adds no authority, since the
+account is root-equivalent through Docker anyway, but keep the release sealed (`silo doctor`).
 
 | Command | What it does |
 | --- | --- |
@@ -18,7 +20,7 @@ run as that account with its environment (no `sudo -u … env HOME=… XDG_RUNTI
 | `silo restart` | Restarts the term-llm web service (ends open web chats). |
 | `silo shell` | (root) A login shell as the service account with the right environment. |
 | `silo prime` | Signs in to 1Password (you type the password) and warms op-cache, so Frontier works for 24 hours. The session is kept only in memory. |
-| `silo claude-login [--sso\|--console]` | Signs the service account in to Claude Code and, as root, links `/usr/local/bin/claude` for the web service. |
+| `silo claude-login [--sso\|--console]` | Signs the service account in to Claude Code and links it as `<prefix>/bin/claude`, which is on the web service's PATH but not root's (an older `/usr/local/bin/claude` link can then be removed). |
 | `silo intake PROJECT` | Creates the project's drop folder `<prefix>/intake/PROJECT/` (private to the account). Copy export files into it; run it again as root afterwards so the files belong to the account. |
 
 ## Intake

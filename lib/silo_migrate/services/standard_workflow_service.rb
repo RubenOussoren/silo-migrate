@@ -863,14 +863,27 @@ module SiloMigrate
 
           source = File.join(@store.workspace_root, relative)
           @store.named.verify_input_identity(input)
-          bytes = File.binread(source)
-          unless Digest::SHA256.hexdigest(bytes) == binding.fetch("sha256") && bytes.bytesize == binding.fetch("bytes")
-            raise StandardWorkflowError.new("STANDARD_INPUT_CHANGED", "content differs from plan")
-          end
-
           target = @store.run_dir(run_id, "work", relative)
           FileUtils.mkdir_p(File.dirname(target), mode: 0o700)
-          File.open(target, File::WRONLY | File::CREAT | File::EXCL, 0o400) { |file| file.binmode; file.write(bytes) }
+          # Streamed: real inputs can be many GB. The copy is kept only if its digest and
+          # size are exactly the plan's.
+          digest = Digest::SHA256.new
+          copied = 0
+          File.open(source, File::RDONLY | File::NOFOLLOW) do |input_file|
+            File.open(target, File::WRONLY | File::CREAT | File::EXCL, 0o400) do |output|
+              input_file.binmode
+              output.binmode
+              while (chunk = input_file.read(1024 * 1024))
+                digest.update(chunk)
+                copied += chunk.bytesize
+                output.write(chunk)
+              end
+            end
+          end
+          unless digest.hexdigest == binding.fetch("sha256") && copied == binding.fetch("bytes")
+            FileUtils.rm_f(target)
+            raise StandardWorkflowError.new("STANDARD_INPUT_CHANGED", "content differs from plan")
+          end
           binding.slice("id", "type", "sha256", "bytes").merge("relative" => relative)
         end
       end

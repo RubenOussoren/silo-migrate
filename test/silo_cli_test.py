@@ -81,7 +81,7 @@ class SiloTest(unittest.TestCase):
 
     def healthy(self):
         listing = 'Available agents (2):\n\n  [user] /x/\n    converter-developer - a\n    migration-analyst - b\n'
-        return {'service status': (0, 'ActiveState=active\n'), ' agents': (0, listing), 'op-cache read op://Everybody/Snorlax LLM/credential --account discourse.1password.com': (0, 'secret'),
+        return {'service status': (0, 'ActiveState=active\n'), ' agents': (0, listing), 'sh op://Everybody/Snorlax LLM/credential --account discourse.1password.com': (0, 'secret'),
                 'auth status --json': (0, json.dumps({'loggedIn': True})), 'docker info': (0, '29.9.3\n')}
 
     def test_doctor_all_good(self):
@@ -99,7 +99,7 @@ class SiloTest(unittest.TestCase):
         responses = self.healthy()
         responses['service status'] = (0, 'ActiveState=failed\n')
         responses[' agents'] = (0, 'Available agents (3):\n\n  [builtin]\n    developer - d\n')
-        del responses['op-cache read op://Everybody/Snorlax LLM/credential --account discourse.1password.com']
+        del responses['sh op://Everybody/Snorlax LLM/credential --account discourse.1password.com']
         responses['auth status --json'] = (0, json.dumps({'loggedIn': False}))
         token = self.home / '.config/silo-migrate/github/token-discourse-org'
         token.parent.mkdir(parents=True)
@@ -136,8 +136,8 @@ class SiloTest(unittest.TestCase):
         self.s.METAL_CONFIG.write_text('SILO_ACCOUNT=silomig\nSILO_REPO=/srv/silo-transfer/silo-migrate.git\nSILO_BRANCH=mvp/metal-installer\n')
         self.s.METAL_CONFIG.chmod(0o640)
         calls = []
-        with mock.patch.object(self.s.os, 'geteuid', return_value=0), mock.patch.object(self.s, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), \
-                mock.patch.object(self.s, 'stream', side_effect=lambda argv: calls.append(argv) or 0), mock.patch.object(self.s.os, 'chown'):
+        with mock.patch.object(self.s, 'need_root'), mock.patch.object(self.s, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                mock.patch.object(self.s, 'stream', side_effect=lambda argv: calls.append(argv) or 0):
             (self.s.INSTALLER / '.git').mkdir(parents=True)
             self.assertEqual(0, self.s.use_github())
         self.assertEqual('SILO_ACCOUNT=silomig\nSILO_REPO=https://github.com/RubenOussoren/silo-migrate.git\nSILO_BRANCH=mvp/metal-installer\n'
@@ -145,10 +145,23 @@ class SiloTest(unittest.TestCase):
         self.assertEqual(0o640, stat.S_IMODE(self.s.METAL_CONFIG.stat().st_mode))
         self.assertEqual(1, len(list(self.root.glob('metal.conf.bak-*'))))
         self.assertEqual(['git', '-C', str(self.s.INSTALLER), 'remote', 'set-url', 'origin', 'https://github.com/RubenOussoren/silo-migrate.git'], calls[0])
+        self.assertEqual([], list(self.root.glob('.metal-*')) + list(self.root.glob('.backup-*')))
+
+    def test_config_rewrite_refuses_symlinks_and_loose_directories(self):
+        real = self.root / 'real.conf'
+        real.write_text('SILO_REPO=/x\n')
+        self.s.METAL_CONFIG.symlink_to(real)
+        with self.assertRaisesRegex(self.s.Stop, 'symlink'):
+            self.s.set_conf_values(self.s.METAL_CONFIG, {'SILO_REPO': 'https://github.com/a/b.git'})
+        self.s.METAL_CONFIG.unlink()
+        self.s.METAL_CONFIG.write_text('SILO_REPO=/x\n')
+        with mock.patch.object(self.s, 'is_root', return_value=True), self.assertRaisesRegex(self.s.Stop, 'root-owned'):
+            self.s.set_conf_values(self.s.METAL_CONFIG, {'SILO_REPO': 'https://github.com/a/b.git'})
+        self.assertEqual('SILO_REPO=/x\n', self.s.METAL_CONFIG.read_text())
 
     def test_use_github_changes_nothing_when_github_is_unreachable(self):
         self.s.METAL_CONFIG.write_text('SILO_REPO=/x\n')
-        with mock.patch.object(self.s.os, 'geteuid', return_value=0), mock.patch.object(self.s, 'run', return_value=subprocess.CompletedProcess([], 128, '', '')):
+        with mock.patch.object(self.s, 'need_root'), mock.patch.object(self.s, 'run', return_value=subprocess.CompletedProcess([], 128, '', '')):
             with self.assertRaisesRegex(self.s.Stop, 'nothing changed'):
                 self.s.use_github()
         self.assertEqual('SILO_REPO=/x\n', self.s.METAL_CONFIG.read_text())
@@ -158,15 +171,18 @@ class SiloTest(unittest.TestCase):
             self.s.update(self.entry)
         (self.prefix / 'state/install-manifest.json').write_text(json.dumps({'branch': 'mvp/metal-installer'}))
         calls = []
+        on_branch = mock.patch.object(self.s, 'run', return_value=subprocess.CompletedProcess([], 0, 'mvp/metal-installer\n', ''))
         with mock.patch.object(self.s.os, 'geteuid', return_value=0), mock.patch.object(self.s, 'stream', side_effect=lambda argv: calls.append(argv) or 0), \
-                mock.patch.object(self.s, 'doctor', return_value=0), mock.patch.object(self.s.time, 'sleep'):
+                mock.patch.object(self.s, 'doctor', return_value=0), mock.patch.object(self.s.time, 'sleep'), on_branch:
             self.assertEqual(0, self.s.update(self.entry))
         self.assertEqual(['git', '-C', str(self.s.INSTALLER), 'pull', '--ff-only'], calls[0])
         self.assertEqual([str(self.s.INSTALLER / 'script/metal'), 'update', '--config', str(self.s.METAL_CONFIG), '--branch', 'mvp/metal-installer'], calls[1])
         self.assertIn('restart', calls[2])
-        with mock.patch.object(self.s.os, 'geteuid', return_value=0), mock.patch.object(self.s, 'stream', return_value=1):
-            with self.assertRaisesRegex(self.s.Stop, 'stopped'):
+        with mock.patch.object(self.s.os, 'geteuid', return_value=0), mock.patch.object(self.s, 'stream', return_value=1), on_branch:
+            with self.assertRaisesRegex(self.s.Stop, 'not main'):
                 self.s.update(self.entry, 'main')
+            with self.assertRaisesRegex(self.s.Stop, 'stopped'):
+                self.s.update(self.entry, 'mvp/metal-installer')
 
     # -- intake ------------------------------------------------------------------------------
 
@@ -176,10 +192,41 @@ class SiloTest(unittest.TestCase):
         self.assertEqual(0o700, stat.S_IMODE(folder.stat().st_mode))
         self.assertEqual(0o700, stat.S_IMODE(folder.parent.stat().st_mode))
         (folder / 'dump.sql').write_text('-- MySQL dump\n')
-        self.s.intake(self.entry, 'mybb-acme')
+        (folder / 'attachments').mkdir()
+        (folder / 'attachments/a.png').write_bytes(b'x' * 10)
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'secret').write_text('x')
+        (folder / 'escape').symlink_to(outside)
+        chowned = []
+        real_chown = os.chown
+        real_fstat = os.fstat
+        as_root = lambda fd: os.stat_result((stat.S_IFDIR | 0o700, 0, 0, 1, 0, 0, 0, 0, 0, 0))  # root-created folder
+        with mock.patch.object(self.s, 'is_root', return_value=True), mock.patch.object(self.s.os, 'fchown'), mock.patch.object(self.s.os, 'fstat', side_effect=as_root), \
+                mock.patch.object(self.s.os, 'chown', side_effect=lambda *a, **k: chowned.append((a, k))):
+            self.s.intake(pwd.struct_passwd(('silomig', 'x', 99999, 99999, '', '/x', '/bin/bash')), 'mybb-acme')
+        names = sorted(a[0] for a, k in chowned)
+        self.assertEqual(['a.png', 'attachments', 'dump.sql', 'escape'], names)  # the link itself, never its target
+        self.assertTrue(all(k.get('follow_symlinks') is False and 'dir_fd' in k for a, k in chowned))
+        os.rename(folder, self.root / 'moved')
+        (self.prefix / 'intake/mybb-acme').symlink_to(outside)
+        with self.assertRaisesRegex(self.s.Stop, 'symlink|plain directory'):
+            self.s.intake(self.entry, 'mybb-acme')
         for name in ('../x', 'a/b', '', '-x'):
             with self.subTest(name=name), self.assertRaises(self.s.Stop):
                 self.s.intake(self.entry, name)
+
+    def test_claude_link_goes_in_the_service_path_not_roots(self):
+        target = self.home / '.local/bin/claude'
+        target.parent.mkdir(parents=True)
+        target.write_text('#!/bin/sh\n')
+        (self.prefix / 'bin').mkdir()
+        calls = []
+        with mock.patch.object(self.s.subprocess, 'call', side_effect=lambda argv: calls.append(argv) or 0):
+            self.s.claude_login(self.entry, [])
+        self.assertIn(['ln', '-sfn', str(target), str(self.prefix / 'bin/claude')], [c[-4:] for c in calls])
+        self.assertIn(['auth', 'login', '--claudeai'], [c[-3:] for c in calls])
+        self.assertFalse(any('/usr/local/bin' in ' '.join(c[-4:]) for c in calls))
 
     def test_cli_entry_points(self):
         result = subprocess.run(['python3', '-I', '-B', str(ROOT / 'bin/silo'), 'nonsense'], capture_output=True, text=True)

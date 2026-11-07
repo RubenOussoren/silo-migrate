@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 """silo: everyday commands for a Migrations node.
 
   silo doctor                      check everything the node needs; print exact fixes
@@ -68,7 +68,7 @@ def as_account(argv, entry=None):
     entry = entry or account()
     env = account_env(entry)
     if os.geteuid() == entry.pw_uid:
-        return ["env", *[k + "=" + v for k, v in env.items()], *argv]
+        return ["env", "-i", *[k + "=" + v for k, v in env.items()], *argv]
     if not is_root():
         raise Stop("run this as root or as " + entry.pw_name)
     return ["sudo", "-u", entry.pw_name, "--", "env", "-i", *[k + "=" + v for k, v in env.items()], *argv]
@@ -143,12 +143,14 @@ def doctor_checks(entry, runner=run):
             same = head == current.name
             add("OK" if same else "WARN", "installer checkout", head[:12] + (" (matches release)" if same else " (differs from the release)"),
                 None if same else "silo update")
+        else:
+            add("WARN", "installer checkout", "can't read " + str(INSTALLER) + " (missing, or not owned by root)")
         try:
             conf = read_conf()
             local = [key for key in ("SILO_REPO", "CONVERTER_REPO") if conf.get(key, "").startswith("/")]
             add("WARN" if local else "OK", "update source",
                 ("local copies for " + ", ".join(local) + ": updates need bundles") if local else "GitHub", "silo use-github" if local else None)
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             add("WARN", "update source", "can't read " + str(METAL_CONFIG))
         link = Path("/usr/local/bin/silo")
         good = link.is_symlink() and os.readlink(link) == str(PREFIX / "current/bin/silo")
@@ -174,15 +176,16 @@ def doctor_checks(entry, runner=run):
 
     reference, op_account, config_text = config_ref(entry)
     if reference:
-        primed = runner(as_account(["op-cache", "read", reference, *(["--account", op_account] if op_account else [])], entry), timeout=20).returncode == 0
+        quiet = ["sh", "-c", 'exec op-cache read "$@" >/dev/null 2>&1', "sh", reference, *(["--account", op_account] if op_account else [])]
+        primed = runner(as_account(quiet, entry), timeout=20).returncode == 0
         add("OK" if primed else "FAIL", "Frontier (op-cache)", "cache primed" if primed else "not primed or expired (24 h)", None if primed else "silo prime")
     else:
         add("WARN", "Frontier (op-cache)", "no op-cache reference in the term-llm config")
 
     if "claude-bin:" in config_text:
-        claude = shutil.which("claude", path="/usr/local/bin")
+        claude = shutil.which("claude", path=str(PREFIX / "bin") + ":/usr/local/bin")
         if not claude:
-            add("FAIL", "Claude (claude-bin)", "/usr/local/bin/claude missing: the web service can't find Claude Code", "silo claude-login")
+            add("FAIL", "Claude (claude-bin)", "claude not on the web service's PATH", "silo claude-login")
         else:
             out = runner(as_account([claude, "auth", "status", "--json"], entry), timeout=30).stdout
             try:
@@ -205,8 +208,11 @@ def doctor_checks(entry, runner=run):
     docker = runner(as_account(["docker", "info", "--format", "{{.ServerVersion}}"], entry), timeout=30)
     add("OK" if docker.returncode == 0 else "FAIL", "Docker", ("server " + docker.stdout.strip()) if docker.returncode == 0 else "unreachable for the service account")
 
-    free = shutil.disk_usage(PREFIX).free / 1024**3
-    add("OK" if free >= 50 else "WARN", "disk", "%.0f GiB free on %s" % (free, PREFIX))
+    try:
+        free = shutil.disk_usage(PREFIX).free / 1024**3
+        add("OK" if free >= 50 else "WARN", "disk", "%.0f GiB free on %s" % (free, PREFIX))
+    except OSError:
+        add("FAIL", "disk", str(PREFIX) + " missing")
 
     writable = 0
     if current.is_dir():
@@ -245,11 +251,16 @@ def update(entry, branch=None):
     need_root("silo update")
     if branch is None:
         try:
-            branch = json.loads((PREFIX / "state/install-manifest.json").read_text()).get("branch")
+            manifest = json.loads((PREFIX / "state/install-manifest.json").read_text())
+            branch = manifest.get("branch") if isinstance(manifest, dict) else None
         except (OSError, ValueError):
             branch = None
     if not branch or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", branch) or ".." in branch:
         raise Stop("pass --branch BRANCH")
+    print("branch: " + branch)
+    checked_out = run(["git", "-C", str(INSTALLER), "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    if checked_out != branch:
+        raise Stop("the installer checkout is on " + (checked_out or "an unknown branch") + ", not " + branch + ": git -C " + str(INSTALLER) + " switch " + branch)
     steps = [["git", "-C", str(INSTALLER), "pull", "--ff-only"],
              [str(INSTALLER / "script/metal"), "update", "--config", str(METAL_CONFIG), "--branch", branch]]
     for argv in steps:
@@ -272,15 +283,27 @@ def set_conf_values(path, updates):
             lines[index] = key + "=" + updates[key]
             seen.add(key)
     lines += [key + "=" + value for key, value in updates.items() if key not in seen]
+    info = os.lstat(path)
+    folder = os.lstat(path.parent)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise Stop(str(path) + " must be a regular file, not a symlink")
+    if is_root() and (folder.st_uid != 0 or folder.st_mode & 0o022):
+        raise Stop(str(path.parent) + " must be root-owned and not group/world writable")
+    import tempfile
+
+    def write_like(data, prefix):
+        descriptor, name = tempfile.mkstemp(prefix=prefix, dir=path.parent)
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(name, stat.S_IMODE(info.st_mode))
+        if is_root():
+            os.chown(name, info.st_uid, info.st_gid)
+        return name
     backup = path.with_name(path.name + ".bak-" + time.strftime("%Y%m%d%H%M%S"))
-    shutil.copy2(path, backup)
-    temporary = path.with_name("." + path.name + ".tmp")
-    temporary.write_text("\n".join(lines) + "\n")
-    info = path.stat()
-    os.chmod(temporary, stat.S_IMODE(info.st_mode))
-    if is_root():
-        os.chown(temporary, info.st_uid, info.st_gid)
-    os.replace(temporary, path)
+    os.replace(write_like(path.read_text(), ".backup-"), backup)
+    os.replace(write_like("\n".join(lines) + "\n", ".metal-"), path)
     return backup
 
 
@@ -323,7 +346,8 @@ def prime(entry):
     signin = subprocess.run(["op", "signin", *(["--account", op_account] if op_account else [])], stdout=subprocess.PIPE, text=True)
     session = op_session(signin.stdout)
     if signin.returncode or not session:
-        raise Stop("1Password sign-in failed")
+        raise Stop("1Password sign-in failed (or op returned no session). Manually, as the account: "
+                   "eval \"$(op signin --account ACCOUNT)\", then op-cache read REFERENCE > /dev/null")
     primed = subprocess.run(["op-cache", "read", reference, *(["--account", op_account] if op_account else [])],
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=dict(os.environ, **session))
     if primed.returncode:
@@ -334,12 +358,14 @@ def prime(entry):
 
 def claude_login(entry, flags):
     target = Path(entry.pw_dir) / ".local/bin/claude"
-    link = Path("/usr/local/bin/claude")
-    if is_root() and target.exists() and not link.exists():
-        link.symlink_to(target)
-        print("linked /usr/local/bin/claude -> " + str(target))
     if not target.exists():
         raise Stop("Claude Code isn't installed for " + entry.pw_name + ": silo shell, then curl -fsSL https://claude.ai/install.sh | bash")
+    # The web service's PATH starts with <prefix>/bin (the account's); root's PATH doesn't,
+    # so root never runs the account's claude by typing `claude`.
+    link = PREFIX / "bin/claude"
+    if not link.is_symlink() or os.readlink(link) != str(target):
+        subprocess.call(as_account(["ln", "-sfn", str(target), str(link)], entry))
+        print("linked " + str(link) + " -> " + str(target))
     mode = ["--console"] if "--console" in flags else ["--claudeai", *(["--sso"] if "--sso" in flags else [])]
     argv = as_account([str(target), "auth", "login", *mode], entry)
     status = subprocess.call(argv)
@@ -359,17 +385,31 @@ def intake(entry, project):
             path.mkdir(mode=mode)
             if is_root():
                 os.chown(path, entry.pw_uid, entry.pw_gid)
-    if is_root():
-        # Files copied in as root become the account's, so the data agent can sort them.
-        for directory, dirs, files in os.walk(folder):
+    # Opened once without following symlinks; everything below is reached through that
+    # descriptor, so swapping a directory for a symlink can't redirect the walk.
+    try:
+        top = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise Stop(str(folder) + " is not a plain directory")
+    count = total = 0
+    try:
+        if os.fstat(top).st_uid not in (0, entry.pw_uid):
+            raise Stop(str(folder) + " has an unexpected owner")
+        if is_root():
+            os.fchown(top, entry.pw_uid, entry.pw_gid)
+        for _path, dirs, files, dirfd in os.fwalk(".", dir_fd=top, follow_symlinks=False):
             for name in dirs + files:
-                path = os.path.join(directory, name)
-                if os.lstat(path).st_uid != entry.pw_uid:
-                    os.lchown(path, entry.pw_uid, entry.pw_gid)
-    files = [p for p in folder.rglob("*") if p.is_file() and not p.is_symlink()]
-    total = sum(p.stat().st_size for p in files)
+                info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+                # Files copied in as root become the account's, so the data agent can sort them.
+                if is_root() and info.st_uid != entry.pw_uid:
+                    os.chown(name, entry.pw_uid, entry.pw_gid, dir_fd=dirfd, follow_symlinks=False)
+                if name in files and stat.S_ISREG(info.st_mode):
+                    count += 1
+                    total += info.st_size
+    finally:
+        os.close(top)
     print("drop folder: " + str(folder))
-    print("contents: %d file(s), %.1f MB" % (len(files), total / 1e6))
+    print("contents: %d file(s), %.1f MB" % (count, total / 1e6))
     print("copy files in from your Mac with:\n  scp FILES SERVER:" + str(folder) + "/\nthen run `silo intake " + project + "` again as root to hand them to the service account.")
     return 0
 
