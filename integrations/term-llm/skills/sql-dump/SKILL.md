@@ -30,7 +30,9 @@ description: Inspect and load SQL dumps into the project's source database - MyS
    missing extension). Report it; `stop_on_error: false` only when the engineer agrees
    that skipping errors is acceptable, and list what was skipped.
 4. `data_db_status`: schemas, table counts and sizes. Compare the table count with the
-   `CREATE TABLE` count from the dump.
+   `CREATE TABLE` count from the dump. It also names the project's DBHub server
+   (`db-<project>`); ask the engineer to turn it on in this chat for exact counts and
+   free read-only queries.
 
 ## Discourse backups (merge sources)
 Extract the backup (`data_extract`), register `dump.sql.gz` as `postgres-dump` and the

@@ -1241,6 +1241,7 @@ def op_db_up(ws, request):
             ws.write_json(ws.data_dir("db") / "state.json", state)
     return {"engine": engine, "ready": ready, "network": names["network"] + " (internal: no outside access, no host address)",
             "read_only_user": RO_USER if state.get("ro_user") else None,
+            "queries": dbhub_info(ws, pull_seconds=90) if ready else None,
             "next": "data_db_load with a registered input" if ready else "still starting; check data_db_status"}
 
 
@@ -1348,7 +1349,7 @@ def op_db_status(ws, request):
         out = db_exec(ws, state["engine"], query=query)
         rows = [line.split("\t" if state["engine"] == "mariadb" else "|") for line in out.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
         result["schemas"] = [{"schema": row[0], "tables": int(row[1]), "approx_mb": row[2]} for row in rows[:20] if len(row) == 3 and row[1].isdigit()]
-        result["queries"] = "free queries: through DBHub once term-llm can attach an MCP server to migration-data only"
+        result["queries"] = dbhub_info(ws, pull_seconds=45)
     return result
 
 
@@ -1360,6 +1361,11 @@ def op_db_reset(ws, request):
     with ws.lock():
         if any(job.get("status") == "running" and job.get("kind") == "db_load" for job in refresh_jobs(ws)):
             refuse("STANDARD_BUSY")
+        # Chats' DBHub processes for this project go first, then its MCP entry.
+        running = docker(["ps", "-aq", "--filter", "label=silo.role=dbhub", "--filter", "label=silo.workspace=" + ws.name], timeout=30)
+        for container in running.stdout.decode().split():
+            docker(["rm", "-f", container], timeout=60)
+        mcp_register(ws, present=False)
         docker(["rm", "-f", names["container"]], timeout=120)
         docker(["volume", "rm", "-f", names["volume"]], timeout=120)
         # Passwords stay with the data: forget them only once the container and volume are gone.
@@ -1371,6 +1377,134 @@ def op_db_reset(ws, request):
             if path.is_file() and not path.is_symlink():
                 path.unlink()
     return {"source_db": None, "note": "the source database was removed; registered inputs are untouched"}
+
+
+# -- DBHub: free read-only queries over MCP ------------------------------------------------
+# Each project's source database gets one MCP server in term-llm's mcp.json, `db-<project>`,
+# limited to migration-data with `agents:`. term-llm starts it per chat as
+# `silo-migrate-control dbhub <project>` (stdio), which runs DBHub in a container on the
+# project's internal network as the read-only user. term-llm 0.9.93 ignores `agents:` (and
+# drops it when the web UI rewrites mcp.json): until the pinned term-llm enforces it, any
+# chat's MCP button can switch it on, so `silo doctor` warns and every data_db_up /
+# data_db_status puts the entry back as it should be.
+
+DBHUB_IMAGE = "bytebase/dbhub:1.5.1@sha256:86edce0447fd9d4bd9eeb7cea7dd3b83473b732a0c437c552b36004c034ff5a9"
+DBHUB_MAX_ROWS = 50
+MCP_AGENT = "migration-data"
+DBHUB_DSN = {"mariadb": "mariadb://" + RO_USER + ":${DB_PASSWORD}@source-db:3306/source?sslmode=disable",
+             "postgres": "postgres://" + RO_USER + ":${DB_PASSWORD}@source-db:5432/source?sslmode=disable"}
+
+
+def mcp_config_path():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")) / "term-llm" / "mcp.json"
+
+
+def mcp_name(ws):
+    return "db-" + ws.name
+
+
+def mcp_entry(ws):
+    # The installed shim sets the control config itself; term-llm passes it no environment.
+    repo = ws.repo.resolve()
+    control = repo.parent.parent / "bin/silo-migrate-control" if repo.parent.name == "releases" else repo / "bin/silo-migrate-control"
+    return {"command": str(control), "args": ["dbhub", ws.name], "agents": [MCP_AGENT]}
+
+
+def mcp_register(ws, present=True):
+    """Put this project's entry in mcp.json (or take it out), leaving everything else as it is."""
+    path = mcp_config_path()
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return "not changed: mcp.json is not a plain file"
+        config = json.loads(path.read_text())
+    except FileNotFoundError:
+        config = {}
+    except (OSError, ValueError):
+        return "not changed: mcp.json can't be read"
+    servers = config.setdefault("servers", {}) if isinstance(config, dict) else None
+    if not isinstance(servers, dict):
+        return "not changed: mcp.json has an unexpected shape"
+    name, entry = mcp_name(ws), mcp_entry(ws)
+    if present and servers.get(name) == entry:
+        return "registered"
+    if not present and name not in servers:
+        return "absent"
+    if present:
+        servers[name] = entry
+    else:
+        del servers[name]
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name("." + path.name + ".silo-" + secrets.token_hex(4))
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(config, handle, indent=2)
+        handle.write("\n")
+    os.replace(temporary, path)
+    return "registered" if present else "removed"
+
+
+def dbhub_image(pull_seconds=0):
+    """Present, or pulled by its pinned digest (Docker checks the content)."""
+    if docker(["image", "inspect", "--format", "{{.Id}}", DBHUB_IMAGE], timeout=30).returncode == 0:
+        return True
+    return bool(pull_seconds) and docker(["pull", "--quiet", DBHUB_IMAGE], timeout=pull_seconds).returncode == 0
+
+
+def dbhub_info(ws, pull_seconds=0):
+    """Register the project's DBHub server and say how the engineer turns it on."""
+    state = db_state(ws)
+    if not (state and state.get("ro_user")):
+        return {"mcp_server": None, "note": "available once the source database is up with its read-only user"}
+    registration = mcp_register(ws)
+    image = dbhub_image(pull_seconds)
+    return {"mcp_server": mcp_name(ws), "registration": registration, "image": "ready" if image else "missing: docker pull " + DBHUB_IMAGE,
+            "how": ("The engineer turns on MCP server " + mcp_name(ws) + " in this chat (MCP button). Its tools: execute_sql (read-only, "
+                    "at most " + str(DBHUB_MAX_ROWS) + " rows: select only the columns you need and shorten long text), search_objects "
+                    "(tables, columns, indexes) and explain_sql. Use only the server for this chat's project.")}
+
+
+def dbhub_toml(engine):
+    return ("# Written by silo-migrate. The read-only user is the limit; DBHub adds read-only transactions and a row cap.\n"
+            "[[sources]]\nid = \"source\"\ndsn = \"" + DBHUB_DSN[engine] + "\"\nconnection_timeout = 10\nquery_timeout = 120\n\n"
+            "[[tools]]\nname = \"execute_sql\"\nsource = \"source\"\nreadonly = true\nmax_rows = " + str(DBHUB_MAX_ROWS) + "\n\n"
+            "[[tools]]\nname = \"search_objects\"\nsource = \"source\"\n\n"
+            "[[tools]]\nname = \"explain_sql\"\nsource = \"source\"\n")
+
+
+def dbhub_main(args, values, base, repo, host):
+    """`dbhub WS`: started by term-llm as the project's MCP server (stdio). Becomes `docker run -i`
+    of DBHub on the project's internal network, signed in as the read-only user. Prints nothing."""
+    if len(args) != 2 or args[0] != "dbhub":
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    ws = Workspace(base, args[1], repo, host, values, None)
+    ws.require(standard=False)
+    state = db_state(ws)
+    if not (state and state.get("ro_user") and state.get("engine") in DBHUB_DSN):
+        refuse("STANDARD_DB_STATE_MISSING: start the project's source database with data_db_up first")
+    if network_safe(ws) is not True:
+        refuse("STANDARD_DB_NETWORK_UNSAFE")
+    password = ro_password(ws)
+    config = ws.data_dir("db") / "dbhub.toml"
+    temporary = config.with_name(".dbhub.toml." + secrets.token_hex(4))
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(dbhub_toml(state["engine"]))
+    os.replace(temporary, config)
+    if "," in str(config):
+        refuse("STANDARD_OPERATION_FAILED")
+    argv = ["docker", "run", "-i", "--rm", "--pull=never", "--name", "silo-dbhub-" + ws.name + "-" + secrets.token_hex(3),
+            "--label", "silo.workspace=" + ws.name, "--label", "silo.role=dbhub", "--network", db_names(ws)["network"],
+            "--read-only", "--tmpfs", "/tmp:rw,size=64m,mode=1777", "--user", f"{os.getuid()}:{os.getgid()}",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "1", "--memory", "512m", "--memory-swap", "512m",
+            "--pids-limit", "128", "--log-driver", "none", "-e", "HOME=/tmp", "-e", "DB_PASSWORD",
+            "--mount", f"type=bind,src={config},dst=/config/dbhub.toml,readonly",
+            DBHUB_IMAGE, "--transport", "stdio", "--config", "/config/dbhub.toml"]
+    # The password reaches docker through the environment, never argv.
+    env = {"PATH": os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin", "DB_PASSWORD": password, "HOME": os.path.expanduser("~")}
+    for key in ("DOCKER_HOST", "DOCKER_CONFIG", "XDG_RUNTIME_DIR"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    os.execvpe(argv[0], argv, env)
 
 
 # -- runs and findings --------------------------------------------------------------------

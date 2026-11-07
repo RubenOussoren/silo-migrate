@@ -150,6 +150,42 @@ def private_file(path, uid):
     return stat.S_ISREG(info.st_mode) and info.st_uid == uid and not info.st_mode & 0o077
 
 
+# The first term-llm release that enforces `agents:` in mcp.json (SamSaffron/term-llm#1332);
+# None until one is pinned. Older releases ignore the field, so any chat can turn DBHub on.
+MCP_AGENTS_SINCE = None
+
+
+def term_llm_version(entry, runner):
+    match = re.search(r"version (\d+)\.(\d+)\.(\d+)", runner(as_account([term_llm(), "version"], entry), timeout=30).stdout or "")
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def dbhub_check(add, entry, runner):
+    """Projects' DBHub servers (db-<project>) must be limited to migration-data, and term-llm must enforce it.
+    Only counts are printed: project names can identify customers."""
+    try:
+        servers = json.loads((Path(entry.pw_dir) / ".config/term-llm/mcp.json").read_text()).get("servers") or {}
+    except FileNotFoundError:
+        servers = {}
+    except (OSError, ValueError, AttributeError):
+        add("WARN", "DBHub", "~/.config/term-llm/mcp.json can't be read")
+        return
+    ours = {name: server for name, server in servers.items() if name.startswith("db-") and isinstance(server, dict) and (server.get("args") or [None])[0] == "dbhub"}
+    if not ours:
+        add("OK", "DBHub", "no project database servers yet")
+        return
+    open_ = sum(1 for server in ours.values() if server.get("agents") != ["migration-data"])
+    if open_:
+        add("WARN", "DBHub", "%d of %d project servers not limited to migration-data" % (open_, len(ours)),
+            "in a migration-data chat for each project, run data_db_status (it puts the limit back)")
+        return
+    version = term_llm_version(entry, runner)
+    enforced = bool(MCP_AGENTS_SINCE and version and version >= MCP_AGENTS_SINCE)
+    add("OK" if enforced else "WARN", "DBHub", "%d project servers, limited to migration-data" % len(ours) + ("" if enforced else
+        "; term-llm %s doesn't enforce the limit yet: turn db-* servers on only in migration-data chats" % (".".join(map(str, version)) if version else "?")),
+        None if enforced else "update term-llm once a release includes SamSaffron/term-llm#1332")
+
+
 def doctor_checks(entry, runner=run):
     checks = []
 
@@ -198,6 +234,8 @@ def doctor_checks(entry, runner=run):
         count = sum(1 for path in shipped_skills.glob("*/SKILL.md"))
         add("OK" if linked else "WARN", "skills", ("%d linked from the release" % count) if linked else str(link) + " is not linked to the release",
             None if linked else "move any existing " + str(link) + " aside, then as the service account: ln -s " + target + " " + str(link) + "; silo restart")
+
+    dbhub_check(add, entry, runner)
 
     chatgpt = (home / ".config/term-llm/chatgpt_oauth.json").is_file()
     add("OK" if chatgpt else "FAIL", "ChatGPT sign-in", "credential present" if chatgpt else "not signed in",

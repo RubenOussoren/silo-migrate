@@ -27,6 +27,9 @@ design (spam users, empty forums), merged (duplicate emails into one user), drop
 error (see the run's logs), unsupported by the importer, or a source filter mismatch.
 "About right" is not a result. A difference with no explanation is a finding.
 
+Source counts: migration-data measures them with DBHub (`execute_sql`, `COUNT(*)` with the
+agreed filter) on the project's source database; other agents use the numbers it reports.
+
 Report a table: entity, source, intermediate, destination, difference, reason. Say which
 numbers were measured and which were taken from earlier reports. Never include real
 names or values; counts and categories are enough.

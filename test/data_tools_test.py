@@ -96,6 +96,8 @@ class FakeDocker:
         self.hostile_role = b''
         self.logs = b'converted 3 records\n'
         self.keep_volume = False
+        self.image_present = True
+        self.dbhub_containers = b''
 
     def __call__(self, argv, timeout=120, input=None):
         self.calls.append((argv, input))
@@ -147,6 +149,12 @@ class FakeDocker:
                 out = b"role\tsafe_role\nhost\t172.%\ninformation_schema\nmysql\nsource\nforum_db\n%\n" + self.hostile_role
         elif argv[0] == 'rm':
             self.state.pop(argv[-1], None)
+        elif argv[0] == 'image' and argv[1] == 'inspect':
+            code = 0 if self.image_present else 1
+        elif argv[0] == 'pull':
+            self.image_present = True
+        elif argv[0] == 'ps':
+            out = self.dbhub_containers
         return subprocess.CompletedProcess(argv, code, out, err)
 
     def argvs(self, verb):
@@ -176,6 +184,10 @@ class DataToolsTest(unittest.TestCase):
                                           identity=lambda document: self.content_id(document['ref']))
         self.values = {'SILO_CONTROL_GEMS': str(top / 'gems')}
         (top / 'gems').mkdir()
+        self.config_home = top / 'config'
+        environ = mock.patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.config_home)})
+        environ.start()
+        self.addCleanup(environ.stop)
 
     def content_id(self, ref):
         profile = json.loads((ROOT / 'runtime/profiles/discourse-2026.11.0-latest-3158c750.json').read_text())
@@ -600,6 +612,87 @@ class DataToolsTest(unittest.TestCase):
         self.assertFalse((self.base / 'arc/.silo-migrate/data/db/secret.env').exists())
         self.assertTrue((self.base / 'arc/inputs/forum.sql').is_file())
         self.assertIsNone(self.op('db_status')['source_db'])
+
+    # -- DBHub ---------------------------------------------------------------------------
+
+    def mcp(self):
+        return json.loads((self.config_home / 'term-llm/mcp.json').read_text())
+
+    def test_db_up_registers_the_projects_dbhub_server_for_migration_data_only(self):
+        self.create()
+        (self.config_home / 'term-llm').mkdir(parents=True)
+        mine = {'command': 'npx', 'args': ['other'], 'extra_field': 1}
+        (self.config_home / 'term-llm/mcp.json').write_text(json.dumps({'servers': {'mine': mine}, 'top_extra': True}))
+        self.docker.image_present = False
+        self.assertIsNone(self.op('db_status')['source_db'])
+        self.assertNotIn('db-arc', self.mcp()['servers'])  # nothing before the database exists
+        queries = self.op('db_up', engine='mariadb')['queries']
+        self.assertEqual(('db-arc', 'registered', 'ready'), (queries['mcp_server'], queries['registration'], queries['image']))
+        self.assertIn(['pull', '--quiet', self.d.DBHUB_IMAGE], self.docker.argvs('pull'))
+        config = self.mcp()
+        self.assertEqual(mine, config['servers']['mine'])
+        self.assertTrue(config['top_extra'])
+        entry = config['servers']['db-arc']
+        self.assertEqual(['migration-data'], entry['agents'])
+        self.assertEqual(['dbhub', 'arc'], entry['args'])
+        self.assertTrue(entry['command'].endswith('/bin/silo-migrate-control'))
+        self.assertEqual(0o600, stat.S_IMODE((self.config_home / 'term-llm/mcp.json').stat().st_mode))
+        # term-llm 0.9.93 drops `agents` when its web UI rewrites mcp.json: status puts it back.
+        del config['servers']['db-arc']['agents']
+        (self.config_home / 'term-llm/mcp.json').write_text(json.dumps(config))
+        self.assertEqual('registered', self.op('db_status')['queries']['registration'])
+        self.assertEqual(['migration-data'], self.mcp()['servers']['db-arc']['agents'])
+        # Never written through a link or into a file it can't parse.
+        (self.config_home / 'term-llm/mcp.json').write_text('{not json')
+        self.assertIn('not changed', self.op('db_status')['queries']['registration'])
+        self.assertEqual('{not json', (self.config_home / 'term-llm/mcp.json').read_text())
+
+    def test_dbhub_runs_on_the_project_network_as_the_read_only_user(self):
+        self.create()
+        with mock.patch.object(self.d.os, 'execvpe') as execvpe, self.assertRaises(self.d.Refusal) as before:
+            self.d.dbhub_main(['dbhub', 'arc'], self.values, self.base, ROOT, self.host)
+        self.assertTrue(str(before.exception).startswith('STANDARD_DB_STATE_MISSING'))
+        execvpe.assert_not_called()
+        self.op('db_up', engine='postgres')
+        with mock.patch.object(self.d.os, 'execvpe') as execvpe:
+            self.d.dbhub_main(['dbhub', 'arc'], self.values, self.base, ROOT, self.host)
+        file, argv, env = execvpe.call_args[0]
+        password = self.d.ro_password(self.d.Workspace(self.base, 'arc', ROOT, self.host, self.values, self.control))
+        self.assertEqual(password, env['DB_PASSWORD'])
+        self.assertNotIn(password, ' '.join(argv))
+        for flag in ('--rm', '-i', '--pull=never', '--read-only', '--log-driver', '-e'):
+            self.assertIn(flag, argv)
+        self.assertEqual('silo-src-arc', argv[argv.index('--network') + 1])
+        self.assertEqual('ALL', argv[argv.index('--cap-drop') + 1])
+        self.assertEqual('none', argv[argv.index('--log-driver') + 1])
+        self.assertNotIn('-p', argv)
+        self.assertEqual(['DB_PASSWORD'], [argv[i + 1] for i, a in enumerate(argv) if a == '-e' and argv[i + 1].startswith('DB_')])
+        self.assertEqual(self.d.DBHUB_IMAGE, argv[argv.index('--transport') - 1])
+        toml = (self.base / 'arc/.silo-migrate/data/db/dbhub.toml')
+        text = toml.read_text()
+        self.assertNotIn(password, text)
+        self.assertIn('postgres://silo_ro:${DB_PASSWORD}@source-db:5432/source', text)
+        self.assertIn('readonly = true', text)
+        self.assertIn('max_rows = 50', text)
+        self.assertEqual(0o600, stat.S_IMODE(toml.stat().st_mode))
+        # A network that could reach the host is refused.
+        self.docker.networks['silo-src-arc'] = ['network', 'create', '--internal', 'silo-src-arc']
+        with mock.patch.object(self.d.os, 'execvpe') as execvpe, self.assertRaises(self.d.Refusal):
+            self.d.dbhub_main(['dbhub', 'arc'], self.values, self.base, ROOT, self.host)
+        execvpe.assert_not_called()
+        for bad in (['dbhub'], ['dbhub', '../x'], ['dbhub', 'arc', 'extra']):
+            with self.subTest(args=bad), self.assertRaises(self.d.Refusal):
+                self.d.dbhub_main(bad, self.values, self.base, ROOT, self.host)
+
+    def test_db_reset_stops_dbhub_and_removes_its_entry(self):
+        self.create()
+        self.op('db_up', engine='mariadb')
+        self.docker.dbhub_containers = b'abc123\ndef456\n'
+        self.op('db_reset', confirm=True)
+        self.assertNotIn('db-arc', self.mcp()['servers'])
+        removed = [argv[-1] for argv in self.docker.argvs('rm')]
+        self.assertEqual(['abc123', 'def456'], removed[:2])
+        self.assertIn(['ps', '-aq', '--filter', 'label=silo.role=dbhub', '--filter', 'label=silo.workspace=arc'], self.docker.argvs('ps'))
 
     # -- findings and output ---------------------------------------------------------
 

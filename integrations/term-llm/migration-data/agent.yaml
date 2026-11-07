@@ -144,7 +144,7 @@ tools:
         required: [workspace, job_id]
         additionalProperties: false
     - name: data_db_up
-      description: "Start (or restart) the project's source database: mariadb for MySQL/MariaDB dumps, postgres for PostgreSQL dumps and Discourse backups (PostgreSQL 18 with Discourse's extensions). Internal network with no outside access, data in a project volume, a read-only user for later query access."
+      description: "Start (or restart) the project's source database: mariadb for MySQL/MariaDB dumps, postgres for PostgreSQL dumps and Discourse backups (PostgreSQL 18 with Discourse's extensions). Internal network with no outside access, data in a project volume, a read-only user. Also registers the project's DBHub MCP server (db-<project>) for free read-only SQL; the engineer turns it on in the chat."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 210
@@ -171,7 +171,7 @@ tools:
         required: [workspace, path]
         additionalProperties: false
     - name: data_db_status
-      description: "Source database status: engine, running/ready, loads, and per schema the number of tables and approximate size. Free SQL queries come later through DBHub."
+      description: "Source database status: engine, running/ready, loads, per schema the number of tables and approximate size, and the project's DBHub MCP server (db-<project>) for free read-only SQL."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 100

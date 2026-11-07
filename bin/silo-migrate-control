@@ -169,13 +169,21 @@ def github_credentials(checkout, url, cwd=None):
     return argv[:-2] + options + argv[-2:], env
 
 
-def host_data(args, values, base, self):
-    """`data WS`: the migration-data agent's operations (bin/data_tools.py), JSON on stdin."""
+def data_tools():
     import importlib.util
     sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("data_tools", Path(__file__).resolve().parent / "data_tools.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def host_data(args, values, base, self):
+    """`data WS`: the migration-data agent's operations (bin/data_tools.py), JSON on stdin.
+    `dbhub WS`: the project's DBHub MCP server over stdio (term-llm starts it; never prints here)."""
+    module = data_tools()
+    if args[:1] == ["dbhub"]:
+        return module.dbhub_main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__])
     result = module.main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin,
                          module.control_runner(self))
     sys.stdout.buffer.write((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -298,7 +306,7 @@ def main(args):
     gems = Path(values.get("SILO_CONTROL_GEMS", str(project / ".runtime-cache/gems")))
     if args[:1] == ["converter"]:
         return host_converter(args, values, base, self)
-    if args[:1] == ["data"]:
+    if args[:1] in (["data"], ["dbhub"]):
         return host_data(args, values, base, self)
     image = values.get("SILO_CONTROL_IMAGE_REF", CONTROL_REF) if configured else CONTROL_REF.split("@", 1)[1]
     if configured:

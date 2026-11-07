@@ -95,6 +95,29 @@ class SiloTest(unittest.TestCase):
             self.assertEqual('OK', checks[name]['status'], (name, checks[name]))
         self.assertNotIn('secret', json.dumps(checks))
 
+    def test_doctor_checks_dbhub_servers_are_limited_without_naming_projects(self):
+        self.assertEqual('OK', self.statuses(self.healthy())['DBHub']['status'])
+        config = self.home / '.config/term-llm/mcp.json'
+        entry = {'command': '/srv/silo-migrate/bin/silo-migrate-control', 'args': ['dbhub', 'acme-forum']}
+        config.write_text(json.dumps({'servers': {'db-acme-forum': entry, 'db-other': {'command': 'x'}, 'mine': {'command': 'y'}}}))
+        responses = dict(self.healthy(), **{' version': (0, 'term-llm version 0.9.93 (commit: x)\n')})
+        check = self.statuses(responses)['DBHub']
+        self.assertEqual(('WARN', '1 of 1 project servers not limited to migration-data'), (check['status'], check['detail']))
+        self.assertIn('data_db_status', check['fix'])
+        entry['agents'] = ['migration-data']
+        config.write_text(json.dumps({'servers': {'db-acme-forum': entry}}))
+        check = self.statuses(responses)['DBHub']
+        self.assertEqual('WARN', check['status'])
+        self.assertIn("0.9.93 doesn't enforce", check['detail'])
+        self.assertIn('#1332', check['fix'])
+        with mock.patch.object(self.s, 'MCP_AGENTS_SINCE', (0, 9, 94)):
+            self.assertEqual('WARN', self.statuses(responses)['DBHub']['status'])
+            newer = dict(responses, **{' version': (0, 'term-llm version 0.9.94\n')})
+            self.assertEqual('OK', self.statuses(newer)['DBHub']['status'])
+        self.assertNotIn('acme', json.dumps(self.statuses(responses)))
+        config.write_text('{broken')
+        self.assertEqual('WARN', self.statuses(responses)['DBHub']['status'])
+
     def test_doctor_reports_each_problem_with_its_fix(self):
         responses = self.healthy()
         responses['service status'] = (0, 'ActiveState=failed\n')

@@ -5,7 +5,13 @@ description: Profile a migration source (forum database, export or another Disco
 
 # Source profile and schema finding
 
-## Gather (from the loaded database status, the dump and sandbox scripts)
+## Gather (from the loaded database, the dump and sandbox scripts)
+With DBHub on (`db-<project>`): `search_objects` for tables and columns (`detail_level:
+summary`), then `execute_sql` for exact counts and value shapes, e.g. `SELECT visible,
+COUNT(*) FROM mybb_posts GROUP BY visible`, `SELECT MIN(dateline), MAX(dateline) …`,
+`SELECT LENGTH(message) …`. At most 50 rows come back: aggregate, don't page through rows.
+Without DBHub: `data_db_status`, `CREATE TABLE` from the dump, and sandbox scripts.
+
 - **Identity**: software and version (from a settings/version table or the dump header),
   table prefix, server version, charset/collation per table.
 - **Tables that matter** for the migration (users, groups, categories/forums, topics/
