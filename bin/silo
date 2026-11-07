@@ -3,7 +3,7 @@
 
   silo doctor                      check everything the node needs; print exact fixes
   silo update [--branch BRANCH]    (root) pull the installer, update the release, restart, doctor
-  silo use-github                  (root) take updates from GitHub instead of copied bundles
+  silo use-github                  (root) take silo-migrate updates from GitHub, not copied bundles
   silo restart                     restart the term-llm web service
   silo shell                       (root) a service-account shell with the right environment
   silo prime                       sign in to 1Password and warm op-cache for Frontier (24 h)
@@ -29,7 +29,6 @@ PREFIX = RELEASE.parent.parent if RELEASE.parent.name == "releases" else Path(os
 METAL_CONFIG = Path(os.environ.get("SILO_METAL_CONFIG", "/etc/silo-migrate/metal.conf"))
 INSTALLER = Path(os.environ.get("SILO_INSTALLER", "/opt/silo-migrate-installer"))
 GITHUB_SILO = "https://github.com/RubenOussoren/silo-migrate.git"
-GITHUB_CONVERTERS = "https://github.com/discourse-org/discourse-converters.git"
 PROJECT = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 REPO = re.compile(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9_./-]+\Z")
 OP_REF = re.compile(r'op-cache read "(op://[^"]+)"(?:\s+--account\s+([A-Za-z0-9._-]+))?')
@@ -147,9 +146,8 @@ def doctor_checks(entry, runner=run):
             add("WARN", "installer checkout", "can't read " + str(INSTALLER) + " (missing, or not owned by root)")
         try:
             conf = read_conf()
-            local = [key for key in ("SILO_REPO", "CONVERTER_REPO") if conf.get(key, "").startswith("/")]
-            add("WARN" if local else "OK", "update source",
-                ("local copies for " + ", ".join(local) + ": updates need bundles") if local else "GitHub", "silo use-github" if local else None)
+            local = conf.get("SILO_REPO", "").startswith("/")
+            add("WARN" if local else "OK", "update source", "local copy: updates need bundles" if local else "GitHub", "silo use-github" if local else None)
         except (OSError, UnicodeDecodeError):
             add("WARN", "update source", "can't read " + str(METAL_CONFIG))
         link = Path("/usr/local/bin/silo")
@@ -309,17 +307,18 @@ def set_conf_values(path, updates):
     return backup
 
 
-def use_github(silo_repo=GITHUB_SILO, converter_repo=GITHUB_CONVERTERS):
+def use_github(silo_repo=GITHUB_SILO):
+    """Only SILO_REPO (public). CONVERTER_REPO stays: metal plan resolves it without a token,
+    and workspaces clone the private converter from GitHub with the token file instead."""
     need_root("silo use-github")
-    for value in (silo_repo, converter_repo):
-        if not REPO.fullmatch(value):
-            raise Stop("repositories must be credential-free HTTPS URLs")
+    if not REPO.fullmatch(silo_repo):
+        raise Stop("repositories must be credential-free HTTPS URLs")
     conf = read_conf()
     branch = conf.get("SILO_BRANCH", "mvp/metal-installer")
     if run(["git", "ls-remote", "--heads", silo_repo, "refs/heads/" + branch], timeout=60).returncode:
         raise Stop("can't reach " + silo_repo + " branch " + branch + ": nothing changed")
-    backup = set_conf_values(METAL_CONFIG, {"SILO_REPO": silo_repo, "CONVERTER_REPO": converter_repo})
-    print("config: SILO_REPO and CONVERTER_REPO now GitHub (backup " + str(backup) + ")")
+    backup = set_conf_values(METAL_CONFIG, {"SILO_REPO": silo_repo})
+    print("config: SILO_REPO now " + silo_repo + " (backup " + str(backup) + ")")
     if (INSTALLER / ".git").exists() and stream(["git", "-C", str(INSTALLER), "remote", "set-url", "origin", silo_repo]):
         raise Stop("couldn't set the installer checkout's origin")
     print("installer checkout now pulls from " + silo_repo + "\nnext: silo update")

@@ -16,7 +16,7 @@ account is root-equivalent through Docker anyway, but keep the release sealed (`
 | --- | --- |
 | `silo doctor` | Checks the release and installer checkout, update source, web service, agents, ChatGPT/Frontier/Claude sign-ins, GitHub token, commit identity, Docker, disk and the read-only release; prints the exact fix for anything wrong. Nothing secret is printed. |
 | `silo update [--branch B]` | (root) Pulls the installer checkout (fast-forward only), runs `metal update`, restarts the web service, then `silo doctor`. Branch defaults to the installed one. |
-| `silo use-github` | (root, once) Points `SILO_REPO`/`CONVERTER_REPO` in `/etc/silo-migrate/metal.conf` and the installer checkout at GitHub, after checking GitHub is reachable; keeps a timestamped backup of the config. From then on updates need no copied bundles. |
+| `silo use-github` | (root, once) Points `SILO_REPO` in `/etc/silo-migrate/metal.conf` and the installer checkout at GitHub (silo-migrate is public), after checking GitHub is reachable; keeps a timestamped backup of the config. From then on updates need no copied bundles. `CONVERTER_REPO` is left as it is: `metal plan` resolves it without a token; workspaces clone the private converter with `converter clone WS --repo https://github.com/discourse-org/discourse-converters.git` and the token file. |
 | `silo restart` | Restarts the term-llm web service (ends open web chats). |
 | `silo shell` | (root) A login shell as the service account with the right environment. |
 | `silo prime` | Signs in to 1Password (you type the password) and warms op-cache, so Frontier works for 24 hours. The session is kept only in memory. |

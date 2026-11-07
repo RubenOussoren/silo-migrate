@@ -140,8 +140,9 @@ class SiloTest(unittest.TestCase):
                 mock.patch.object(self.s, 'stream', side_effect=lambda argv: calls.append(argv) or 0):
             (self.s.INSTALLER / '.git').mkdir(parents=True)
             self.assertEqual(0, self.s.use_github())
-        self.assertEqual('SILO_ACCOUNT=silomig\nSILO_REPO=https://github.com/RubenOussoren/silo-migrate.git\nSILO_BRANCH=mvp/metal-installer\n'
-                         'CONVERTER_REPO=https://github.com/discourse-org/discourse-converters.git\n', self.s.METAL_CONFIG.read_text())
+        # CONVERTER_REPO is left alone: metal plan resolves it without a token.
+        self.assertEqual('SILO_ACCOUNT=silomig\nSILO_REPO=https://github.com/RubenOussoren/silo-migrate.git\nSILO_BRANCH=mvp/metal-installer\n',
+                         self.s.METAL_CONFIG.read_text())
         self.assertEqual(0o640, stat.S_IMODE(self.s.METAL_CONFIG.stat().st_mode))
         self.assertEqual(1, len(list(self.root.glob('metal.conf.bak-*'))))
         self.assertEqual(['git', '-C', str(self.s.INSTALLER), 'remote', 'set-url', 'origin', 'https://github.com/RubenOussoren/silo-migrate.git'], calls[0])
