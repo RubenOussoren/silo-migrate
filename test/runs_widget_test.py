@@ -160,7 +160,10 @@ else:
         data = json.dumps(body).encode() if body is not None else None
         sent = {'Content-Type': 'application/json', 'X-Silo-Runs': '1'} if method == 'POST' else {}
         sent.update(headers or {})
-        connection.request(method, path, body=data, headers=sent)
+        try:
+            connection.request(method, path, body=data, headers=sent)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # an oversized body: the server answered and closed before reading it all
         response = connection.getresponse()
         raw = response.read()
         connection.close()

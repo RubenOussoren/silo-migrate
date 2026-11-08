@@ -3,6 +3,9 @@ require_relative 'standard_convert_run_test'
 
 # Scripted Docker for review runs: answers the prebuilt stack, its PostgreSQL and the
 # importer on top of the convert fixture. No subprocess, Docker socket or network.
+REVIEW_IMPORT_OK = "SILO_SIDEKIQ: paused=true running=0 (before import)\nStarting...\nImporting users...\nDone! (1 minutes)\n" \
+                   "running 'import:ensure_consistency' rake task.\nSILO_SIDEKIQ: paused=true (after import)\n"
+
 class ReviewScriptedRuntime < ConvertScriptedRuntime
   attr_accessor :import_output, :settings_rows, :destination_counts, :import_exit_failure, :role_failure
 
@@ -45,9 +48,17 @@ class ReviewScriptedRuntime < ConvertScriptedRuntime
       port = cmd.find { |arg| arg.start_with?('SILO_SITE_PORT=') }.to_s.split('=', 2).last
       site_json('admin_username' => 'silo_review_admin', 'disable_emails' => 'yes', 'login_required' => true, 'allow_restore' => false,
                 'base_url' => "http://127.0.0.1:#{port}")
-    elsif line.include?('generic_bulk.rb')
-      import_exit_failure ? review_fail('importer crashed') : review_ok(import_output || "Starting...\nImporting users...\nDone! (1 minutes)\nNow run the 'import:ensure_consistency' rake task.\n")
-    elsif line.include?('import:ensure_consistency') || line.include?('bundle check') || line.include?('mkdir -p /shared/import') || cmd.include?('chown')
+    elsif line.include?('review_import.rb') && cmd[1] == 'exec' && !cmd.include?('chown')
+      if import_exit_failure == :after_done
+        SiloMigrate::Runtime::CommandResult.new(success?: false, stdout: REVIEW_IMPORT_OK.lines.first(4).join, stderr: 'PG::TRDeadlockDetected', status: 1)
+      elsif import_exit_failure == :refused
+        review_fail("REVIEW_IMPORT_REFUSED: background jobs still running\n")
+      elsif import_exit_failure
+        review_fail('importer crashed')
+      else
+        review_ok(import_output || REVIEW_IMPORT_OK)
+      end
+    elsif line.include?('bundle check') || line.include?('mkdir -p /shared/import') || cmd.include?('chown')
       review_ok
     elsif cmd.include?('printenv')
       review_ok("yes\n")
@@ -226,11 +237,12 @@ class StandardReviewRunTest < StandardConvertRunTest
                      'review_url' => 'http://127.0.0.1:18080', 'import_issues' => 0 }, public[:results])
       refute_match(/user_custom_fields|"destination"/, JSON.generate(@service.status))
 
-      # The importer runs once, without an uploads database, then the consistency pass.
-      imports = @runtime.calls.select { |cmd| cmd.join(' ').include?('generic_bulk.rb') }
+      # The importer runs once, inside the Sidekiq-pausing wrapper, without an uploads database;
+      # its own consistency pass is not repeated.
+      imports = @runtime.calls.select { |cmd| cmd[1] == 'exec' && !cmd.include?('chown') && cmd.join(' ').include?('review_import.rb') }
       assert_equal 1, imports.size
-      assert imports.first.last.end_with?('generic_bulk.rb /shared/import/intermediate.sqlite')
-      assert @runtime.calls.any? { |cmd| cmd.join(' ').include?('import:ensure_consistency') }
+      assert imports.first.last.end_with?('ruby /tmp/review_import.rb /shared/import/intermediate.sqlite')
+      refute @runtime.calls.any? { |cmd| cmd.join(' ').include?('rake import:ensure_consistency') }
       # Destination counts: SELECT-only role created first, each count read-only and timed.
       role = @runtime.calls.index { |cmd| cmd.include?('postgres') && cmd.include?('psql') }
       counts = @runtime.calls.each_index.select { |index| @runtime.calls[index].include?('silo_count') }
@@ -275,8 +287,9 @@ class StandardReviewRunTest < StandardConvertRunTest
 
   def test_review_import_issues_are_counted_not_fatal
     with_review do
-      @runtime.import_output = "Starting...\n\nImport issues (details in /tmp/generic_bulk_import_issues_20261108_101500.log):\n" \
-                               "  post skipped (raw contains null bytes): 2\n  invalid email update skipped: 1\nDone! (3 minutes)\n"
+      @runtime.import_output = "SILO_SIDEKIQ: paused=true running=0 (before import)\nStarting...\n\nImport issues (details in /tmp/generic_bulk_import_issues_20261108_101500.log):\n" \
+                               "  post skipped (raw contains null bytes): 2\n  invalid email update skipped: 1\nDone! (3 minutes)\n" \
+                               "SILO_SIDEKIQ: paused=true (after import)\n"
       result = run_review
       assert_equal 'completed', result[:status], result.inspect
       assert_equal 3, result[:results]['import_issues']
@@ -293,10 +306,36 @@ class StandardReviewRunTest < StandardConvertRunTest
 
   def test_review_import_without_completion_or_with_unsafe_settings_fails
     with_review do
-      @runtime.import_output = "Starting...\nImporting users...\n"
+      @runtime.import_output = "SILO_SIDEKIQ: paused=true running=0 (before import)\nStarting...\nImporting users...\n"
       result = run_review
       assert_equal 'failed', result[:status]
       assert_equal({ 'stage' => 'import', 'code' => 'STANDARD_IMPORT_FAILED' }, result[:failure].slice('stage', 'code'))
+      @service.reset_run(run_id: result[:run_id], yes: true)
+
+      # Without the pause line the run refuses to continue; a failure after Done! names the consistency pass.
+      @runtime.import_output = "Starting...\nDone! (1 minutes)\n"
+      result = run_review
+      assert_includes File.read(@service.store.run_dir(result[:run_id], 'private', 'failure.json')), 'sidekiq not paused'
+      @service.reset_run(run_id: result[:run_id], yes: true)
+      @runtime.import_output = nil
+      @runtime.import_exit_failure = true
+      result = run_review
+      assert_includes File.read(@service.store.run_dir(result[:run_id], 'private', 'failure.json')), 'importer exit'
+      @service.reset_run(run_id: result[:run_id], yes: true)
+      @runtime.import_exit_failure = :after_done
+      result = run_review
+      assert_includes File.read(@service.store.run_dir(result[:run_id], 'private', 'failure.json')), 'after the completion line'
+      @service.reset_run(run_id: result[:run_id], yes: true)
+      @runtime.import_exit_failure = :refused
+      result = run_review
+      assert_includes File.read(@service.store.run_dir(result[:run_id], 'private', 'failure.json')), 'refused: background jobs still running'
+      @service.reset_run(run_id: result[:run_id], yes: true)
+      # Both markers are required: a pause lost before the end refuses the run.
+      @runtime.import_exit_failure = false
+      @runtime.import_output = REVIEW_IMPORT_OK.lines.first(4).join
+      result = run_review
+      assert_includes File.read(@service.store.run_dir(result[:run_id], 'private', 'failure.json')), 'sidekiq not paused'
+      @runtime.import_output = nil
       assert_equal 'dirty', @service.store.load.dig('instances', instance_name(@service.show_plan(result[:plan_id])), 'state')
       @service.reset_run(run_id: result[:run_id], yes: true)
 

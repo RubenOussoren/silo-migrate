@@ -19,10 +19,12 @@ module SiloMigrate
       REVIEW_OPERATION = "standard_review"
       REVIEW_STAGES = %w[preflight site_up site_setup import verify review_url].freeze
       REVIEW_ADMIN = "silo_review_admin"
-      REVIEW_IMPORT_TIMEOUT = 8 * 3600
-      REVIEW_CONSISTENCY_TIMEOUT = 4 * 3600
+      # The importer, its consistency pass and up to 10 minutes of waiting for background jobs.
+      REVIEW_IMPORT_TIMEOUT = 12 * 3600
       DESTINATION_TIMEOUT = 1800
       DESTINATION_ROLE = "silo_count"
+      # review_import.rb prints these only when Sidekiq and the scheduler stayed paused.
+      REVIEW_IMPORT_MARKERS = [/^SILO_SIDEKIQ: paused=true running=0 \(before import\)$/, /^SILO_SIDEKIQ: paused=true \(after import\)$/].freeze
       RUN_ID = /\Arun-[0-9a-f]{32}\z/
       ISSUE_LOG = %r{\A/tmp/generic_bulk_import_issues_\d{8}_\d{6}\.log\z}
       # Sized per host when the plan is proposed (never below the profile's), bound by the digest.
@@ -86,7 +88,7 @@ module SiloMigrate
           "mutations" => [
             "create one local review site (loopback port #{review_port}, no outbound network, emails disabled, login required) with its own networks and volumes",
             "create the review admin account (its password is shown only to the engineer)",
-            "import #{from_run}'s intermediate database with the generic bulk importer, then run import:ensure_consistency",
+            "import #{from_run}'s intermediate database with the generic bulk importer and its consistency pass, with background jobs paused",
             roles["reconciliation"] ? "count each reconciliation check on the intermediate database and, where it has destination_sql, on the site (report only)" : "no reconciliation checks",
             "keep the site running until the engineer resets this run"
           ],
@@ -272,11 +274,16 @@ module SiloMigrate
         raise StandardWorkflowError.new("STANDARD_IMPORT_FAILED", "import folder") unless prepared.success?
 
         stack.copy_in(artifact, "/shared/import/intermediate.sqlite")
-        # No uploads database: generic_bulk then imports no uploads (deferred this slice).
-        result = stack.discourse_shell(["bundle", "exec", "ruby", "script/bulk_import/generic_bulk.rb", "/shared/import/intermediate.sqlite"],
+        # generic_bulk through review_import.rb, which holds a Sidekiq pause for the whole import
+        # including the importer's own import:ensure_consistency (background jobs deadlocked
+        # its bulk UPDATEs on arc). No uploads database: no uploads (deferred this slice).
+        result = stack.discourse_shell(["bundle", "exec", "ruby", "/tmp/review_import.rb", "/shared/import/intermediate.sqlite"],
                                        timeout: REVIEW_IMPORT_TIMEOUT)
         log(run_id, "import", result)
-        raise StandardWorkflowError.new("STANDARD_IMPORT_FAILED", "importer exit") unless result.success?
+        raise StandardWorkflowError.new("STANDARD_IMPORT_FAILED", review_import_failure(result)) unless result.success?
+        unless REVIEW_IMPORT_MARKERS.all? { |marker| result.stdout.to_s.b.match?(marker) }
+          raise StandardWorkflowError.new("STANDARD_IMPORT_FAILED", "sidekiq not paused")
+        end
 
         report = review_import_report(result.stdout.to_s)
         raise StandardWorkflowError.new("STANDARD_IMPORT_FAILED", "no completion line") unless report
@@ -288,13 +295,18 @@ module SiloMigrate
             nil # the counts are in the import log; the details file is a convenience
           end
         end
-        consistency = stack.discourse_shell(%w[bundle exec rake import:ensure_consistency], timeout: REVIEW_CONSISTENCY_TIMEOUT)
-        log(run_id, "import-consistency", consistency)
-        raise StandardWorkflowError.new("STANDARD_IMPORT_FAILED", "ensure_consistency") unless consistency.success?
-
         record_results(run_id, import_issues: report[:issues])
         @store.update { |state| state.fetch("runs").fetch(run_id).fetch("results")["import_issue_counts"] = report[:counts] }
         set_instance_state(stack, "imported")
+      end
+
+      # Private detail: the wrapper's fixed refusal reason, or where the importer stopped.
+      def review_import_failure(result)
+        refused = result.stderr.to_s.b[/REVIEW_IMPORT_REFUSED: ([A-Za-z ]{1,60})/, 1]
+        return "refused: #{refused}" if refused
+        return "after the completion line (consistency pass or directory refresh)" if result.stdout.to_s.b.match?(/^Done! \(\d+ minutes\)$/)
+
+        "importer exit"
       end
 
       # Real data has issues (e.g. a post with null bytes): they are counted and kept for

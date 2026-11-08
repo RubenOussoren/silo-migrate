@@ -153,8 +153,12 @@ $C standard run admin-password "$WS" RUN_ID      # the review admin's sign-in (t
        remapped);
      - creates the admin `silo_review_admin`. Its password is private to the run.
   4. `import`:
-     - runs `generic_bulk.rb` without an uploads database (uploads are deferred), then
-       `import:ensure_consistency`;
+     - runs `generic_bulk.rb`, and the `import:ensure_consistency` pass it runs itself, without an
+       uploads database (uploads are deferred);
+     - first, `review_import.rb` pauses Sidekiq and the scheduler. It sets Discourse's pause key
+       without an expiry and waits until no job or scheduled job is running. Otherwise background
+       jobs, such as rebaking imported posts, deadlock the bulk updates (seen on arc). Both
+       `SILO_SIDEKIQ` markers must appear in the log;
      - only the importer's completion line is required. Its "Import issues" are counted
        (public `import_issues`); the categories and the details file stay private.
   5. `verify`:

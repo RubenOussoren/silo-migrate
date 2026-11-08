@@ -83,7 +83,7 @@ module SiloMigrate
       EXECUTE_LOCK_WAIT = 120
       # Longer than EXECUTE_LOCK_WAIT, so a queued executor isn't called never-started.
       CLAIM_GRACE_SECONDS = 180
-      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb].freeze
+      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
       attr_reader :store
