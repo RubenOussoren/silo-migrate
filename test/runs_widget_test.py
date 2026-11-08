@@ -77,13 +77,20 @@ if args[:2] == ['standard', 'status']:
         {'plan_id': 'plan-%032x' % 1, 'digest': 'a' * 64, 'status': 'proposed', 'created_at': '2026-11-07T10:00:00Z'},
         {'plan_id': 'plan-%032x' % 2, 'digest': 'b' * 64, 'status': 'stale', 'created_at': '2026-11-07T09:00:00Z'}],
         'runs': [{'run_id': 'run-%032x' % 1, 'status': 'completed', 'stages': {}, 'results': {'reconciliation_checks': 1}}]}))
+elif args[:3] == ['standard', 'plan', 'show'] and os.environ.get('RUNS_MODE') == 'review':
+    print(json.dumps({'version': 1, 'plan_id': args[4], 'operation': 'standard_review',
+                      'from_run': {'run_id': 'run-%032x' % 2, 'intermediate_sha256': 'e' * 64, 'intermediate_bytes': 42},
+                      'instances': {'review': {'port': 18081}}, 'roles': {'reconciliation': 'input-%032x' % 3}}))
+elif args[:3] == ['standard', 'run', 'admin-password']:
+    print(json.dumps({'version': 1, 'run_id': args[4], 'username': 'silo_review_admin',
+                      'password': 'INVENTED-ADMIN-SECRET', 'review_url': 'http://127.0.0.1:18081'}))
 elif args[:3] == ['standard', 'plan', 'show']:
     print(json.dumps({'version': 1, 'plan_id': args[4], 'digest': 'a' * 64, 'status': 'proposed', 'operation': 'standard_convert',
                       'roles': {'source': 'input-%032x' % 1, 'settings': 'input-%032x' % 2, 'reconciliation': 'input-%032x' % 3},
                       'inputs': [], 'converter': {'branch': 'migration/arc/mybb-converter'}}))
 elif args[:3] == ['standard', 'run', 'show']:
-    print(json.dumps({'version': 1, 'run_id': args[4], 'status': 'completed', 'stages': {'convert': 'passed'},
-                      'results': {'reconciliation_checks': 1, 'reconciliation_matched': 0, 'reconciliation_differs': 1, 'reconciliation_errors': 0}}))
+    print(json.dumps({'version': 1, 'run_id': args[4], 'status': 'completed', 'stages': {name: 'passed' for name in (['preflight', 'site_up', 'site_setup', 'import', 'verify', 'review_url'] if mode == 'review' else ['convert'])},
+                      'results': {'reconciliation_checks': 1, 'reconciliation_matched': 0, 'reconciliation_differs': 1, 'reconciliation_errors': 0, **({'review_url': 'http://127.0.0.1:18081', 'import_issues': 2} if mode == 'review' else {})}}))
 elif args[:2] == ['converter', 'log']:
     print(json.dumps({'version': 1, 'workspace': args[2], 'branch': 'migration/arc/mybb-core-conversion', 'head': '7' * 40, 'uncommitted': 2,
                       'not_pushed': 2, 'ahead_of_main': 2, 'commits': [{'sha': '7' * 40, 'subject': 'Add validated MyBB converter foundations', 'pushed': False}],
@@ -224,6 +231,66 @@ else:
         self.assertIsNone(self.get('/api/push?workspace=arc&id=' + 'f' * 64)[1]['pull_request']['url'])
         self.assertEqual(404, self.get('/api/push?workspace=arc&id=' + 'e' * 64)[0])
         self.assertEqual(400, self.get('/api/run?workspace=arc&id=run-1')[0])
+
+    def test_review_details_destination_and_password_post(self):
+        os.environ['RUNS_MODE'] = 'review'
+        path = self.base / 'arc/.silo-migrate/named/standard/state.json'
+        state = json.loads(path.read_text())
+        body = state['plans'][pid(1)]['body']
+        body['operation'] = 'standard_review'
+        checks_path = self.base / 'arc/inputs/derived/checks.json'
+        checks = json.loads(CHECKS)
+        checks['checks'][0]['destination_sql'] = "SELECT COUNT(*) FROM users"
+        checks_path.write_text(json.dumps(checks))
+        for binding in body['input_binding']:
+            if binding['type'] == 'reconciliation':
+                binding['sha256'] = hashlib.sha256(checks_path.read_bytes()).hexdigest()
+        row = {'name': 'users', 'source': 1234, 'intermediate': 1233, 'destination': 1232,
+               'difference': -1, 'destination_difference': -1, 'status': 'differs'}
+        state['runs'][rid(1)].update(plan_id=pid(1), instances={'review': 'review-site'},
+                                     results={'reconciliation': [row, dict(row, name='no_destination', destination=None, destination_difference=None)]})
+        state['instances'] = {'review-site': {'state': 'ready', 'port': 18081}}
+        path.write_text(json.dumps(state))
+        status, plan = self.get('/api/plan?workspace=arc&id=' + pid(1))
+        self.assertEqual(200, status)
+        self.assertEqual('standard_review', plan['operation'])
+        self.assertEqual(42, plan['from_run']['intermediate_bytes'])
+        self.assertEqual(18081, plan['instances']['review']['port'])
+        self.assertIn('destination_sql', plan['texts']['reconciliation'])
+        self.assertEqual(body['limits'], plan['limits'])
+        status, run = self.get('/api/run?workspace=arc&id=' + rid(1))
+        self.assertEqual(200, status)
+        self.assertEqual('standard_review', run['operation'])
+        self.assertTrue(run['review_site_available'])
+        self.assertEqual(row, run['reconciliation'][0])
+        self.assertIsNone(run['reconciliation'][1]['destination'])
+        self.assertEqual(2, run['results']['import_issues'])
+        self.assertEqual('http://127.0.0.1:18081', run['results']['review_url'])
+        self.assertEqual({'preflight', 'site_up', 'site_setup', 'import', 'verify', 'review_url'}, set(run['stages']))
+        status, secret = self.post('admin-password', run_id=rid(1))
+        self.assertEqual(200, status)
+        self.assertEqual('silo_review_admin', secret['username'])
+        self.assertEqual('INVENTED-ADMIN-SECRET', secret['password'])
+        self.assertIn(['standard', 'run', 'admin-password', 'arc', rid(1)], self.calls())
+        for endpoint in ('/api/overview?workspace=arc', '/api/summary', '/api/run?workspace=arc&id=' + rid(1)):
+            data = self.get(endpoint)[1]
+            self.assertNotIn('INVENTED-ADMIN-SECRET', json.dumps(data))
+            self.assertNotIn('password', json.dumps(data))
+        self.assertEqual(404, self.get('/api/admin-password?workspace=arc&id=' + rid(1))[0])
+        state['instances']['review-site']['state'] = 'removed'
+        path.write_text(json.dumps(state))
+        self.assertFalse(self.get('/api/run?workspace=arc&id=' + rid(1))[1]['review_site_available'])
+
+    def test_admin_password_validation_and_ui_labels(self):
+        for run_id in ('run-1', '--yes', rid(1) + ' --yes'):
+            self.assertEqual(400, self.post('admin-password', run_id=run_id)[0])
+        self.assertEqual([], self.calls())
+        self.assertEqual(403, self.request('POST', '/api/admin-password', {'workspace': 'arc', 'run_id': rid(1)},
+                                          headers={'X-Silo-Runs': '0'})[0])
+        script = (WIDGET / 'app.js').read_text()
+        for text in ('Review import', 'Convert run', 'Full run', 'Destination difference', 'Show admin password',
+                     'Copy password', "'Hide'", 'ssh -N -L ${port}:127.0.0.1:${port}', 'location.hostname', 'stays until Reset'):
+            self.assertIn(text, script)
 
     def test_converter_view_is_read_only_and_survives_a_refusal(self):
         status, data = self.get('/api/converter?workspace=arc&id=arc')

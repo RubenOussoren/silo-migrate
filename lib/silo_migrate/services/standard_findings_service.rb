@@ -6,6 +6,7 @@ require "json"
 require "time"
 require_relative "../standard_store"
 require_relative "standard_convert_run"
+require_relative "standard_review_run"
 
 module SiloMigrate
   module Services
@@ -34,14 +35,16 @@ module SiloMigrate
         /\A(convert|conversion-[a-z-]+)\z/ => "convert",
         /\A(backup-baseline|baseline-restore(-disable)?)\z/ => "baseline",
         /\Auploads\z/ => "uploads",
-        /\Aimport\z/ => "import",
+        /\Aimport(-consistency)?\z/ => "import",
         /\Abackup-final\z/ => "final_backup",
         /\Afinal-restore(-disable)?\z/ => "restore"
       }.freeze
 
+      # Real-data runs: their completed results (reconciliation differences, import issues)
+      # are what converter work fixes, so findings on them are allowed.
       def convert_run?(state, run_id)
         plan = state.fetch("plans")[state.fetch("runs").fetch(run_id)["plan_id"]]
-        plan&.dig("body", "operation") == StandardConvertRun::CONVERT_OPERATION
+        [StandardConvertRun::CONVERT_OPERATION, StandardReviewRun::REVIEW_OPERATION].include?(plan&.dig("body", "operation"))
       end
 
       def self.log_stage(name)

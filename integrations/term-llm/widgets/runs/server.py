@@ -45,7 +45,7 @@ MAX_STATE = 4 * 1024 * 1024     # the stores' limit for state.json
 MAX_INPUT_TEXT = 256 * 1024     # settings and reconciliation inputs shown in a plan
 MAX_EVIDENCE = 64 * 1024
 MAX_BODY = 4096                 # POST bodies are a few IDs
-STAGE_NAMES = ("preflight", "convert", "reconcile", "site_up", "baseline", "uploads", "import", "verify_site",
+STAGE_NAMES = ("preflight", "convert", "reconcile", "site_up", "site_setup", "verify", "baseline", "uploads", "import", "verify_site",
                "final_backup", "review_url", "restore", "verify_restore")
 HERE = Path(__file__).resolve().parent
 INSTALLED = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/widgets/[a-z0-9-]+")
@@ -363,7 +363,12 @@ def run_detail(store, control, workspace, run_id):
     run = store.runs(workspace).get(run_id) or {}
     results = run.get("results") if isinstance(run.get("results"), dict) else {}
     reconciliation = results.get("reconciliation") if isinstance(results.get("reconciliation"), list) else None
-    return dict(shown, workspace=workspace, reconciliation=reconciliation,
+    plan = store.plans(workspace).get(run.get("plan_id")) or {}
+    body = plan.get("body") if isinstance(plan.get("body"), dict) else {}
+    instance = (store.state(workspace).get("instances") or {}).get((run.get("instances") or {}).get("review"))
+    review_site_available = isinstance(instance, dict) and instance.get("state") != "removed"
+    return dict(shown, workspace=workspace, operation=body.get("operation"), review_site_available=review_site_available,
+                reconciliation=reconciliation,
                 conversion_summary=store.evidence(workspace, run_id, "conversion-summary.txt"))
 
 
@@ -403,6 +408,9 @@ def decide(store, control, action, body):
         argv = ["start-run", workspace, plan_id]
     elif action == "recover" and run_ok:
         argv = ["standard", "run", "recover", workspace, run_id]
+    elif action == "admin-password" and run_ok:
+        # Only this explicit, signed-in POST retrieves a password. Never read it into status.
+        argv = ["standard", "run", "admin-password", workspace, run_id]
     elif action == "reset" and run_ok:
         argv = ["standard", "run", "reset", workspace, run_id, "--yes"]
     elif action == "push" and digest_ok:

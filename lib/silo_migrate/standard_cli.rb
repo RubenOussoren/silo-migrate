@@ -27,6 +27,8 @@ module SiloMigrate
         plan propose WORKSPACE --dataset ID [--baseline seed|BASELINE_ID] [--ports A,B] [--allow-unqualified-runtime]
         plan propose WORKSPACE --operation convert --source INPUT_ID --settings INPUT_ID [--reconciliation INPUT_ID] [--charset NAME]
                                                        (real data: convert and reconcile counts only; no import)
+        plan propose WORKSPACE --operation review --from-run RUN_ID [--reconciliation INPUT_ID] [--port N]
+                                                       (real data: import a completed convert run into a local review site)
         plan show WORKSPACE PLAN_ID
         plan approve WORKSPACE PLAN_ID --sha256 DIGEST --reviewer NAME
         plan discard WORKSPACE PLAN_ID --reviewer NAME          (a proposal nobody will approve)
@@ -36,6 +38,7 @@ module SiloMigrate
         run execute WORKSPACE RUN_ID
         run show WORKSPACE RUN_ID
         run private-paths WORKSPACE RUN_ID
+        run admin-password WORKSPACE RUN_ID                  (engineer: a review site's admin sign-in)
         run recover WORKSPACE RUN_ID
         run reset WORKSPACE RUN_ID --yes
         finding review WORKSPACE FINDING_ID
@@ -62,7 +65,8 @@ module SiloMigrate
 
     PARSE_ERROR = "STANDARD_ARGUMENTS_INVALID"
     DETAILED = %w[STANDARD_SETTINGS_INVALID STANDARD_RECONCILIATION_INVALID STANDARD_CONVERTER_DEPS_MISSING
-                  STANDARD_CONVERTER_PLATFORM_MISSING STANDARD_INPUTS_INCOMPLETE STANDARD_DUMP_KIND_UNSUPPORTED].freeze
+                  STANDARD_CONVERTER_PLATFORM_MISSING STANDARD_INPUTS_INCOMPLETE STANDARD_DUMP_KIND_UNSUPPORTED
+                  STANDARD_REVIEW_SOURCE_INVALID].freeze
     OPERATION_ERROR = "STANDARD_OPERATION_FAILED"
     # Exit codes are per the contract: failed run returns its JSON and exits 1.
 
@@ -184,6 +188,14 @@ module SiloMigrate
           return service(workspace).propose_convert_plan(source: opts.fetch("--source"), settings: opts.fetch("--settings"), reconciliation: opts["--reconciliation"],
                                                          charset: opts.fetch("--charset", "utf8mb4"), allow_unqualified_runtime: !allow.nil?)
         end
+        if args[0, 2] == %w[--operation review]
+          args.shift(2)
+          opts = options!(args, "--from-run", "--reconciliation", "--port", optional: %w[--reconciliation --port])
+          port = opts["--port"]
+          invalid! if port && !port.match?(/\A[1-9]\d{0,4}\z/)
+          return service(workspace).propose_review_plan(from_run: opts.fetch("--from-run"), reconciliation: opts["--reconciliation"],
+                                                        port: port&.to_i, allow_unqualified_runtime: !allow.nil?)
+        end
         opts = options!(args, "--dataset", "--baseline", "--ports", optional: %w[--baseline --ports])
         service(workspace).propose_plan(dataset_id: opts.fetch("--dataset"), baseline: opts.fetch("--baseline", "seed"), ports: ports(opts["--ports"]), allow_unqualified_runtime: !allow.nil?)
       when "show"
@@ -223,6 +235,7 @@ module SiloMigrate
       when "execute" then no_more!(args); service(workspace).execute(run_id: identifier)
       when "show" then no_more!(args); service(workspace).show_run(identifier)
       when "private-paths" then no_more!(args); service(workspace).private_paths(identifier)
+      when "admin-password" then no_more!(args); service(workspace).admin_password(identifier)
       when "recover" then no_more!(args); service(workspace).recover(run_id: identifier)
       when "reset"
         expect!(args.shift, "--yes")

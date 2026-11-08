@@ -21,6 +21,7 @@ require_relative "prebuilt_stack"
 require_relative "standard_oracle"
 require_relative "discourse_archive"
 require_relative "standard_convert_run"
+require_relative "standard_review_run"
 
 module SiloMigrate
   module Services
@@ -34,6 +35,7 @@ module SiloMigrate
     class StandardWorkflowService
       include DiscourseArchive
       include StandardConvertRun
+      include StandardReviewRun
 
       STAGES = %w[preflight convert site_up baseline uploads import verify_site final_backup review_url restore verify_restore].freeze
 
@@ -41,6 +43,7 @@ module SiloMigrate
         "standard_full_snapshot" => "supported_synthetic",
         "launch_snapshot_from_preimport_baseline" => "supported_synthetic",
         "standard_convert" => "supported_real_data_convert_and_reconcile_only",
+        "standard_review" => "supported_real_data_local_review_import_without_uploads",
         "other_existing_converters" => "not_implemented_in_workbench",
         "new_converter_development" => "not_implemented_in_workbench",
         "delta_import" => "not_implemented_requires_base_lineage",
@@ -72,6 +75,7 @@ module SiloMigrate
         "STANDARD_SOURCE_EMPTY" => "The dump put no tables in the run's database: it probably creates and uses its own (mysqldump --databases). Have migration-data remove its CREATE DATABASE and USE lines, register the result, then propose a new plan.",
         "STANDARD_SETTINGS_INVALID" => "The converter settings input is not valid YAML with ${SILO_DB_*} placeholders. Register corrected settings, then propose a new plan.",
         "STANDARD_RECONCILIATION_INVALID" => "The reconciliation input is invalid. Register a corrected one, then propose a new plan.",
+        "STANDARD_REVIEW_SOURCE_INVALID" => "The convert run this review imports is missing, not completed, or its intermediate database changed. Propose a review of a completed convert run.",
         "STANDARD_INTERNAL" => "An unexpected failure occurred. Inspect private evidence, reset this run, then re-plan."
       }.freeze
 
@@ -79,7 +83,7 @@ module SiloMigrate
       EXECUTE_LOCK_WAIT = 120
       # Longer than EXECUTE_LOCK_WAIT, so a queued executor isn't called never-started.
       CLAIM_GRACE_SECONDS = 180
-      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb].freeze
+      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
       attr_reader :store
@@ -491,6 +495,10 @@ module SiloMigrate
           # keeps blocking new runs. Retrying is safe: absent resources are skipped.
           sweep_run_resources(run_id)
           convert_leftovers!(run_id) if convert_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+          # The review admin's sign-in is useless once its site is gone (also a setup file a crash left).
+          if review_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+            %w[admin-password review-setup.env].each { |name| FileUtils.rm_f(@store.run_dir(run_id, "private", name)) }
+          end
           @store.update do |current|
             stacks.each { |stack| current.fetch("instances")[stack.name] = stack.record }
           end
@@ -638,6 +646,7 @@ module SiloMigrate
 
       def stale_reason(plan, state)
         return convert_stale_reason(plan, state) if convert_plan?(plan)
+        return review_stale_reason(plan, state) if review_plan?(plan)
 
         body = plan.fetch("body")
         named = @store.named_state
@@ -692,7 +701,7 @@ module SiloMigrate
           dirty = state.fetch("instances").values.select { |record| %w[creating dirty].include?(record["state"]) }
           raise StandardWorkflowError.new("STANDARD_DIRTY_INSTANCE", "reset the earlier run first") unless dirty.empty?
 
-          convert_plan?(plan) ? convert_admission!(plan.fetch("body")) : admission!(state)
+          operation_admission!(plan, state)
           state.fetch("consumed_outputs").concat(outputs)
           plan["status"] = "consumed"
           plan["run_id"] = run_id
@@ -709,6 +718,13 @@ module SiloMigrate
       # Admission against the aggregate envelope, counting containers that exist now.
       # Docker enforces each limit; the host lock stops a second workspace starting
       # while this one is between containers.
+      def operation_admission!(plan, state)
+        return convert_admission!(plan.fetch("body")) if convert_plan?(plan)
+        return review_capacity!(plan.dig("body", "limits")) if review_plan?(plan)
+
+        admission!(state)
+      end
+
       def admission!(_state)
         stack = lock.dig("limits", "stack")
         needed_cpus = stack.values.sum { |limit| limit["cpus"] } * 2
@@ -748,7 +764,6 @@ module SiloMigrate
 
       def execute_stages(run_id)
         @store.update { |state| state.fetch("runs").fetch(run_id)["status"] = "running" }
-        convert = convert_plan?(plan_for(run_id))
         stages_for(plan_for(run_id)).each do |stage|
           stage_method = "stage_#{stage}"
           begin_stage(run_id, stage)
@@ -759,7 +774,7 @@ module SiloMigrate
             end
             guard_disk!
             if stage == STAGES.first
-              convert ? convert_admission!(plan_for(run_id).fetch("body")) : admission!(nil)
+              operation_admission!(plan_for(run_id), nil)
             end
             send(stage_method, run_id)
             finish_stage(run_id, stage, "passed")
@@ -876,6 +891,7 @@ module SiloMigrate
         stale = stale_reason(plan, @store.load)
         raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
         return convert_preflight(run_id, plan) if convert_plan?(plan)
+        return review_preflight(run_id, plan) if review_plan?(plan)
 
         named = @store.named_state
         resolved = lock.fetch("images").transform_values { |image| ImageIdentity.resolve(@runtime, image) }
@@ -1151,12 +1167,13 @@ module SiloMigrate
       end
 
       def stage_site_up(run_id)
-        target = plan_for(run_id).dig("body", "instances", "review")
-        stack = create_stack(run_id, "review", target)
+        body = plan_for(run_id).fetch("body")
+        # Review runs import real data: their stack is sized per host and bound by the plan.
+        stack = create_stack(run_id, "review", body.dig("instances", "review"), limits: body["operation"] == REVIEW_OPERATION ? body.fetch("limits") : nil)
         assert_runtime_identity!(run_id, stack, "review")
       end
 
-      def create_stack(run_id, role, target)
+      def create_stack(run_id, role, target, limits: nil)
         name = target.fetch("name")
         db_password = SecureRandom.hex(24)
         env_file = @store.run_dir(run_id, "private", "#{role}.env")
@@ -1165,7 +1182,9 @@ module SiloMigrate
           state.fetch("instances")[name] = { "name" => name, "containers" => {}, "networks" => [], "volumes" => [], "state" => "creating", "role" => role, "run_id" => run_id, "port" => target.fetch("port"), "hostname" => target.fetch("hostname") }
           state.fetch("runs").fetch(run_id).fetch("instances")[role] = name
         end
-        stack = PrebuiltStack.new(runtime: @runtime, lock: resolved_lock(run_id), name: name, record: @store.load.fetch("instances").fetch(name), sleeper: @sleeper)
+        selected = resolved_lock(run_id)
+        selected.fetch("limits")["stack"] = limits if limits
+        stack = PrebuiltStack.new(runtime: @runtime, lock: selected, name: name, record: @store.load.fetch("instances").fetch(name), sleeper: @sleeper)
         stack.create!(hostname: target.fetch("hostname"), port: target.fetch("port"), env_file: env_file,
                       labels: { "silo-migrate.run" => run_id, "silo-migrate.role" => role }) do |record|
           @store.update { |state| state.fetch("instances")[name] = record }
@@ -1360,7 +1379,18 @@ module SiloMigrate
         db&.close
       end
 
+      def stage_site_setup(run_id)
+        review_site_setup(run_id)
+      end
+
+      def stage_verify(run_id)
+        review_verify(run_id, plan_for(run_id))
+      end
+
       def stage_import(run_id)
+        plan = plan_for(run_id)
+        return review_import(run_id, plan) if review_plan?(plan)
+
         stack = stack_for(run_id, "review")
         args = ["bundle", "exec", "ruby", "script/bulk_import/generic_bulk.rb", "/shared/import/intermediate.sqlite", "/shared/import/uploads.sqlite3"]
         result = stack.discourse_shell(args, timeout: 1200)
@@ -1571,6 +1601,8 @@ module SiloMigrate
 
       # Local review convenience only, after the portable archive already exists.
       def stage_review_url(run_id)
+        return review_url_check(run_id) if review_plan?(plan_for(run_id))
+
         stack = stack_for(run_id, "review")
         result = stack.rails_runner("/tmp/set_review_port.rb", env: { "SILO_SITE_PORT" => stack.record.fetch("port").to_s })
         evidence(run_id, "review-url.json", result)
@@ -1688,6 +1720,7 @@ module SiloMigrate
           operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
           platform: body["platform"], roles: body["roles"], source_charset: body["source_charset"], converter_deps: body.dig("converter_deps", "key"),
           reconciliation_policy: body["reconciliation_policy"],
+          from_run: body["from_run"]&.slice("run_id", "plan_id", "converter_revision", "intermediate_sha256", "intermediate_bytes"), limits: body["limits"],
           collision_policy: body["collision_policy"], inputs: body["input_binding"].map { |input| input.slice("id", "type", "bytes", "sha256") },
           app_revision: body["app_revision"], converter_revision: body["converter_revision"], code_identity: body["code_identity"],
           instances: (body["instances"] || {}).transform_values { |target| target.slice("name", "port", "hostname") },
@@ -1710,7 +1743,8 @@ module SiloMigrate
           stage: run["stage"], stages: run["stages"].transform_values { |entry| entry["status"] },
           # Never the per-check reconciliation numbers: they are derived from customer data.
           assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments",
-                                                                       "conversion_summary", "reconciliation_checks", "reconciliation_matched", "reconciliation_differs", "reconciliation_errors"),
+                                                                       "conversion_summary", "reconciliation_checks", "reconciliation_matched", "reconciliation_differs", "reconciliation_errors",
+                                                                       "review_url", "import_issues"),
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
         if status == "not_started"

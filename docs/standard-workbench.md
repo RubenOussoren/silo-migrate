@@ -124,6 +124,68 @@ $C start-run "$WS" PLAN_ID
 - **Findings on a completed convert run are allowed:** differences are what converter work
   fixes.
 
+## Review runs on real data
+
+A review plan (`standard_review`) imports a **completed convert run's** intermediate database
+into one local Discourse review site. Nothing is converted again. migration-data proposes it
+(`data_plan_propose` with `from_run`). You approve and start it in the Runs widget, or as the
+service account:
+
+```sh
+$C standard plan propose "$WS" --operation review --from-run RUN_ID [--reconciliation INPUT_ID] [--port N]
+$C standard run admin-password "$WS" RUN_ID      # the review admin's sign-in (the widget shows it on click)
+```
+
+- **What the digest binds:**
+  - the convert run, its plan digest, and the intermediate database's SHA-256, size and file
+    identity (if it changes, the plan goes stale: `STANDARD_REVIEW_SOURCE_INVALID`);
+  - the reconciliation input (by default the convert run's);
+  - code, the runtime profile and its images;
+  - the site's name, loopback port and limits. These are sized to the host at proposal, never
+    below the profile's: web up to 2 CPUs and 6 GiB, the database up to 2 CPUs and 4 GiB.
+- **Stages:**
+  1. `preflight`: rehashes the intermediate database and resolves the images.
+  2. `site_up`: the profile's stack. Web is on an `--internal` network with no route out,
+     published only on `127.0.0.1:PORT`, with SMTP at `smtp.invalid` and
+     `DISCOURSE_DISABLE_EMAILS=yes`.
+  3. `site_setup`:
+     - sets `login_required`, no restore and the port, before any data arrives (so nothing is
+       remapped);
+     - creates the admin `silo_review_admin`. Its password is private to the run.
+  4. `import`:
+     - runs `generic_bulk.rb` without an uploads database (uploads are deferred), then
+       `import:ensure_consistency`;
+     - only the importer's completion line is required. Its "Import issues" are counted
+       (public `import_issues`); the categories and the details file stay private.
+  5. `verify`:
+     - emails are still disabled and login is still required;
+     - reconciliation: intermediate counts again; destination counts where a check has
+       `destination_sql`;
+     - source counts come from the convert run, for checks whose name and `source_sql` are
+       byte-identical to it.
+  6. `review_url`: over the published port, the site answers and an anonymous visitor gets no
+     topic list.
+- **Destination counts:**
+  - each check may carry `destination_sql`, one SELECT/WITH count with the same rules as the
+    other queries, and no `pg_*`, `SET`, `COPY` or locking;
+  - it runs inside a scalar subquery, in a read-only transaction with a statement timeout, as
+    `silo_count`;
+  - `silo_count` is a login role created after the import, with SELECT on the public schema
+    only.
+  - Imported records have `import_id` custom fields. Users without an email get a random
+    `…@email.invalid` address from the importer.
+- **Opening the site:** an SSH tunnel with the **same** local port, because Discourse's base URL
+  is `http://127.0.0.1:PORT`. Run `ssh -N -L PORT:127.0.0.1:PORT SERVER`, then open
+  `http://127.0.0.1:PORT/` and sign in as `silo_review_admin`. The Runs widget shows the
+  password on click.
+- **Other accounts:** imported admins and moderators keep their flags. If a converter ever
+  imports password hashes, those accounts could sign in too, but only through your tunnel.
+- **Destination errors:** they keep only the SQLSTATE, because PostgreSQL messages can quote
+  values. `silo_count` can't read session, API-key or password tables.
+- **Lifetime:** the site holds customer data and stays until you **Reset** the run. Reset
+  removes its containers, networks and volumes and deletes the admin password. Admission counts
+  running sites, so reset old ones before starting another.
+
 ## The Runs widget
 
 The web UI's **Runs** widget (`<base>/widgets/runs/`) is where the engineer makes the decisions
@@ -141,6 +203,11 @@ that used to be terminal commands as the service account. A **Runs · N** tab on
   Buttons:
   - **Reset:** finished or failed runs.
   - **Recover:** abandoned or never-started runs.
+- **Review runs:**
+  - the Destination column;
+  - the review URL with its SSH-tunnel line (same port);
+  - **Show admin password**: fetched only when clicked, never in status;
+  - **Reset**: removes the site.
 - **Converter pushes:** converter-developer's proposals, with the PR text, commits, files and
   diff stat. **Push and open draft PR** (exact digest) replaces `converter push WS --sha256 D`.
 
@@ -167,6 +234,7 @@ A plan's digest covers its inputs, code identity, selected profile file SHA256, 
 | `STANDARD_BUSY` | Another operation is running. |
 | `STANDARD_DIRTY_INSTANCE` | An earlier run left an instance dirty. Reset that run. |
 | `STANDARD_CAPACITY` | Retained instances leave too little CPU, memory or disk. Reset an earlier run. |
+| `STANDARD_REVIEW_SOURCE_INVALID` | A review plan's convert run is missing, not completed, or its intermediate database changed. |
 
 ## Failure and recovery
 

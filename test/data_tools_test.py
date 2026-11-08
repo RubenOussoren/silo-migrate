@@ -804,6 +804,37 @@ class DataToolsTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.refused('STANDARD_ARGUMENTS_INVALID', 'plan_propose', **bad)
 
+    def test_review_plan_propose_skips_converter_and_selects_summary(self):
+        self.create()
+        run_id, checks = 'run-' + 'a' * 32, 'input-' + 'b' * 32
+        calls = []
+        plan = {'plan_id': 'plan-' + 'c' * 32, 'digest': 'd' * 64, 'status': 'proposed',
+                'operation': 'standard_review', 'from_run': {'run_id': run_id, 'intermediate_sha256': 'e' * 64, 'intermediate_bytes': 42},
+                'roles': {'reconciliation': checks}, 'inputs': [], 'instances': {'review': {'port': 18081}},
+                'limits': {'web': {'cpus': 2, 'memory_mib': 4096, 'pids': 512}},
+                'mutations': ['import'], 'not_included': ['uploads'], 'private': 'never returned'}
+
+        def control(argv, input=None, timeout=120):
+            calls.append(argv)
+            return json.dumps(plan)
+        self.control = control
+        result = self.op('plan_propose', from_run=run_id, reconciliation=checks)
+        argv = ['standard', 'plan', 'propose', 'arc', '--operation', 'review', '--from-run', run_id]
+        self.assertEqual([argv + ['--reconciliation', checks]], calls)
+        for key in ('from_run', 'instances', 'limits', 'roles', 'inputs', 'digest', 'plan_id', 'mutations', 'not_included'):
+            self.assertEqual(plan[key], result[key])
+        self.assertNotIn('private', result)
+        calls.clear()
+        self.op('plan_propose', from_run=run_id)
+        self.assertEqual([argv], calls)
+        calls.clear()
+        for bad in ({'from_run': 'run-1'}, {'from_run': run_id + ' --yes'}, {'from_run': None},
+                    {'from_run': run_id, 'source': checks}, {'from_run': run_id, 'settings': checks},
+                    {'from_run': run_id, 'charset': 'utf8mb4'}, {'from_run': run_id, 'reconciliation': 'input-1'}):
+            with self.subTest(bad=bad):
+                self.refused('STANDARD_ARGUMENTS_INVALID', 'plan_propose', **bad)
+        self.assertEqual([], calls)
+
     def test_control_refusals_keep_a_short_detail(self):
         runner = self.d.control_runner('/bin/sh')
         with mock.patch.object(self.d.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '',

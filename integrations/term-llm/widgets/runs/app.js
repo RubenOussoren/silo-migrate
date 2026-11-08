@@ -1,6 +1,7 @@
 // Runs widget page. All text from the server is inserted with textContent, never as HTML.
 const ERRORS = {
   STANDARD_BUSY: 'The project is busy (a run or another decision). Try again in a moment.',
+  STANDARD_REVIEW_SOURCE_INVALID: 'Review needs a completed convert run with an unchanged intermediate database. Ask migration-data to check the source run.',
   STANDARD_STALE_PLAN: 'This plan is stale: something it binds changed (inputs, converter commit, code or runtime). Discard it and ask migration-data to propose again.',
   STANDARD_APPROVAL_MISMATCH: 'The plan differs from what this page showed. Nothing was approved.',
   STANDARD_TRANSITION_INVALID: 'That was already decided. The page has been refreshed.',
@@ -14,6 +15,7 @@ const ERRORS = {
   STANDARD_REQUEST_REFUSED: 'The request was refused. Reload the page.',
   STANDARD_OPERATION_TIMEOUT: 'No answer in time. It may still have happened: press Refresh before trying again.',
 };
+const operationLabel = (operation) => operation === 'standard_review' ? 'Review import' : operation === 'standard_convert' ? 'Convert run' : 'Full run';
 const RUN_DONE = new Set(['completed', 'failed', 'interrupted']);
 const state = { workspace: '', selected: null, overview: null };
 const $ = (id) => document.getElementById(id);
@@ -121,7 +123,7 @@ async function loadList() {
   state.overview = data;
   const plans = data.plans.slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   const runs = data.runs.slice().sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
-  const planItem = (plan) => entry('plan', plan.plan_id, `${plan.operation === 'standard_convert' ? 'Convert run' : 'Full run'}${plan.platform ? ` · ${plan.platform}` : ''}`,
+  const planItem = (plan) => entry('plan', plan.plan_id, `${operationLabel(plan.operation)}${plan.platform ? ` · ${plan.platform}` : ''}`,
     [badge(plan.status), ` ${short(plan.plan_id, 13)} · ${ago(plan.created_at)}${plan.approved_by ? ` · approved by ${plan.approved_by}` : ''}`]);
   const runItem = (run) => entry('run', run.run_id, `Run ${short(run.run_id, 12)}`,
     [badge(run.status), ` ${run.stage ? `${run.stage} · ` : ''}${ago(run.started_at)}`]);
@@ -185,12 +187,15 @@ function checksView(text) {
   let spec = null;
   try { spec = JSON.parse(text); } catch { /* shown as text */ }
   if (!spec || !Array.isArray(spec.checks)) return el('pre', {}, text);
-  return table(['Check', 'Expect', 'Source query', 'Intermediate query', 'Note'],
-    spec.checks.map((c) => [c.name, c.expect || 'equal', el('code', {}, c.source_sql || ''), el('code', {}, c.intermediate_sql || ''), c.note || '']));
+  const destination = spec.checks.some((c) => c.destination_sql);
+  return table(['Check', 'Expect', 'Source query', 'Intermediate query', ...(destination ? ['Destination query'] : []), 'Note'],
+    spec.checks.map((c) => [c.name, c.expect || 'equal', el('code', {}, c.source_sql || ''), el('code', {}, c.intermediate_sql || ''),
+      ...(destination ? [el('code', {}, c.destination_sql || '')] : []), c.note || '']));
 }
 
 function renderPlan(plan) {
   const convert = plan.operation === 'standard_convert';
+  const review = plan.operation === 'standard_review';
   const converter = plan.converter || {};
   const inputs = (plan.inputs || []).map((input) => {
     const role = Object.entries(plan.roles || {}).find(([, id]) => id === input.id);
@@ -199,8 +204,8 @@ function renderPlan(plan) {
   });
   const parts = [el('h2', { class: 'mono' }, plan.plan_id), facts([
     ['Status', badge(plan.status)],
-    ['What', convert ? `Convert run: load the dump, run converters/${plan.platform}, count (no import)` : 'Full synthetic run'],
-    ['Converter', `${converter.branch || ''} @ ${short(plan.converter_revision, 12)}${converter.repo ? ` (${converter.repo})` : ''}`],
+    ['What', convert ? `Convert run: load the dump, run converters/${plan.platform}, count (no import)` : review ? 'Review import: import a completed convert run into one local site' : 'Full run'],
+    ['Converter', review ? null : `${converter.branch || ''} @ ${short(plan.converter_revision, 12)}${converter.repo ? ` (${converter.repo})` : ''}`],
     ['Proposed', plan.created_at],
     ['Approved by', plan.approved_by],
     ['Discarded', plan.discarded ? `${plan.discarded.discarded_at} by ${plan.discarded.reviewer}` : null],
@@ -211,12 +216,20 @@ function renderPlan(plan) {
   ])];
   if (plan.status === 'stale') parts.push(el('p', { class: 'note' }, 'Stale: something this plan binds has changed since it was proposed. It can\'t be approved or started; discard it and ask migration-data to propose again.'));
   parts.push(block('Inputs (by content hash)', table(['Role', 'File', 'Type', 'Bytes', 'SHA-256'], inputs, [3])));
-  if (convert) {
+  if (review) {
+    const source = plan.from_run || {};
+    parts.push(block('Review source', facts([['Source run', source.run_id, true],
+      ['Intermediate SHA-256', source.intermediate_sha256, true], ['Intermediate bytes', source.intermediate_bytes],
+      ['Loopback port', ((plan.instances || {}).review || {}).port]])));
+    parts.push(block('Limits', facts(Object.entries(plan.limits || {}).map(([name, limit]) =>
+      [name, `${limit.cpus} CPUs, ${limit.memory_mib} MiB, ${limit.pids} pids`]))));
+  }
+  if (convert || review) {
     const limits = plan.limits || {};
-    parts.push(block('Limits', facts([['Database', limits.db ? `${limits.db.cpus} CPUs, ${limits.db.memory_mib} MiB` : ''],
+    if (convert) parts.push(block('Limits', facts([['Database', limits.db ? `${limits.db.cpus} CPUs, ${limits.db.memory_mib} MiB` : ''],
       ['Converter', limits.converter ? `${limits.converter.cpus} CPUs, ${limits.converter.memory_mib} MiB` : '']])));
     const texts = plan.texts || {};
-    parts.push(block('Converter settings (the run fills in ${SILO_DB_*})', texts.settings == null ? el('p', { class: 'empty' }, '(not readable, or changed since the plan)') : el('pre', {}, texts.settings)));
+    if (convert) parts.push(block('Converter settings (the run fills in ${SILO_DB_*})', texts.settings == null ? el('p', { class: 'empty' }, '(not readable, or changed since the plan)') : el('pre', {}, texts.settings)));
     if ((plan.roles || {}).reconciliation) {
       parts.push(block('Reconciliation checks (reported, not enforced)', texts.reconciliation == null ? el('p', { class: 'empty' }, '(not readable, or changed since the plan)') : checksView(texts.reconciliation)));
     }
@@ -224,7 +237,7 @@ function renderPlan(plan) {
   parts.push(block('What it does', el('ul', {}, (plan.mutations || []).map((m) => el('li', {}, m)))),
     block('Not included', el('p', {}, (plan.not_included || []).join(', '))));
   const actions = [];
-  const unseen = convert && ((plan.texts || {}).settings == null || ((plan.roles || {}).reconciliation && (plan.texts || {}).reconciliation == null));
+  const unseen = (convert && (plan.texts || {}).settings == null) || ((convert || review) && (plan.roles || {}).reconciliation && (plan.texts || {}).reconciliation == null);
   if (plan.status === 'proposed') {
     const question = unseen
       ? `Approve plan ${plan.plan_id}?\nDigest ${plan.digest}\nThe settings or checks could NOT be shown here: you approve them by hash only.`
@@ -266,18 +279,50 @@ function renderRun(run) {
   parts.push(el('div', { class: 'stages' }, Object.entries(run.stages || {}).map(([name, status]) => el('span', {}, `${name} `, badge(status)))));
   if (run.failure && run.failure.recovery) parts.push(el('p', { class: 'note' }, run.failure.recovery));
   if (run.recovery) parts.push(el('p', { class: 'note' }, run.recovery));
+  const destination = (run.reconciliation || []).some((row) => row.destination != null);
   if (results.reconciliation_checks !== undefined) {
     parts.push(block(`Reconciliation: ${results.reconciliation_checks} checks, ${results.reconciliation_matched} matched, ${results.reconciliation_differs} differ, ${results.reconciliation_errors} errors`,
       Array.isArray(run.reconciliation) && run.reconciliation.length
-        ? table(['Check', 'Source', 'Intermediate', 'Difference', 'Status', 'Note'],
-          run.reconciliation.map((r) => [r.name, r.source, r.intermediate, r.difference, badge(r.status), r.error || r.note || '']), [1, 2, 3])
+        ? table(['Check', 'Source', 'Intermediate', 'Difference', ...(destination ? ['Destination', 'Destination difference'] : []), 'Status', 'Note'],
+          run.reconciliation.map((r) => [r.name, r.source, r.intermediate, r.difference, ...(destination ? [r.destination, r.destination_difference] : []), badge(r.status), r.error || r.note || '']), [1, 2, 3, ...(destination ? [4, 5] : [])])
         : el('p', { class: 'empty' }, 'No checks in this run.')));
   }
   if (run.artifacts && run.artifacts.intermediate) {
     parts.push(block('Intermediate database', facts([['Bytes', String(run.artifacts.intermediate.bytes)], ['SHA-256', run.artifacts.intermediate.sha256, true]])));
   }
   if (run.conversion_summary) parts.push(block('Converter summary', el('pre', {}, run.conversion_summary)));
+  if (results.import_issues !== undefined) parts.push(block('Import issues', String(results.import_issues)));
+  // Accept only the contracted loopback URL before constructing links or tunnel instructions.
+  const reviewURL = /^http:\/\/127[.]0[.]0[.]1:([0-9]{1,5})\/?$/.exec(results.review_url || '');
+  if (run.operation === 'standard_review' && reviewURL && Number(reviewURL[1]) > 0 && Number(reviewURL[1]) <= 65535) {
+    const port = reviewURL[1];
+    const url = `http://127.0.0.1:${port}/`;
+    parts.push(block('Review site', el('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, url),
+      el('p', {}, 'Open an SSH tunnel first, using the SAME local port (required by the Discourse base URL):'),
+      el('pre', {}, `ssh -N -L ${port}:127.0.0.1:${port} ${location.hostname || '<server>'}`),
+      el('p', { class: 'note' }, 'Use your SSH server/login in place of the hostname hint. This site holds customer data and stays until Reset. Login is required; emails are disabled; uploads are deferred.')));
+  }
   const actions = [];
+  if (run.operation === 'standard_review' && run.status === 'completed' && run.review_site_available) {
+    const credentials = el('div');
+    const workspace = run.workspace;
+    const show = el('button', { type: 'button', onclick: async () => {
+      show.disabled = true;
+      try {
+        let data = await api('api/admin-password', { workspace, run_id: run.run_id });
+        if (!credentials.isConnected) return;
+        credentials.replaceChildren(facts([['Username', data.username, true], ['Password', data.password, true]]),
+          el('button', { type: 'button', onclick: async () => {
+            try { await navigator.clipboard.writeText(data.password); toast('Password copied.'); }
+            catch { toast('Copy unavailable; select the password instead.', true); }
+          } }, 'Copy password'),
+          el('button', { type: 'button', onclick: () => { credentials.replaceChildren(); data = null; show.hidden = false; } }, 'Hide'));
+        show.hidden = true;
+      } catch (error) { toast(explain(error), true); }
+      finally { show.disabled = false; }
+    } }, 'Show admin password');
+    parts.push(block('Review administrator', show, credentials));
+  }
   if (['abandoned', 'not_started'].includes(run.status)) {
     actions.push(el('button', { type: 'button', onclick: async () => {
       if (await act('recover', { run_id: run.run_id }, `Mark ${run.run_id} as interrupted? Do this only if the run's process is gone (for example after a restart). Then reset it.`)) { toast('Marked interrupted.'); await refreshAll(); }

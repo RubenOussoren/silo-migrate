@@ -42,9 +42,8 @@ file, registered with type `reconciliation`:
 ]}
 ```
 
-- **Names:** lowercase.
-- **Queries:** each query is one `SELECT COUNT(*)` (or `WITH ... SELECT`). No comments, no
-  `;` inside, no `INTO`/file/lock functions, and no `ATTACH`/`PRAGMA` on the intermediate side.
+- **Names:** lowercase. **Queries:** each query is one `SELECT COUNT(*)` (or `WITH ... SELECT`). No comments, no
+  backslashes anywhere in check SQL (use `[.]` for a literal dot in regexes), `;` inside, no `INTO`/file/lock functions, and no `ATTACH`/`PRAGMA` on the intermediate side.
 - **Expectations:** `expect: report` is for a number you only want to see.
 - **When counts are taken:** the run counts the source side on its own copy of the dump,
   right after loading it (before the converter runs), and the intermediate side on the
@@ -52,9 +51,28 @@ file, registered with type `reconciliation`:
 - **Results:** in `data_run_evidence` under `results.reconciliation`, as matched, differs,
   reported or error. They are private: only totals are public. Never put the per-check
   numbers in a finding with real names; counts are fine.
-- **Intermediate tables:** check `db/migrations/` in the converter checkout for the table
-  names before writing the intermediate queries.
+- **Intermediate tables:** see `db/migrations/` in the converter checkout first.
 
 Report a table: entity, source, intermediate, destination, difference, reason. Say which
-numbers were measured and which were taken from earlier reports. Never include real
-names or values; counts and categories are enough.
+numbers were measured and which came from earlier reports. No real names or values.
+
+## Review destination counts
+
+After a convert run whose checks match, register a **new** reconciliation input for
+`data_plan_propose(from_run=RUN_ID, reconciliation=INPUT_ID)`: the convert checks
+byte-for-byte (source counts are reused only when name and `source_sql` are identical),
+each with an optional `destination_sql`. Review runs run it on the site's **PostgreSQL**
+as a SELECT-only role in a read-only transaction; same rules as above (one SELECT/WITH
+count, no backslashes, no `pg_*`/`SET`/`COPY`). No `destination_sql`: null, not zero.
+- Count imported rows only: they have a `user_custom_fields`, `category_custom_fields`,
+  `topic_custom_fields` or `post_custom_fields` row with `name = 'import_id'` (use EXISTS).
+  Seeded topics and the review admin have none. `posts` includes first posts.
+- Users without an intermediate email get a random `<32 hex>@email.invalid` primary address
+  (`user_emails`, `"primary" = true`). `users.staged` is a boolean. Old URLs: `permalinks`.
+- Invented examples:
+
+```sql
+SELECT COUNT(*) FROM posts p WHERE EXISTS (SELECT 1 FROM post_custom_fields f WHERE f.post_id = p.id AND f.name = 'import_id')
+SELECT COUNT(*) FROM users u WHERE u.staged AND EXISTS (SELECT 1 FROM user_custom_fields f WHERE f.user_id = u.id AND f.name = 'import_id')
+SELECT COUNT(*) FROM user_emails e WHERE e."primary" AND e.email ~ '^[0-9a-f]{32}@email[.]invalid$'
+```

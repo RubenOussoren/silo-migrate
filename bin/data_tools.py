@@ -1543,9 +1543,26 @@ INPUT_ID = re.compile(r"input-[0-9a-f]{32}\Z")
 
 
 def op_plan_propose(ws, request):
-    """Propose a convert-only plan on real data: the registered dump, settings and (optional)
-    reconciliation checks, by input ID. Only a proposal: the engineer approves and starts it."""
+    """Propose conversion from inputs or review from a completed convert run.
+    Only a proposal: the engineer approves and starts it."""
     ws.require()
+    from_run = request.get("from_run")
+    if "from_run" in request:
+        if (not isinstance(from_run, str) or not RUN.fullmatch(from_run)
+                or any(key in request for key in ("source", "settings", "charset"))):
+            refuse("STANDARD_ARGUMENTS_INVALID")
+        reconciliation = request.get("reconciliation")
+        if reconciliation is not None and (not isinstance(reconciliation, str) or not INPUT_ID.fullmatch(reconciliation)):
+            refuse("STANDARD_ARGUMENTS_INVALID")
+        argv = ["standard", "plan", "propose", ws.name, "--operation", "review", "--from-run", from_run]
+        if reconciliation is not None:
+            argv += ["--reconciliation", reconciliation]
+        # The proposal hashes the convert run's intermediate database (can be GBs).
+        plan = json.loads(ws.control(argv, timeout=120))
+        return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "platform", "from_run",
+                                                  "roles", "inputs", "limits", "mutations", "not_included")},
+                "instances": {"review": {"port": ((plan.get("instances") or {}).get("review") or {}).get("port")}},
+                "next": "Tell the engineer the plan is waiting in the Runs widget, where they approve and start it. Access the review site via an SSH tunnel; it stays until Reset."}
     roles = {key: request.get(key) for key in ("source", "settings", "reconciliation")}
     charset = request.get("charset", "utf8mb4")
     if roles["reconciliation"] is None:

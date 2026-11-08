@@ -132,7 +132,10 @@ module SiloMigrate
       end
 
       def stages_for(plan)
-        convert_plan?(plan) ? CONVERT_STAGES : self.class::STAGES
+        return CONVERT_STAGES if convert_plan?(plan)
+        return StandardReviewRun::REVIEW_STAGES if review_plan?(plan)
+
+        self.class::STAGES
       end
 
       def convert_stale_reason(plan, state)
@@ -266,13 +269,17 @@ module SiloMigrate
         names = []
         checks.each_with_index do |check, index|
           label = "check #{index + 1}"
-          raise StandardWorkflowError.new("STANDARD_RECONCILIATION_INVALID", label) unless check.is_a?(Hash) && (check.keys - %w[name source_sql intermediate_sql expect note]).empty?
+          raise StandardWorkflowError.new("STANDARD_RECONCILIATION_INVALID", label) unless check.is_a?(Hash) && (check.keys - %w[name source_sql intermediate_sql destination_sql expect note]).empty?
           raise StandardWorkflowError.new("STANDARD_RECONCILIATION_INVALID", "#{label}: name") unless check["name"].is_a?(String) && check["name"].match?(CHECK_NAME) && !names.include?(check["name"])
           raise StandardWorkflowError.new("STANDARD_RECONCILIATION_INVALID", "#{label}: expect") unless EXPECT.include?(check.fetch("expect", "equal"))
           raise StandardWorkflowError.new("STANDARD_RECONCILIATION_INVALID", "#{label}: note") unless check["note"].nil? || (check["note"].is_a?(String) && check["note"].bytesize <= 500)
 
           %w[source_sql intermediate_sql].each do |key|
             raise StandardWorkflowError.new("STANDARD_RECONCILIATION_INVALID", "#{label}: #{key}") unless count_sql?(check[key], intermediate: key == "intermediate_sql")
+          end
+          # Optional: the review site's count (review runs only; convert runs ignore it).
+          if check.key?("destination_sql") && !count_sql?(check["destination_sql"], destination: true)
+            raise StandardWorkflowError.new("STANDARD_RECONCILIATION_INVALID", "#{label}: destination_sql")
           end
           names << check["name"]
         end
@@ -283,15 +290,17 @@ module SiloMigrate
 
       # One read-only counting query: a single SELECT/WITH statement, no comments, no
       # statement separators. Source queries also run as a SELECT-only user on the
-      # run's own copy; intermediate queries on a read-only SQLite connection.
-      def count_sql?(sql, intermediate:)
+      # run's own copy; intermediate queries on a read-only SQLite connection; destination
+      # queries as a SELECT-only PostgreSQL role in a read-only transaction.
+      def count_sql?(sql, intermediate: false, destination: false)
         return false unless sql.is_a?(String) && sql.bytesize.between?(1, MAX_SQL_BYTES) && sql.valid_encoding?
         return false if sql.match?(/[\x00-\x08\x0b\x0c\x0e-\x1f]/) || sql.include?("--") || sql.include?("/*") || sql.include?("#")
 
         body = sql.strip.sub(/;\z/, "")
         return false if body.include?(";") || body.include?("\\") || !body.match?(/\A(?:SELECT|WITH)\b/i)
         return false if intermediate && body.match?(/\b(?:ATTACH|DETACH|PRAGMA|LOAD_EXTENSION|VACUUM|INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/i)
-        return false if !intermediate && body.match?(/\b(?:INTO|OUTFILE|DUMPFILE|LOAD_FILE|SLEEP|BENCHMARK|GET_LOCK|FOR\s+UPDATE|LOCK\s+IN)\b/i)
+        return false if !intermediate && !destination && body.match?(/\b(?:INTO|OUTFILE|DUMPFILE|LOAD_FILE|SLEEP|BENCHMARK|GET_LOCK|FOR\s+UPDATE|LOCK\s+IN)\b/i)
+        return false if destination && body.match?(/\b(?:INTO|COPY|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CREATE|DROP|ALTER|GRANT|REVOKE|SET|RESET|LOCK|FOR\s+(?:UPDATE|SHARE|NO\s+KEY|KEY)|pg_\w+|lo_\w+|dblink\w*|set_config|current_setting|txid_\w+|UESCAPE)\b|U&/i)
 
         true
       end
