@@ -23,6 +23,10 @@ module SiloMigrate
       REVIEW_IMPORT_TIMEOUT = 12 * 3600
       DESTINATION_TIMEOUT = 1800
       DESTINATION_ROLE = "silo_count"
+      # With the liveness check (10 s), the role step (30 s) and exec margin, the locked section
+      # ends before the migration-data tool's control call gives up (285 s).
+      ANALYST_COUNT_TIMEOUT = 230
+      ANALYST_ROLE_TIMEOUT = 30
       # review_import.rb prints these only when Sidekiq and the scheduler stayed paused.
       REVIEW_IMPORT_MARKERS = [/^SILO_SIDEKIQ: paused=true running=0 \(before import\)$/, /^SILO_SIDEKIQ: paused=true \(after import\)$/].freeze
       RUN_ID = /\Arun-[0-9a-f]{32}\z/
@@ -118,6 +122,54 @@ module SiloMigrate
         end
 
         { version: 1, run_id: run_id, username: REVIEW_ADMIN, password: File.read(path).strip, review_url: "http://127.0.0.1:#{record.fetch('port')}" }
+      end
+
+      # Trusted analyst path (migration-data): one count, as reconciliation does it, on a run's
+      # intermediate database (a convert run's own, or the one a review run imported) or on a
+      # review run's live site. The number is private; nothing is recorded.
+      def analyst_count(run_id, side:, sql:)
+        state = @store.load
+        run = state.fetch("runs")[run_id]
+        raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
+
+        plan = state.fetch("plans").fetch(run.fetch("plan_id"), {})
+        case side
+        when "intermediate"
+          raise StandardWorkflowError, "STANDARD_RECONCILIATION_INVALID" unless count_sql?(sql, intermediate: true)
+
+          source = review_plan?(plan) ? plan.dig("body", "from_run", "run_id") : run_id
+          source_run = state.fetch("runs")[source]
+          unless (convert_plan?(plan) || review_plan?(plan)) && source_run&.dig("artifacts", "intermediate")
+            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID"
+          end
+
+          binding = review_artifact_binding!(source, source_run, hash: false)
+          # A review run counts the very file it imported (stat identity bound by its plan).
+          if review_plan?(plan) && binding != plan.dig("body", "from_run").slice("intermediate_sha256", "intermediate_bytes", "intermediate_stat")
+            raise StandardWorkflowError.new("STANDARD_REVIEW_SOURCE_INVALID", "artifact changed")
+          end
+          count, error = intermediate_count(review_artifact_path(source), sql, timeout: ANALYST_COUNT_TIMEOUT)
+        when "destination"
+          raise StandardWorkflowError, "STANDARD_RECONCILIATION_INVALID" unless count_sql?(sql, destination: true)
+
+          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless review_plan?(plan)
+
+          @store.with_op_lock do
+            # Checked again under the lock: a reset may have removed the site meanwhile.
+            current = @store.load
+            record = current.fetch("instances")[current.dig("runs", run_id, "instances", "review").to_s]
+            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless record && %w[imported review dirty].include?(record["state"])
+
+            stack = stack_for(run_id, "review")
+            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless stack.live?
+
+            prepared = destination_role!(stack, timeout: ANALYST_ROLE_TIMEOUT)
+            count, error = prepared ? destination_count(stack, sql, timeout: ANALYST_COUNT_TIMEOUT, margin: 5) : [nil, "query failed: count role unavailable"]
+          end
+        else
+          raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID"
+        end
+        { version: 1, run_id: run_id, side: side, count: count, error: error }
       end
 
       private
@@ -434,7 +486,7 @@ module SiloMigrate
 
       # A login role that can only read: SELECT on the public schema's tables, read-only
       # transactions and a statement timeout as role defaults. Created after the import.
-      def destination_role!(stack)
+      def destination_role!(stack, timeout: 120)
         sql = <<~SQL
           DO $$ BEGIN
             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '#{DESTINATION_ROLE}') THEN
@@ -458,17 +510,17 @@ module SiloMigrate
           END $$;
         SQL
         @runtime.run(["docker", "exec", "-i", stack.container("db"), "psql", "-X", "-q", "-U", "postgres", "-d", "discourse", "-v", "ON_ERROR_STOP=1"],
-                     capture: true, timeout: 120, stdin_data: sql).success?
+                     capture: true, timeout: timeout, stdin_data: sql).success?
       end
 
       # One count, as the read-only role, inside a scalar subquery: one value at most. An
       # error keeps only its SQLSTATE: PostgreSQL messages can quote values.
-      def destination_count(stack, sql)
+      def destination_count(stack, sql, timeout: DESTINATION_TIMEOUT, margin: 60)
         body = sql.strip.sub(/;\z/, "")
-        script = "BEGIN TRANSACTION READ ONLY;\nSET LOCAL statement_timeout = '#{DESTINATION_TIMEOUT}s';\nSELECT (#{body});\nROLLBACK;\n"
+        script = "BEGIN TRANSACTION READ ONLY;\nSET LOCAL statement_timeout = '#{timeout.to_i}s';\nSELECT (#{body});\nROLLBACK;\n"
         result = @runtime.run(["docker", "exec", "-i", stack.container("db"), "psql", "-X", "-q", "-A", "-t", "-U", DESTINATION_ROLE, "-d", "discourse",
                                "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=sqlstate"],
-                              capture: true, timeout: DESTINATION_TIMEOUT + 60, stdin_data: script)
+                              capture: true, timeout: timeout + margin, stdin_data: script)
         unless result.success?
           state = result.stderr.to_s.b[/ERROR:\s+([0-9A-Z]{5})\b/, 1]
           return [nil, state ? "query failed: SQLSTATE #{state}" : "query failed"]

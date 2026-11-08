@@ -83,6 +83,10 @@ class FakeControl:
             return json.dumps({'version': 1, 'finding_id': 'finding-' + 'c' * 32, 'status': 'proposed'})
         if argv[:3] == ['standard', 'analyst', 'evidence']:
             return json.dumps({'version': 1, 'run_id': argv[4], 'status': 'failed'})
+        if argv[:3] == ['standard', 'analyst', 'count']:
+            return json.dumps({'version': 1, 'run_id': argv[4], 'side': argv[6], 'count': 7, 'error': None})
+        if argv[:3] == ['standard', 'plan', 'show']:
+            return json.dumps({'version': 1, 'plan_id': argv[4], 'run_id': None if argv[4].endswith('0') else 'run-' + 'e' * 32})
         raise AssertionError(argv)
 
 
@@ -745,6 +749,24 @@ class DataToolsTest(unittest.TestCase):
         self.refused('STANDARD_PATH_INVALID', 'notes_write', text='x')
 
     # -- findings and output ---------------------------------------------------------
+
+    def test_run_tools_accept_the_plan_id_and_count_one_query(self):
+        self.create()
+        evidence = self.op('run_evidence', run_id='plan-' + 'a' * 32)
+        self.assertEqual('run-' + 'e' * 32, evidence['run_id'])
+        self.refused('STANDARD_RUN_NOT_FOUND', 'run_evidence', run_id='plan-' + '0' * 32)
+        counted = self.op('run_count', run_id='run-' + 'd' * 32, side='destination', sql='SELECT COUNT(*) FROM posts')
+        self.assertEqual(7, counted['count'])
+        argv, sent = [(argv, sent) for argv, sent in self.control.calls if argv[:3] == ['standard', 'analyst', 'count']][-1]
+        self.assertEqual(['standard', 'analyst', 'count', 'arc', 'run-' + 'd' * 32, '--side', 'destination', '--sql-file', '-'], argv)
+        self.assertEqual('SELECT COUNT(*) FROM posts', sent)  # stdin, never argv
+        audit = (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text()
+        self.assertNotIn('FROM posts', audit)
+        self.assertIn('sql_sha256', audit)
+        self.op('run_count', run_id='plan-' + 'a' * 32, side='intermediate', sql='SELECT COUNT(*) FROM posts')
+        for bad in ({'side': 'source', 'sql': 'SELECT 1'}, {'side': 'intermediate', 'sql': ''}, {'side': 'intermediate', 'sql': 'x' * 5000},
+                    {'side': 'intermediate', 'sql': 5}, {'run_id': 'run-1', 'side': 'intermediate', 'sql': 'SELECT 1'}):
+            self.refused('STANDARD_ARGUMENTS_INVALID', 'run_count', **dict({'run_id': 'run-' + 'd' * 32}, **bad))
 
     def test_findings_and_evidence_go_through_the_standard_interface(self):
         self.create()

@@ -22,7 +22,7 @@ def refuse(code):
     raise ValueError(code)
 
 
-def capture(args, extra_env=None):
+def capture(args, extra_env=None, passthrough=False):
     # No inherited GIT_* settings (e.g. GIT_CONFIG_PARAMETERS) reach host Git, and
     # every call is bounded: an include pointing at a FIFO must not hang a held lock.
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
@@ -34,7 +34,9 @@ def capture(args, extra_env=None):
     except subprocess.TimeoutExpired:
         refuse("STANDARD_OPERATION_FAILED")
     if result.returncode:
-        refuse("STANDARD_OPERATION_FAILED")
+        # passthrough: our own CLI's fixed refusal code (e.g. STANDARD_DIRTY_INSTANCE), never raw output.
+        code = re.search(r"^Error: ((?:STANDARD|NAMED)_[A-Z_]+)", result.stderr, re.M) if passthrough else None
+        refuse(code[1] if code else "STANDARD_OPERATION_FAILED")
     return result.stdout.strip()
 
 
@@ -333,7 +335,7 @@ def main(args):
     if args[:1] == ["start-run"]:
         if len(args) != 3:
             refuse("STANDARD_ARGUMENTS_INVALID")
-        claimed = json.loads(capture([str(self), "standard", "run", "claim", *args[1:]]))
+        claimed = json.loads(capture([str(self), "standard", "run", "claim", *args[1:]], passthrough=True))
         run_id = claimed["run_id"]
         print(json.dumps(claimed), flush=True)
         result = subprocess.run([str(self), "--detach", "standard", "run", "execute", args[1], run_id], stdout=subprocess.DEVNULL)

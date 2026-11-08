@@ -189,7 +189,7 @@ tools:
         required: [workspace, confirm]
         additionalProperties: false
     - name: data_run_evidence
-      description: "Read one workflow run's private evidence: stages, assertions, results and failure record first, then every log with its size and stage, then bounded tails (failed stage first)."
+      description: "Read one workflow run's private evidence: stages, assertions, results and failure record first, then every log with its size and stage, then bounded tails (failed stage first). run_id may also be the plan ID the Runs widget shows; the answer names the run."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70
@@ -199,6 +199,20 @@ tools:
           workspace: {type: string}
           run_id: {type: string}
         required: [workspace, run_id]
+        additionalProperties: false
+    - name: data_run_count
+      description: "One count for investigating a run, as reconciliation does it: side intermediate runs a single SELECT/WITH count on the run's intermediate database (a convert run's own, or the one a review run imported); side destination runs it on a review run's live site (Discourse PostgreSQL, read-only role). Same SQL rules as reconciliation checks; 230 s limit. Returns {count, error}. Private like reconciliation results: findings may state aggregate counts, never customer values (and keep values out of the SQL where you can). STANDARD_BUSY (destination side): a run is in progress; try again after it."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 295
+      input:
+        type: object
+        properties:
+          workspace: {type: string}
+          run_id: {type: string, description: "Run ID, or the plan ID that started it"}
+          side: {type: string, enum: [intermediate, destination]}
+          sql: {type: string, description: "SELECT COUNT(*) ... (one statement, no comments, no backslashes)"}
+        required: [workspace, run_id, side, sql]
         additionalProperties: false
     - name: data_plan_propose
       description: "Propose a local review import with from_run (completed convert run ID; no source/settings/charset), or a convert-only workflow run on real data (no import): the registered source dump, the converter settings (type converter-settings, with ${SILO_DB_*} placeholders) and optionally reconciliation checks (type reconciliation), by input ID. Convert proposals prepare the converter's locked gems first if needed; review proposals skip refresh/dependencies. Returns the plan ID and digest; the engineer approves and starts it."

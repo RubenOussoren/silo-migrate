@@ -49,6 +49,7 @@ module SiloMigrate
 
       Trusted analyst path (separate private investigation session only):
         analyst evidence WORKSPACE RUN_ID
+        analyst count WORKSPACE RUN_ID --side intermediate|destination --sql-file -   (SQL on stdin; one private count)
         finding propose WORKSPACE --run RUN_ID --file PATH|- [--kind finding|reproduction]
         finding propose WORKSPACE --kind schema --file PATH|-   (source schema; no run)
 
@@ -281,11 +282,23 @@ module SiloMigrate
     end
 
     def analyst(args)
-      expect!(args.shift, "evidence")
+      action = args.shift
       workspace = positional!(args)
       run_id = positional!(args)
-      no_more!(args)
-      findings(workspace).private_evidence(run_id)
+      case action
+      when "evidence"
+        no_more!(args)
+        findings(workspace).private_evidence(run_id)
+      when "count"
+        # The SQL comes on stdin: it may quote customer values and must not be in any argv.
+        opts = options!(args, "--side", "--sql-file")
+        invalid! unless opts.fetch("--sql-file") == "-"
+        sql = $stdin.read(Services::StandardConvertRun::MAX_SQL_BYTES + 1).to_s
+        invalid! if sql.bytesize > Services::StandardConvertRun::MAX_SQL_BYTES
+        sql.force_encoding(Encoding::UTF_8) # stdin is binary; count_sql? then checks it is valid UTF-8
+        service(workspace).analyst_count(run_id, side: opts.fetch("--side"), sql: sql)
+      else invalid!
+      end
     end
 
     # The complete adapter surface. Nothing here approves, resets or releases.
@@ -356,7 +369,7 @@ module SiloMigrate
         option = args.shift
         invalid! unless allowed.include?(option) && !result.key?(option)
         value = args.shift
-        invalid! if value.nil? || (value.start_with?("-") && !(value == "-" && option == "--file"))
+        invalid! if value.nil? || (value.start_with?("-") && !(value == "-" && %w[--file --sql-file].include?(option)))
         result[option] = value
       end
       invalid! unless (allowed - optional - result.keys).empty?

@@ -48,6 +48,30 @@ class ControlWrapperTest < SiloMigrateTest
     PY
   end
 
+  def test_start_run_passes_the_claims_refusal_code_through
+    python_test <<~PY
+      class Done:
+          def __init__(self, code, err):
+              self.returncode, self.stdout, self.stderr = code, '', err
+      cases = [('Error: STANDARD_DIRTY_INSTANCE\\n', 'STANDARD_DIRTY_INSTANCE'),
+               ('Error: STANDARD_REVIEW_SOURCE_INVALID: artifact changed. Propose a review\\n', 'STANDARD_REVIEW_SOURCE_INVALID'),
+               ('Traceback: secret value\\n', 'STANDARD_OPERATION_FAILED')]
+      for stderr, code in cases:
+          with patch('subprocess.run', return_value=Done(1, stderr)):
+              try:
+                  wrapper['capture'](['claim'], passthrough=True)
+                  raise AssertionError('accepted a failed claim')
+              except ValueError as error:
+                  assert str(error) == code, (str(error), code)
+          with patch('subprocess.run', return_value=Done(1, stderr)):
+              try:
+                  wrapper['capture'](['git'])
+                  raise AssertionError('accepted a failed command')
+              except ValueError as error:
+                  assert str(error) == 'STANDARD_OPERATION_FAILED'
+    PY
+  end
+
   def test_configured_mounts_and_control_content_check_before_docker_run
     python_test <<~PY
       with tempfile.TemporaryDirectory() as temp:

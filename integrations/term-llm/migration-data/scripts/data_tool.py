@@ -32,6 +32,7 @@ TOOLS = {
     "data_db_status": ("db_status", set(), 90),
     "data_db_reset": ("db_reset", {"confirm"}, 200),
     "data_run_evidence": ("run_evidence", {"run_id"}, 60),
+    "data_run_count": ("run_count", {"run_id", "side", "sql"}, 290),
     "data_propose_finding": ("propose_finding", {"text", "run_id"}, 60),
     "data_plan_propose": ("plan_propose", {"source", "settings", "reconciliation", "charset", "from_run"}, 290),
     "data_notes": ("notes", set(), 60),

@@ -285,6 +285,70 @@ class StandardReviewRunTest < StandardConvertRunTest
     end
   end
 
+  def test_review_analyst_counts_on_intermediate_and_live_site
+    with_review do
+      @runtime.destination_counts = { 'post_custom_fields' => 4 }
+      plan = propose_review
+      result = run_review(plan)
+      count = ->(run_id, side, sql) { @service.analyst_count(run_id, side: side, sql: sql) }
+      # Intermediate: a convert run's own database, and the one a review run imported.
+      assert_equal({ version: 1, run_id: @convert[:run_id], side: 'intermediate', count: 4, error: nil },
+                   count.call(@convert[:run_id], 'intermediate', "SELECT COUNT(*) FROM posts WHERE TRIM(id) <> ''"))
+      assert_equal 3, count.call(result[:run_id], 'intermediate', 'SELECT COUNT(*) FROM users')[:count]
+      # Destination: the live site, read-only role, the analyst time limit.
+      @runtime.live_result = %w[db redis web proxy].map { |role| "true #{instance_name(plan)}" }.join("\n") + "\n"
+      assert_equal 4, count.call(result[:run_id], 'destination', "SELECT COUNT(*) FROM post_custom_fields WHERE name = 'import_id'")[:count]
+      assert_includes @runtime.stdins.last, "SET LOCAL statement_timeout = '230s'"
+      assert_equal 'query failed: SQLSTATE 42P01', count.call(result[:run_id], 'destination', 'SELECT COUNT(*) FROM missing')[:error]
+      standard_error('STANDARD_TRANSITION_INVALID') { count.call(@convert[:run_id], 'destination', 'SELECT COUNT(*) FROM posts') }
+      standard_error('STANDARD_RECONCILIATION_INVALID') { count.call(result[:run_id], 'destination', "SELECT set_config('a', 'b', false)") }
+      standard_error('STANDARD_RECONCILIATION_INVALID') { count.call(result[:run_id], 'intermediate', 'ATTACH DATABASE x AS y') }
+      standard_error('STANDARD_ARGUMENT_INVALID') { count.call(result[:run_id], 'source', 'SELECT 1') }
+      standard_error('STANDARD_REFERENCE_INVALID') { count.call("run-#{'0' * 32}", 'intermediate', 'SELECT 1') }
+      @runtime.live_result = ''
+      standard_error('STANDARD_TRANSITION_INVALID') { count.call(result[:run_id], 'destination', 'SELECT COUNT(*) FROM posts') }
+      @service.reset_run(run_id: result[:run_id], yes: true)
+      standard_error('STANDARD_TRANSITION_INVALID') { count.call(result[:run_id], 'destination', 'SELECT COUNT(*) FROM posts') }
+      # The CLI form (trusted analyst path).
+      out = StringIO.new
+      cli = SiloMigrate::StandardCLI.new(env: @env, output: out, error: StringIO.new, runtime: @runtime, code_root: @code_root)
+      status = with_stdin('SELECT COUNT(*) FROM users') do
+        cli.run(['analyst', 'count', 'synthetic', @convert[:run_id], '--side', 'intermediate', '--sql-file', '-'])
+      end
+      assert_equal 0, status
+      assert_equal 3, JSON.parse(out.string)['count']
+      # Non-ASCII SQL from stdin is UTF-8; invalid UTF-8 is refused by the validator.
+      out = StringIO.new
+      cli = SiloMigrate::StandardCLI.new(env: @env, output: out, error: StringIO.new, runtime: @runtime, code_root: @code_root)
+      with_stdin("SELECT COUNT(*) FROM users WHERE 'café' <> 'cafe'".b) do
+        assert_equal 0, cli.run(['analyst', 'count', 'synthetic', @convert[:run_id], '--side', 'intermediate', '--sql-file', '-'])
+      end
+      assert_equal({ 'count' => 3, 'error' => nil }, JSON.parse(out.string).slice('count', 'error'))
+      err = StringIO.new
+      cli = SiloMigrate::StandardCLI.new(env: @env, output: StringIO.new, error: err, runtime: @runtime, code_root: @code_root)
+      with_stdin("SELECT COUNT(*) FROM users WHERE 'x' <> '\xff'".b) do
+        refute_equal 0, cli.run(['analyst', 'count', 'synthetic', @convert[:run_id], '--side', 'intermediate', '--sql-file', '-'])
+      end
+      assert_includes err.string, 'STANDARD_RECONCILIATION_INVALID'
+      err = StringIO.new
+      cli = SiloMigrate::StandardCLI.new(env: @env, output: StringIO.new, error: err, runtime: @runtime, code_root: @code_root)
+      refute_equal 0, cli.run(['analyst', 'count', 'synthetic', @convert[:run_id], '--side', 'intermediate', '--sql', 'SELECT 1'])
+      assert_includes err.string, 'STANDARD_ARGUMENTS_INVALID'
+      # A review run counts only the file it imported.
+      File.chmod(0o600, artifact)
+      File.binwrite(artifact, File.binread(artifact).reverse)
+      standard_error('STANDARD_REVIEW_SOURCE_INVALID') { count.call(result[:run_id], 'intermediate', 'SELECT COUNT(*) FROM users') }
+    end
+  end
+
+  def with_stdin(text)
+    saved = $stdin
+    $stdin = StringIO.new(text)
+    yield
+  ensure
+    $stdin = saved
+  end
+
   def test_review_import_issues_are_counted_not_fatal
     with_review do
       @runtime.import_output = "SILO_SIDEKIQ: paused=true running=0 (before import)\nStarting...\n\nImport issues (details in /tmp/generic_bulk_import_issues_20261108_101500.log):\n" \

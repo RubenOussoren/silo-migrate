@@ -1532,11 +1532,37 @@ def dbhub_main(args, values, base, repo, host):
 
 # -- runs and findings --------------------------------------------------------------------
 
-def op_run_evidence(ws, request):
+PLAN_ID = re.compile(r"plan-[0-9a-f]{32}\Z")
+
+
+def run_of(ws, request):
+    """The run ID, or the run a plan ID started (the Runs widget shows both); returns the run ID."""
     run_id = request.get("run_id")
+    if isinstance(run_id, str) and PLAN_ID.fullmatch(run_id):
+        run_id = json.loads(ws.control(["standard", "plan", "show", ws.name, run_id], timeout=30)).get("run_id")
+        if not run_id:
+            refuse("STANDARD_RUN_NOT_FOUND")
     if not isinstance(run_id, str) or not RUN.fullmatch(run_id):
         refuse("STANDARD_ARGUMENTS_INVALID")
-    return {"evidence": json.loads(ws.control(["standard", "analyst", "evidence", ws.name, run_id]))}
+    return run_id
+
+
+def op_run_evidence(ws, request):
+    run_id = run_of(ws, request)
+    return {"run_id": run_id, "evidence": json.loads(ws.control(["standard", "analyst", "evidence", ws.name, run_id]))}
+
+
+def op_run_count(ws, request):
+    """One count on a run's intermediate database, or on a review run's site (read-only role)."""
+    started = time.monotonic()
+    run_id = run_of(ws, request)
+    side, sql = request.get("side"), request.get("sql")
+    if side not in ("intermediate", "destination") or not isinstance(sql, str) or not 0 < len(sql.encode()) <= 4096:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    # On stdin, never in argv: the SQL may quote customer values.
+    counted = json.loads(ws.control(["standard", "analyst", "count", ws.name, run_id, "--side", side, "--sql-file", "-"], input=sql,
+                                 timeout=max(10, 285 - int(time.monotonic() - started))))
+    return {key: counted.get(key) for key in ("run_id", "side", "count", "error")}
 
 
 INPUT_ID = re.compile(r"input-[0-9a-f]{32}\Z")
@@ -1666,10 +1692,10 @@ def op_notes_write(ws, request):
 
 OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
-       "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "propose_finding": op_propose_finding,
+       "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding,
        "plan_propose": op_plan_propose,
        "notes": op_notes, "notes_write": op_notes_write}
-# Logged with their arguments (minus script code and finding text, logged by hash).
+# Logged with their arguments (minus script code, finding text and count SQL, logged by hash).
 QUIET = {"status", "list", "job", "db_status", "notes"}
 
 
@@ -1699,7 +1725,7 @@ def fit(result):
 def audit_args(request):
     shown = {}
     for key, value in request.items():
-        if key in ("code", "text") and isinstance(value, str):
+        if key in ("code", "text", "sql") and isinstance(value, str):
             shown[key + "_sha256"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
         elif isinstance(value, (str, int, bool)) or value is None:
             shown[key] = value if not isinstance(value, str) else value[:300]
