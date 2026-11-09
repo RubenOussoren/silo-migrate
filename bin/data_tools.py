@@ -1699,10 +1699,12 @@ def op_notes_write(ws, request):
 # -- decisions: choices that must survive any chat ---------------------------------------------
 # Append-only. Unlike the notes, nothing rewrites an entry: a changed decision is a new entry on
 # the same topic. Kept apart from data_notes so that the notes still always fit a read whole.
+# Every entry says what it rests on, so an assumption can't read as the engineer's ruling.
 
 MAX_DECISION_TOPIC = 120
 MAX_DECISION = 2000
 DECISIONS_SHOWN = 200
+DECISION_BASES = ("engineer_ruling", "default")
 
 
 def decisions_path(ws):
@@ -1736,7 +1738,10 @@ def op_decide(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID: topic")
     if not isinstance(decision, str) or not decision.strip() or len(decision) > MAX_DECISION or "\x00" in decision:
         refuse("STANDARD_ARGUMENTS_INVALID: decision")
-    entry = {"id": "decision-" + secrets.token_hex(8), "at": now(), "topic": topic.strip(), "decision": decision.strip()}
+    basis = request.get("basis")
+    if basis not in DECISION_BASES:
+        refuse("STANDARD_ARGUMENTS_INVALID: basis")
+    entry = {"id": "decision-" + secrets.token_hex(8), "at": now(), "topic": topic.strip(), "decision": decision.strip(), "basis": basis}
     with ws.lock():
         ws.append("decisions.jsonl", entry)
     return {"id": entry["id"], "at": entry["at"]}
@@ -1745,7 +1750,8 @@ def op_decide(ws, request):
 def op_decisions(ws, request):
     if not ws.initialized():
         return {"decisions": [], "total": 0}
-    entries = read_decisions(ws)
+    # Entries written before `basis` existed can't be told apart, so they say so.
+    entries = [dict({"basis": "not_recorded"}, **entry) for entry in read_decisions(ws)]
     return {"decisions": entries[-DECISIONS_SHOWN:][::-1], "total": len(entries)}
 
 

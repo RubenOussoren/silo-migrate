@@ -38,7 +38,7 @@ TOOLS = {
     "data_plan_propose": ("plan_propose", {"source", "settings", "reconciliation", "charset", "from_run"}, 290),
     "data_notes": ("notes", set(), 60),
     "data_notes_write": ("notes_write", {"text"}, 60),
-    "data_decide": ("decide", {"topic", "decision"}, 60),
+    "data_decide": ("decide", {"topic", "decision", "basis"}, 60),
     "data_decisions": ("decisions", set(), 60),
 }
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")

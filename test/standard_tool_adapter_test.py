@@ -241,7 +241,7 @@ else:
             'data_script': ({'code': 'puts 1', 'into': 'xml', 'language': 'ruby'}, {'op': 'script', 'code': 'puts 1', 'into': 'xml', 'language': 'ruby'}),
             'data_db_up': ({'engine': 'postgres'}, {'op': 'db_up', 'engine': 'postgres'}),
             'data_guide': ({'confirm': True}, {'op': 'guide'}),
-            'data_decide': ({'topic': 'Empty posts', 'decision': 'Drop them', 'at': 'x'}, {'op': 'decide', 'topic': 'Empty posts', 'decision': 'Drop them'}),
+            'data_decide': ({'topic': 'Empty posts', 'decision': 'Drop them', 'basis': 'default', 'at': 'x'}, {'op': 'decide', 'topic': 'Empty posts', 'decision': 'Drop them', 'basis': 'default'}),
             'data_decisions': ({}, {'op': 'decisions'}),
             'data_notes_write': ({'text': '# arc', 'path': 'x'}, {'op': 'notes_write', 'text': '# arc'}),
             'data_propose_finding': ({'text': 'schema', 'run_id': None}, {'op': 'propose_finding', 'text': 'schema'}),

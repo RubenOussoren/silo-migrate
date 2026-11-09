@@ -968,16 +968,18 @@ class DataToolsTest(unittest.TestCase):
 
     def test_decisions_are_append_only_newest_first_and_survive_a_bad_line(self):
         self.assertEqual({'decisions': [], 'total': 0}, {k: v for k, v in self.op('decisions').items() if k != 'version'})
-        self.refused('STANDARD_NOT_INITIALIZED', 'decide', topic='a', decision='b')
+        self.refused('STANDARD_NOT_INITIALIZED', 'decide', topic='a', decision='b', basis='default')
         self.create()
-        self.refused('STANDARD_ARGUMENTS_INVALID: topic', 'decide', topic=' ', decision='b')
-        self.refused('STANDARD_ARGUMENTS_INVALID: topic', 'decide', topic='a\nb', decision='b')
-        self.refused('STANDARD_ARGUMENTS_INVALID: topic', 'decide', topic='a' * 121, decision='b')
-        self.refused('STANDARD_ARGUMENTS_INVALID: decision', 'decide', topic='a', decision='')
-        self.refused('STANDARD_ARGUMENTS_INVALID: decision', 'decide', topic='a', decision='b' * 2001)
-        first = self.op('decide', topic='Empty posts', decision='Keep posts with attachments')
+        self.refused('STANDARD_ARGUMENTS_INVALID: topic', 'decide', topic=' ', decision='b', basis='default')
+        self.refused('STANDARD_ARGUMENTS_INVALID: topic', 'decide', topic='a\nb', decision='b', basis='default')
+        self.refused('STANDARD_ARGUMENTS_INVALID: topic', 'decide', topic='a' * 121, decision='b', basis='default')
+        self.refused('STANDARD_ARGUMENTS_INVALID: decision', 'decide', topic='a', decision='', basis='default')
+        self.refused('STANDARD_ARGUMENTS_INVALID: decision', 'decide', topic='a', decision='b' * 2001, basis='default')
+        for basis in (None, 'engineer', 'ruling'):
+            self.refused('STANDARD_ARGUMENTS_INVALID: basis', 'decide', topic='a', decision='b', basis=basis)
+        first = self.op('decide', topic='Empty posts', decision='Keep posts with attachments', basis='default')
         self.assertRegex(first['id'], r'decision-[0-9a-f]{16}\Z')
-        self.op('decide', topic='Empty posts', decision='Drop them all')
+        self.op('decide', topic='Empty posts', decision='Drop them all', basis='engineer_ruling')
         path = self.base / 'arc/.silo-migrate/data/decisions.jsonl'
         self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
         with open(path, 'a') as out:
@@ -985,7 +987,12 @@ class DataToolsTest(unittest.TestCase):
         result = self.op('decisions')
         self.assertEqual(['Drop them all', 'Keep posts with attachments'], [entry['decision'] for entry in result['decisions']])
         self.assertEqual(2, result['total'])
+        self.assertEqual(['engineer_ruling', 'default'], [entry['basis'] for entry in result['decisions']])
         self.assertEqual(2, self.op('guide')['decisions_recorded'])
+        # Entries from before `basis` existed say so; nothing presents them as rulings.
+        with open(path, 'a') as out:
+            out.write(json.dumps({'id': 'decision-old', 'at': 'x', 'topic': 'Old', 'decision': 'Backfilled'}) + '\n')
+        self.assertEqual('not_recorded', self.op('decisions')['decisions'][0]['basis'])
         audit = (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text()
         self.assertNotIn('Drop them all', audit)
         self.assertIn('decision_sha256', audit)

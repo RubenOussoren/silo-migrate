@@ -63,5 +63,7 @@ engineer's own steps today. Don't suggest the tool does them.
 
 ## Keep the project's memory
 
-Record the engineer's rulings with `data_decide` when they're made (for example, what to
-do with empty posts). To change one, record a new decision on the same topic.
+Record the engineer's rulings with `data_decide` when they make them in this chat (for
+example, what to do with empty posts), with basis `engineer_ruling`. An assumption is
+basis `default`. Answering "what's next?" records nothing. Never copy earlier notes into
+the log. To change a decision, record a new one on the same topic.

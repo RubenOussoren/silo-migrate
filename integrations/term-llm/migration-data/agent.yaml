@@ -241,7 +241,7 @@ tools:
       timeout_seconds: 70
       input: *no_arguments
     - name: data_decide
-      description: "Record a decision the engineer made, so that it survives any chat: what to do with empty posts, which content to exclude, a customer's preference. Append-only; to change one, record a new decision on the same topic."
+      description: "Record a ruling the engineer gives in this chat, when they give it, so that it survives any chat: what to do with empty posts, which content to exclude, a customer's preference. Also records a default you applied, labelled as one. Never use it to copy in earlier notes or to answer a question. Append-only; to change one, record a new decision on the same topic."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70
@@ -249,11 +249,12 @@ tools:
         type: object
         properties:
           topic: {type: string, description: "Short subject, at most 120 characters"}
-          decision: {type: string, description: "What was decided and why, at most 2000 characters"}
-        required: [topic, decision]
+          decision: {type: string, description: "What was decided and why, at most 2000 characters. Don't say the engineer decided something unless they said so in this chat."}
+          basis: {type: string, enum: [engineer_ruling, default], description: "engineer_ruling only if the engineer gave this ruling in this chat; default for anything you or a tool assumed"}
+        required: [topic, decision, basis]
         additionalProperties: false
     - name: data_decisions
-      description: "This project's recorded decisions, newest first. For a topic with several entries, the newest one stands."
+      description: "This project's recorded decisions, newest first. For a topic with several entries, the newest one stands. basis says what each rests on; default and not_recorded entries are not the engineer's rulings."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70
