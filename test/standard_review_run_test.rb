@@ -137,6 +137,21 @@ class StandardReviewRunTest < StandardConvertRunTest
     JSON.parse(File.read(@service.store.run_dir(run_id, 'evidence', 'reconciliation.json'))).fetch('checks').to_h { |row| [row['name'], row] }
   end
 
+  def test_a_review_plan_carries_the_delivery_of_its_convert_run
+    with_review do
+      assert_equal({ 'dataset_id' => @dataset, 'kind' => 'development', 'version' => 1 }, propose_review[:delivery])
+    end
+  end
+
+  def test_a_convert_run_from_before_labels_can_be_reviewed_once_its_data_is_labelled
+    with_review do
+      @service.store.update { |state| state.fetch('plans').fetch(@convert[:plan_id]).fetch('body').delete('delivery') }
+      assert_equal 'development', propose_review.dig(:delivery, 'kind')
+      FileUtils.rm_f(File.join(@root, '.silo-migrate', 'named', 'deliveries.json'))
+      standard_error('STANDARD_DELIVERY_UNLABELLED') { propose_review }
+    end
+  end
+
   def test_review_plan_binds_the_completed_convert_run
     with_review do
       plan = propose_review

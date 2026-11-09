@@ -120,6 +120,7 @@ class StandardConvertRunTest < SiloMigrateTest
       @root = File.join(env.fetch('SILO_MIGRATE_BASE_PATH'), 'synthetic')
       source = @named.add_source('synthetic', platform: 'mybb')[:source_id]
       @dataset = @named.add_dataset('synthetic', source_id: source)[:dataset_id]
+      label_delivery('development')
       @ids = {}
       @ids['source'] = add_input('dump.sql', dump, 'mysql-dump')
       @ids['settings'] = add_input('derived/settings.yml', settings, 'converter-settings')
@@ -148,6 +149,11 @@ class StandardConvertRunTest < SiloMigrateTest
     end
   end
 
+  def label_delivery(kind)
+    File.write(File.join(@root, '.silo-migrate', 'named', 'deliveries.json'),
+               JSON.generate('version' => 1, 'deliveries' => { @dataset => { 'dataset_id' => @dataset, 'kind' => kind, 'version' => 1 } }))
+  end
+
   def add_input(name, bytes, type)
     relative = "inputs/#{name}"
     write(File.join(@root, relative), bytes, mode: 'wb')
@@ -172,6 +178,26 @@ class StandardConvertRunTest < SiloMigrateTest
     FileUtils.mkdir_p(File.join(deps_path, 'gems'))
     FileUtils.mkdir_p(File.join(deps_path, 'emoji_cache'))
     File.write(File.join(deps_path, 'ready.json'), JSON.generate(binding.slice('image', 'gemfile_sha256', 'lockfile_sha256').merge('recipe' => 1)))
+  end
+
+  def test_a_plan_binds_the_delivery_and_needs_one
+    with_convert do
+      plan = propose_convert
+      assert_equal({ 'dataset_id' => @dataset, 'kind' => 'development', 'version' => 1 }, plan[:delivery])
+      FileUtils.rm_f(File.join(@root, '.silo-migrate', 'named', 'deliveries.json'))
+      standard_error('STANDARD_DELIVERY_UNLABELLED') { propose_convert }
+      File.write(File.join(@root, '.silo-migrate', 'named', 'deliveries.json'), 'not json')
+      standard_error('STANDARD_DELIVERY_UNLABELLED') { propose_convert }
+      label_delivery('rehearsal')
+      standard_error('STANDARD_DELIVERY_UNLABELLED') { propose_convert }
+    end
+  end
+
+  def test_launch_data_can_be_labelled_but_cannot_run_yet
+    with_convert do
+      label_delivery('launch')
+      standard_error('STANDARD_LAUNCH_NOT_READY') { propose_convert }
+    end
   end
 
   def propose_convert(**overrides)

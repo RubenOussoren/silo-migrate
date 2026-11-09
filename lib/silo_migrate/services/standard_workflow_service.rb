@@ -1711,7 +1711,7 @@ module SiloMigrate
 
       def public_plan(plan, state, summary: false)
         body = plan.fetch("body")
-        result = { plan_id: plan["id"], digest: plan["digest"], status: plan_status(plan, state), run_id: plan["run_id"], created_at: plan["created_at"], approved_by: plan.dig("approval", "reviewer") }
+        result = { plan_id: plan["id"], digest: plan["digest"], status: plan_status(plan, state), run_id: plan["run_id"], created_at: plan["created_at"], approved_by: plan.dig("approval", "reviewer"), delivery: body["delivery"] }
         return result if summary
 
         result.merge(

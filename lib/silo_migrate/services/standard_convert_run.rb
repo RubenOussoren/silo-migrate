@@ -46,6 +46,20 @@ module SiloMigrate
 
       # -- planning -------------------------------------------------------------
 
+      # What the engineer said this data is for, read from the record only they can write. Part of
+      # the plan body, so it's covered by the approval.
+      def delivery_binding!(dataset_id)
+        path = File.join(@store.workspace_root, ".silo-migrate", "named", "deliveries.json")
+        record = File.file?(path) && !File.symlink?(path) ? JSON.parse(File.read(path)).dig("deliveries", dataset_id) : nil
+        raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED" unless record.is_a?(Hash) && %w[development launch].include?(record["kind"]) && record["version"].is_a?(Integer)
+        # A launch run needs an accepted development run, and acceptance isn't built yet.
+        raise StandardWorkflowError, "STANDARD_LAUNCH_NOT_READY" if record["kind"] == "launch"
+
+        { "dataset_id" => dataset_id, "kind" => record["kind"], "version" => record["version"] }
+      rescue JSON::ParserError, SystemCallError
+        raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED"
+      end
+
       def propose_convert_plan(source:, settings:, reconciliation: nil, charset: "utf8mb4", allow_unqualified_runtime: false)
         state = @store.load
         raise StandardWorkflowError, "STANDARD_SIZE_LIMIT" if state.fetch("plans").size >= self.class::MAX_PLANS
@@ -74,6 +88,7 @@ module SiloMigrate
         end
         settings_template!(read_registered_small(inputs.fetch("settings"), MAX_SPEC_BYTES))
 
+        delivery = delivery_binding!(inputs.fetch("source").fetch("dataset_id"))
         dataset = named.fetch("datasets").fetch(inputs.fetch("source").fetch("dataset_id"))
         platform = named.fetch("sources").fetch(dataset.fetch("source_id")).fetch("platform").unpack1("m0").force_encoding("UTF-8")
         raise StandardWorkflowError.new("STANDARD_CONVERTER_PLATFORM_MISSING", "platform name") unless platform.valid_encoding? && platform.match?(PLATFORM)
@@ -91,6 +106,7 @@ module SiloMigrate
           "operation" => CONVERT_OPERATION,
           "workspace_id" => named.fetch("workspace_id"),
           "dataset_id" => inputs.fetch("source").fetch("dataset_id"),
+          "delivery" => delivery,
           "platform" => platform,
           "roles" => roles,
           "input_binding" => ids.map { |id| named.fetch("inputs").fetch(id).slice("id", "sha256", "bytes", "type") },

@@ -763,6 +763,167 @@ def move_in(ws, meta, src_root, parts, dest_fd, name, relative, kind, provenance
     return dict(settle(ws, meta, dest_fd, name, relative, kind, pending, record), how=how)
 
 
+# -- deliveries: which data is for what ---------------------------------------------------------
+# One set of files received together, with a purpose only the engineer can set. Each is its own
+# dataset. The record is kept beside the workspace's registry rather than in it, so that a rollback
+# to a release that doesn't know about deliveries can still read the registry.
+
+DELIVERY_KINDS = ("development", "launch")
+MAX_LABELLED_BY = 120
+
+
+def deliveries_file(ws):
+    return ws.root / ".silo-migrate/named/deliveries.json"
+
+
+def read_deliveries(ws):
+    """{dataset_id: record}. Nothing here is written by an agent."""
+    path = deliveries_file(ws)
+    if path.is_symlink():
+        refuse("STANDARD_PATH_INVALID")
+    document = ws.read_json(path, {})
+    records = document.get("deliveries") if isinstance(document, dict) else None
+    return records if isinstance(records, dict) else {}
+
+
+def delivery_label(record):
+    return "%s v%d" % (record["kind"].capitalize(), record["version"]) if record["kind"] == "development" else "Launch"
+
+
+def drop_listing(ws):
+    """Regular files in the drop folder: relative path, size and modification time."""
+    if not ws.intake.is_dir() or ws.intake.is_symlink():
+        return []
+    files = []
+    for folder, _dirs, names, dirfd in os.fwalk(str(ws.intake), follow_symlinks=False):
+        for name in names:
+            info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            if stat.S_ISREG(info.st_mode):
+                relative = os.path.relpath(os.path.join(folder, name), str(ws.intake))
+                files.append({"path": relative, "bytes": info.st_size, "mtime_ns": info.st_mtime_ns})
+    return sorted(files, key=lambda item: item["path"])[:MAX_LIST]
+
+
+def claimed_by(records, path, size, mtime_ns):
+    """The dataset whose delivery holds exactly this file, or None. A changed file isn't claimed."""
+    for dataset_id, record in records.items():
+        for item in record.get("files") or []:
+            if item.get("path") == path and item.get("bytes") == size and item.get("mtime_ns") == mtime_ns:
+                return dataset_id
+    return None
+
+
+def split_drop_files(ws, records):
+    labelled, unlabelled = [], []
+    for item in drop_listing(ws):
+        (labelled if claimed_by(records, item["path"], item["bytes"], item["mtime_ns"]) else unlabelled).append(item)
+    return labelled, unlabelled
+
+
+def unlabelled_data(ws, records):
+    """Datasets already holding files but never labelled: anything taken before labels existed."""
+    state = ws.named_state()
+    holding = {record.get("dataset_id") for record in (state.get("inputs") or {}).values()}
+    return [dataset_id for dataset_id in (state.get("datasets") or {}) if dataset_id in holding and dataset_id not in records]
+
+
+def delivery_of_take(ws, root, parts, relative):
+    """The dataset this file goes into. Only the engineer's label makes a file takeable."""
+    pending = ws.read_json(pending_for(ws, relative), None)
+    if pending:  # finishing an interrupted take: already decided
+        return pending["provenance"].get("dataset_id") or ws.meta()["dataset_id"]
+    records = read_deliveries(ws)
+    fd, info = open_regular(root, parts)
+    try:
+        dataset = claimed_by(records, "/".join(parts), info.st_size, info.st_mtime_ns)
+        if dataset is None:
+            refuse("STANDARD_DELIVERY_UNLABELLED: the engineer labels new files on the Project page")
+        if records[dataset]["kind"] == "launch":
+            refuse_if_development_copy(ws, records, fd, info)
+    finally:
+        os.close(fd)
+    return dataset
+
+
+def refuse_if_development_copy(ws, records, fd, info):
+    """Launch data identical to a development delivery is almost certainly the wrong file. Only
+    files of the same size are hashed, so this costs nothing in the normal case."""
+    development = {dataset_id for dataset_id, record in records.items() if record["kind"] == "development"}
+    candidates = [record for record in (ws.named_state().get("inputs") or {}).values()
+                  if record.get("dataset_id") in development and record.get("bytes") == info.st_size]
+    if candidates:
+        os.lseek(fd, 0, os.SEEK_SET)
+        digest = sha256_fd(fd)
+        if any(record.get("sha256") == digest for record in candidates):
+            refuse("STANDARD_DELIVERY_SAME_AS_DEVELOPMENT")
+
+
+def engineer_only(ws):
+    # Agents have no mapping to these operations. This is a second lock on the same door.
+    if ws.chat:
+        refuse("STANDARD_DATA_OPERATION_REFUSED")
+
+
+def op_deliveries(ws, request):
+    """The engineer's view for the Project page. It holds file names, so it never reaches a chat."""
+    engineer_only(ws)
+    if not ws.initialized():
+        return {"initialized": False, "deliveries": [], "unlabelled_files": [], "labelled_files": [], "unlabelled_data": []}
+    records = read_deliveries(ws)
+    labelled, unlabelled = split_drop_files(ws, records)
+    return {"initialized": True, "deliveries": sorted(records.values(), key=lambda record: record["labelled_at"], reverse=True),
+            "unlabelled_files": unlabelled, "labelled_files": labelled, "unlabelled_data": unlabelled_data(ws, records)}
+
+
+def op_delivery_label(ws, request):
+    """Set what a delivery is for. Engineer only, from the Project page. A label never changes."""
+    engineer_only(ws)
+    ws.require(standard=False)
+    kind, by = request.get("kind"), request.get("by")
+    if kind not in DELIVERY_KINDS:
+        refuse("STANDARD_ARGUMENTS_INVALID: kind")
+    if not isinstance(by, str) or not by.strip() or len(by) > MAX_LABELLED_BY or re.search(r"[\x00-\x1f]", by):
+        refuse("STANDARD_ARGUMENTS_INVALID: by")
+    if kind == "launch" and request.get("confirm") != "LAUNCH":
+        refuse("STANDARD_DELIVERY_CONFIRM_LAUNCH")
+    with ws.lock():
+        records, meta = read_deliveries(ws), ws.meta()
+        same_kind = [record for record in records.values() if record["kind"] == kind]
+        if kind == "launch" and same_kind and request.get("replaces_launch") is not True:
+            refuse("STANDARD_DELIVERY_LAUNCH_EXISTS")
+        state = ws.named_state()
+        untagged = [dataset_id for dataset_id in (state.get("datasets") or {}) if dataset_id not in records]
+        holding = set(unlabelled_data(ws, records))
+        files = []
+        if "dataset_id" in request:  # data taken before labels existed
+            dataset_id = request["dataset_id"]
+            if kind != "development" or dataset_id not in holding or "files" in request:
+                refuse("STANDARD_ARGUMENTS_INVALID: dataset_id")
+        else:
+            if holding:
+                refuse("STANDARD_DELIVERY_LABEL_EXISTING_FIRST")
+            wanted = request.get("files")
+            if not isinstance(wanted, list) or not wanted or not all(isinstance(item, dict) for item in wanted):
+                refuse("STANDARD_ARGUMENTS_INVALID: files")
+            _labelled, unlabelled = split_drop_files(ws, records)
+            current = {item["path"]: item for item in unlabelled}
+            for item in wanted:
+                if current.get(item.get("path")) != {key: item.get(key) for key in ("path", "bytes", "mtime_ns")}:
+                    refuse("STANDARD_DELIVERY_FILES_CHANGED: the files changed since the page loaded")
+            files = [current[item["path"]] for item in wanted]
+            if untagged:
+                dataset_id = untagged[0]
+            else:
+                dataset_id = json.loads(ws.control(["named", "dataset", "add", ws.name, "--source", meta["source_id"], "--label", kind]))["dataset_id"]
+        version = 1 + max((record["version"] for record in same_kind), default=0)
+        record = {"dataset_id": dataset_id, "kind": kind, "version": version, "labelled_at": now(), "labelled_by": by.strip(), "files": files}
+        records[dataset_id] = record
+        ws.write_json(deliveries_file(ws), {"version": 1, "deliveries": records})
+        meta["dataset_id"] = dataset_id
+        ws.write_json(ws.data_dir() / "workspace.json", meta)
+    return {"dataset_id": dataset_id, "kind": kind, "delivery": delivery_label(record), "files": len(files)}
+
+
 def op_take(ws, request):
     """Move one file from the drop folder into inputs/, make it read-only, register it."""
     ws.require()
@@ -778,8 +939,9 @@ def op_take(ws, request):
         root, inputs = ws.open_area("intake"), None
         try:
             inputs = ws.open_area("inputs")
-            result = move_in(ws, meta, root, parts, inputs, name, "inputs/" + name, kind,
-                             {"event": "take", "from": "intake/" + "/".join(parts)})
+            dataset = delivery_of_take(ws, root, parts, "inputs/" + name)
+            result = move_in(ws, dict(meta, dataset_id=dataset), root, parts, inputs, name, "inputs/" + name, kind,
+                             {"event": "take", "from": "intake/" + "/".join(parts), "dataset_id": dataset})
         finally:
             os.close(root)
             if inputs is not None:
@@ -1764,8 +1926,6 @@ GUIDE_STAGES = (("files", "Customer files received"), ("workspace", "Workspace c
                 ("review", "Review import passed its checks"), ("site", "Site reviewed"))
 GUIDE_RECENT = 10
 GUIDE_ACTIVE = ("claimed", "running")
-GUIDE_PURPOSE = ("not tracked yet: this tool can't tell a development dump from a launch dump. "
-                 "Check which delivery a run uses from its input IDs and checksums before approving it")
 GUIDE_ACCEPTANCE = "not recorded yet: the engineer's review of a site isn't stored anywhere"
 DEFAULT_CONTACT = "your node admin"
 MAX_CONTACT = 200
@@ -1801,7 +1961,7 @@ def guide_records(ws):
     except (Refusal, ValueError, subprocess.SubprocessError) as error:
         return dict(empty, findings=guide_findings(state), pushes=guide_pushes(standard),
                     warning=str(error).split(":")[0] if isinstance(error, Refusal) else "STANDARD_OPERATION_FAILED")
-    plans = [{"plan_id": plan.get("plan_id"), "kind": kinds.get(plan.get("plan_id")), "status": plan.get("status"),
+    plans = [{"plan_id": plan.get("plan_id"), "kind": kinds.get(plan.get("plan_id")), "status": plan.get("status"), "delivery": plan.get("delivery"),
               "run_id": plan.get("run_id"), "created_at": plan.get("created_at") or ""} for plan in status.get("plans", [])]
     runs = []
     for run in status.get("runs", []):
@@ -1875,8 +2035,10 @@ def guide_flow(ws, facts, records):
         if facts["drop_files"]:
             return ("agent", "Create the workspace with data_create (ask the engineer for the source platform if it isn't clear), then take the files with data_take.", "this chat")
         return copy_files
+    if facts["labelled_files"]:
+        return ("agent", "Take the labelled files in the drop folder with data_take, each with a clear type.", "this chat")
     if not facts["inputs"]:
-        return ("agent", "Take the files in the drop folder with data_take.", "this chat") if facts["drop_files"] else copy_files
+        return copy_files
     runs = records["runs"]
     converts = [run for run in runs if run["kind"] == "convert"]
     reviews = [run for run in runs if run["kind"] == "review"]
@@ -1927,6 +2089,18 @@ def guide_stages(facts, records):
     return current, stages
 
 
+def guide_data(records):
+    """Which delivery is which: labels, versions and IDs only, never file names."""
+    ordered = sorted(records.values(), key=lambda record: record["labelled_at"], reverse=True)
+    newest = {}
+    for record in ordered:
+        newest.setdefault(record["kind"], record["dataset_id"])
+    return {"current": delivery_label(ordered[0]) if ordered else None,
+            "note": None if ordered else "no data is labelled yet: only the engineer can say what files are for",
+            "deliveries": [{"label": delivery_label(record), "kind": record["kind"], "dataset_id": record["dataset_id"], "labelled_at": record["labelled_at"],
+                            "state": "current" if newest[record["kind"]] == record["dataset_id"] else "replaced"} for record in ordered]}
+
+
 def op_guide(ws, request):
     state = ws.named_state() if ws.initialized() else {}
     db = ws.read_json(ws.data / "db" / "state.json", None) if ws.initialized() and (ws.data / "db").is_dir() else None
@@ -1934,12 +2108,20 @@ def op_guide(ws, request):
     if ws.intake.is_dir() and not ws.intake.is_symlink():
         for _path, _dirs, files, _dirfd in os.fwalk(str(ws.intake), follow_symlinks=False):
             drop_files += len(files)
-    facts = {"initialized": ws.initialized(), "drop_files": drop_files, "inputs": len(state.get("inputs") or {}), "db_loaded": bool(db and db.get("loads"))}
+    deliveries = read_deliveries(ws) if ws.initialized() else {}
+    labelled, unlabelled = split_drop_files(ws, deliveries) if ws.initialized() else ([], [])
+    not_labelled = unlabelled_data(ws, deliveries) if ws.initialized() else []
+    facts = {"initialized": ws.initialized(), "drop_files": drop_files, "labelled_files": len(labelled), "inputs": len(state.get("inputs") or {}),
+             "db_loaded": bool(db and db.get("loads"))}
     records = guide_records(ws) if ws.initialized() else {"plans": [], "runs": [], "sites": [], "findings": [], "pushes": [], "warning": None}
     contact = support_contact(ws)
     active = [run for run in records["runs"] if run["status"] in GUIDE_ACTIVE]
     happening = ["%s run %s is %s (stage %s)." % (run["kind"] or "workflow", run["run_id"], run["status"], run["stage"]) for run in active]
     waiting, also = [], []
+    if not_labelled:
+        waiting.append({"what": "Label the data already in this project as Development on the Project page.", "where": "Project page"})
+    if unlabelled:
+        waiting.append({"what": "%d new file(s) arrived: say what they're for (Development or Launch) on the Project page." % len(unlabelled), "where": "Project page"})
     latest_start = {run["kind"]: run["started_at"] or "" for run in records["runs"]}
     for plan in records["plans"]:
         if plan["status"] not in ("proposed", "approved"):
@@ -1957,8 +2139,6 @@ def op_guide(ws, request):
     stale = [plan for plan in records["plans"] if plan["status"] == "stale"]
     if stale:
         also.append("Plan %s is out of date because something it depends on changed: propose it again, and discard the old one in the Runs widget." % stale[-1]["plan_id"])
-    if facts["initialized"] and facts["inputs"] and drop_files:
-        also.append("%d file(s) in the drop folder haven't been taken." % drop_files)
     also += ["The review site of run %s is still up and holds customer data until it's reset in the Runs widget." % site["run_id"] for site in records["sites"]]
     if records["warning"]:
         step = ("agent", "Plans and runs couldn't be read (%s). Tell the engineer, and ask %s if it keeps happening." % (records["warning"], contact), "this chat")
@@ -1972,7 +2152,7 @@ def op_guide(ws, request):
     return {"project": ws.name, "stage": current, "stages": stages, "happening": happening, "waiting_on_engineer": waiting,
             "next": {"who": step[0], "action": step[1], "where": step[2]}, "also": also,
             "plans": records["plans"][-GUIDE_RECENT:][::-1], "runs": records["runs"][-GUIDE_RECENT:][::-1],
-            "data_purpose": GUIDE_PURPOSE, "site_acceptance": GUIDE_ACCEPTANCE, "support_contact": contact,
+            "data": guide_data(deliveries), "site_acceptance": GUIDE_ACCEPTANCE, "support_contact": contact,
             "decisions_recorded": len(read_decisions(ws)) if ws.initialized() else 0}
 
 
@@ -1980,9 +2160,9 @@ OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_creat
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
        "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding,
        "plan_propose": op_plan_propose,
-       "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions}
+       "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions, "deliveries": op_deliveries, "delivery_label": op_delivery_label}
 # Logged with their arguments (minus script code, finding text, count SQL and decisions, logged by hash).
-QUIET = {"status", "list", "job", "db_status", "notes", "guide", "decisions"}
+QUIET = {"status", "list", "job", "db_status", "notes", "guide", "decisions", "deliveries"}
 
 
 def fit(result):

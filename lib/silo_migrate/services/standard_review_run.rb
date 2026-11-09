@@ -62,6 +62,7 @@ module SiloMigrate
           roles["reconciliation"] = recon_id
         end
 
+        delivery = delivery_binding!(source_plan.dig("body", "dataset_id"))
         limits = review_limits
         review_capacity!(limits, running: false)
         review_port = select_review_port(state, port)
@@ -73,6 +74,7 @@ module SiloMigrate
           "operation" => REVIEW_OPERATION,
           "workspace_id" => named.fetch("workspace_id"),
           "dataset_id" => source_body["dataset_id"],
+          "delivery" => delivery,
           "platform" => source_body["platform"],
           "from_run" => { "run_id" => from_run, "plan_id" => source_plan.fetch("id"), "plan_digest" => source_plan.fetch("digest"),
                           "converter_revision" => source_body["converter_revision"] }.merge(artifact),

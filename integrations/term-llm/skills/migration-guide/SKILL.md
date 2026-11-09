@@ -28,7 +28,9 @@ so never ask which one it is. The first chat creates the workspace with `data_cr
 | Stage | Who | Where |
 | --- | --- | --- |
 | Copy files to the drop folder (`scp`), then `silo intake PROJECT` | Engineer | Server terminal |
-| Create the workspace, take the files, load the source database | migration-data | Chat |
+| Create the workspace | migration-data | Chat |
+| Say what new files are for: Development or Launch | Engineer | Project page |
+| Take the labelled files, load the source database | migration-data | Chat |
 | Profile the data and propose a finding | migration-data | Chat |
 | Review and release the finding | Engineer | Findings widget |
 | Write, test and review the converter; propose a push | converter-developer, converter-reviewer | A separate chat in the project |
@@ -58,7 +60,8 @@ engineer's own steps today. Don't suggest the tool does them.
 
 ## Limits to state plainly
 
-- Which data a run uses is **not labelled** as development or launch yet (see `data_purpose`).
+- A run can't use unlabelled data, and only the engineer labels (see `data` for what's current).
+- Launch data can be labelled, but a launch run is refused until accepting a site is built.
 - A site's review isn't recorded yet (see `site_acceptance`).
 
 ## Keep the project's memory
