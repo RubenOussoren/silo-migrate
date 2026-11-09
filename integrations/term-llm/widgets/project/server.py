@@ -39,6 +39,8 @@ MAX_BODY = 128 * 1024  # a label lists the files it covers
 MAX_FINDING_BODY = findings.MAX_TEXT * 7  # JSON can escape each byte of a finding's text up to 6 bytes
 RUN_ACTIONS = ("approve", "discard", "start", "recover", "admin-password", "reset", "push", "discard-push")
 FINDING_ACTIONS = ("release", "amend", "reject", "withdraw")
+RUN_PATHS = {"/api/runs/" + action for action in RUN_ACTIONS}
+FINDING_PATHS = {"/api/findings/" + action for action in FINDING_ACTIONS}
 RUN_VIEWS = {"plan": runs.plan_detail, "run": runs.run_detail, "push": runs.push_detail}
 MAX_FILES = 400
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -207,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 length = -1
             path = urlsplit(self.path).path
-            limit = MAX_FINDING_BODY if path.startswith("/api/findings/") else MAX_BODY
+            limit = MAX_FINDING_BODY if path.startswith("/api/findings/") else runs.MAX_BODY if path.startswith("/api/runs/") else MAX_BODY
             if not 0 < length <= limit:
                 self.close_connection = True
                 raise Refused("STANDARD_ARGUMENTS_INVALID", 413 if length > 0 else 400)
@@ -220,9 +222,9 @@ class Handler(BaseHTTPRequestHandler):
             action = path.rsplit("/", 1)[-1]
             if path == "/api/label":
                 result = label(self.server.control, body)
-            elif path.startswith("/api/runs/") and action in RUN_ACTIONS:
+            elif path in RUN_PATHS:
                 result = runs.decide(runs.Store(self.server.base), self.server.control, action, body)
-            elif path.startswith("/api/findings/") and action in FINDING_ACTIONS:
+            elif path in FINDING_PATHS:
                 result = findings.decide(self.server.control, action, body.get("workspace"), body.get("id"), body.get("text"))
             else:
                 raise Refused("STANDARD_ARGUMENTS_INVALID")
@@ -248,7 +250,7 @@ def main(argv):
     if len(argv) != 2 or not argv[1].startswith("/"):
         raise SystemExit("usage: server.py SOCKET")
     control, base = runs.locate()
-    # As in the Runs widget: the socket folder must be ours and private.
+    # As the Runs module always did: the socket folder must be ours and private.
     folder = os.lstat(os.path.dirname(argv[1]))
     if not stat.S_ISDIR(folder.st_mode) or folder.st_uid != os.geteuid() or folder.st_mode & 0o077:
         raise SystemExit("project widget: " + os.path.dirname(argv[1]) + " must be a folder owned by this account, mode 0700")

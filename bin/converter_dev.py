@@ -445,7 +445,7 @@ def op_status(checkout, request):
 
 
 def converter_log(checkout, limit=30):
-    """Engineer view (the Runs widget): where the checkout is, what is committed and what has
+    """Engineer view (the Project page's Runs tab): where the checkout is, what is committed and what has
     reached GitHub. Commits are pushed when an origin branch contains them."""
     unpushed_shas = {commit["sha"] for commit in unpushed(checkout)}
     commits = []
@@ -840,7 +840,7 @@ def op_push_propose(checkout, request):
         os.replace(temporary, path)
     return {"digest": digest, "status": "proposed", "proposal": proposal,
             "approve": "silo-migrate-control converter push " + checkout.workspace + " --sha256 " + digest,
-            "note": "Nothing is pushed until the engineer approves it in the web UI's Runs widget (or runs the approve command). A draft PR is then opened with the server's GitHub token."}
+            "note": "Nothing is pushed until the engineer approves it on the web UI's Project page, Runs tab (or runs the approve command). A draft PR is then opened with the server's GitHub token."}
 
 
 def load_proposals(checkout):

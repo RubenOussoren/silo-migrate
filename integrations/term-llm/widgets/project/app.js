@@ -31,8 +31,9 @@ function readHash() {
   const params = new URLSearchParams(location.hash.slice(1));
   const tab = params.get('tab');
   const kind = params.get('kind');
+  const kinds = { runs: ['plan', 'run', 'push', 'converter'], findings: ['finding'] }[tab] || [];
   return { project: params.get('project') || params.get('ws'), tab: TABS.some(([id]) => id === tab) ? tab : null,
-    selected: kind && params.get('id') ? { kind, id: params.get('id') } : null };
+    selected: kinds.includes(kind) && params.get('id') ? { kind, id: params.get('id') } : null };
 }
 
 function writeHash() {
@@ -42,7 +43,12 @@ function writeHash() {
 }
 
 // What stops leaving a tab: an open finding with unsaved edits.
-const leaving = () => !(views.findings && views.findings.unsaved()) || confirm('Discard your edits to this finding?');
+function leaving() {
+  if (!(views.findings && views.findings.unsaved())) return true;
+  if (!confirm('Discard your edits to this finding?')) return false;
+  views.findings.discard();
+  return true;
+}
 
 function go(tab, selected = null) {
   if (!leaving()) return;
@@ -203,12 +209,17 @@ async function refresh(full = true) {
   const repaint = () => { if (state.tab === 'overview' || state.tab === 'files') render(); else { renderData(); renderStages(); renderTabs(); } };
   // The quick answers first, so the page has something to show while the slower one runs.
   try {
-    const [files, counts] = await Promise.all([api(`api/files?workspace=${encodeURIComponent(project)}`), api(`api/counts?workspace=${encodeURIComponent(project)}`)]);
+    const files = await api(`api/files?workspace=${encodeURIComponent(project)}`);
     if (stale()) return;
     state.files = files;
-    state.counts = counts;
     repaint();
   } catch (error) { if (!stale()) toast(explain(error), true); }
+  try {
+    const counts = await api(`api/counts?workspace=${encodeURIComponent(project)}`);
+    if (stale()) return;
+    state.counts = counts;
+    renderTabs();
+  } catch { /* the tabs keep their last counts */ }
   if (full && (state.tab === 'runs' || state.tab === 'findings') && !state.selected) views[state.tab].show();
   try {
     const guide = await api(`api/guide?workspace=${encodeURIComponent(project)}`);
@@ -254,7 +265,13 @@ async function start() {
     if (selected) { state.selected = selected; writeHash(); render(); }
   } else render();
   // Only the overview and files refresh by themselves: a detail being read or edited stays put.
-  setInterval(() => { if (!document.hidden) refresh(false); }, POLL_MS);
+  // One refresh at a time: the guide can take a while, and a slow server shouldn't get a queue.
+  let busy = false;
+  setInterval(async () => {
+    if (document.hidden || busy) return;
+    busy = true;
+    try { await refresh(false); } finally { busy = false; }
+  }, POLL_MS);
 }
 
 start();

@@ -301,7 +301,7 @@ def doctor_checks(entry, runner=run):
     extensions = ",".join(args[args.index("--extensions") + 1:args.index("--extensions") + 2]).split(",") if "--extensions" in args else []
     findings = (spec is not None and "--disable-widgets" not in args and "--disable-extensions" not in args
                 and ui + "/widgets" in args and ui + "/extensions" in args and "silo-findings" in extensions)
-    add("OK" if findings else "WARN", "findings widget", "on: the Project tab and page in the web UI" if findings else "off: release findings and approve runs from the terminal",
+    add("OK" if findings else "WARN", "project page", "on: the Project tab and page in the web UI" if findings else "off: release findings and approve runs from the terminal",
         None if findings else "silo update")
     themed = (spec is not None and "--disable-extensions" not in args and ui + "/extensions" in args
               and extensions[:2] == ["varnish", "silo-theme"]

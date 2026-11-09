@@ -1,7 +1,7 @@
-"""Runs widget: the engineer's approvals for workflow runs and converter pushes, in the web UI.
+"""Runs: the engineer's approvals for workflow runs and converter pushes, in the web UI.
 
-term-llm starts this on demand (widget.yaml) on a Unix socket and serves it, behind the web
-UI's sign-in, at <base>/widgets/runs/. It replaces the terminal steps an engineer had to run as
+The Project page (widgets/project) imports this and calls its views and decisions; it isn't a page
+of its own any more. It replaces the terminal steps an engineer had to run as
 the service account:
 
   plans   migration-data (or the operator) proposes; here the engineer reads what the plan

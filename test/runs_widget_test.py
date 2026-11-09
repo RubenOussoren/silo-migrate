@@ -436,7 +436,8 @@ class ApprovalShowsTheDataTest(unittest.TestCase):
         source = (ROOT / 'integrations/term-llm/widgets/project/runs.js').read_text()
         self.assertIn("['Data', el('strong', {}, dataLabel(data))]", source)
         self.assertEqual(4, source.count('on ${dataLabel(data)}'))  # the heading, both approval texts, the start text
-        self.assertIn('Start this run on ${dataLabel(data)}', source)
+        self.assertIn('Start this run of ${ctx.project} on ${dataLabel(data)}', source)
+        self.assertEqual(2, source.count('Approval code ${short(data.digest, 16)}'))  # the code the page shows, in both approval texts
         self.assertIn("'Not labelled'", source)
         self.assertIn('${operationLabel(plan.operation)} on ${dataLabel(plan)}', source)
 

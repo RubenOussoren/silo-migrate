@@ -1,7 +1,7 @@
-"""Findings widget: the engineer's release gate in the term-llm web UI.
+"""Findings: the engineer's release gate in the term-llm web UI.
 
-term-llm starts this on demand (widget.yaml) on a Unix socket and serves it, behind the web
-UI's sign-in, at <base>/widgets/findings/. It lists each workspace's findings from the
+The Project page (widgets/project) imports this and calls its views and decisions; it isn't a page
+of its own any more. It lists each workspace's findings from the
 standard store (read-only, straight from disk, so lists stay fast however many there are)
 and runs every decision through `silo-migrate-control standard finding …`, which locks,
 validates and records it. Release and amend take the exact text the engineer sees in the

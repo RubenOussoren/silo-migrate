@@ -88,3 +88,5 @@ textarea { width: 100%; font: 13px/1.55 var(--font-mono); background: var(--surf
 .commits { margin: 0; padding-left: 18px; font-size: 13px; }
 .link.current { color: var(--text); }
 a { color: var(--accent); }
+.chips { flex-wrap: wrap; align-items: center; }
+input.search { font: inherit; font-size: 13px; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; margin-left: auto; min-width: 220px; }

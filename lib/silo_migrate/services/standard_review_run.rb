@@ -110,7 +110,7 @@ module SiloMigrate
         show_plan(plan_id)
       end
 
-      # Engineer only (the Runs widget, behind the web UI sign-in): the review admin's
+      # Engineer only (the Project page's Runs tab, behind the web UI sign-in): the review admin's
       # sign-in while its site exists.
       def admin_password(run_id)
         state = @store.load

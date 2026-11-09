@@ -1,5 +1,5 @@
 // The Runs tab: plans to approve and start, runs to follow and reset, converter pushes.
-// The decisions are the Runs widget's, unchanged: same checks, same exact-digest approval.
+// The decisions are those of widgets/runs/server.py, unchanged: same checks, same exact-digest approval.
 import { el, safe, short, badge, ago, toast, api, explain, facts, block, table, details, card, back, item } from './ui.js';
 
 const RUN_DONE = new Set(['completed', 'failed', 'interrupted']);
@@ -97,25 +97,25 @@ export function runsView(ctx) {
     if ((convert || review) && (data.roles || {}).reconciliation) {
       more.push(block('Count checks', texts.reconciliation == null ? el('p', { class: 'quiet' }, '(not readable, or changed since the plan)') : checksView(texts.reconciliation)));
     }
-    more.push(block('What it does', el('ul', {}, (data.mutations || []).map((m) => el('li', {}, m)))), block('Not included', el('p', {}, (data.not_included || []).join(', '))));
+    more.push(block('What it does', el('ul', {}, (data.mutations || []).map((m) => el('li', {}, safe(m))))), block('Not included', el('p', {}, (data.not_included || []).join(', '))));
     const actions = [];
     if (data.status === 'proposed') {
       const question = unseen
-        ? `Approve this run on ${dataLabel(data)}?\nThe settings or checks could NOT be shown here: you approve them by their checksum only.`
-        : `Approve this run on ${dataLabel(data)}?\nIt runs exactly what this page shows.`;
+        ? `Approve this run of ${ctx.project} on ${dataLabel(data)}?\nApproval code ${short(data.digest, 16)}…\nThe settings or checks could NOT be shown here: you approve them by their checksum only.`
+        : `Approve this run of ${ctx.project} on ${dataLabel(data)}?\nApproval code ${short(data.digest, 16)}…\nIt runs exactly what this page shows.`;
       actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
         if (await act('approve', { plan_id: data.plan_id, digest: data.digest }, question)) { toast('Approved. Start it when you are ready.'); ctx.refresh(); }
       } }, 'Approve'));
     }
     if (data.status === 'approved') {
       actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
-        const outcome = await act('start', { plan_id: data.plan_id }, `Start this run on ${dataLabel(data)} now? It runs in the background on the server.`);
+        const outcome = await act('start', { plan_id: data.plan_id }, `Start this run of ${ctx.project} on ${dataLabel(data)} now? It runs in the background on the server.`);
         if (outcome) { toast('Started.'); ctx.open('run', outcome.run_id); }
       } }, 'Start'));
     }
     if (['proposed', 'approved', 'stale'].includes(data.status)) {
       actions.push(el('button', { type: 'button', class: 'btn q', onclick: async () => {
-        if (await act('discard', { plan_id: data.plan_id }, 'Discard this plan? It can never be approved or run.')) { toast('Discarded.'); ctx.close(); }
+        if (await act('discard', { plan_id: data.plan_id }, `Discard this plan of ${ctx.project}? It can never be approved or run.`)) { toast('Discarded.'); ctx.close(); }
       } }, 'Discard'));
     }
     const notes = [];
@@ -130,7 +130,7 @@ export function runsView(ctx) {
     if (!spec || !Array.isArray(spec.checks)) return el('pre', {}, safe(text));
     const destination = spec.checks.some((c) => c.destination_sql);
     return table(['Check', 'Source query', 'Converted query', ...(destination ? ['Site query'] : []), 'Note'],
-      spec.checks.map((c) => [c.name, el('code', {}, c.source_sql || ''), el('code', {}, c.intermediate_sql || ''), ...(destination ? [el('code', {}, c.destination_sql || '')] : []), c.note || '']));
+      spec.checks.map((c) => [safe(c.name), el('code', {}, safe(c.source_sql || '')), el('code', {}, safe(c.intermediate_sql || '')), ...(destination ? [el('code', {}, safe(c.destination_sql || ''))] : []), safe(c.note || '')]));
   }
 
   function run(data) {
@@ -139,19 +139,19 @@ export function runsView(ctx) {
     const destination = rows.some((row) => row.destination != null);
     const bad = rows.filter((row) => row.status !== 'matched');
     const say = ['claimed', 'running'].includes(data.status) ? `Running: ${data.stage || 'starting'}.`
-      : data.status === 'completed' ? (bad.length ? `${bad.map((row) => row.name).join(', ')} ${bad.length === 1 ? 'doesn\'t' : 'don\'t'} match.` : rows.length ? 'Finished. Every check matches.' : 'Finished.')
+      : data.status === 'completed' ? (bad.length ? `${bad.map((row) => safe(row.name)).join(', ')} ${bad.length === 1 ? 'doesn\'t' : 'don\'t'} match.` : rows.length ? 'Finished. Every check matches.' : 'Finished.')
         : data.status === 'failed' ? `Stopped at ${data.stage || 'a stage'}.` : `This run is ${data.status.replace('_', ' ')}.`;
     const parts = [];
     if (rows.length) {
       parts.push(table(['Check', 'Source', 'Converted', ...(destination ? ['Site'] : []), ''],
-        rows.map((r) => [r.name, r.source, r.intermediate, ...(destination ? [r.destination] : []), badge(r.status === 'matched' ? 'ok' : 'differs', r.status)]),
+        rows.map((r) => [safe(r.name), r.source, r.intermediate, ...(destination ? [r.destination] : []), badge(r.status === 'matched' ? 'ok' : 'differs', r.status)]),
         destination ? [1, 2, 3] : [1, 2], (i) => (rows[i].status !== 'matched' ? 'bad' : '')));
     } else if (results.reconciliation_checks !== undefined) parts.push(el('p', { class: 'quiet' }, 'No count checks in this run.'));
     if (data.failure && data.failure.recovery) parts.push(el('p', { class: 'note' }, data.failure.recovery));
     if (data.recovery) parts.push(el('p', { class: 'note' }, data.recovery));
     // Accept only the contracted loopback URL before constructing links or tunnel instructions.
     const reviewURL = /^http:\/\/127[.]0[.]0[.]1:([0-9]{1,5})\/?$/.exec(results.review_url || '');
-    if (data.operation === 'standard_review' && reviewURL && Number(reviewURL[1]) > 0 && Number(reviewURL[1]) <= 65535 && data.review_site_available) {
+    if (data.operation === 'standard_review' && data.status === 'completed' && reviewURL && Number(reviewURL[1]) > 0 && Number(reviewURL[1]) <= 65535 && data.review_site_available) {
       const port = reviewURL[1];
       const url = `http://127.0.0.1:${port}/`;
       const credentials = el('div');
@@ -174,12 +174,12 @@ export function runsView(ctx) {
     const actions = [];
     if (['abandoned', 'not_started'].includes(data.status)) {
       actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
-        if (await act('recover', { run_id: data.run_id }, 'Mark this run as interrupted? Only do this if its process is gone, for example after a restart. Then reset it.')) { toast('Marked interrupted.'); ctx.refresh(); }
+        if (await act('recover', { run_id: data.run_id }, `Mark this run of ${ctx.project} as interrupted? Only do this if its process is gone, for example after a restart. Then reset it.`)) { toast('Marked interrupted.'); ctx.refresh(); }
       } }, 'Recover'));
     }
     if (RUN_DONE.has(data.status)) {
       actions.push(el('button', { type: 'button', class: 'btn q', onclick: async () => {
-        if (await act('reset', { run_id: data.run_id }, 'Reset this run? Its review site, containers and leftovers are removed. Evidence, plans and backups stay.')) { toast('Reset.'); ctx.refresh(); }
+        if (await act('reset', { run_id: data.run_id }, `Reset this run of ${ctx.project}? Its review site, containers and leftovers are removed. Evidence, plans and backups stay.`)) { toast('Reset.'); ctx.refresh(); }
       } }, data.operation === 'standard_review' ? 'Reset the site' : 'Reset'));
     }
     const more = [facts([['Run', data.run_id, true], ['Plan', data.plan_id, true], ['Started', data.started_at], ['Finished', data.finished_at],
@@ -187,7 +187,7 @@ export function runsView(ctx) {
     el('div', { class: 'stagelist' }, Object.entries(data.stages || {}).map(([name, status]) => el('span', {}, `${name} `, badge(status))))];
     if (rows.length) {
       more.push(block('All check columns', table(['Check', 'Source', 'Converted', 'Difference', ...(destination ? ['Site', 'Site difference'] : []), 'Status', 'Note'],
-        rows.map((r) => [r.name, r.source, r.intermediate, r.difference, ...(destination ? [r.destination, r.destination_difference] : []), r.status, r.error || r.note || '']), [1, 2, 3])));
+        rows.map((r) => [safe(r.name), r.source, r.intermediate, r.difference, ...(destination ? [r.destination, r.destination_difference] : []), r.status, safe(r.error || r.note || '')]), [1, 2, 3])));
     }
     if (data.artifacts && data.artifacts.intermediate) more.push(block('Converted database', facts([['Bytes', String(data.artifacts.intermediate.bytes)], ['SHA-256', data.artifacts.intermediate.sha256, true]])));
     if (data.conversion_summary) more.push(block('Converter summary', el('pre', {}, safe(data.conversion_summary))));
@@ -205,7 +205,7 @@ export function runsView(ctx) {
     const commitList = el('ul', { class: 'commits' }, commits.map((c) => el('li', { class: 'mono' }, commitLine(c))));
     const actions = [];
     const discard = el('button', { type: 'button', class: 'btn q', onclick: async () => {
-      if (await act('discard-push', { digest: data.digest }, 'Discard this push proposal? It will never be pushed.')) { toast('Discarded.'); ctx.close(); }
+      if (await act('discard-push', { digest: data.digest }, `Discard this push proposal of ${ctx.project}? It will never be pushed.`)) { toast('Discarded.'); ctx.close(); }
     } }, 'Discard');
     if (data.status === 'proposed' || (data.status === 'pushed' && !(pull && pull.url))) {
       actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
@@ -230,9 +230,9 @@ export function runsView(ctx) {
       details(table(['Commit', 'Subject', 'Author', 'Date', 'GitHub'], (log.commits || []).map((c) => [el('span', { class: 'mono' }, short(c.sha, 10)), safe(c.subject), safe(c.author), (c.date || '').slice(0, 16).replace('T', ' '), c.pushed ? 'pushed' : 'not yet']))))];
   }
 
-  async function detail(kind, id) {
+  async function detail(kind, id, quiet = false) {
     const mine = ++ticket;
-    ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, 'Loading…')]);
+    if (!quiet) ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, 'Loading…')]);  // a refresh keeps what's shown
     let data;
     try { data = await api(`api/runs/${kind}?${new URLSearchParams({ workspace: ctx.project, id })}`); } catch (error) {
       if (mine === ticket) ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, explain(error))]);
@@ -240,13 +240,16 @@ export function runsView(ctx) {
     }
     if (mine !== ticket) return;
     const render = { plan, run, push, converter }[kind];
+    const open = [...document.querySelectorAll('#content details[open]')].length > 0;
     ctx.mount([back('Runs', ctx.close), ...render(data)]);
-    // A run in progress refreshes itself while it's the one on screen.
+    if (quiet && open) for (const node of document.querySelectorAll('#content details.more')) node.open = true;
+    // A run in progress refreshes itself while it's the one on screen (waiting while the tab is hidden).
     if (kind === 'run' && ['claimed', 'running'].includes(data.status)) {
-      setTimeout(() => {
-        const still = ctx.selected && ctx.selected.kind === 'run' && ctx.selected.id === id && mine === ticket;
-        if (still && document.getElementById('content').isConnected) (document.hidden ? null : detail(kind, id));
-      }, 5000);
+      const again = () => {
+        if (!(ctx.selected && ctx.selected.kind === 'run' && ctx.selected.id === id && mine === ticket)) return;
+        if (document.hidden) setTimeout(again, 5000); else detail(kind, id, true);
+      };
+      setTimeout(again, 5000);
     }
   }
 

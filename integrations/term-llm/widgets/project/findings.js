@@ -1,5 +1,5 @@
 // The Findings tab: what migration-data proposes, and the only way text reaches the coding agents.
-// The decisions are the Findings widget's, unchanged: the exact text and its checksum are sent.
+// The decisions are those of widgets/findings/server.py, unchanged: the exact text and its checksum are sent.
 import { el, safe, ago, toast, api, explain, facts, details, card, back, item } from './ui.js';
 
 const STATUS_LABEL = { proposed: 'to review', released: 'released', rejected: 'rejected', superseded: 'replaced', withdrawn: 'withdrawn' };
@@ -111,18 +111,22 @@ export function findingsView(ctx) {
 
   async function act(action, record, text) {
     const words = {
-      release: `Release this exact text (${new TextEncoder().encode(text || '').length} bytes) to the coding agents?`,
-      amend: 'Release this corrected text? It replaces the current one; the coding agents will see only the new version.',
-      reject: 'Reject this finding? Nothing is released.',
-      withdraw: 'Withdraw this finding? The coding agents won\'t be able to read it any more. It doesn\'t erase what they already read.',
+      release: `Release this exact text (${new TextEncoder().encode(text || '').length} bytes) to the coding agents of ${ctx.project}?`,
+      amend: `Release this corrected text for ${ctx.project}? It replaces the current one; the coding agents will see only the new version.`,
+      reject: `Reject this finding of ${ctx.project}? Nothing is released.`,
+      withdraw: `Withdraw this finding of ${ctx.project}? The coding agents won't be able to read it any more. It doesn't erase what they already read.`,
     };
     if (!confirm(words[action])) return;
+    // One decision at a time.
+    const buttons = [...document.querySelectorAll('#content .actions button')];
+    for (const button of buttons) button.disabled = true;
     try {
       const outcome = await api(`api/findings/${action}`, { workspace: ctx.project, id: record.id, text });
       toast(action === 'amend' ? 'Released the correction.' : `Done: ${outcome.status}.`);
       editing = null;
       if (outcome.finding_id && outcome.finding_id !== record.id) ctx.open('finding', outcome.finding_id); else ctx.refresh();
     } catch (error) {
+      for (const button of buttons) button.disabled = false;
       toast(explain(error), true);  // nothing changed: the page, edits included, stays as it is
     }
   }
@@ -131,10 +135,14 @@ export function findingsView(ctx) {
     const mine = ++ticket;
     editing = null;
     const filter = ctx.state.filter || 'proposed';
-    const chips = el('div', { class: 'chips' }, FILTERS.map(([id, label]) => el('button', { type: 'button', class: id === filter ? 'chip on' : 'chip', onclick: () => { ctx.state.filter = id; list(); } }, label)));
+    const page = ctx.state.page || 0;
+    const search = el('input', { type: 'search', class: 'search', placeholder: 'Search: ID, kind or first line', 'aria-label': 'Search findings', value: ctx.state.q || '' });
+    let timer = null;
+    search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { ctx.state.q = search.value; ctx.state.page = 0; list(); }, 300); });
+    const chips = el('div', { class: 'chips' }, FILTERS.map(([id, label]) => el('button', { type: 'button', class: id === filter ? 'chip on' : 'chip', onclick: () => { ctx.state.filter = id; ctx.state.page = 0; list(); } }, label)), search);
     ctx.mount([chips, el('p', { class: 'quiet' }, 'Loading…')]);
     let data;
-    try { data = await api(`api/findings/list?${new URLSearchParams({ workspace: ctx.project, status: filter, q: ctx.state.q || '' })}`); } catch (error) {
+    try { data = await api(`api/findings/list?${new URLSearchParams({ workspace: ctx.project, status: filter, q: ctx.state.q || '', page })}`); } catch (error) {
       if (mine === ticket) ctx.mount([chips, el('p', { class: 'quiet' }, explain(error))]);
       return;
     }
@@ -142,7 +150,12 @@ export function findingsView(ctx) {
     const items = data.items.map((record) => item(safe(record.title || record.id), `${record.kind} · ${STATUS_LABEL[record.status]} · ${ago(record.updated_at)}${record.supersedes ? ' · correction' : ''}`,
       () => ctx.open('finding', record.id)));
     const empty = filter === 'proposed' ? 'Nothing to review. migration-data proposes findings when converter work needs to know something.' : 'Nothing here.';
-    ctx.mount([chips, ...(items.length ? items : [el('p', { class: 'quiet' }, empty)]), data.total > items.length ? el('p', { class: 'hint' }, `Showing the newest ${items.length} of ${data.total}.`) : null]);
+    const pager = data.pages > 1 ? el('div', { class: 'actions' },
+      el('button', { type: 'button', class: 'btn q', disabled: data.page === 0, onclick: () => { ctx.state.page = data.page - 1; list(); } }, 'Newer'),
+      el('span', { class: 'hint' }, `Page ${data.page + 1} of ${data.pages} · ${data.total} in all`),
+      el('button', { type: 'button', class: 'btn q', disabled: data.page + 1 >= data.pages, onclick: () => { ctx.state.page = data.page + 1; list(); } }, 'Older')) : null;
+    ctx.mount([chips, ...(items.length ? items : [el('p', { class: 'quiet' }, ctx.state.q ? 'Nothing matches.' : empty)]), pager]);
+    if (ctx.state.q) { search.focus(); search.setSelectionRange(search.value.length, search.value.length); }
   }
 
   async function detail(id) {
@@ -157,7 +170,9 @@ export function findingsView(ctx) {
     if (mine !== ticket) return;
     const more = details(facts([['Finding', record.id, true], ['Kind', record.kind + (record.run_id ? ` (run ${record.run_id})` : '')], ['Proposed', record.proposed_at],
       ['Decided', record.decided_at ? `${record.decided_at}${record.reviewer ? ` by ${record.reviewer}` : ''}` : null], ['SHA-256', record.sha256, true]]),
-    record.versions.length > 1 ? el('ol', {}, record.versions.map((version) => el('li', {}, el('button', { type: 'button', class: version.id === record.id ? 'link current' : 'link', onclick: () => ctx.open('finding', version.id) }, version.id), ` · ${STATUS_LABEL[version.status]} · ${ago(version.updated_at)}`))) : null);
+    record.versions.length > 1 ? el('ol', {}, record.versions.map((version) => el('li', {}, el('button', { type: 'button', class: version.id === record.id ? 'link current' : 'link', onclick: () => {
+      if (!unsaved() || confirm('Discard your edits to this finding?')) { editing = null; ctx.open('finding', version.id); }
+    } }, version.id), ` · ${STATUS_LABEL[version.status]} · ${ago(version.updated_at)}`))) : null);
     let parts;
     if (record.status === 'proposed') {
       const [view, toggle] = textView(record.proposal);
@@ -185,5 +200,5 @@ export function findingsView(ctx) {
     ctx.mount([back('Findings', leave), ...parts]);
   }
 
-  return { show: () => (ctx.selected ? detail(ctx.selected.id) : list()), unsaved };
+  return { show: () => (ctx.selected ? detail(ctx.selected.id) : list()), unsaved, discard: () => { editing = null; } };
 }

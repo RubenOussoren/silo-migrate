@@ -1131,14 +1131,14 @@ def service_spec_args():
     return args if isinstance(args, list) else None
 
 def service_current(args):
-    """The saved service arguments already have web UI projects and the Findings widget/extension."""
+    """The saved service arguments already have web UI projects and the Project page and its extension."""
     wanted = web_ui_args()
     pairs = {wanted[i]: wanted[i + 1] for i in range(0, len(wanted), 2)}
     return ("--projects" in args and not {"--no-projects", "--disable-widgets", "--disable-extensions"} & set(args)
             and all(flag in args and args.index(flag) + 1 < len(args) and args[args.index(flag) + 1] == value for flag, value in pairs.items()))
 
 def refresh_service():
-    """Re-install the web service when its saved arguments predate web UI projects or the Findings widget.
+    """Re-install the web service when its saved arguments predate web UI projects or the Project page.
     Keeps the unit's directory, environment and secrets (term-llm reuses them); silo update restarts."""
     global STAGE
     args = service_spec_args()

@@ -5,7 +5,7 @@ export function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs || {})) {
     if (key === 'class') node.className = value;
-    else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2), value);
+    else if (key.startsWith('on')) { if (typeof value === 'function') node.addEventListener(key.slice(2), value); }
     else if (key === 'value') node.value = value;
     else if (value !== undefined && value !== null && value !== false) node.setAttribute(key, value === true ? '' : value);
   }

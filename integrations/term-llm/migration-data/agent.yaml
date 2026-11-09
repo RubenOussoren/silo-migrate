@@ -186,7 +186,7 @@ tools:
         required: [confirm]
         additionalProperties: false
     - name: data_run_evidence
-      description: "Read one workflow run's private evidence: stages, assertions, results and failure record first, then every log with its size and stage, then bounded tails (failed stage first). run_id may also be the plan ID the Runs widget shows; the answer names the run."
+      description: "Read one workflow run's private evidence: stages, assertions, results and failure record first, then every log with its size and stage, then bounded tails (failed stage first). run_id may also be the plan ID the Project page's Runs tab shows; the answer names the run."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70

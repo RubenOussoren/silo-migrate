@@ -20,7 +20,7 @@
   background: #b7791f;
   border-color: #b7791f;
 }
-/* The Runs tab sits below the Findings tab; its panel opens beside it. */
+/* Older tab classes are kept so a cached page still lays out; only the Project tab is created now. */
 .silo-runs-tab { top: calc(40% + 120px); }
 .silo-runs-tab.has-pending {
   color: #fff;
