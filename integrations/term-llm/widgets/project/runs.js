@@ -235,7 +235,12 @@ export function runsView(ctx) {
     if (!quiet) ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, 'Loading…')]);  // a refresh keeps what's shown
     let data;
     try { data = await api(`api/runs/${kind}?${new URLSearchParams({ workspace: ctx.project, id })}`); } catch (error) {
-      if (mine === ticket) ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, explain(error))]);
+      if (mine !== ticket) return;
+      if (quiet) {  // a passing error during a refresh: keep what's shown and try again
+        setTimeout(() => { if (ctx.selected && ctx.selected.id === id && mine === ticket) detail(kind, id, true); }, 5000);
+        return;
+      }
+      ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, explain(error))]);
       return;
     }
     if (mine !== ticket) return;

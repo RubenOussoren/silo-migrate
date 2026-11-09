@@ -236,6 +236,8 @@ function choose(project) {
   state.counts = {};
   state.selected = null;
   state.typing = false;
+  state.findings.page = 0;  // another project's page or search would show an empty list
+  state.findings.q = '';
   $('project').value = project;
   try { localStorage.setItem('silo-project', project); } catch { /* the default */ }
   writeHash();

@@ -131,14 +131,14 @@ export function findingsView(ctx) {
     }
   }
 
-  async function list() {
+  async function list(typed = false) {
     const mine = ++ticket;
     editing = null;
     const filter = ctx.state.filter || 'proposed';
     const page = ctx.state.page || 0;
     const search = el('input', { type: 'search', class: 'search', placeholder: 'Search: ID, kind or first line', 'aria-label': 'Search findings', value: ctx.state.q || '' });
     let timer = null;
-    search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { ctx.state.q = search.value; ctx.state.page = 0; list(); }, 300); });
+    search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { ctx.state.q = search.value; ctx.state.page = 0; list(true); }, 300); });
     const chips = el('div', { class: 'chips' }, FILTERS.map(([id, label]) => el('button', { type: 'button', class: id === filter ? 'chip on' : 'chip', onclick: () => { ctx.state.filter = id; ctx.state.page = 0; list(); } }, label)), search);
     ctx.mount([chips, el('p', { class: 'quiet' }, 'Loading…')]);
     let data;
@@ -147,6 +147,11 @@ export function findingsView(ctx) {
       return;
     }
     if (mine !== ticket) return;
+    if (!data.items.length && data.page > 0) {  // past the end, e.g. after the last item was decided
+      ctx.state.page = Math.max(0, data.pages - 1);
+      list(typed);
+      return;
+    }
     const items = data.items.map((record) => item(safe(record.title || record.id), `${record.kind} · ${STATUS_LABEL[record.status]} · ${ago(record.updated_at)}${record.supersedes ? ' · correction' : ''}`,
       () => ctx.open('finding', record.id)));
     const empty = filter === 'proposed' ? 'Nothing to review. migration-data proposes findings when converter work needs to know something.' : 'Nothing here.';
@@ -155,7 +160,7 @@ export function findingsView(ctx) {
       el('span', { class: 'hint' }, `Page ${data.page + 1} of ${data.pages} · ${data.total} in all`),
       el('button', { type: 'button', class: 'btn q', disabled: data.page + 1 >= data.pages, onclick: () => { ctx.state.page = data.page + 1; list(); } }, 'Older')) : null;
     ctx.mount([chips, ...(items.length ? items : [el('p', { class: 'quiet' }, ctx.state.q ? 'Nothing matches.' : empty)]), pager]);
-    if (ctx.state.q) { search.focus(); search.setSelectionRange(search.value.length, search.value.length); }
+    if (typed) { search.focus(); search.setSelectionRange(search.value.length, search.value.length); }
   }
 
   async function detail(id) {
