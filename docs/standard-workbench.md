@@ -264,7 +264,7 @@ Select the operator agent by path:
 term-llm ask --agent ./integrations/term-llm/migration-operator "Workspace my-project: what's the status?"
 ```
 
-It can read safe status, propose plans, request an already-approved run and read released findings. It can't approve, reset, release or read logs. These limits come from its tool set and the `standard agent` command surface, which doesn't include those operations. It can also search the web for public documentation; its instructions keep workspace names, IDs and tool output out of queries.
+It can read safe status, propose plans and read released findings. It can't approve, start, reset, release or read logs. These limits come from its tool set and the `standard agent` command surface, which doesn't include those operations. It can also search the web for public documentation; its instructions keep workspace names, IDs and tool output out of queries.
 
 ## Investigation and release
 

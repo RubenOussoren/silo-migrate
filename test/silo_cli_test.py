@@ -352,6 +352,37 @@ class SiloTest(unittest.TestCase):
             self.s.web_project(self.entry, 'mybb-acme')
         self.assertEqual(2, len(sent))
 
+    def test_doctor_warns_when_frontier_has_no_context_window(self):
+        config = self.home / '.config/term-llm/config.yaml'
+        self.assertEqual('WARN', self.statuses(self.healthy())['Frontier context']['status'])
+        text = config.read_text()
+        config.write_text('providers:\n  cdck_frontier:\n    model: CDCK/MoM\n    context_window: 256000  # tokens\n  other:\n    context_window: 5\n')
+        check = self.statuses(self.healthy())['Frontier context']
+        self.assertEqual(('OK', 'context_window 256000'), (check['status'], check['detail']))
+        # Another provider's value doesn't count, and neither does a zero.
+        for body in ('providers:\n  cdck_frontier:\n    model: CDCK/MoM\n  other:\n    context_window: 5\n',
+                     'providers:\n  cdck_frontier:\n    context_window: 0\n'):
+            config.write_text(body)
+            self.assertEqual('WARN', self.statuses(self.healthy())['Frontier context']['status'])
+        config.write_text(text)
+
+    def test_set_contact_is_root_only_one_line_and_read_back_by_doctor(self):
+        import contextlib
+        self.assertEqual('WARN', self.statuses(self.healthy())['support contact']['status'])
+        with self.assertRaisesRegex(self.s.Stop, 'needs root'):
+            self.s.set_contact('Ruben')
+        (self.prefix / 'etc').mkdir()
+        with mock.patch.object(self.s, 'is_root', return_value=True), contextlib.redirect_stdout(io.StringIO()):
+            for bad in ('', 'two\nlines', 'x' * 81):
+                with self.assertRaises(self.s.Stop):
+                    self.s.set_contact(bad)
+            self.assertEqual(0, self.s.set_contact('  Ruben '))
+        target = self.prefix / 'etc/support-contact'
+        self.assertEqual('Ruben\n', target.read_text())
+        self.assertEqual(0o644, stat.S_IMODE(target.stat().st_mode))
+        check = self.statuses(self.healthy())['support contact']
+        self.assertEqual(('OK', 'Ruben'), (check['status'], check['detail']))
+
     def test_doctor_shows_whether_web_projects_are_on(self):
         spec = self.home / '.config/term-llm/services/web/service.json'
         spec.parent.mkdir(parents=True)

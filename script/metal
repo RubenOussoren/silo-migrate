@@ -612,7 +612,7 @@ def make_plan(allow=False):
     if C["TERM_LLM_SERVICE"] != "skip" and (P/"bin/term-llm").exists() and (home()/".config/term-llm/config.yaml").exists() and entry \
             and (P/"current").exists() and not agents_ready(expected=shipped_agents(P/"current") or MIGRATION_AGENTS):
         refuse("METAL_AGENTS_CONFIG", "existing term-llm config preserved; " + AGENTS_HELP + " (" + agents_path() + "), then re-plan")
-    notes.append("Everyday node commands: <prefix>/current/bin/silo (doctor, update, use-github, restart, shell, prime, claude-login, intake); link it once as root: ln -sfn " + str(P/"current/bin/silo") + " /usr/local/bin/silo")
+    notes.append("Everyday node commands: <prefix>/current/bin/silo (doctor, update, use-github, restart, shell, prime, claude-login, intake, set-contact); link it once as root: ln -sfn " + str(P/"current/bin/silo") + " /usr/local/bin/silo")
     notes.append("Web UI projects are on (--projects): every chat belongs to a project. 'silo intake PROJECT' creates the folder ~/projects/PROJECT and its web UI project; migration-data's tools work only in a chat inside that project and only on that workspace. Existing chats move to the home project. 'metal update' re-installs the service once to switch this on.")
     notes.append("Root, every apply/update: /etc/tmpfiles.d/silo-migrate-term-llm.conf reserves /tmp/term-llm-widgets (term-llm's widget sockets; 0.9.93 doesn't check its owner) for the service account at boot, and it is created now; if another account owns it, apply/update stops for you to inspect it.")
     notes.append("Findings release gate in the web UI: the release's widget (integrations/term-llm/widgets/findings, on a Unix socket behind the web UI sign-in) and extension 'silo-findings' (a 'Findings' tab showing what waits for review). Release, reject, amend and withdraw run 'standard finding …' as the account.")
@@ -1150,7 +1150,7 @@ def refresh_service():
         run(service_args())
     except Refusal as refusal:
         # The new release is in place either way; doctor shows the fix.
-        print("METAL_SERVICE_UPDATE_SKIPPED: " + str(refusal).split(":")[0] + "; web UI projects stay off, so migration-data's tools "
+        print("METAL_SERVICE_UPDATE_SKIPPED: " + str(refusal).split(":")[0] + "; web UI projects stay off, so the migration agents' tools "
               "refuse (STANDARD_CHAT_NOT_IN_PROJECT) until 'silo update' is run again", flush=True)
         return False
     return True

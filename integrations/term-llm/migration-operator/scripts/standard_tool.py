@@ -2,7 +2,7 @@
 """Fixed mapping from term-llm custom tools to `silo-migrate standard agent`.
 
 Arguments are validated here and never reach a shell. There is deliberately no
-mapping to approve, reset, release or private-path commands.
+mapping to approve, start, reset, release or private-path commands.
 """
 import json
 import os
@@ -10,7 +10,6 @@ import pwd
 import re
 import subprocess
 import sys
-import time
 
 WORKSPACE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 PATTERNS = {
@@ -58,14 +57,13 @@ def argument(args, name, required=True):
     value = args.get(name)
     if value is None and not required:
         return None
-    pattern = WORKSPACE if name == "workspace" else PATTERNS[name]
-    if not isinstance(value, str) or not pattern.match(value):
+    if not isinstance(value, str) or not PATTERNS[name].match(value):
         raise ValueError(name)
     return value
 
 
-def run(argv, detach=False):
-    command = [control_path()] + (["--detach"] if detach else []) + ["standard", "agent"] + argv
+def run(argv):
+    command = [control_path(), "standard", "agent"] + argv
     return subprocess.run(command, capture_output=True, text=True, timeout=55, env=control_env())
 
 
@@ -95,10 +93,12 @@ def main():
     tool = os.environ.get("TERM_LLM_TOOL_NAME", "")
     try:
         args = json.load(sys.stdin)
-        workspace = argument(args, "workspace")
-        project = chat_project()
-        if project is not None and workspace != project:
-            return fail("STANDARD_WORKSPACE_NOT_THIS_PROJECT")
+        if not isinstance(args, dict):
+            return fail("STANDARD_ARGUMENTS_INVALID")
+        # The chat's web UI project decides the workspace; the model can't name another one.
+        workspace = chat_project()
+        if workspace is None or not WORKSPACE.match(workspace):
+            return fail("STANDARD_CHAT_NOT_IN_PROJECT")
         if tool == "migration_status":
             return emit(run(["status", workspace]))
         if tool == "migration_plan_propose":
@@ -109,35 +109,6 @@ def main():
             return emit(run(argv))
         if tool == "migration_plan_show":
             return emit(run(["plan-show", workspace, argument(args, "plan_id")]))
-        if tool == "migration_run_request":
-            plan_id = argument(args, "plan_id")
-            shown = run(["plan-show", workspace, plan_id])
-            if shown.returncode != 0:
-                return emit(shown)
-            status = json.loads(shown.stdout).get("status")
-            if status != "approved":
-                return fail("STANDARD_NOT_APPROVED" if status == "proposed" else "STANDARD_PLAN_NOT_RUNNABLE")
-            # Claim in the foreground so a refusal is reported truthfully; nothing has
-            # changed at that point. Then execute in the background.
-            claimed = run(["run-claim", workspace, plan_id])
-            if claimed.returncode != 0:
-                return emit(claimed)
-            run_id = json.loads(claimed.stdout).get("run_id")
-            if not isinstance(run_id, str) or not PATTERNS["run_id"].match(run_id):
-                return fail("STANDARD_OPERATION_FAILED")
-            started = run(["run-execute", workspace, run_id], detach=True)
-            if started.returncode != 0:
-                return fail("STANDARD_RUN_NOT_STARTED")
-            # "started" would overstate it until the executor has actually picked it up.
-            deadline = time.monotonic() + float(os.environ.get("SILO_TOOL_START_WAIT", "15"))
-            status = "claimed"
-            while status == "claimed" and time.monotonic() < deadline:
-                time.sleep(float(os.environ.get("SILO_TOOL_START_POLL", "2")))
-                shown = run(["run-show", workspace, run_id])
-                if shown.returncode == 0:
-                    status = json.loads(shown.stdout).get("status", status)
-            print(json.dumps({"version": 1, "plan_id": plan_id, "run_id": run_id, "status": status}))
-            return 0
         if tool == "migration_run_show":
             return emit(run(["run-show", workspace, argument(args, "run_id")]))
         if tool == "migration_findings":

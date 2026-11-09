@@ -32,9 +32,7 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           path: {type: string, description: "Directory relative to the checkout root; omit for the root"}
-        required: [workspace]
         additionalProperties: false
     - name: dev_read
       description: "Read a text file of the converter checkout from start_line, up to about 32 KB. Use next_line to continue."
@@ -44,10 +42,9 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           path: {type: string}
           start_line: {type: integer, minimum: 1}
-        required: [workspace, path]
+        required: [path]
         additionalProperties: false
     - name: dev_search
       description: "Search the same files as dev_list (git grep). Fixed string by default; fixed=false for an extended regex."
@@ -57,12 +54,11 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           pattern: {type: string}
           path: {type: string}
           fixed: {type: boolean}
           ignore_case: {type: boolean}
-        required: [workspace, pattern]
+        required: [pattern]
         additionalProperties: false
     - name: dev_status
       description: "Branch, HEAD, uncommitted changes and commits not yet pushed."
@@ -71,9 +67,7 @@ tools:
       timeout_seconds: 60
       input:
         type: object
-        properties:
-          workspace: {type: string, description: "Migration workspace name"}
-        required: [workspace]
+        properties: {}
         additionalProperties: false
     - name: dev_diff
       description: "Diff of uncommitted changes (scope working) or of all unpushed commits (scope unpushed); optionally one path."
@@ -83,10 +77,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           scope: {type: string, enum: [working, unpushed]}
           path: {type: string}
-        required: [workspace]
         additionalProperties: false
     - name: dev_test
       description: "Run the converter's tests (suite test; omit file for the full suite, or one test/..._test.rb file) or lint (suite lint: Rubocop and syntax_tree `stree check`, as GitHub CI runs them; omit file for all, or one Ruby file) in a sandbox: converter image, no network, no customer data. Takes up to a few minutes."
@@ -96,10 +88,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           suite: {type: string, enum: [test, lint]}
           file: {type: string}
-        required: [workspace]
         additionalProperties: false
     - name: dev_push_show
       description: "Show the latest push proposals for this workspace and their status (proposed, pushed, pull request)."
@@ -108,9 +98,7 @@ tools:
       timeout_seconds: 60
       input:
         type: object
-        properties:
-          workspace: {type: string, description: "Migration workspace name"}
-        required: [workspace]
+        properties: {}
         additionalProperties: false
     - name: dev_findings
       description: "List investigation findings an engineer has released for coding work."
@@ -119,9 +107,7 @@ tools:
       timeout_seconds: 60
       input:
         type: object
-        properties:
-          workspace: {type: string, description: "Migration workspace name"}
-        required: [workspace]
+        properties: {}
         additionalProperties: false
     - name: dev_finding_show
       description: "Read one released finding and its synthetic reproduction. Unreleased findings are refused."
@@ -131,9 +117,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           finding_id: {type: string}
-        required: [workspace, finding_id]
+        required: [finding_id]
         additionalProperties: false
     - name: dev_write
       description: "Create or replace a file in the converter checkout (not protected, ignored or Git-internal paths). Returns a diff."
@@ -143,10 +128,9 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           path: {type: string}
           content: {type: string}
-        required: [workspace, path, content]
+        required: [path, content]
         additionalProperties: false
     - name: dev_edit
       description: "Replace exact text in a file of the converter checkout. old_text must match exactly once unless replace_all. Returns a diff."
@@ -156,12 +140,11 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           path: {type: string}
           old_text: {type: string}
           new_text: {type: string}
           replace_all: {type: boolean}
-        required: [workspace, path, old_text, new_text]
+        required: [path, old_text, new_text]
         additionalProperties: false
     - name: dev_delete
       description: "Delete a file from the converter checkout."
@@ -171,9 +154,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           path: {type: string}
-        required: [workspace, path]
+        required: [path]
         additionalProperties: false
     - name: dev_branch
       description: "Switch to (or, for a project's first change, create) the branch migration/<workspace>/<topic>. One branch per project: creating a second one is refused (STANDARD_DEV_ONE_BRANCH) unless new_pr is true because the engineer asked for a separate PR. Uncommitted changes come along."
@@ -183,10 +165,9 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           topic: {type: string, description: "Lowercase, e.g. mybb-converter"}
           new_pr: {type: boolean, description: "Only when the engineer asked for a separate pull request"}
-        required: [workspace, topic]
+        required: [topic]
         additionalProperties: false
     - name: dev_format
       description: "Format Ruby files with syntax_tree and the repository's .streerc (what GitHub CI checks), in the sandbox, and write the result back like dev_write. path: a file or folder; omit it for your uncommitted Ruby files. Takes up to a few minutes."
@@ -196,9 +177,7 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           path: {type: string, description: "A Ruby file or a folder, e.g. converters/mybb"}
-        required: [workspace]
         additionalProperties: false
     - name: dev_commit
       description: "Commit all visible changes on the current migration branch, built from their verified content, authored as the engineer, with an Assisted-by trailer. Nothing else in the checkout is committed."
@@ -208,9 +187,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           message: {type: string, description: "Subject line (max 100 chars), blank line, body"}
-        required: [workspace, message]
+        required: [message]
         additionalProperties: false
     - name: dev_push_propose
       description: "Propose pushing the current migration branch and opening a draft pull request. Nothing is pushed: the engineer approves the returned digest with a command."
@@ -220,9 +198,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string, description: "Migration workspace name"}
           title: {type: string}
           body: {type: string}
           base: {type: string, description: "Base branch, default main"}
-        required: [workspace, title]
+        required: [title]
         additionalProperties: false

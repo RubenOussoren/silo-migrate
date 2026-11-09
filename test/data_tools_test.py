@@ -41,6 +41,8 @@ class FakeControl:
     def __init__(self, base):
         self.base = base
         self.calls = []
+        self.status = {'version': 1, 'plans': [], 'runs': [], 'instances': []}
+        self.status_refusal = None
 
     def __call__(self, argv, input=None, timeout=120):
         self.calls.append((argv, input))
@@ -85,6 +87,10 @@ class FakeControl:
             return json.dumps({'version': 1, 'run_id': argv[4], 'status': 'failed'})
         if argv[:3] == ['standard', 'analyst', 'count']:
             return json.dumps({'version': 1, 'run_id': argv[4], 'side': argv[6], 'count': 7, 'error': None})
+        if argv[:2] == ['standard', 'status']:
+            if self.status_refusal:
+                raise self.status_refusal
+            return json.dumps(self.status)
         if argv[:3] == ['standard', 'plan', 'show']:
             return json.dumps({'version': 1, 'plan_id': argv[4], 'run_id': None if argv[4].endswith('0') else 'run-' + 'e' * 32})
         raise AssertionError(argv)
@@ -319,7 +325,7 @@ class DataToolsTest(unittest.TestCase):
         self.refused('STANDARD_ARGUMENTS_INVALID', 'take', path='again.sql', type='Mysql Dump')
         self.refused('STANDARD_ARGUMENTS_INVALID', 'take', path='again.sql', type='x', name='../escape')
         failed = [json.loads(line) for line in (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text().splitlines()][-1]
-        self.assertEqual('STANDARD_ARGUMENTS_INVALID', failed['result'])
+        self.assertEqual('STANDARD_ARGUMENTS_INVALID: name', failed['result'])
 
     def test_register_moves_work_output_with_its_job(self):
         self.create()
@@ -722,6 +728,278 @@ class DataToolsTest(unittest.TestCase):
         self.assertIn(['ps', '-aq', '--filter', 'label=silo.role=dbhub', '--filter', 'label=silo.workspace=arc'], self.docker.argvs('ps'))
 
     # -- project notes ---------------------------------------------------------------------
+
+    # -- the guide: every state is invented ----------------------------------------------------
+
+    def guide_state(self, findings=None, plans=None, runs=None, sites=None, pushes=None):
+        """Write the workbench's state the way it's stored, and what `standard status` reports."""
+        standard = self.base / 'arc/.silo-migrate/named/standard'
+        state = json.loads((standard / 'state.json').read_text())
+        state['findings'] = {key: dict(value) for key, value in (findings or {}).items()}
+        state['plans'] = {plan['plan_id']: {'body': {'operation': 'standard_' + plan['kind']}} for plan in (plans or [])}
+        for run in runs or []:
+            state['plans'].setdefault(run['plan_id'], {'body': {'operation': 'standard_' + run['kind']}})
+        (standard / 'state.json').write_text(json.dumps(state))
+        folder = standard / 'converter-pushes'
+        folder.mkdir(exist_ok=True)
+        for push in pushes or []:
+            (folder / (push['digest'] + '.json')).write_text(json.dumps(dict(push, proposal={'branch': push.get('branch', 'migration/arc/x')})))
+        self.control.status = {'version': 1, 'instances': sites or [],
+                               'plans': [{'plan_id': plan['plan_id'], 'status': plan['status'], 'run_id': plan.get('run_id'), 'created_at': plan.get('created_at', '2026-01-01T00:00:00Z')}
+                                         for plan in plans or []],
+                               'runs': [{'run_id': run['run_id'], 'plan_id': run['plan_id'], 'status': run['status'], 'stage': run.get('stage'),
+                                         'started_at': run.get('started_at', '2026-01-02T00:00:00Z'), 'finished_at': None, 'failure': run.get('failure'),
+                                         'results': {'reconciliation_checks': run.get('checks', 0), 'reconciliation_matched': run.get('matched', 0),
+                                                     'reconciliation_differs': run.get('differ', 0), 'reconciliation_errors': run.get('errors', 0)}}
+                                        for run in runs or []]}
+
+    def drop(self, name, text):
+        (self.intake / name).write_text(text)
+
+    def guide_ready(self):
+        """A workspace with files taken and the source database loaded."""
+        self.create()
+        self.drop('dump.sql', DUMP)
+        self.op('take', path='dump.sql', type='mysql-dump')
+        (self.base / 'arc/.silo-migrate/data/db').mkdir(exist_ok=True)
+        (self.base / 'arc/.silo-migrate/data/db/state.json').write_text(json.dumps({'engine': 'mariadb', 'loads': [{'at': 'x'}]}))
+
+    def assertNext(self, who, text, guide=None):
+        step = (guide or self.op('guide'))['next']
+        self.assertEqual(who, step['who'], step)
+        self.assertIn(text, step['action'])
+
+    def stages(self, guide):
+        return [stage['id'] for stage in guide['stages'] if stage['state'] == 'done']
+
+    def test_guide_for_a_new_project_with_no_files_asks_the_engineer_to_copy_them(self):
+        guide = self.op('guide')
+        self.assertEqual('arc', guide['project'])
+        self.assertEqual('files', guide['stage'])
+        self.assertNext('engineer', 'silo intake arc', guide)
+        self.assertIn(str(self.base.parent / 'intake/arc'), guide['next']['action'])
+        self.assertEqual([], self.control.calls)  # nothing exists yet, so nothing is asked of the workbench
+
+    def test_guide_for_a_new_project_with_files_tells_the_agent_to_create_the_workspace(self):
+        self.drop('dump.sql', DUMP)
+        guide = self.op('guide')
+        self.assertEqual('workspace', guide['stage'])
+        self.assertNext('agent', 'data_create', guide)
+
+    def test_guide_walks_the_whole_flow(self):
+        self.create()
+        self.drop('dump.sql', DUMP)
+        self.assertNext('agent', 'data_take')
+        self.op('take', path='dump.sql', type='mysql-dump')
+        self.assertNext('agent', 'data_db_load')
+        (self.base / 'arc/.silo-migrate/data/db').mkdir(exist_ok=True)
+        (self.base / 'arc/.silo-migrate/data/db/state.json').write_text(json.dumps({'engine': 'mariadb', 'loads': [{'at': 'x'}]}))
+        self.assertNext('agent', 'data_propose_finding')
+        finding = 'finding-' + '1' * 32
+        self.guide_state(findings={finding: {'status': 'proposed', 'proposed_at': '2026-01-01T00:00:00Z'}})
+        self.assertNext('engineer', 'Review finding ' + finding)
+        released = {finding: {'status': 'released', 'release': {'released_at': '2026-01-02T00:00:00Z'}}}
+        self.guide_state(findings=released)
+        self.assertNext('engineer', 'converter-developer chat')
+        self.guide_state(findings=released, pushes=[{'digest': 'a' * 64, 'status': 'proposed', 'proposed_at': '2026-01-03T00:00:00Z'}])
+        self.assertNext('engineer', 'converter push')
+        pushes = [{'digest': 'a' * 64, 'status': 'pushed', 'proposed_at': '2026-01-03T00:00:00Z', 'pushed_at': '2026-01-03T01:00:00Z'}]
+        self.guide_state(findings=released, pushes=pushes)
+        self.assertNext('agent', 'propose a convert run')
+        convert = {'run_id': 'run-' + '1' * 32, 'plan_id': 'plan-' + '1' * 32, 'kind': 'convert', 'status': 'completed', 'checks': 6, 'matched': 6, 'started_at': '2026-01-04T00:00:00Z'}
+        self.guide_state(findings=released, pushes=pushes, runs=[convert])
+        guide = self.op('guide')
+        self.assertNext('agent', 'from_run=' + convert['run_id'], guide)
+        self.assertEqual('review', guide['stage'])
+        self.assertEqual(['files', 'workspace', 'source_db', 'finding', 'converter', 'convert'], self.stages(guide))
+        review = {'run_id': 'run-' + '2' * 32, 'plan_id': 'plan-' + '2' * 32, 'kind': 'review', 'status': 'completed', 'checks': 6, 'matched': 6, 'started_at': '2026-01-05T00:00:00Z'}
+        site = {'run_id': review['run_id'], 'role': 'review', 'state': 'ready', 'live': True, 'port': 18080}
+        self.guide_state(findings=released, pushes=pushes, runs=[convert, review], sites=[site])
+        guide = self.op('guide')
+        self.assertNext('engineer', 'SSH tunnel', guide)
+        self.assertEqual('site', guide['stage'])
+        self.assertEqual('not_recorded', guide['stages'][-1]['state'])
+        self.assertTrue(any('holds customer data' in line for line in guide['also']))
+        self.guide_state(findings=released, pushes=pushes, runs=[convert, review])
+        self.assertNext('nobody', 'next pass')
+
+    def test_guide_puts_a_running_run_first_then_what_waits_on_the_engineer(self):
+        self.guide_ready()
+        plan = {'plan_id': 'plan-' + '3' * 32, 'kind': 'convert', 'status': 'proposed', 'created_at': '2026-01-03T00:00:00Z'}
+        running = {'run_id': 'run-' + '4' * 32, 'plan_id': 'plan-' + '4' * 32, 'kind': 'convert', 'status': 'running', 'stage': 'convert'}
+        self.guide_state(plans=[plan], runs=[running])
+        guide = self.op('guide')
+        self.assertNext('nobody', 'Nothing is needed', guide)
+        self.assertEqual(1, len(guide['waiting_on_engineer']))
+        self.guide_state(plans=[plan])
+        self.assertNext('engineer', 'Approve or discard convert plan')
+        self.guide_state(plans=[dict(plan, status='approved')])
+        self.assertNext('engineer', 'Start approved convert plan')
+
+    def test_guide_does_not_let_a_leftover_plan_hide_the_next_step(self):
+        self.guide_ready()
+        convert = {'run_id': 'run-' + '9' * 32, 'plan_id': 'plan-' + '9' * 32, 'kind': 'convert', 'status': 'completed', 'checks': 6, 'matched': 6, 'started_at': '2026-01-04T00:00:00Z'}
+        leftover = {'plan_id': 'plan-' + 'a' * 32, 'kind': 'convert', 'status': 'proposed', 'created_at': '2026-01-03T00:00:00Z'}
+        self.guide_state(plans=[leftover], runs=[convert])
+        guide = self.op('guide')
+        self.assertEqual([], guide['waiting_on_engineer'])
+        self.assertNext('agent', 'from_run=' + convert['run_id'], guide)
+        self.assertTrue(any('never run' in line and leftover['plan_id'] in line for line in guide['also']))
+        # A plan proposed after the last run is the real next step.
+        self.guide_state(plans=[dict(leftover, created_at='2026-01-05T00:00:00Z')], runs=[convert])
+        self.assertNext('engineer', 'Approve or discard convert plan')
+
+    def test_guide_explains_runs_that_did_not_pass(self):
+        self.guide_ready()
+        base = {'run_id': 'run-' + '5' * 32, 'plan_id': 'plan-' + '5' * 32, 'kind': 'convert', 'stage': 'import'}
+        for run, who, text in ((dict(base, status='failed', failure={'code': 'STANDARD_IMPORT_FAILED'}), 'agent', 'STANDARD_IMPORT_FAILED'),
+                               (dict(base, status='abandoned'), 'engineer', 'Recover it'),
+                               (dict(base, status='not_started'), 'engineer', 'Recover it'),
+                               (dict(base, status='completed', checks=6, matched=5, differ=1), 'agent', '5 of 6'),
+                               (dict(base, status='completed', checks=0), 'agent', 'no count checks')):
+            with self.subTest(status=run['status'], checks=run.get('checks')):
+                self.guide_state(runs=[run])
+                guide = self.op('guide')
+                self.assertNext(who, text, guide)
+                self.assertNotIn('convert', self.stages(guide))
+
+    def test_guide_asks_for_a_new_convert_run_after_a_newer_push_and_a_new_review_after_a_newer_convert(self):
+        self.guide_ready()
+        convert = {'run_id': 'run-' + '6' * 32, 'plan_id': 'plan-' + '6' * 32, 'kind': 'convert', 'status': 'completed', 'checks': 6, 'matched': 6, 'started_at': '2026-01-04T00:00:00Z'}
+        review = {'run_id': 'run-' + '7' * 32, 'plan_id': 'plan-' + '7' * 32, 'kind': 'review', 'status': 'completed', 'checks': 6, 'matched': 6, 'started_at': '2026-01-03T00:00:00Z'}
+        self.guide_state(runs=[review, convert])
+        guide = self.op('guide')
+        self.assertNext('agent', 'from_run=' + convert['run_id'], guide)
+        self.assertNotIn('review', self.stages(guide))
+        pushes = [{'digest': 'b' * 64, 'status': 'pushed', 'proposed_at': '2026-01-05T00:00:00Z', 'pushed_at': '2026-01-05T01:00:00Z'}]
+        self.guide_state(runs=[convert], pushes=pushes)
+        self.assertNext('agent', 'propose a convert run')
+
+    def test_guide_lets_a_convert_run_settle_a_finding_that_needed_no_change(self):
+        self.guide_ready()
+        finding = 'finding-' + '2' * 32
+        released = {finding: {'status': 'released', 'release': {'released_at': '2026-01-03T00:00:00Z'}}}
+        pushes = [{'digest': 'a' * 64, 'status': 'pushed', 'proposed_at': '2026-01-01T00:00:00Z', 'pushed_at': '2026-01-02T00:00:00Z'}]
+        self.guide_state(findings=released, pushes=pushes)
+        self.assertNext('engineer', 'converter-developer chat')
+        convert = {'run_id': 'run-' + 'c' * 32, 'plan_id': 'plan-' + 'c' * 32, 'kind': 'convert', 'status': 'completed', 'checks': 6, 'matched': 6, 'started_at': '2026-01-04T00:00:00Z'}
+        self.guide_state(findings=released, pushes=pushes, runs=[convert])
+        self.assertNext('agent', 'from_run=' + convert['run_id'])
+
+    def test_guide_notices_a_finding_released_after_the_last_run_with_no_pushes(self):
+        self.guide_ready()
+        finding = 'finding-' + '3' * 32
+        convert = {'run_id': 'run-' + 'd' * 32, 'plan_id': 'plan-' + 'd' * 32, 'kind': 'convert', 'status': 'completed', 'checks': 6, 'matched': 6, 'started_at': '2026-01-04T00:00:00Z'}
+        self.guide_state(findings={finding: {'status': 'released', 'release': {'released_at': '2026-01-05T00:00:00Z'}}}, runs=[convert])
+        self.assertNext('engineer', finding)
+
+    def test_guide_survives_a_run_with_no_start_time(self):
+        self.guide_ready()
+        self.guide_state(runs=[{'run_id': 'run-' + 'e' * 32, 'plan_id': 'plan-' + 'e' * 32, 'kind': 'convert', 'status': 'completed', 'checks': 6, 'matched': 6, 'started_at': None}])
+        self.assertNext('agent', 'from_run=')
+
+    def test_guide_keeps_only_the_code_when_the_workbench_refuses(self):
+        self.guide_ready()
+        self.guide_state()
+        self.control.status_refusal = self.d.Refusal('STANDARD_OPERATION_FAILED: some detail')
+        action = self.op('guide')['next']['action']
+        self.assertIn('STANDARD_OPERATION_FAILED', action)
+        self.assertNotIn('some detail', action)
+
+    def test_drop_folder_and_contact_come_from_the_install_prefix_not_the_workspaces_folder(self):
+        top = Path(self.temp.name) / 'layout'
+        release = top / 'srv/releases' / ('a' * 40)
+        release.mkdir(parents=True)
+        (top / 'srv/etc').mkdir()
+        (top / 'srv/etc/support-contact').write_text('Ruben\n')
+        workspaces = top / 'elsewhere/workspaces'
+        workspaces.mkdir(parents=True)
+        ws = self.d.Workspace(workspaces, 'arc', release, self.host, self.values, self.control)
+        self.assertEqual(top / 'srv/intake/arc', ws.intake)
+        self.assertEqual('Ruben', self.d.support_contact(ws))
+
+    def test_guide_treats_an_older_push_proposal_as_superseded(self):
+        self.guide_ready()
+        self.guide_state(pushes=[{'digest': 'a' * 64, 'status': 'proposed', 'proposed_at': '2026-01-01T00:00:00Z'},
+                                 {'digest': 'b' * 64, 'status': 'proposed', 'proposed_at': '2026-01-02T00:00:00Z'}])
+        waiting = self.op('guide')['waiting_on_engineer']
+        self.assertEqual(['Review converter push ' + 'b' * 64 + ' and push it.'], [item['what'] for item in waiting])
+
+    def test_guide_flags_a_stale_plan_and_files_left_in_the_drop_folder(self):
+        self.guide_ready()
+        self.drop('more.sql', DUMP)
+        self.guide_state(plans=[{'plan_id': 'plan-' + '8' * 32, 'kind': 'convert', 'status': 'stale'}])
+        also = self.op('guide')['also']
+        self.assertTrue(any('out of date' in line for line in also))
+        self.assertTrue(any('drop folder' in line for line in also))
+
+    def test_guide_says_when_it_could_not_read_the_workbench(self):
+        self.guide_ready()
+        self.guide_state()
+        self.control.status_refusal = self.d.Refusal('STANDARD_OPERATION_FAILED')
+        guide = self.op('guide')
+        self.assertNext('agent', "couldn't be read", guide)
+        self.assertIn('STANDARD_OPERATION_FAILED', guide['next']['action'])
+
+    def test_guide_holds_no_file_names_or_customer_values(self):
+        self.create()
+        self.drop('customer-name-export.sql', DUMP)
+        self.op('take', path='customer-name-export.sql', type='mysql-dump')
+        printed = json.dumps(self.op('guide'))
+        self.assertNotIn('customer-name', printed)
+        self.assertNotIn(MARKER, printed)
+
+    def test_guide_always_says_what_it_does_not_track_and_who_to_ask(self):
+        guide = self.op('guide')
+        self.assertIn('not tracked yet', guide['data_purpose'])
+        self.assertIn('not recorded yet', guide['site_acceptance'])
+        self.assertEqual('your node admin', guide['support_contact'])
+        contact = self.base.parent / 'etc/support-contact'
+        contact.parent.mkdir(exist_ok=True)
+        contact.write_text('Ruben\n')
+        self.assertEqual('Ruben', self.op('guide')['support_contact'])
+        contact.write_text('two\nlines\n')
+        self.assertEqual('your node admin', self.op('guide')['support_contact'])
+        contact.unlink()
+        contact.symlink_to(self.base / 'elsewhere')
+        self.assertEqual('your node admin', self.op('guide')['support_contact'])
+
+    # -- decisions ---------------------------------------------------------------------------
+
+    def test_decisions_are_append_only_newest_first_and_survive_a_bad_line(self):
+        self.assertEqual({'decisions': [], 'total': 0}, {k: v for k, v in self.op('decisions').items() if k != 'version'})
+        self.refused('STANDARD_NOT_INITIALIZED', 'decide', topic='a', decision='b')
+        self.create()
+        self.refused('STANDARD_ARGUMENTS_INVALID: topic', 'decide', topic=' ', decision='b')
+        self.refused('STANDARD_ARGUMENTS_INVALID: topic', 'decide', topic='a\nb', decision='b')
+        self.refused('STANDARD_ARGUMENTS_INVALID: topic', 'decide', topic='a' * 121, decision='b')
+        self.refused('STANDARD_ARGUMENTS_INVALID: decision', 'decide', topic='a', decision='')
+        self.refused('STANDARD_ARGUMENTS_INVALID: decision', 'decide', topic='a', decision='b' * 2001)
+        first = self.op('decide', topic='Empty posts', decision='Keep posts with attachments')
+        self.assertRegex(first['id'], r'decision-[0-9a-f]{16}\Z')
+        self.op('decide', topic='Empty posts', decision='Drop them all')
+        path = self.base / 'arc/.silo-migrate/data/decisions.jsonl'
+        self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+        with open(path, 'a') as out:
+            out.write('not json\n')
+        result = self.op('decisions')
+        self.assertEqual(['Drop them all', 'Keep posts with attachments'], [entry['decision'] for entry in result['decisions']])
+        self.assertEqual(2, result['total'])
+        self.assertEqual(2, self.op('guide')['decisions_recorded'])
+        audit = (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text()
+        self.assertNotIn('Drop them all', audit)
+        self.assertIn('decision_sha256', audit)
+        self.assertIn('topic_sha256', audit)
+        self.assertNotIn('Empty posts', audit)
+        self.assertNotIn('"op": "decisions"', audit)
+        path.unlink()
+        path.symlink_to(self.base / 'elsewhere.jsonl')
+        self.refused('STANDARD_PATH_INVALID', 'decisions')
+
+    def test_refusals_name_the_bad_field(self):
+        self.create()
+        self.refused('STANDARD_ARGUMENTS_INVALID: timeout_minutes', 'script', language='ruby', code='puts 1', into='x', timeout_minutes='soon')
+        self.refused('STANDARD_ARGUMENTS_INVALID: area', 'list', area='nope')
 
     def test_notes_are_the_projects_memory_with_previous_versions_kept(self):
         self.assertIn("doesn't exist yet", self.op('notes')['note'])

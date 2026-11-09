@@ -12,20 +12,27 @@ max_turns: 60
 # ~/.config/term-llm/skills). term-llm 0.9.93 can't give an agent a subset: a bare name list
 # turns model activation off, and ",+" lists these first but shows every installed skill.
 # Every shipped skill is this agent's, so ",+" is exactly this set; the other agents have none.
-skills: "intake-basics,sql-dump,export-to-sql,uploads-sorting,source-profile,count-reconciliation,path-converter,mybb,+"
+skills: "migration-guide,intake-basics,sql-dump,export-to-sql,uploads-sorting,source-profile,count-reconciliation,path-converter,mybb,+"
 tools:
   enabled: [update_plan]
   custom:
+    - name: data_guide
+      description: "Where this project stands and what happens next, computed from its state: stages, what's running, what's waiting on the engineer, the single next action and who takes it, recent plans and runs, who to ask for help. Call it at the start of every chat and whenever someone asks what's next."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties: {}
+        additionalProperties: false
     - name: data_status
       description: "Overview of a workspace: drop folder contents, registered inputs (IDs, paths, types, sizes, SHA-256), work folders, recent jobs, the source database. Start here."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70
-      input: &workspace_only
+      input: &no_arguments
         type: object
-        properties:
-          workspace: {type: string, description: "Project/workspace name, e.g. arc. Also the drop folder <prefix>/intake/<workspace>."}
-        required: [workspace]
+        properties: {}
         additionalProperties: false
     - name: data_list
       description: "List a folder: area intake (the drop folder), inputs (registered, read-only), work (sandbox outputs) or converter (the workspace's converter checkout, read-only). Files show size and a sniffed kind (and the inner kind of compressed files). Symlinks are never followed."
@@ -35,10 +42,9 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           area: {type: string, enum: [intake, inputs, work, converter]}
           path: {type: string, description: "Folder inside the area; omit for its top"}
-        required: [workspace, area]
+        required: [area]
         additionalProperties: false
     - name: data_peek
       description: "Read part of one file. mode head (from offset, decompressing gzip/bzip2/xz unless decompress is false), tail (raw end bytes), search (stream the whole file for a fixed string, or a regex with regex true; returns line numbers and short context; stops after max_matches or ~40 s) or archive (list zip/tar entries). At most 32 KiB per call."
@@ -48,7 +54,6 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           area: {type: string, enum: [intake, inputs, work, converter]}
           path: {type: string}
           mode: {type: string, enum: [head, tail, search, archive]}
@@ -59,7 +64,7 @@ tools:
           ignore_case: {type: boolean}
           max_matches: {type: integer, description: "search: 1-100, default 40"}
           decompress: {type: boolean}
-        required: [workspace, area, path, mode]
+        required: [area, path, mode]
         additionalProperties: false
     - name: data_create
       description: "Create the workspace once: named workspace, a source with its platform label (e.g. mybb, phpbb, discourse), the initial dataset, a clone of discourse-converters from GitHub (engineer's token) and the standard workflow binding. Steps already done are skipped."
@@ -69,10 +74,9 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           platform: {type: string, description: "Source platform label, lowercase, e.g. mybb"}
           converter_branch: {type: string, description: "discourse-converters branch to clone (default main)"}
-        required: [workspace, platform]
+        required: [platform]
         additionalProperties: false
     - name: data_take
       description: "Move one file from the drop folder into inputs/ (renamed to a safe name), make it read-only, checksum it and register it in the dataset with a type label (e.g. mysql-dump, postgres-dump, discourse-backup, archive, xml, json, csv, uploads). The bytes are never changed. Records provenance."
@@ -82,11 +86,10 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           path: {type: string, description: "Path inside the drop folder"}
           type: {type: string, description: "Lowercase label: letters, digits, - and _"}
           name: {type: string, description: "Optional file name in inputs/ (letters, digits, . _ -)"}
-        required: [workspace, path, type]
+        required: [path, type]
         additionalProperties: false
     - name: data_register
       description: "Register a finished output: move one file from work/<folder>/ into inputs/derived/, read-only, checksummed, with provenance (the job and script hash that produced it and the inputs it saw)."
@@ -96,11 +99,10 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           path: {type: string, description: "Path inside work/, starting with the folder name"}
           type: {type: string}
           name: {type: string}
-        required: [workspace, path, type]
+        required: [path, type]
         additionalProperties: false
     - name: data_script
       description: "Run your own Ruby (default) or Python script in the sandbox: no network, read-only root, registered inputs read-only at /in, one new writable folder work/<into> at /out, silo-migrate at /silo (read-only), 2 CPUs, 4 GB memory, a time limit. Starts a job and returns at once; poll data_job. Use it for XML/JSON/CSV to SQL, splitting, sorting uploads and checks."
@@ -110,12 +112,11 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           language: {type: string, enum: [ruby, python]}
           code: {type: string, description: "The whole script (max 256 KiB)"}
           into: {type: string, description: "New work folder name: lowercase letters, digits, - and _"}
           timeout_minutes: {type: integer, description: "1-360, default 30"}
-        required: [workspace, code, into]
+        required: [code, into]
         additionalProperties: false
     - name: data_extract
       description: "Extract an archive (zip, tar, tar.gz/bz2/xz, or one gzip/bzip2/xz file) from inputs/ into a new work folder, in the sandbox. Links, devices and unsafe names are skipped and counted. Starts a job; poll data_job."
@@ -125,11 +126,10 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           path: {type: string, description: "inputs/... path of the archive"}
           into: {type: string}
           timeout_minutes: {type: integer}
-        required: [workspace, path, into]
+        required: [path, into]
         additionalProperties: false
     - name: data_job
       description: "Status of a job (script, extract or db_load): running, succeeded, failed, timed_out; exit code, log tail and the files it wrote."
@@ -139,9 +139,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           job_id: {type: string}
-        required: [workspace, job_id]
+        required: [job_id]
         additionalProperties: false
     - name: data_db_up
       description: "Start (or restart) the project's source database: mariadb for MySQL/MariaDB dumps, postgres for PostgreSQL dumps and Discourse backups (PostgreSQL 18 with Discourse's extensions). Internal network with no outside access, data in a project volume, a read-only user. Also registers the project's DBHub MCP server (db-<project>) for free read-only SQL; the engineer turns it on in the chat."
@@ -151,9 +150,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           engine: {type: string, enum: [mariadb, postgres]}
-        required: [workspace, engine]
+        required: [engine]
         additionalProperties: false
     - name: data_db_load
       description: "Load a registered SQL dump (plain, gzip, bzip2 or xz; PostgreSQL custom-format dumps via pg_restore) into the source database. Starts a job; poll data_job, then data_db_status for schemas and table counts."
@@ -163,19 +161,18 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           path: {type: string, description: "inputs/... path"}
           charset: {type: string, enum: [utf8mb4, utf8mb3, utf8, latin1, binary], description: "MariaDB client character set (default utf8mb4; a dump's own SET NAMES still applies)"}
           stop_on_error: {type: boolean, description: "default true"}
           timeout_minutes: {type: integer, description: "default 120"}
-        required: [workspace, path]
+        required: [path]
         additionalProperties: false
     - name: data_db_status
       description: "Source database status: engine, running/ready, loads, per schema the number of tables and approximate size, and the project's DBHub MCP server (db-<project>) for free read-only SQL."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 100
-      input: *workspace_only
+      input: *no_arguments
     - name: data_db_reset
       description: "Remove the source database (container, volume, network) to start over. Registered inputs are untouched. Needs confirm true."
       script: scripts/data_tool.py
@@ -184,9 +181,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           confirm: {type: boolean}
-        required: [workspace, confirm]
+        required: [confirm]
         additionalProperties: false
     - name: data_run_evidence
       description: "Read one workflow run's private evidence: stages, assertions, results and failure record first, then every log with its size and stage, then bounded tails (failed stage first). run_id may also be the plan ID the Runs widget shows; the answer names the run."
@@ -196,9 +192,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           run_id: {type: string}
-        required: [workspace, run_id]
+        required: [run_id]
         additionalProperties: false
     - name: data_run_count
       description: "One count for investigating a run, as reconciliation does it: side intermediate runs a single SELECT/WITH count on the run's intermediate database (a convert run's own, or the one a review run imported); side destination runs it on a review run's live site (Discourse PostgreSQL, read-only role). Same SQL rules as reconciliation checks; 230 s limit. Returns {count, error}. Private like reconciliation results: findings may state aggregate counts, never customer values (and keep values out of the SQL where you can). STANDARD_BUSY (destination side): a run is in progress; try again after it."
@@ -208,11 +203,10 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           run_id: {type: string, description: "Run ID, or the plan ID that started it"}
           side: {type: string, enum: [intermediate, destination]}
           sql: {type: string, description: "SELECT COUNT(*) ... (one statement, no comments, no backslashes)"}
-        required: [workspace, run_id, side, sql]
+        required: [run_id, side, sql]
         additionalProperties: false
     - name: data_plan_propose
       description: "Propose a local review import with from_run (completed convert run ID; no source/settings/charset), or a convert-only workflow run on real data (no import): the registered source dump, the converter settings (type converter-settings, with ${SILO_DB_*} placeholders) and optionally reconciliation checks (type reconciliation), by input ID. Convert proposals prepare the converter's locked gems first if needed; review proposals skip refresh/dependencies. Returns the plan ID and digest; the engineer approves and starts it."
@@ -222,13 +216,11 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           from_run: {type: string, pattern: "^run-[0-9a-f]{32}$", description: "Completed convert run ID for review; mutually exclusive with source, settings and charset"}
           source: {type: string, description: "Input ID of the registered SQL dump (plain, gzip, bzip2 or xz)"}
           settings: {type: string, description: "Input ID of the converter settings (type converter-settings)"}
           reconciliation: {type: string, description: "Input ID of the reconciliation checks (type reconciliation); optional"}
           charset: {type: string, enum: [utf8mb4, utf8mb3, utf8, latin1, binary], description: "Client character set for loading the dump; default utf8mb4"}
-        required: [workspace]
         additionalProperties: false
     - name: data_propose_finding
       description: "Propose a finding privately for the engineer. Without run_id: a schema finding (tables, columns, counts, invented example rows) for converter work. With run_id: the cause of a failed run. Never include real customer values. The engineer decides what is released to coding agents."
@@ -238,17 +230,37 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           text: {type: string}
           run_id: {type: string}
-        required: [workspace, text]
+        required: [text]
         additionalProperties: false
     - name: data_notes
       description: "Read this project's notes: what earlier chats learned and decided (export shape, quirks, decisions, open questions, what's done). Read them at the start of every chat."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70
-      input: *workspace_only
+      input: *no_arguments
+    - name: data_decide
+      description: "Record a decision the engineer made, so that it survives any chat: what to do with empty posts, which content to exclude, a customer's preference. Append-only; to change one, record a new decision on the same topic."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties:
+          topic: {type: string, description: "Short subject, at most 120 characters"}
+          decision: {type: string, description: "What was decided and why, at most 2000 characters"}
+        required: [topic, decision]
+        additionalProperties: false
+    - name: data_decisions
+      description: "This project's recorded decisions, newest first. For a topic with several entries, the newest one stands."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties: {}
+        additionalProperties: false
     - name: data_notes_write
       description: "Replace this project's notes with an updated version (Markdown, under ~32 KiB). The previous version is kept. Update them at the end of meaningful work."
       script: scripts/data_tool.py
@@ -257,7 +269,6 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           text: {type: string, description: "The whole notes document, not a diff"}
-        required: [workspace, text]
+        required: [text]
         additionalProperties: false

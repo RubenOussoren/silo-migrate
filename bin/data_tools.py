@@ -234,17 +234,23 @@ def text_of(data):
 class Workspace:
     def __init__(self, base, name, repo, host, values, control):
         if not isinstance(name, str) or not WORKSPACE.fullmatch(name):
-            refuse("STANDARD_ARGUMENTS_INVALID")
+            refuse("STANDARD_ARGUMENTS_INVALID: workspace")
         self.name = name
         self.base = Path(base)
         self.root = self.base / name
-        self.intake = self.base.parent / "intake" / name
+        # The install prefix, where `silo` keeps the drop folders and settings: workspaces may live elsewhere.
+        self.prefix = self.repo_prefix(Path(repo), self.base)
+        self.intake = self.prefix / "intake" / name
         self.repo = Path(repo)
         self.host = host
         self.values = values
         self.control = control
         self.data = self.root / ".silo-migrate" / "data"
         self.chat = False
+
+    @staticmethod
+    def repo_prefix(repo, base):
+        return repo.parent.parent if repo.parent.name == "releases" else base.parent
 
     # state -------------------------------------------------------------------
     def initialized(self):
@@ -299,7 +305,7 @@ class Workspace:
         if area == "intake":
             return self.intake
         if area not in ("inputs", "work", "converter"):
-            refuse("STANDARD_ARGUMENTS_INVALID")
+            refuse("STANDARD_ARGUMENTS_INVALID: area")
         self.require(standard=False)
         return self.root / area
 
@@ -411,7 +417,7 @@ def op_status(ws, request):
 def op_list(ws, request):
     area = request.get("area", "intake")
     if area not in AREAS:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: area")
     parts = parts_of(request.get("path"), allow_empty=True)
     if area == "converter" and ".git" in parts:
         refuse("STANDARD_PATH_INVALID")
@@ -452,12 +458,12 @@ def op_list(ws, request):
 def op_peek(ws, request):
     area = request.get("area", "intake")
     if area not in AREAS:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: area")
     parts = parts_of(request.get("path"))
     mode = request.get("mode", "head")
     limit = request.get("bytes", 8192)
     if not isinstance(limit, int) or not 1 <= limit <= MAX_PEEK:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: bytes")
     decompress = request.get("decompress", True) is not False
     if area == "converter" and ".git" in parts:
         refuse("STANDARD_PATH_INVALID")
@@ -471,7 +477,7 @@ def op_peek(ws, request):
         if mode == "head":
             offset = request.get("offset", 0)
             if not isinstance(offset, int) or offset < 0:
-                refuse("STANDARD_ARGUMENTS_INVALID")
+                refuse("STANDARD_ARGUMENTS_INVALID: offset")
             stream, compressed = reader(fd, decompress)
             deadline = time.monotonic() + SCAN_SECONDS
             try:
@@ -498,7 +504,7 @@ def op_peek(ws, request):
         elif mode == "archive":
             result.update(archive_listing(fd))
         else:
-            refuse("STANDARD_ARGUMENTS_INVALID")
+            refuse("STANDARD_ARGUMENTS_INVALID: mode")
     finally:
         os.close(fd)
     return result
@@ -507,15 +513,15 @@ def op_peek(ws, request):
 def search(fd, request, decompress):
     pattern = request.get("pattern")
     if not isinstance(pattern, str) or not 1 <= len(pattern) <= 200:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: pattern")
     flags = re.IGNORECASE if request.get("ignore_case") else 0
     try:
         matcher = re.compile(pattern.encode("utf-8") if request.get("regex") else re.escape(pattern.encode("utf-8")), flags)
     except re.error:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: pattern")
     wanted = request.get("max_matches", 40)
     if not isinstance(wanted, int) or not 1 <= wanted <= MAX_MATCHES:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: max_matches")
     stream, compressed = reader(fd, decompress)
     matches, scanned, number, complete = [], 0, 1, True
     deadline = time.monotonic() + SCAN_SECONDS
@@ -590,13 +596,13 @@ def archive_listing(fd):
 def op_create(ws, request):
     platform = request.get("platform")
     if not isinstance(platform, str) or not PLATFORM.fullmatch(platform):
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: platform")
     repo = request.get("converter_repo") or CONVERTER_REPO
     branch = request.get("converter_branch") or "main"
     if not isinstance(repo, str) or not re.fullmatch(r"https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+?(\.git)?", repo):
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: converter_repo")
     if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}", branch) or ".." in branch:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: converter_branch")
     done = []
     with Locked(ws.base / ".silo-data-create.lock"):
         if not ws.initialized():
@@ -638,7 +644,7 @@ def create_steps(ws, platform, repo, branch, done):
 def dest_name(raw, fallback):
     name = raw if raw is not None else re.sub(r"[^A-Za-z0-9._-]+", "_", fallback).strip("._") or "input"
     if not isinstance(name, str) or not SAFE_NAME.fullmatch(name) or name.startswith("."):
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: name")
     return name
 
 
@@ -763,7 +769,7 @@ def op_take(ws, request):
     parts = parts_of(request.get("path"))
     kind = request.get("type")
     if not isinstance(kind, str) or not TYPE.fullmatch(kind):
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: type")
     name = dest_name(request.get("name"), parts[-1])
     with ws.lock():
         meta = ws.meta()
@@ -787,7 +793,7 @@ def op_register(ws, request):
     parts = parts_of(request.get("path"))
     kind = request.get("type")
     if not isinstance(kind, str) or not TYPE.fullmatch(kind) or len(parts) < 2 or not WORK_NAME.fullmatch(parts[0]):
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: type or path")
     name = dest_name(request.get("name"), parts[0] + "-" + parts[-1])
     with ws.lock():
         meta = ws.meta()
@@ -830,13 +836,13 @@ def input_digests(ws):
 def minutes(request):
     value = request.get("timeout_minutes", JOB_DEFAULT_MINUTES)
     if not isinstance(value, int) or not 1 <= value <= JOB_MAX_MINUTES:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: timeout_minutes")
     return value
 
 
 def work_dir(ws, into, fresh=True):
     if not isinstance(into, str) or not WORK_NAME.fullmatch(into):
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: into")
     work = ws.root / "work"
     if work.is_symlink():
         refuse("STANDARD_PATH_INVALID")
@@ -903,7 +909,7 @@ def op_script(ws, request):
     language = request.get("language", "ruby")
     code = request.get("code")
     if language not in ("ruby", "python") or not isinstance(code, str) or not code.strip() or len(code.encode("utf-8")) > MAX_SCRIPT:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: language or code")
     limit = minutes(request)
     with ws.lock():
         out = work_dir(ws, request.get("into"))
@@ -927,7 +933,7 @@ def op_extract(ws, request):
     ws.require()
     parts = parts_of(request.get("path"))
     if parts[0] != "inputs" or len(parts) < 2:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: path")
     limit = minutes(request)
     with ws.lock():
         digest = registered(ws, "/".join(parts))["sha256"]
@@ -1050,7 +1056,7 @@ def op_job(ws, request):
     ws.require(standard=False)
     job_id = request.get("job_id")
     if not isinstance(job_id, str) or not JOB.fullmatch(job_id):
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: job_id")
     path = ws.data / "jobs" / (job_id + ".json")
     job = ws.read_json(path, None)
     if not job:
@@ -1192,7 +1198,7 @@ def op_db_up(ws, request):
     ws.require()
     engine = request.get("engine")
     if engine not in ENGINES:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: engine")
     names = db_names(ws)
     with ws.lock():
         state = db_state(ws)
@@ -1264,12 +1270,12 @@ def op_db_load(ws, request):
     ws.require()
     parts = parts_of(request.get("path"))
     if parts[0] != "inputs" or len(parts) < 2:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: path")
     charset = request.get("charset", "utf8mb4")
     stop_on_error = request.get("stop_on_error", True) is not False
     limit = minutes({"timeout_minutes": request.get("timeout_minutes", 120)})
     if charset not in CHARSETS:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: charset")
     names = db_names(ws)
     with ws.lock():
         state = db_state(ws)
@@ -1543,7 +1549,7 @@ def run_of(ws, request):
         if not run_id:
             refuse("STANDARD_RUN_NOT_FOUND")
     if not isinstance(run_id, str) or not RUN.fullmatch(run_id):
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: run_id")
     return run_id
 
 
@@ -1558,7 +1564,7 @@ def op_run_count(ws, request):
     run_id = run_of(ws, request)
     side, sql = request.get("side"), request.get("sql")
     if side not in ("intermediate", "destination") or not isinstance(sql, str) or not 0 < len(sql.encode()) <= 4096:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: side or sql")
     # On stdin, never in argv: the SQL may quote customer values.
     counted = json.loads(ws.control(["standard", "analyst", "count", ws.name, run_id, "--side", side, "--sql-file", "-"], input=sql,
                                  timeout=max(10, 285 - int(time.monotonic() - started))))
@@ -1576,10 +1582,10 @@ def op_plan_propose(ws, request):
     if "from_run" in request:
         if (not isinstance(from_run, str) or not RUN.fullmatch(from_run)
                 or any(key in request for key in ("source", "settings", "charset"))):
-            refuse("STANDARD_ARGUMENTS_INVALID")
+            refuse("STANDARD_ARGUMENTS_INVALID: from_run")
         reconciliation = request.get("reconciliation")
         if reconciliation is not None and (not isinstance(reconciliation, str) or not INPUT_ID.fullmatch(reconciliation)):
-            refuse("STANDARD_ARGUMENTS_INVALID")
+            refuse("STANDARD_ARGUMENTS_INVALID: reconciliation")
         argv = ["standard", "plan", "propose", ws.name, "--operation", "review", "--from-run", from_run]
         if reconciliation is not None:
             argv += ["--reconciliation", reconciliation]
@@ -1594,7 +1600,7 @@ def op_plan_propose(ws, request):
     if roles["reconciliation"] is None:
         del roles["reconciliation"]
     if not all(isinstance(value, str) and INPUT_ID.fullmatch(value) for value in roles.values()) or charset not in CHARSETS:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: source, settings, reconciliation or charset")
     argv = ["standard", "plan", "propose", ws.name, "--operation", "convert", "--charset", charset,
             *[flag for key, value in roles.items() for flag in ("--" + key, value)]]
     prepared = None
@@ -1625,13 +1631,13 @@ def op_propose_finding(ws, request):
     text = request.get("text")
     run_id = request.get("run_id")
     if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > MAX_FINDING:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: text")
     if run_id is None:
         argv = ["standard", "finding", "propose", ws.name, "--kind", "schema", "--file", "-"]
     elif isinstance(run_id, str) and RUN.fullmatch(run_id):
         argv = ["standard", "finding", "propose", ws.name, "--run", run_id, "--file", "-"]
     else:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: run_id")
     result = json.loads(ws.control(argv, input=text))
     return {"finding_id": result.get("finding_id"), "status": result.get("status"), "kind": "schema" if run_id is None else "finding",
             "note": "private proposal; the engineer reviews and decides what is released to coding agents"}
@@ -1668,7 +1674,7 @@ def op_notes_write(ws, request):
     ws.require(standard=False)
     text = request.get("text")
     if not isinstance(text, str) or not text.strip() or "\x00" in text:
-        refuse("STANDARD_ARGUMENTS_INVALID")
+        refuse("STANDARD_ARGUMENTS_INVALID: text")
     if len(json.dumps(text, ensure_ascii=False).encode("utf-8")) > NOTES_JSON_BYTES:
         refuse("STANDARD_NOTES_TOO_LARGE: keep notes under about 32 KiB; summarise older parts")
     with ws.lock():
@@ -1690,13 +1696,287 @@ def op_notes_write(ws, request):
     return {"bytes": path.stat().st_size, "previous_versions": len(list(history.glob("*.md")))}
 
 
+# -- decisions: choices that must survive any chat ---------------------------------------------
+# Append-only. Unlike the notes, nothing rewrites an entry: a changed decision is a new entry on
+# the same topic. Kept apart from data_notes so that the notes still always fit a read whole.
+
+MAX_DECISION_TOPIC = 120
+MAX_DECISION = 2000
+DECISIONS_SHOWN = 200
+
+
+def decisions_path(ws):
+    return ws.data_dir() / "decisions.jsonl"
+
+
+def read_decisions(ws):
+    """Oldest first. A damaged line is skipped rather than hiding every other decision."""
+    try:
+        fd = os.open(decisions_path(ws), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        refuse("STANDARD_PATH_INVALID")
+    entries = []
+    with os.fdopen(fd, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
+
+
+def op_decide(ws, request):
+    ws.require(standard=False)
+    topic, decision = request.get("topic"), request.get("decision")
+    if not isinstance(topic, str) or not topic.strip() or len(topic) > MAX_DECISION_TOPIC or re.search(r"[\x00-\x1f]", topic):
+        refuse("STANDARD_ARGUMENTS_INVALID: topic")
+    if not isinstance(decision, str) or not decision.strip() or len(decision) > MAX_DECISION or "\x00" in decision:
+        refuse("STANDARD_ARGUMENTS_INVALID: decision")
+    entry = {"id": "decision-" + secrets.token_hex(8), "at": now(), "topic": topic.strip(), "decision": decision.strip()}
+    with ws.lock():
+        ws.append("decisions.jsonl", entry)
+    return {"id": entry["id"], "at": entry["at"]}
+
+
+def op_decisions(ws, request):
+    if not ws.initialized():
+        return {"decisions": [], "total": 0}
+    entries = read_decisions(ws)
+    return {"decisions": entries[-DECISIONS_SHOWN:][::-1], "total": len(entries)}
+
+
+# -- the guide: one computed answer to "where are we and what's next" --------------------------
+# Worked out from disk on every call and never remembered, so a new chat knows as much as an old
+# one. Only stages, IDs, statuses, codes and totals: no file names or customer values.
+
+GUIDE_STAGES = (("files", "Customer files received"), ("workspace", "Workspace created"), ("source_db", "Source database loaded"),
+                ("finding", "Finding released"), ("converter", "Converter pushed"), ("convert", "Convert run passed its checks"),
+                ("review", "Review import passed its checks"), ("site", "Site reviewed"))
+GUIDE_RECENT = 10
+GUIDE_ACTIVE = ("claimed", "running")
+GUIDE_PURPOSE = ("not tracked yet: this tool can't tell a development dump from a launch dump. "
+                 "Check which delivery a run uses from its input IDs and checksums before approving it")
+GUIDE_ACCEPTANCE = "not recorded yet: the engineer's review of a site isn't stored anywhere"
+DEFAULT_CONTACT = "your node admin"
+MAX_CONTACT = 200
+
+
+def support_contact(ws):
+    """The person to ask, set per server by the node admin (`silo set-contact`)."""
+    try:
+        fd = os.open(ws.prefix / "etc" / "support-contact", os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            text = handle.read(MAX_CONTACT * 4 + 1).decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return DEFAULT_CONTACT
+    text = text.strip()
+    return text if text and len(text) <= MAX_CONTACT and not re.search(r"[\x00-\x1f]", text) else DEFAULT_CONTACT
+
+
+def guide_records(ws):
+    """The workbench's own view of plans and runs (it knows staleness and dead processes), joined
+    with what that view leaves out: each plan's kind, findings and converter pushes."""
+    standard = ws.root / ".silo-migrate/named/standard"
+    empty = {"plans": [], "runs": [], "sites": [], "findings": [], "pushes": [], "warning": None}
+    state_file = standard / "state.json"
+    if standard.is_symlink() or state_file.is_symlink() or not state_file.is_file():
+        return empty
+    state = ws.read_json(state_file, {})
+    state = state if isinstance(state, dict) else {}
+    bodies = state.get("plans") if isinstance(state.get("plans"), dict) else {}
+    kinds = {key: str((plan.get("body") or {}).get("operation") or "").replace("standard_", "") or None
+             for key, plan in bodies.items() if isinstance(plan, dict)}
+    try:
+        status = json.loads(ws.control(["standard", "status", ws.name], timeout=45))
+    except (Refusal, ValueError, subprocess.SubprocessError) as error:
+        return dict(empty, findings=guide_findings(state), pushes=guide_pushes(standard),
+                    warning=str(error).split(":")[0] if isinstance(error, Refusal) else "STANDARD_OPERATION_FAILED")
+    plans = [{"plan_id": plan.get("plan_id"), "kind": kinds.get(plan.get("plan_id")), "status": plan.get("status"),
+              "run_id": plan.get("run_id"), "created_at": plan.get("created_at") or ""} for plan in status.get("plans", [])]
+    runs = []
+    for run in status.get("runs", []):
+        results = run.get("results") or {}
+        failure = run.get("failure")
+        runs.append({"run_id": run.get("run_id"), "plan_id": run.get("plan_id"), "kind": kinds.get(run.get("plan_id")), "status": run.get("status"),
+                     "stage": run.get("stage"), "started_at": run.get("started_at") or "", "finished_at": run.get("finished_at"),
+                     "checks": results.get("reconciliation_checks") or 0, "matched": results.get("reconciliation_matched") or 0,
+                     "differ": results.get("reconciliation_differs") or 0, "errors": results.get("reconciliation_errors") or 0,
+                     "import_issues": results.get("import_issues"), "failure": failure.get("code") if isinstance(failure, dict) else None})
+    sites = [{"run_id": site.get("run_id"), "state": site.get("state"), "live": site.get("live"), "port": site.get("port")}
+             for site in status.get("instances", []) if site.get("role") == "review" and site.get("state") != "removed"]
+    return {"plans": plans, "runs": runs, "sites": sites, "findings": guide_findings(state), "pushes": guide_pushes(standard), "warning": None}
+
+
+def guide_findings(state):
+    found = state.get("findings") if isinstance(state.get("findings"), dict) else {}
+    out = []
+    for key, record in found.items():
+        if isinstance(record, dict):
+            release = record.get("release") if isinstance(record.get("release"), dict) else {}
+            out.append({"id": key, "status": record.get("status"), "at": release.get("released_at") or record.get("proposed_at") or ""})
+    return sorted(out, key=lambda item: str(item["at"]))
+
+
+def guide_pushes(standard):
+    """Oldest first. Only the newest proposal for a branch can still be pushed."""
+    directory = standard / "converter-pushes"
+    if directory.is_symlink() or not directory.is_dir():
+        return []
+    records = []
+    for path in sorted(directory.glob("*.json")):
+        if path.is_symlink() or not DIGEST.fullmatch(path.stem):
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and isinstance(record.get("proposal"), dict):
+            records.append(record)
+    records.sort(key=lambda record: str(record.get("proposed_at") or ""))
+    newest = {record["proposal"].get("branch"): index for index, record in enumerate(records)}
+    return [{"id": record.get("digest"), "at": str(record.get("pushed_at") or record.get("proposed_at") or ""),
+             "status": "superseded" if record.get("status") == "proposed" and newest[record["proposal"].get("branch")] != index else record.get("status")}
+            for index, record in enumerate(records)]
+
+
+def guide_passed(run):
+    return bool(run) and run["status"] == "completed" and run["checks"] > 0 and run["matched"] == run["checks"]
+
+
+def guide_problem(run, kind):
+    """What to do about a run that finished without passing, or None if it passed or is still going."""
+    label = "The %s run %s" % (kind, run["run_id"])
+    if run["status"] in GUIDE_ACTIVE or guide_passed(run):
+        return None
+    if run["status"] in ("abandoned", "not_started"):
+        return ("engineer", label + " stopped without finishing. Recover it in the Runs widget, then a new plan can be proposed.", "Runs widget")
+    if run["status"] != "completed":
+        return ("agent", "%s failed at stage %s (%s). Read data_run_evidence and explain the cause." % (label, run["stage"], run["failure"] or "no code"), "this chat")
+    if not run["checks"]:
+        return ("agent", label + " has no count checks, so nothing proved it. Register checks and propose it again.", "this chat")
+    return ("agent", "%s finished with %d of %d checks matching (%d differ, %d errors). Read data_run_evidence and explain why; "
+            "a difference stops the process until it's explained." % (label, run["matched"], run["checks"], run["differ"], run["errors"]), "this chat")
+
+
+def guide_flow(ws, facts, records):
+    """The next step along the stages, once nothing is running or waiting on the engineer."""
+    copy_files = ("engineer", "Copy the customer's files to the drop folder (%s) with scp, then run `silo intake %s` as root." % (ws.intake, ws.name), "server terminal")
+    if not facts["initialized"]:
+        if facts["drop_files"]:
+            return ("agent", "Create the workspace with data_create (ask the engineer for the source platform if it isn't clear), then take the files with data_take.", "this chat")
+        return copy_files
+    if not facts["inputs"]:
+        return ("agent", "Take the files in the drop folder with data_take.", "this chat") if facts["drop_files"] else copy_files
+    runs = records["runs"]
+    converts = [run for run in runs if run["kind"] == "convert"]
+    reviews = [run for run in runs if run["kind"] == "review"]
+    if not facts["db_loaded"] and not runs:
+        return ("agent", "Start the source database with data_db_up and load the dump with data_db_load.", "this chat")
+    released = [item for item in records["findings"] if item["status"] == "released"]
+    if not released and not runs:
+        return ("agent", "Profile the source database and propose a finding with data_propose_finding, so converter work can start.", "this chat")
+    pushed = [item for item in records["pushes"] if item["status"] == "pushed"]
+    last_push = pushed[-1]["at"] if pushed else ""
+    # Newer than the last push and the last convert run: following the "no change needed" advice
+    # and running a convert run settles a finding just as a push does.
+    if released and released[-1]["at"] > max(last_push, converts[-1]["started_at"] if converts else ""):
+        return ("engineer", "Open a converter-developer chat in this project and ask it to work from released finding %s. If the converter needs no change for it, "
+                "ask migration-data to propose a convert run instead." % released[-1]["id"], "new chat")
+    latest = converts[-1] if converts else None
+    if not latest or latest["started_at"] < last_push:
+        return ("agent", "Register the converter settings and count checks if they aren't already, then propose a convert run with data_plan_propose.", "this chat")
+    problem = guide_problem(latest, "convert")
+    if problem:
+        return problem
+    review = reviews[-1] if reviews else None
+    if not review or review["started_at"] < latest["started_at"]:
+        return ("agent", "Propose a review import of the passed convert run with data_plan_propose from_run=%s. Destination count checks need registering first if they aren't." % latest["run_id"], "this chat")
+    problem = guide_problem(review, "review")
+    if problem:
+        return problem
+    if any(site["run_id"] == review["run_id"] and site["live"] for site in records["sites"]):
+        return ("engineer", "Open review site of run %s through the SSH tunnel shown in the Runs widget and check it. Reset it there before the next review run." % review["run_id"], "Runs widget")
+    return ("nobody", "The last review import passed and its site is gone. New files or a converter fix start the next pass.", "this chat")
+
+
+def guide_stages(facts, records):
+    """Which stages are done. A later stage's evidence counts for the ones before it, since not
+    every migration needs each of them (an existing converter needs no finding or push)."""
+    runs = records["runs"]
+    latest = {}
+    for run in runs:
+        latest[run["kind"]] = run
+    convert, review = latest.get("convert"), latest.get("review")
+    done = {"files": facts["drop_files"] > 0 or facts["inputs"] > 0, "workspace": facts["initialized"],
+            "source_db": facts["db_loaded"] or bool(runs), "finding": any(item["status"] == "released" for item in records["findings"]) or bool(runs),
+            "converter": any(item["status"] == "pushed" for item in records["pushes"]) or bool(runs),
+            "convert": guide_passed(convert), "review": guide_passed(review) and review["started_at"] >= (convert or {}).get("started_at", "")}
+    current = next((key for key, _label in GUIDE_STAGES[:-1] if not done[key]), "site")
+    stages = [{"id": key, "label": label, "state": "not_recorded" if key == "site" else "done" if done[key] else "current" if key == current else "to_do"}
+              for key, label in GUIDE_STAGES]
+    return current, stages
+
+
+def op_guide(ws, request):
+    state = ws.named_state() if ws.initialized() else {}
+    db = ws.read_json(ws.data / "db" / "state.json", None) if ws.initialized() and (ws.data / "db").is_dir() else None
+    drop_files = 0
+    if ws.intake.is_dir() and not ws.intake.is_symlink():
+        for _path, _dirs, files, _dirfd in os.fwalk(str(ws.intake), follow_symlinks=False):
+            drop_files += len(files)
+    facts = {"initialized": ws.initialized(), "drop_files": drop_files, "inputs": len(state.get("inputs") or {}), "db_loaded": bool(db and db.get("loads"))}
+    records = guide_records(ws) if ws.initialized() else {"plans": [], "runs": [], "sites": [], "findings": [], "pushes": [], "warning": None}
+    contact = support_contact(ws)
+    active = [run for run in records["runs"] if run["status"] in GUIDE_ACTIVE]
+    happening = ["%s run %s is %s (stage %s)." % (run["kind"] or "workflow", run["run_id"], run["status"], run["stage"]) for run in active]
+    waiting, also = [], []
+    latest_start = {run["kind"]: run["started_at"] or "" for run in records["runs"]}
+    for plan in records["plans"]:
+        if plan["status"] not in ("proposed", "approved"):
+            continue
+        kind = plan["kind"] or "workflow"
+        # Left behind by a later run of the same kind: worth tidying, but not the next step.
+        if (plan["created_at"] or "") < latest_start.get(plan["kind"], ""):
+            also.append("%s plan %s is older than the latest %s run and was never run: discard it in the Runs widget unless it's still wanted." % (kind, plan["plan_id"], kind))
+        elif plan["status"] == "proposed":
+            waiting.append({"what": "Approve or discard %s plan %s." % (kind, plan["plan_id"]), "where": "Runs widget"})
+        else:
+            waiting.append({"what": "Start approved %s plan %s." % (kind, plan["plan_id"]), "where": "Runs widget"})
+    waiting += [{"what": "Review converter push %s and push it." % item["id"], "where": "Runs widget"} for item in records["pushes"] if item["status"] == "proposed"]
+    waiting += [{"what": "Review finding %s and release, amend or reject it." % item["id"], "where": "Findings widget"} for item in records["findings"] if item["status"] == "proposed"]
+    stale = [plan for plan in records["plans"] if plan["status"] == "stale"]
+    if stale:
+        also.append("Plan %s is out of date because something it depends on changed: propose it again, and discard the old one in the Runs widget." % stale[-1]["plan_id"])
+    if facts["initialized"] and facts["inputs"] and drop_files:
+        also.append("%d file(s) in the drop folder haven't been taken." % drop_files)
+    also += ["The review site of run %s is still up and holds customer data until it's reset in the Runs widget." % site["run_id"] for site in records["sites"]]
+    if records["warning"]:
+        step = ("agent", "Plans and runs couldn't be read (%s). Tell the engineer, and ask %s if it keeps happening." % (records["warning"], contact), "this chat")
+    elif active:
+        step = ("nobody", happening[0] + " Nothing is needed until it finishes.", "Runs widget")
+    elif waiting:
+        step = ("engineer", waiting[0]["what"], waiting[0]["where"])
+    else:
+        step = guide_flow(ws, facts, records)
+    current, stages = guide_stages(facts, records)
+    return {"project": ws.name, "stage": current, "stages": stages, "happening": happening, "waiting_on_engineer": waiting,
+            "next": {"who": step[0], "action": step[1], "where": step[2]}, "also": also,
+            "plans": records["plans"][-GUIDE_RECENT:][::-1], "runs": records["runs"][-GUIDE_RECENT:][::-1],
+            "data_purpose": GUIDE_PURPOSE, "site_acceptance": GUIDE_ACCEPTANCE, "support_contact": contact,
+            "decisions_recorded": len(read_decisions(ws)) if ws.initialized() else 0}
+
+
 OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
        "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding,
        "plan_propose": op_plan_propose,
-       "notes": op_notes, "notes_write": op_notes_write}
-# Logged with their arguments (minus script code, finding text and count SQL, logged by hash).
-QUIET = {"status", "list", "job", "db_status", "notes"}
+       "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions}
+# Logged with their arguments (minus script code, finding text, count SQL and decisions, logged by hash).
+QUIET = {"status", "list", "job", "db_status", "notes", "guide", "decisions"}
 
 
 def fit(result):
@@ -1725,7 +2005,7 @@ def fit(result):
 def audit_args(request):
     shown = {}
     for key, value in request.items():
-        if key in ("code", "text", "sql") and isinstance(value, str):
+        if key in ("code", "text", "sql", "decision", "topic") and isinstance(value, str):
             shown[key + "_sha256"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
         elif isinstance(value, (str, int, bool)) or value is None:
             shown[key] = value if not isinstance(value, str) else value[:300]

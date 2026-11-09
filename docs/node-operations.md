@@ -22,6 +22,7 @@ account is root-equivalent through Docker anyway, but keep the release sealed (`
 | `silo prime` | Signs in to 1Password (you type the password) and warms op-cache, so Frontier works for 24 hours. The session is kept only in memory. |
 | `silo claude-login [--sso\|--console]` | Signs the service account in to Claude Code and links it as `<prefix>/bin/claude`, which is on the web service's PATH but not root's (an older `/usr/local/bin/claude` link can then be removed). |
 | `silo intake PROJECT` | Creates the project's drop folder `<prefix>/intake/PROJECT/` (private to the account), its chat folder `~/projects/PROJECT` and its web UI project. Copy export files into the drop folder; run it again as root afterwards so the files belong to the account. |
+| `silo set-contact NAME` | (root) Sets who the agents tell engineers to ask when they can't help. Stored in `<prefix>/etc/support-contact`, on this server only. |
 
 ## Intake
 
@@ -97,13 +98,14 @@ and the web UI keeps chats apart:
   answers; otherwise choose New project and pick that folder). Chats from before projects were
   turned on, and server-support chats, live in the home project.
 - term-llm runs a project chat's tools in the project's folder, and a chat can't move to
-  another project. The tools use that: **migration-data works only in a project chat and only on
-  that project's workspace** (`STANDARD_CHAT_NOT_IN_PROJECT`, `STANDARD_WORKSPACE_NOT_THIS_PROJECT`);
-  the operator and converter agents are held to the project's workspace when their chat is in one.
+  another project. The tools use that: **every migration agent works only in a project chat, on
+  that project's workspace**, and takes it from the chat (`STANDARD_CHAT_NOT_IN_PROJECT` outside one).
   The project folder holds nothing and should stay empty (term-llm would read project skills from
   it); customer data stays in the workspace. The lock doesn't reach DBHub: MCP servers start in
   the service's home folder, not the project's, so turning on only the chat's own `db-<project>`
   stays your job (migration-data is told to stop if another project's server is on).
+- **The guide:** every migration-data chat starts with `data_guide`, which works out from the project's state where it stands and what's next, so a new chat knows as much as an old one. Agents take the project from the chat, so they never need to be told which one it is.
+- **Decisions:** `data_decide` records the engineer's rulings in an append-only log in the workspace; `data_decisions` reads them back.
 - **Project notes** are migration-data's memory: `data_notes` / `data_notes_write` keep one notes
   file per workspace (`.silo-migrate/data/notes.md`, the last 20 versions in `notes-history/`).
   It reads them at the start of each chat and updates them after meaningful work. term-llm's own

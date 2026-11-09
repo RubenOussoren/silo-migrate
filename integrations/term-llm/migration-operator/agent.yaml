@@ -16,11 +16,9 @@ tools:
       script: scripts/standard_tool.py
       call: json
       timeout_seconds: 60
-      input: &workspace_only
+      input: &no_arguments
         type: object
-        properties:
-          workspace: {type: string, description: "Migration workspace name"}
-        required: [workspace]
+        properties: {}
         additionalProperties: false
     - name: migration_plan_propose
       description: "Propose (not approve) a standard migration plan for a registered dataset. Returns a plan ID and digest for the engineer to review."
@@ -30,10 +28,9 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           dataset_id: {type: string}
           baseline: {type: string, description: "'seed' for a new synthetic baseline, or an accepted baseline ID. Launch snapshots must use the accepted pre-import baseline."}
-        required: [workspace, dataset_id]
+        required: [dataset_id]
         additionalProperties: false
     - name: migration_plan_show
       description: "Show exactly what a plan does: inputs, instances, ports, outputs and mutations."
@@ -43,21 +40,8 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           plan_id: {type: string}
-        required: [workspace, plan_id]
-        additionalProperties: false
-    - name: migration_run_request
-      description: "Request execution of a plan the engineer has already approved. Refused unless approved and current. Starts in the background; poll with migration_run_show."
-      script: scripts/standard_tool.py
-      call: json
-      timeout_seconds: 120
-      input:
-        type: object
-        properties:
-          workspace: {type: string}
-          plan_id: {type: string}
-        required: [workspace, plan_id]
+        required: [plan_id]
         additionalProperties: false
     - name: migration_run_show
       description: "Show a run's stages, assertion results, safe artifact identities and any fixed failure code with its recovery instruction."
@@ -67,16 +51,15 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           run_id: {type: string}
-        required: [workspace, run_id]
+        required: [run_id]
         additionalProperties: false
     - name: migration_findings
       description: "List investigation findings an engineer has released for coding work."
       script: scripts/standard_tool.py
       call: json
       timeout_seconds: 60
-      input: *workspace_only
+      input: *no_arguments
     - name: migration_finding_show
       description: "Read one released finding and its synthetic reproduction. Unreleased findings are refused."
       script: scripts/standard_tool.py
@@ -85,7 +68,6 @@ tools:
       input:
         type: object
         properties:
-          workspace: {type: string}
           finding_id: {type: string}
-        required: [workspace, finding_id]
+        required: [finding_id]
         additionalProperties: false

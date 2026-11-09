@@ -84,11 +84,13 @@ def chat_project():
     return cwd[len(root) + 1:].split(os.sep)[0] if cwd.startswith(root + os.sep) else None
 
 
-def emit(result):
+def emit(result, detail=False):
     # Bytes throughout: the size check and the output don't depend on the locale.
     if result.returncode != 0 or not result.stdout.strip():
-        match = re.search(rb"Error: ([A-Z_]+)", result.stderr)
-        return fail(match.group(1).decode() if match else "STANDARD_OPERATION_FAILED")
+        # Only converter_dev's own refusals keep their detail (branch names, a build step): this
+        # agent is on the code side, so nothing from another path may add text here.
+        match = re.search(rb"(?m)^Error: ((?:STANDARD|NAMED)_[A-Z_]+(?:: [^\n]{1,200})?)" if detail else rb"Error: ([A-Z_]+)", result.stderr)
+        return fail(match.group(1).decode("utf-8", "replace") if match else "STANDARD_OPERATION_FAILED")
     if len(result.stdout) > MAX_OUTPUT_BYTES:
         return fail("STANDARD_OUTPUT_TOO_LARGE")
     try:
@@ -109,16 +111,13 @@ def main():
         args = json.load(sys.stdin)
     except ValueError:
         return fail("STANDARD_ARGUMENTS_INVALID")
-    if not isinstance(args, dict) or not isinstance(args.get("workspace"), str) or not WORKSPACE.match(args["workspace"]):
+    if not isinstance(args, dict):
         return fail("STANDARD_ARGUMENTS_INVALID")
-    workspace = args["workspace"]
-    project = chat_project()
-    # The reviewer is often started by the developer (spawn_agent), which could point it at any
-    # folder: it works only inside a web UI project, and only on that project's workspace.
-    if project is None and role() == "reviewer":
+    # The chat's web UI project decides the workspace. A spawned reviewer runs in its parent's
+    # project; the model can't name another one.
+    workspace = chat_project()
+    if workspace is None or not WORKSPACE.match(workspace):
         return fail("STANDARD_CHAT_NOT_IN_PROJECT")
-    if project is not None and workspace != project:
-        return fail("STANDARD_WORKSPACE_NOT_THIS_PROJECT")
     timeout = 290 if tool in ("dev_test", "dev_format") else 55
     try:
         if tool == "dev_findings":
@@ -135,7 +134,7 @@ def main():
                                     capture_output=True, timeout=timeout, env=control_env())
     except subprocess.TimeoutExpired:
         return fail("STANDARD_OPERATION_TIMEOUT")
-    return emit(result)
+    return emit(result, detail=tool in TOOLS)
 
 
 if __name__ == "__main__":

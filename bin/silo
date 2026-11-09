@@ -9,6 +9,7 @@
   silo prime                       sign in to 1Password and warm op-cache for Frontier (24 h)
   silo claude-login [--sso|--console]   sign the service account in to Claude Code
   silo intake PROJECT              prepare the drop folder and the web UI project for a project
+  silo set-contact NAME            (root) who the agents tell engineers to ask for help
 
 Run as root or as the service account; account steps always run as the service account.
 """
@@ -30,6 +31,7 @@ METAL_CONFIG = Path(os.environ.get("SILO_METAL_CONFIG", "/etc/silo-migrate/metal
 INSTALLER = Path(os.environ.get("SILO_INSTALLER", "/opt/silo-migrate-installer"))
 GITHUB_SILO = "https://github.com/RubenOussoren/silo-migrate.git"
 PROJECT = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
+CONTACT = re.compile(r"[^\x00-\x1f\x7f]{1,80}\Z")
 REPO = re.compile(r"https://[A-Za-z0-9.-]+/[A-Za-z0-9_./-]+\Z")
 OP_REF = re.compile(r'op-cache read "(op://[^"]+)"(?:\s+--account\s+([A-Za-z0-9._-]+))?')
 
@@ -117,6 +119,57 @@ def config_ref(entry):
         return None, None, ""
     match = OP_REF.search(text)
     return (match[1], match[2], text) if match else (None, None, text)
+
+
+def context_window(config_text, provider):
+    """The provider's context_window from the term-llm config, or None. Without one term-llm never
+    compacts a chat, and the Frontier model isn't one it knows. Read by indentation: stdlib only."""
+    lines = config_text.splitlines()
+    for number, line in enumerate(lines):
+        if re.fullmatch(r"\s*" + re.escape(provider) + r":\s*(#.*)?", line):
+            indent = len(line) - len(line.lstrip())
+            for inner in lines[number + 1:]:
+                if not inner.strip() or inner.lstrip().startswith("#"):
+                    continue
+                if len(inner) - len(inner.lstrip()) <= indent:
+                    break
+                match = re.fullmatch(r"\s*context_window:\s*([1-9][0-9]*)\s*(#.*)?", inner)
+                if match:
+                    return int(match[1])
+    return None
+
+
+def contact_file():
+    return PREFIX / "etc" / "support-contact"
+
+
+def read_contact():
+    try:
+        fd = os.open(contact_file(), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read(1024).decode("utf-8").strip() or None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def set_contact(name):
+    if not is_root():
+        raise Stop("set-contact needs root")
+    name = name.strip()
+    if not CONTACT.fullmatch(name):
+        raise Stop("a contact is one line of at most 80 characters")
+    target = contact_file()
+    if target.parent.is_symlink() or not target.parent.is_dir():
+        raise Stop(str(target.parent) + " is not a plain directory")
+    # The account owns this folder, so root touches the file only through its descriptor.
+    temporary = target.with_name(".support-contact." + os.urandom(8).hex())
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    os.fchmod(fd, 0o644)  # whatever the umask: the service account reads it
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(name + "\n")
+    os.replace(temporary, target)
+    print("support contact: " + name)
+    return 0
 
 
 def op_cache_settings(entry):
@@ -277,6 +330,12 @@ def doctor_checks(entry, runner=run):
         add("OK" if primed else "FAIL", "Frontier (op-cache)", "cache primed" if primed else "not primed or expired (24 h)", None if primed else "silo prime")
     else:
         add("WARN", "Frontier (op-cache)", "no op-cache reference in the term-llm config")
+
+    window = context_window(config_text, "cdck_frontier")
+    add("OK" if window else "WARN", "Frontier context", "context_window " + str(window) if window else "no context_window for cdck_frontier: long chats never compact and eventually fail",
+        None if window else "add context_window (the model's size in tokens) under cdck_frontier in ~/.config/term-llm/config.yaml, then silo restart")
+    contact = read_contact()
+    add("OK" if contact else "WARN", "support contact", contact or "not set: agents will say to ask the node admin", None if contact else "silo set-contact NAME")
 
     if "claude-bin:" in config_text:
         claude = shutil.which("claude", path=str(PREFIX / "bin") + ":/usr/local/bin")
@@ -617,7 +676,7 @@ def main(args):
         print(__doc__.strip())
         return 0
     command, rest = args[0], args[1:]
-    known = {"doctor", "update", "use-github", "restart", "shell", "prime", "claude-login", "intake"}
+    known = {"doctor", "update", "use-github", "restart", "shell", "prime", "claude-login", "intake", "set-contact"}
     if command not in known:
         raise Stop("unknown command; see silo --help")
     entry = account()
@@ -639,6 +698,8 @@ def main(args):
         return claude_login(entry, rest)
     if command == "intake" and len(rest) == 1:
         return intake(entry, rest[0])
+    if command == "set-contact" and len(rest) == 1:
+        return set_contact(rest[0])
     raise Stop("wrong arguments; see silo --help")
 
 

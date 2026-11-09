@@ -24,18 +24,18 @@ import json, os, sys
 data = sys.stdin.read()
 with open(os.environ['RECORD'], 'a') as out:
     out.write(json.dumps([sys.argv[1:], data]) + '\\n')
+if os.environ.get('REFUSE'):
+    print('Error: ' + os.environ['REFUSE'], file=sys.stderr)
+    sys.exit(1)
 print(json.dumps({'version': 1, 'ok': True}))
 ''')
         self.control.chmod(0o700)
 
-    def call(self, agent, tool, args, project='auto'):
-        # As in real use, the reviewer runs in its workspace's web UI project unless a test says otherwise.
-        if project == 'auto':
-            workspace = args.get('workspace') if isinstance(args, dict) else None
-            project = workspace if agent == 'converter-reviewer' and isinstance(workspace, str) and workspace.replace('-', '').isalnum() else None
+    def call(self, agent, tool, args, project='example-forum', refuse=None):
+        # As in real use, tools run in the chat's web UI project folder.
         root = Path(self.temp.name) / 'projects'
         env = dict(os.environ, SILO_CONTROL=str(self.control), RECORD=str(self.record), TERM_LLM_TOOL_NAME=tool, PYTHONDONTWRITEBYTECODE='1',
-                   SILO_TESTING='1', SILO_PROJECTS_ROOT=str(root))
+                   SILO_TESTING='1', SILO_PROJECTS_ROOT=str(root), REFUSE=refuse or '')
         env.pop('TERM_LLM_AGENT_DIR', None)
         cwd = root / project if project else Path(self.temp.name)
         cwd.mkdir(parents=True, exist_ok=True)
@@ -78,42 +78,47 @@ print(json.dumps({'version': 1, 'ok': True}))
         self.assertEqual(set(cases) | {'dev_findings', 'dev_finding_show'}, set(self.tools('converter-developer')))
         for tool, (args, request) in cases.items():
             with self.subTest(tool=tool):
-                self.assertEqual(True, self.call('converter-developer', tool, dict(workspace='example-forum', op='push', sha256='0' * 64, **args))['ok'])
+                self.assertEqual(True, self.call('converter-developer', tool, dict(op='push', sha256='0' * 64, **args))['ok'])
                 self.assertEqual([[['converter', 'dev', 'example-forum', '--role', 'developer'], json.dumps(request)]], self.calls())
 
     def test_reviewer_is_read_only_before_anything_runs(self):
         self.assertEqual(set(), WRITE_TOOLS & set(self.tools('converter-reviewer')))
         for tool in WRITE_TOOLS:
             with self.subTest(tool=tool):
-                self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('converter-reviewer', tool, {'workspace': 'example-forum', 'path': 'a', 'content': 'x'})['error'])
+                self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('converter-reviewer', tool, {'path': 'a', 'content': 'x'})['error'])
                 self.assertEqual([], self.calls())
-        self.call('converter-reviewer', 'dev_test', {'workspace': 'example-forum'})
+        self.call('converter-reviewer', 'dev_test', {})
         self.assertEqual([[['converter', 'dev', 'example-forum', '--role', 'reviewer'], json.dumps({'op': 'test'})]], self.calls())
 
     def test_findings_use_the_released_only_surface(self):
-        self.call('converter-reviewer', 'dev_findings', {'workspace': 'example-forum'})
-        self.call('converter-developer', 'dev_finding_show', {'workspace': 'example-forum', 'finding_id': 'finding-' + 'a' * 32})
+        self.call('converter-reviewer', 'dev_findings', {})
+        self.call('converter-developer', 'dev_finding_show', {'finding_id': 'finding-' + 'a' * 32})
         self.assertEqual([[['standard', 'agent', 'findings', 'example-forum'], ''],
                           [['standard', 'agent', 'finding-show', 'example-forum', 'finding-' + 'a' * 32], '']], self.calls())
 
     def test_no_push_approval_and_invalid_arguments_never_invoke_control(self):
         for agent in ('converter-developer', 'converter-reviewer'):
-            for tool, args in (('dev_push', {'workspace': 'x', 'sha256': '0' * 64}), ('converter_push', {'workspace': 'x'}),
-                               ('dev_list', {'workspace': '../x'}), ('dev_list', {'workspace': 'x;id'}), ('dev_list', {}),
-                               ('dev_finding_show', {'workspace': 'x', 'finding_id': 'finding-x'})):
+            for tool, args in (('dev_push', {'sha256': '0' * 64}), ('converter_push', {}), ('dev_list', []),
+                               ('dev_finding_show', {'finding_id': 'finding-x'})):
                 with self.subTest(agent=agent, tool=tool, args=args):
                     self.assertIn(self.call(agent, tool, args)['error'], ('STANDARD_TOOL_UNKNOWN', 'STANDARD_ARGUMENTS_INVALID'))
         self.assertEqual([], self.calls())
 
-    def test_in_a_web_ui_project_only_that_workspace(self):
+    def test_the_chats_project_decides_the_workspace(self):
         for agent in ('converter-developer', 'converter-reviewer'):
             with self.subTest(agent=agent):
-                self.assertTrue(self.call(agent, 'dev_status', {'workspace': 'arc'}, project='arc')['ok'])
-                self.assertEqual('STANDARD_WORKSPACE_NOT_THIS_PROJECT', self.call(agent, 'dev_status', {'workspace': 'arc'}, project='acme')['error'])
-        # Outside a project: the developer works as before; the reviewer (often a sub-agent) refuses.
-        self.assertTrue(self.call('converter-developer', 'dev_status', {'workspace': 'arc'}, project=None)['ok'])
-        self.assertEqual('STANDARD_CHAT_NOT_IN_PROJECT', self.call('converter-reviewer', 'dev_status', {'workspace': 'arc'}, project=None)['error'])
-        self.assertEqual(3, len(self.calls()))
+                self.assertTrue(self.call(agent, 'dev_status', {}, project='arc')['ok'])
+                self.assertEqual(['converter', 'dev', 'arc'], self.calls()[0][0][:3])
+                self.assertTrue(self.call(agent, 'dev_status', {'workspace': 'acme'}, project='arc')['ok'])  # a stray name changes nothing
+                self.assertEqual(['converter', 'dev', 'arc'], self.calls()[0][0][:3])
+                for project in (None, '.hidden'):
+                    self.assertEqual('STANDARD_CHAT_NOT_IN_PROJECT', self.call(agent, 'dev_status', {}, project=project)['error'])
+                self.assertEqual([], self.calls())
+
+    def test_only_the_converter_tools_keep_a_refusals_detail(self):
+        refusal = 'STANDARD_DEV_ONE_BRANCH: this project already has migration/x'
+        self.assertEqual(refusal, self.call('converter-developer', 'dev_branch', {'topic': 't'}, refuse=refusal)['error'])
+        self.assertEqual('STANDARD_REFERENCE_INVALID', self.call('converter-developer', 'dev_findings', {}, refuse='STANDARD_REFERENCE_INVALID: other text')['error'])
 
     def test_only_the_developer_may_start_an_agent_and_only_the_reviewer(self):
         import re

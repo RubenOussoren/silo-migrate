@@ -18,6 +18,7 @@ WORKSPACE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 MAX_OUTPUT_BYTES = 48 * 1024
 # tool -> (data op, allowed request keys, timeout seconds; term-llm allows at most 300)
 TOOLS = {
+    "data_guide": ("guide", set(), 60),
     "data_status": ("status", set(), 60),
     "data_list": ("list", {"area", "path"}, 60),
     "data_peek": ("peek", {"area", "path", "mode", "offset", "bytes", "pattern", "regex", "ignore_case", "max_matches", "decompress"}, 60),
@@ -37,6 +38,8 @@ TOOLS = {
     "data_plan_propose": ("plan_propose", {"source", "settings", "reconciliation", "charset", "from_run"}, 290),
     "data_notes": ("notes", set(), 60),
     "data_notes_write": ("notes_write", {"text"}, 60),
+    "data_decide": ("decide", {"topic", "decision"}, 60),
+    "data_decisions": ("decisions", set(), 60),
 }
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
 
@@ -81,8 +84,9 @@ def chat_project():
 
 def emit(result):
     if result.returncode != 0 or not result.stdout.strip():
-        match = re.search(rb"Error: ([A-Z_]+)", result.stderr)
-        return fail(match.group(1).decode() if match else "STANDARD_OPERATION_FAILED")
+        # The code and the short detail the host adds: this agent is on the customer-data side.
+        match = re.search(rb"(?m)^Error: ((?:STANDARD|NAMED)_[A-Z_]+(?:: [^\n]{1,200})?)", result.stderr)
+        return fail(match.group(1).decode("utf-8", "replace") if match else "STANDARD_OPERATION_FAILED")
     if len(result.stdout) > MAX_OUTPUT_BYTES:
         return fail("STANDARD_OUTPUT_TOO_LARGE")
     try:
@@ -101,19 +105,17 @@ def main():
         args = json.load(sys.stdin)
     except ValueError:
         return fail("STANDARD_ARGUMENTS_INVALID")
-    if not isinstance(args, dict) or not isinstance(args.get("workspace"), str) or not WORKSPACE.match(args["workspace"]):
+    if not isinstance(args, dict):
         return fail("STANDARD_ARGUMENTS_INVALID")
-    # One customer per chat: the chat's web UI project decides the workspace.
+    # One customer per chat: the chat's web UI project decides the workspace, and the model has no say.
     project = chat_project()
-    if project is None:
+    if project is None or not WORKSPACE.match(project):
         return fail("STANDARD_CHAT_NOT_IN_PROJECT")
-    if args["workspace"] != project:
-        return fail("STANDARD_WORKSPACE_NOT_THIS_PROJECT")
     op, keys, timeout = TOOLS[tool]
     # "via": the host applies chat-only limits (a tool has 300 s); the agent can't set or drop it.
     request = {"op": op, **{key: value for key, value in args.items() if key in keys and value is not None}, "via": "chat"}
     try:
-        result = subprocess.run([control_path(), "data", args["workspace"]], input=json.dumps(request).encode("utf-8"),
+        result = subprocess.run([control_path(), "data", project], input=json.dumps(request).encode("utf-8"),
                                 capture_output=True, timeout=timeout, env=control_env())
     except subprocess.TimeoutExpired:
         return fail("STANDARD_OPERATION_TIMEOUT")
