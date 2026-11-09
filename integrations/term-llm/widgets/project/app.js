@@ -119,7 +119,11 @@ function renderOverview() {
     ...guide.runs.slice(0, 5).map((run) => `Run        ${run.run_id} · ${run.kind || '-'} · ${run.status} · ${run.matched}/${run.checks} checks`)];
   const others = guide.waiting_on_engineer.slice(1).map((entry) => el('p', { class: 'note' }, plain(entry.what)));
   const also = guide.also.map((line) => el('p', { class: 'note' }, plain(line)));
-  return [card(eyebrow, plain(next.action), el('div', { class: 'row' }, left), details(el('pre', { class: 'mono' }, lines.join('\n')))), ...others, ...also];
+  // The page redraws every few seconds: an open Details stays open.
+  const more = details(el('pre', { class: 'mono' }, lines.join('\n')));
+  more.open = state.details;
+  more.addEventListener('toggle', () => { state.details = more.open; });
+  return [card(eyebrow, plain(next.action), el('div', { class: 'row' }, left), more), ...others, ...also];
 }
 
 async function submitLabel(kind, extra) {

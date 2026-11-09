@@ -41,11 +41,14 @@ export function runsView(ctx) {
     }
     if (mine !== ticket) return;
     const plans = data.plans.slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
-    const runs = data.runs.slice().sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
+    // A run is known by its plan: what kind it is and which data it used.
+    const planOf = Object.fromEntries(data.plans.map((plan) => [plan.plan_id, plan]));
+    const runs = data.runs.map((r) => ({ ...r, operation: (planOf[r.plan_id] || {}).operation, delivery: (planOf[r.plan_id] || {}).delivery }))
+      .sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
     const planItem = (plan) => item(`${operationLabel(plan.operation)} on ${dataLabel(plan)}`,
       `${plan.status === 'approved' ? 'Approved, ready to start' : plan.status === 'proposed' ? 'Waiting for your approval' : plan.status.replace('_', ' ')} · ${ago(plan.created_at)}`,
       () => ctx.open('plan', plan.plan_id));
-    const runItem = (run) => item(`${operationLabel(run.operation)} · ${run.status === 'completed' ? 'finished' : run.status.replace('_', ' ')}`,
+    const runItem = (run) => item(`${operationLabel(run.operation)}${run.delivery ? ` on ${dataLabel(run)}` : ''} · ${run.status === 'completed' ? 'finished' : run.status.replace('_', ' ')}`,
       `${run.stage ? `${run.stage} · ` : ''}${ago(run.started_at)}`, () => ctx.open('run', run.run_id));
     const pushItem = (push) => item(safe(push.title || 'Converter update'), `${push.status === 'proposed' ? 'Waiting for your approval' : push.status} · ${ago(push.proposed_at)}`,
       () => ctx.open('push', push.digest));
@@ -177,7 +180,12 @@ export function runsView(ctx) {
         if (await act('recover', { run_id: data.run_id }, `Mark this run of ${ctx.project} as interrupted? Only do this if its process is gone, for example after a restart. Then reset it.`)) { toast('Marked interrupted.'); ctx.refresh(); }
       } }, 'Recover'));
     }
-    if (RUN_DONE.has(data.status)) {
+    // Only offered while there's something to remove: a review site still up, or what a run that
+    // didn't finish cleanly may have left. A convert run cleans up after itself when it ends.
+    const review = data.operation === 'standard_review';
+    const leftovers = review ? data.review_site_available : data.status !== 'completed';
+    if (RUN_DONE.has(data.status) && !leftovers) parts.push(el('p', { class: 'hint' }, review ? 'Its site has been reset: nothing is left to remove.' : 'Nothing to clean up: it tidied up after itself.'));
+    if (RUN_DONE.has(data.status) && leftovers) {
       actions.push(el('button', { type: 'button', class: 'btn q', onclick: async () => {
         if (await act('reset', { run_id: data.run_id }, `Reset this run of ${ctx.project}? Its review site, containers and leftovers are removed. Evidence, plans and backups stay.`)) { toast('Reset.'); ctx.refresh(); }
       } }, data.operation === 'standard_review' ? 'Reset the site' : 'Reset'));
