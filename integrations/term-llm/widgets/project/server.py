@@ -1,9 +1,10 @@
 #!/usr/bin/env -S python3 -I
-"""Project page: one project at a glance, and the only place new files are labelled.
+"""Project page: one project at a glance, its files, findings, runs and converter pushes.
 
 Reached only through term-llm's signed-in proxy, by the engineer. It shows file names, so it never
-serves an agent. It reuses the Runs widget's plumbing and never touches a project's data itself:
-everything goes through `silo-migrate-control data WS`, in bin/data_tools.py.
+serves an agent. The decisions are the Findings and Runs modules' own, called unchanged (their
+server.py files stay as libraries): exact-digest approvals, exact-text releases, the same refusals.
+Labels and the guide go through `silo-migrate-control data WS`, in bin/data_tools.py.
 """
 import importlib.util
 import json
@@ -18,16 +19,31 @@ from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler
 
 HERE = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("silo_runs_widget", HERE.parent / "runs" / "server.py")
-runs = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(runs)
+
+
+def _load(name, folder):
+    spec = importlib.util.spec_from_file_location(name, HERE.parent / folder / "server.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+runs = _load("silo_runs_widget", "runs")
+findings = _load("silo_findings_widget", "findings")
 
 Refused = runs.Refused
+REFUSALS = (runs.Refused, findings.Refused)
 WORKSPACE = runs.WORKSPACE
 DATASET = re.compile(r"dataset-[0-9a-f]{32}\Z")
 MAX_BODY = 128 * 1024  # a label lists the files it covers
+MAX_FINDING_BODY = findings.MAX_TEXT * 7  # JSON can escape each byte of a finding's text up to 6 bytes
+RUN_ACTIONS = ("approve", "discard", "start", "recover", "admin-password", "reset", "push", "discard-push")
+FINDING_ACTIONS = ("release", "amend", "reject", "withdraw")
+RUN_VIEWS = {"plan": runs.plan_detail, "run": runs.run_detail, "push": runs.push_detail}
 MAX_FILES = 400
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/ui.js": ("ui.js", "text/javascript; charset=utf-8"), "/runs.js": ("runs.js", "text/javascript; charset=utf-8"),
+          "/findings.js": ("findings.js", "text/javascript; charset=utf-8"),
           "/app.css": ("app.css", "text/css; charset=utf-8"), "/tokens.css": ("tokens.css", "text/css; charset=utf-8")}
 # Varnish's own font files, so that the page matches without a second copy of them.
 FONTS = {"/fonts/Geist-Variable.woff2": "Geist-Variable.woff2", "/fonts/GeistMono-Variable.woff2": "GeistMono-Variable.woff2"}
@@ -61,13 +77,29 @@ def project_names(base, intake):
     return sorted(names)
 
 
+def counts(base, workspace):
+    """What waits on the engineer in one project's Findings and Runs, read straight from disk."""
+    if not isinstance(workspace, str) or not WORKSPACE.fullmatch(workspace):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    try:
+        items, _running = runs.waiting(runs.Store(base), workspace)
+        waiting_runs = len(items)
+    except REFUSALS:
+        waiting_runs = 0
+    try:
+        to_review = sum(1 for record in findings.Store(base).records(workspace) if record["status"] == "proposed")
+    except REFUSALS:
+        to_review = 0
+    return {"findings": to_review, "runs": waiting_runs}
+
+
 SUMMARY_SECONDS = 20
 _summary = {"at": 0.0, "value": None}
 
 
 def summary(base, control):
-    """For the edge tab: projects with files or data waiting for a label. Cached briefly: every open
-    chat page asks for it."""
+    """For the edge tab: what waits on the engineer in each project (labels, findings, runs). Cached
+    briefly: every open chat page asks for it."""
     if _summary["value"] is not None and time.monotonic() - _summary["at"] < SUMMARY_SECONDS:
         return _summary["value"]
     waiting = []
@@ -76,7 +108,11 @@ def summary(base, control):
             view = data(control, name, {"op": "deliveries"}, timeout=20)
             count = len(view["unlabelled_files"]) + len(view["unlabelled_data"]) + len(view.get("not_ready_files") or [])
         except Exception:  # noqa: BLE001 - one project's trouble mustn't hide the others
-            continue
+            count = 0
+        try:
+            count += sum(counts(base, name).values())
+        except Exception:  # noqa: BLE001
+            pass
         if count:
             waiting.append({"workspace": name, "files": count})
     _summary.update(at=time.monotonic(), value={"waiting": len(waiting), "latest": waiting[:8]})
@@ -137,8 +173,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, data(control, query.get("workspace"), {"op": "deliveries"}, timeout=30))
             if url.path == "/api/guide":
                 return self.send(200, data(control, query.get("workspace"), {"op": "guide"}))
+            if url.path == "/api/counts":
+                return self.send(200, counts(base, query.get("workspace")))
+            if url.path == "/api/runs/overview":
+                return self.send(200, runs.overview(runs.Store(base), control, query.get("workspace")))
+            if url.path == "/api/runs/converter":
+                return self.send(200, runs.converter_detail(runs.Store(base), control, query.get("workspace")))
+            view = RUN_VIEWS.get(url.path.removeprefix("/api/runs/")) if url.path.startswith("/api/runs/") else None
+            if view is runs.push_detail:
+                return self.send(200, view(runs.Store(base), query.get("workspace"), query.get("id")))
+            if view:
+                return self.send(200, view(runs.Store(base), control, query.get("workspace"), query.get("id")))
+            if url.path in ("/api/findings/list", "/api/findings/finding"):
+                workspace = query.get("workspace")
+                if not isinstance(workspace, str) or not WORKSPACE.fullmatch(workspace):  # one project only, never all
+                    raise Refused("STANDARD_ARGUMENTS_INVALID")
+                store = findings.Store(base)
+                if url.path.endswith("/list"):
+                    return self.send(200, findings.page_of(store, query))
+                return self.send(200, findings.detail(store, workspace, query.get("id")))
             return self.send(404, {"error": "STANDARD_NOT_FOUND"})
-        except Refused as refused:
+        except REFUSALS as refused:
             return self.send(refused.status, {"error": refused.code})
         except Exception:  # noqa: BLE001 - never a traceback in term-llm's log
             return self.send(500, {"error": "STANDARD_OPERATION_FAILED"})
@@ -151,21 +206,31 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = -1
-            if not 0 < length <= MAX_BODY:
+            path = urlsplit(self.path).path
+            limit = MAX_FINDING_BODY if path.startswith("/api/findings/") else MAX_BODY
+            if not 0 < length <= limit:
                 self.close_connection = True
                 raise Refused("STANDARD_ARGUMENTS_INVALID", 413 if length > 0 else 400)
             raw = self.rfile.read(length)
             if self.headers.get("X-Silo-Project") != "1" or not (self.headers.get("Content-Type") or "").startswith("application/json"):
                 raise Refused("STANDARD_REQUEST_REFUSED", 403)
             body = json.loads(raw)
-            if urlsplit(self.path).path != "/api/label" or not isinstance(body, dict):
+            if not isinstance(body, dict):
                 raise Refused("STANDARD_ARGUMENTS_INVALID")
-            result = label(self.server.control, body)
-            _summary["value"] = None  # the tab's count changed
+            action = path.rsplit("/", 1)[-1]
+            if path == "/api/label":
+                result = label(self.server.control, body)
+            elif path.startswith("/api/runs/") and action in RUN_ACTIONS:
+                result = runs.decide(runs.Store(self.server.base), self.server.control, action, body)
+            elif path.startswith("/api/findings/") and action in FINDING_ACTIONS:
+                result = findings.decide(self.server.control, action, body.get("workspace"), body.get("id"), body.get("text"))
+            else:
+                raise Refused("STANDARD_ARGUMENTS_INVALID")
+            _summary["value"] = None  # the tab's count may have changed
             return self.send(200, result)
         except (ValueError, UnicodeDecodeError):
             return self.send(400, {"error": "STANDARD_ARGUMENTS_INVALID"})
-        except Refused as refused:
+        except REFUSALS as refused:
             return self.send(refused.status, {"error": refused.code})
         except Exception:  # noqa: BLE001
             return self.send(500, {"error": "STANDARD_OPERATION_FAILED"})

@@ -1,5 +1,0 @@
-title: Runs
-description: Approve and start migration-data's proposed workflow runs, follow them, reset them, and push converter-developer's proposed changes as draft PRs.
-mount: runs
-# A Unix socket, not a TCP port: only term-llm's signed-in proxy can reach it.
-command: ["python3", "-I", "-B", "server.py", "$SOCKET"]

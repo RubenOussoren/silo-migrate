@@ -290,9 +290,9 @@ else:
         self.assertEqual([], self.calls())
         self.assertEqual(403, self.request('POST', '/api/admin-password', {'workspace': 'arc', 'run_id': rid(1)},
                                           headers={'X-Silo-Runs': '0'})[0])
-        script = (WIDGET / 'app.js').read_text()
-        for text in ('Review import', 'Convert run', 'Full run', 'Destination difference', 'Show admin password',
-                     'Copy password', "'Hide'", 'ssh -N -L ${port}:127.0.0.1:${port}', 'location.hostname', 'stays until Reset'):
+        script = (ROOT / 'integrations/term-llm/widgets/project/runs.js').read_text()
+        for text in ('Import into a review site', 'Convert run', 'Site difference', 'Show admin password',
+                     'Copy password', "'Hide'", 'ssh -N -L ${port}:127.0.0.1:${port}', 'holds customer data until it is reset'):
             self.assertIn(text, script)
 
     def test_converter_view_is_read_only_and_survives_a_refusal(self):
@@ -366,7 +366,7 @@ else:
         import time
         time.sleep(3)
         self.assertFalse(late.exists(), 'a process the timed-out call started kept running')
-        self.assertIn('STANDARD_OPERATION_TIMEOUT', (WIDGET / 'app.js').read_text())
+        self.assertIn('STANDARD_OPERATION_TIMEOUT', (ROOT / 'integrations/term-llm/widgets/project/ui.js').read_text())
 
     def test_reviewer_name_refuses_control_and_format_characters(self):
         home = Path(self.temp.name) / 'home'
@@ -400,18 +400,14 @@ else:
         (pushes / ('c' * 64 + '.json')).symlink_to(outside / 'secret.yml')
         self.assertEqual(404, self.get('/api/push?workspace=arc&id=' + 'c' * 64)[0])
 
-    def test_page_assets_headers_and_text_only_rendering(self):
-        status, raw, response = self.request('GET', '/')
-        self.assertEqual(200, status)
-        self.assertIn(b'app.js', raw)
-        self.assertIn("script-src 'self'", response.getheader('Content-Security-Policy'))
-        self.assertEqual('no-store', response.getheader('Cache-Control'))
-        for asset in ('/app.js', '/app.css'):
-            self.assertEqual(200, self.request('GET', asset)[0])
+    def test_the_old_page_is_retired_and_its_successor_renders_text_only(self):
+        # This module is now a library of the Project page, which shows runs in its own tab.
+        self.assertFalse((WIDGET / 'widget.yaml').exists())
         self.assertEqual(404, self.request('GET', '/server.py')[0])
-        script = (WIDGET / 'app.js').read_text()
-        self.assertNotIn('innerHTML', script)
-        self.assertIn("'X-Silo-Runs': '1'", script)
+        project = ROOT / 'integrations/term-llm/widgets/project'
+        for name in ('runs.js', 'ui.js', 'app.js', 'findings.js'):
+            self.assertNotIn('innerHTML', (project / name).read_text())
+        self.assertIn("'X-Silo-Project': '1'", (project / 'ui.js').read_text())
 
     def test_refuses_to_start_in_a_socket_folder_that_isnt_private(self):
         shared = Path(self.temp.name) / 'shared'
@@ -423,11 +419,13 @@ else:
         self.assertFalse((shared / 'runs.sock').exists())
 
     def test_manifest_uses_a_socket_and_the_extension_only_reads(self):
-        manifest = (WIDGET / 'widget.yaml').read_text()
+        manifest = (ROOT / 'integrations/term-llm/widgets/project/widget.yaml').read_text()
         self.assertIn('"$SOCKET"', manifest)
         self.assertNotIn('$PORT', manifest)
         extension = (ROOT / 'integrations/term-llm/extensions/silo-findings/main.js').read_text()
-        self.assertIn("mount: 'runs'", extension)
+        self.assertIn("mount: 'project'", extension)
+        self.assertNotIn("mount: 'runs'", extension)
+        self.assertNotIn("mount: 'findings'", extension)
         self.assertNotIn("method: 'POST'", extension)
         self.assertNotIn('innerHTML', extension)
 
@@ -435,11 +433,12 @@ else:
 
 class ApprovalShowsTheDataTest(unittest.TestCase):
     def test_every_approval_names_the_delivery_it_runs_on(self):
-        source = (WIDGET / 'app.js').read_text()
-        self.assertIn("['Data', el('strong', {}, dataLabel(plan))]", source)
-        self.assertEqual(2, source.count('on ${dataLabel(plan)}?'))
+        source = (ROOT / 'integrations/term-llm/widgets/project/runs.js').read_text()
+        self.assertIn("['Data', el('strong', {}, dataLabel(data))]", source)
+        self.assertEqual(4, source.count('on ${dataLabel(data)}'))  # the heading, both approval texts, the start text
+        self.assertIn('Start this run on ${dataLabel(data)}', source)
         self.assertIn("'Not labelled'", source)
-        self.assertIn('${operationLabel(plan.operation)} · ${dataLabel(plan)}', source)
+        self.assertIn('${operationLabel(plan.operation)} on ${dataLabel(plan)}', source)
 
 if __name__ == '__main__':
     unittest.main()

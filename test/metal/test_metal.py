@@ -113,7 +113,10 @@ class InstallerTests(unittest.TestCase):
         for name in ("varnish", "silo-theme", "silo-findings"):
             self.assertTrue((Path(__file__).resolve().parents[2]/"integrations/term-llm/extensions"/name/"extension.yaml").is_file())
         shipped = Path(__file__).resolve().parents[2]/"integrations/term-llm"
-        self.assertTrue((shipped/"widgets/findings/widget.yaml").is_file())
+        self.assertTrue((shipped/"widgets/project/widget.yaml").is_file())
+        # Findings and Runs are tabs of the Project page now: their code is its library, not a page.
+        self.assertFalse((shipped/"widgets/findings/widget.yaml").exists())
+        self.assertFalse((shipped/"widgets/runs/widget.yaml").exists())
         self.assertTrue((shipped/"extensions/silo-findings/extension.yaml").is_file())
         self.assertIn("  projects:\n    enabled: true\n", self.m.fresh_config())
         self.assertEqual("prompt", args[args.index("--approval") + 1])

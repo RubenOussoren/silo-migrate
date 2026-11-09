@@ -1824,7 +1824,7 @@ PLAN_ID = re.compile(r"plan-[0-9a-f]{32}\Z")
 
 
 def run_of(ws, request):
-    """The run ID, or the run a plan ID started (the Runs widget shows both); returns the run ID."""
+    """The run ID, or the run a plan ID started (the Project page's Runs tab shows both); returns the run ID."""
     run_id = request.get("run_id")
     if isinstance(run_id, str) and PLAN_ID.fullmatch(run_id):
         run_id = json.loads(ws.control(["standard", "plan", "show", ws.name, run_id], timeout=30)).get("run_id")
@@ -1876,7 +1876,7 @@ def op_plan_propose(ws, request):
         return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "platform", "from_run",
                                                   "roles", "inputs", "limits", "mutations", "not_included")},
                 "instances": {"review": {"port": ((plan.get("instances") or {}).get("review") or {}).get("port")}},
-                "next": "Tell the engineer the plan is waiting in the Runs widget, where they approve and start it. Access the review site via an SSH tunnel; it stays until Reset."}
+                "next": "Tell the engineer the plan is waiting in the Project page's Runs tab, where they approve and start it. Access the review site via an SSH tunnel; it stays until Reset."}
     roles = {key: request.get(key) for key in ("source", "settings", "reconciliation")}
     charset = request.get("charset", "utf8mb4")
     if roles["reconciliation"] is None:
@@ -1905,7 +1905,7 @@ def op_plan_propose(ws, request):
             "converter_revision": plan.get("converter_revision"), "converter_branch": converter.get("branch"),
             "converter_deps": plan.get("converter_deps"), "dependencies_prepared": prepared,
             "mutations": plan.get("mutations"), "not_included": plan.get("not_included"),
-            "next": ("Tell the engineer the plan is waiting in the web UI's Runs widget (the Runs tab), where they review, "
+            "next": ("Tell the engineer the plan is waiting in the Project page's Runs tab, where they review, "
                      "approve and start it. When it has finished, read it with data_run_evidence.")}
 
 
@@ -2139,7 +2139,7 @@ def guide_problem(run, kind):
     if run["status"] in GUIDE_ACTIVE or guide_passed(run):
         return None
     if run["status"] in ("abandoned", "not_started"):
-        return ("engineer", label + " stopped without finishing. Recover it in the Runs widget, then a new plan can be proposed.", "Runs widget")
+        return ("engineer", label + " stopped without finishing. Recover it in the Project page's Runs tab, then a new plan can be proposed.", "Runs tab")
     if run["status"] != "completed":
         return ("agent", "%s failed at stage %s (%s). Read data_run_evidence and explain the cause." % (label, run["stage"], run["failure"] or "no code"), "this chat")
     if not run["checks"]:
@@ -2187,7 +2187,7 @@ def guide_flow(ws, facts, records):
     if problem:
         return problem
     if any(site["run_id"] == review["run_id"] and site["live"] for site in records["sites"]):
-        return ("engineer", "Open review site of run %s through the SSH tunnel shown in the Runs widget and check it. Reset it there before the next review run." % review["run_id"], "Runs widget")
+        return ("engineer", "Open review site of run %s through the SSH tunnel shown in the Project page's Runs tab and check it. Reset it there before the next review run." % review["run_id"], "Runs tab")
     return ("nobody", "The last review import passed and its site is gone. New files or a converter fix start the next pass.", "this chat")
 
 
@@ -2260,21 +2260,21 @@ def op_guide(ws, request):
         kind = plan["kind"] or "workflow"
         # Left behind by a later run of the same kind: worth tidying, but not the next step.
         if (plan["created_at"] or "") < latest_start.get(plan["kind"], ""):
-            also.append("%s plan %s is older than the latest %s run and was never run: discard it in the Runs widget unless it's still wanted." % (kind, plan["plan_id"], kind))
+            also.append("%s plan %s is older than the latest %s run and was never run: discard it in the Project page's Runs tab unless it's still wanted." % (kind, plan["plan_id"], kind))
         elif plan["status"] == "proposed":
-            waiting.append({"what": "Approve or discard %s plan %s." % (kind, plan["plan_id"]), "where": "Runs widget"})
+            waiting.append({"what": "Approve or discard %s plan %s." % (kind, plan["plan_id"]), "where": "Runs tab"})
         else:
-            waiting.append({"what": "Start approved %s plan %s." % (kind, plan["plan_id"]), "where": "Runs widget"})
-    waiting += [{"what": "Review converter push %s and push it." % item["id"], "where": "Runs widget"} for item in records["pushes"] if item["status"] == "proposed"]
-    waiting += [{"what": "Review finding %s and release, amend or reject it." % item["id"], "where": "Findings widget"} for item in records["findings"] if item["status"] == "proposed"]
+            waiting.append({"what": "Start approved %s plan %s." % (kind, plan["plan_id"]), "where": "Runs tab"})
+    waiting += [{"what": "Review converter push %s and push it." % item["id"], "where": "Runs tab"} for item in records["pushes"] if item["status"] == "proposed"]
+    waiting += [{"what": "Review finding %s and release, amend or reject it." % item["id"], "where": "Findings tab"} for item in records["findings"] if item["status"] == "proposed"]
     stale = [plan for plan in records["plans"] if plan["status"] == "stale"]
     if stale:
-        also.append("Plan %s is out of date because something it depends on changed: propose it again, and discard the old one in the Runs widget." % stale[-1]["plan_id"])
-    also += ["The review site of run %s is still up and holds customer data until it's reset in the Runs widget." % site["run_id"] for site in records["sites"]]
+        also.append("Plan %s is out of date because something it depends on changed: propose it again, and discard the old one in the Project page's Runs tab." % stale[-1]["plan_id"])
+    also += ["The review site of run %s is still up and holds customer data until it's reset in the Project page's Runs tab." % site["run_id"] for site in records["sites"]]
     if records["warning"]:
         step = ("agent", "Plans and runs couldn't be read (%s). Tell the engineer, and ask %s if it keeps happening." % (records["warning"], contact), "this chat")
     elif active:
-        step = ("nobody", happening[0] + " Nothing is needed until it finishes.", "Runs widget")
+        step = ("nobody", happening[0] + " Nothing is needed until it finishes.", "Runs tab")
     elif waiting:
         step = ("engineer", waiting[0]["what"], waiting[0]["where"])
     else:

@@ -132,10 +132,39 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         self.assertEqual(data, (ROOT / 'integrations/term-llm/extensions/varnish/fonts/Geist-Variable.woff2').read_bytes())
         self.assertEqual(404, self.request('GET', '/fonts/../server.py')[0])
 
+    def test_runs_and_findings_decisions_go_to_their_own_unchanged_logic(self):
+        calls = []
+        self.m.runs.decide = lambda store, control, action, body: calls.append(('runs', action, body)) or {'status': 'ok'}
+        self.m.findings.decide = lambda control, action, workspace, finding_id, text: calls.append(('findings', action, workspace, finding_id, text)) or {'status': 'ok'}
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        for action in self.m.RUN_ACTIONS:
+            self.assertEqual(200, self.request('POST', '/api/runs/' + action, {'workspace': 'arc', 'plan_id': 'p'}, headers)[0])
+        for action in self.m.FINDING_ACTIONS:
+            self.assertEqual(200, self.request('POST', '/api/findings/' + action, {'workspace': 'arc', 'id': 'f', 'text': 't'}, headers)[0])
+        self.assertEqual(len(self.m.RUN_ACTIONS) + len(self.m.FINDING_ACTIONS), len(calls))
+        self.assertEqual(('runs', 'approve', {'workspace': 'arc', 'plan_id': 'p'}), calls[0])
+        self.assertEqual(('findings', 'release', 'arc', 'f', 't'), calls[len(self.m.RUN_ACTIONS)])
+        for path in ('/api/runs/approve-all', '/api/findings/delete', '/api/runs/../label', '/api/other/approve'):
+            self.assertEqual(400, self.request('POST', path, {'workspace': 'arc'}, headers)[0])
+        self.assertEqual(403, self.request('POST', '/api/runs/approve', {'workspace': 'arc'}, {'Content-Type': 'application/json', 'X-Silo-Runs': '1'})[0])
+        self.assertEqual(len(self.m.RUN_ACTIONS) + len(self.m.FINDING_ACTIONS), len(calls))
+
+    def test_findings_are_shown_one_project_at_a_time(self):
+        for query in ('', 'workspace=', 'workspace=../x'):
+            self.assertEqual(400, self.request('GET', '/api/findings/list?' + query)[0])
+        status, data, _ = self.request('GET', '/api/findings/list?workspace=arc')
+        self.assertEqual((200, 0), (status, json.loads(data)['total']))  # nothing proposed in this fixture
+
+    def test_counts_never_fail_for_a_new_project(self):
+        self.assertEqual({'findings': 0, 'runs': 0}, json.loads(self.request('GET', '/api/counts?workspace=new-forum')[1]))
+        self.assertEqual(400, self.request('GET', '/api/counts?workspace=../x')[0])
+
     def test_the_page_builds_with_dom_calls_only(self):
-        source = (WIDGET / 'app.js').read_text()
-        for word in ('innerHTML', 'insertAdjacentHTML', 'document.write', 'http://', 'https://', 'eval('):
-            self.assertNotIn(word, source)
+        for name in ('app.js', 'ui.js', 'runs.js', 'findings.js'):
+            source = (WIDGET / name).read_text()
+            for word in ('innerHTML', 'insertAdjacentHTML', 'document.write', 'https://', 'eval('):
+                self.assertNotIn(word, source, name)
+        self.assertNotIn('http://', (WIDGET / 'app.js').read_text())
         self.assertNotIn('//', (WIDGET / 'tokens.css').read_text().replace('/*', ''))
 
 

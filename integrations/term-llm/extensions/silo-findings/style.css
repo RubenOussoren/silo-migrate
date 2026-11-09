@@ -57,5 +57,5 @@
 }
 
 /* The Project tab sits above the others. */
-.silo-project-tab { top: calc(40% - 120px); }
+.silo-project-tab { top: 40%; }
 .silo-project-panel { top: 12%; }

@@ -1366,7 +1366,7 @@ class DataToolsTest(unittest.TestCase):
         self.assertEqual('plan-' + 'e' * 32, result['plan_id'])
         self.assertEqual({'status': 'prepared', 'gems_added': ['markbridge-0.5.0']}, result['dependencies_prepared'])
         self.assertNotIn('private', result)
-        self.assertIn('Runs widget', result['next'])
+        self.assertIn('Runs tab', result['next'])
         self.assertEqual('migration/arc/mybb-converter', result['converter_branch'])
         calls.clear()
         answers.append('plan')

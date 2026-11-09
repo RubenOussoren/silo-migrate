@@ -128,7 +128,7 @@ $C start-run "$WS" PLAN_ID
 
 A review plan (`standard_review`) imports a **completed convert run's** intermediate database
 into one local Discourse review site. Nothing is converted again. migration-data proposes it
-(`data_plan_propose` with `from_run`). You approve and start it in the Runs widget, or as the
+(`data_plan_propose` with `from_run`). You approve and start it in the Project page's Runs tab, or as the
 service account:
 
 ```sh
@@ -180,7 +180,7 @@ $C standard run admin-password "$WS" RUN_ID      # the review admin's sign-in (t
     `…@email.invalid` address from the importer.
 - **Opening the site:** an SSH tunnel with the **same** local port, because Discourse's base URL
   is `http://127.0.0.1:PORT`. Run `ssh -N -L PORT:127.0.0.1:PORT SERVER`, then open
-  `http://127.0.0.1:PORT/` and sign in as `silo_review_admin`. The Runs widget shows the
+  `http://127.0.0.1:PORT/` and sign in as `silo_review_admin`. The Project page's Runs tab shows the
   password on click.
 - **Other accounts:** imported admins and moderators keep their flags. If a converter ever
   imports password hashes, those accounts could sign in too, but only through your tunnel.
@@ -190,11 +190,11 @@ $C standard run admin-password "$WS" RUN_ID      # the review admin's sign-in (t
   removes its containers, networks and volumes and deletes the admin password. Admission counts
   running sites, so reset old ones before starting another.
 
-## The Runs widget
+## The Runs tab (Project page)
 
-The web UI's **Runs** widget (`<base>/widgets/runs/`) is where the engineer makes the decisions
-that used to be terminal commands as the service account. A **Runs · N** tab on the chat page
-(beside **Findings · N**) counts what is waiting and links into it. Per project, it shows:
+The **Runs** tab of the web UI's Project page (`<base>/widgets/project/`; its logic is `widgets/runs/server.py`) is where the engineer makes the decisions
+that used to be terminal commands as the service account. The **Project** tab on the chat page
+counts what is waiting and links into it. Per project, it shows:
 
 - **Plans:** what each plan binds (operation, platform, converter branch and commit, inputs by
   path and hash, limits). For a convert plan, it also shows the converter settings and the

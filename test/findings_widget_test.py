@@ -213,19 +213,14 @@ print(json.dumps({'version': 1, 'finding_id': 'finding-' + 'f' * 32 if action ==
         self.assertNotIn('linked', self.get('/api/summary')[1]['workspaces'])
         self.assertEqual(404, self.get('/api/finding?workspace=linked&id=' + fid(500))[0])
 
-    def test_page_assets_and_headers(self):
-        status, raw, response = self.request('GET', '/')
-        self.assertEqual(200, status)
-        self.assertIn(b'app.js', raw)
-        self.assertIn("script-src 'self'", response.getheader('Content-Security-Policy'))
-        self.assertEqual('no-store', response.getheader('Cache-Control'))
-        for asset in ('/app.js', '/app.css'):
-            self.assertEqual(200, self.request('GET', asset)[0])
+    def test_the_old_page_is_retired_and_its_successor_inserts_text_as_text(self):
+        # This module is now a library of the Project page, which shows findings in its own tab.
+        self.assertFalse((WIDGET / 'widget.yaml').exists())
         self.assertEqual(404, self.request('GET', '/server.py')[0])
-        self.assertEqual(404, self.request('GET', '/../widget.yaml')[0])
-        # The page inserts server text as text, never as HTML.
-        script = (WIDGET / 'app.js').read_text()
+        script = (ROOT / 'integrations/term-llm/widgets/project/findings.js').read_text()
         self.assertNotIn('innerHTML', script)
+        for words in ('Release this exact text', 'Discard your edits to this finding?', "api/findings/${action}"):
+            self.assertIn(words, script)
         self.assertNotIn('innerHTML', (ROOT / 'integrations/term-llm/extensions/silo-findings/main.js').read_text())
 
     def test_reviewer_is_the_commit_identity(self):
@@ -255,7 +250,7 @@ print(json.dumps({'version': 1, 'finding_id': 'finding-' + 'f' * 32 if action ==
             self.w.main(['server.py', 'relative.sock'])
 
     def test_manifest_uses_a_socket_and_the_extension_only_reads(self):
-        manifest = (WIDGET / 'widget.yaml').read_text()
+        manifest = (ROOT / 'integrations/term-llm/widgets/project/widget.yaml').read_text()
         self.assertIn('"$SOCKET"', manifest)
         self.assertNotIn('$PORT', manifest)
         extension = (ROOT / 'integrations/term-llm/extensions/silo-findings/main.js').read_text()

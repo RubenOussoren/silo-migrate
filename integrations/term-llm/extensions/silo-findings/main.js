@@ -1,9 +1,8 @@
-// Two tabs on the right edge, each with a small panel of links into its widget:
-//   Findings · N   findings waiting for review (widgets/findings)
-//   Runs · N       plans to approve or start and converter pushes waiting (widgets/runs)
-// They only read (GET api/summary, signed in by the web UI's own cookie); every decision
-// happens in the widgets. No finding text, settings or counts are shown here.
-// (One extension for both, so the web service's --extensions list stays as installed.)
+// One tab on the right edge, with a small panel of links into the Project page:
+//   Project · N   projects with files to label, findings to review, or plans and pushes waiting
+// It only reads (GET api/summary, signed in by the web UI's own cookie); every decision happens on
+// the Project page. No finding text, file names, settings or counts are shown here.
+// (The extension keeps its old name, so the web service's --extensions list stays as installed.)
 const POLL_MS = 60_000;
 
 function age(iso) {
@@ -83,34 +82,9 @@ export function activate(ui) {
   edgeTab(ui, {
     mount: 'project', className: 'silo-project', label: 'Project',
     count: (data) => (data ? data.waiting : 0),
-    tooltip: (_data, n) => (n ? `${n} project(s) with new files to label` : 'Open a project'),
-    heading: (_data, n) => (n ? 'New files to label' : 'Projects'),
-    items: (data) => ((data && data.latest) || []).map((item) => ({ text: `${item.workspace} · ${item.files} new file(s)`, hash: `#project=${encodeURIComponent(item.workspace)}&tab=files`, at: '' })),
+    tooltip: (_data, n) => (n ? `${n} project(s) with something waiting for you` : 'Open the Project page'),
+    heading: (_data, n) => (n ? 'Waiting for you' : 'Nothing waiting'),
+    items: (data) => ((data && data.latest) || []).map((item) => ({ text: `${item.workspace} · ${item.files} waiting`, hash: `#project=${encodeURIComponent(item.workspace)}`, at: '' })),
     more: () => 'Open the Project page…',
-  });
-  edgeTab(ui, {
-    mount: 'findings', className: 'silo-findings', label: 'Findings',
-    count: (data) => (data ? data.pending : 0),
-    tooltip: (_data, n) => (n ? `${n} finding(s) waiting for your review` : 'No findings waiting; open the history'),
-    heading: (_data, n) => (n ? 'Findings to review' : 'No findings to review'),
-    items: (data) => ((data && data.latest) || []).map((item) => ({
-      text: `${item.workspace} · ${item.kind}`, hash: hashFor(item.workspace, `&id=${encodeURIComponent(item.id)}`), at: item.proposed_at })),
-    more: (data, n) => (n > ((data && data.latest.length) || 0) ? 'All findings to review…' : 'Open findings and history…'),
-  });
-  const WHAT = { plan: { proposed: 'plan to approve (or discard)', approved: 'approved: start it' }, push: { proposed: 'push to approve' } };
-  edgeTab(ui, {
-    mount: 'runs', className: 'silo-runs', label: 'Runs',
-    count: (data) => (data ? data.waiting : 0),
-    tooltip: (data, n) => (n ? `${n} plan(s) or push(es) waiting for you` : data && data.running ? `${data.running} run(s) in progress` : 'Nothing waiting; open runs'),
-    heading: (data, n) => (n ? 'Waiting for you' : data && data.running ? 'Runs in progress' : 'Nothing waiting'),
-    items: (data) => [
-      ...((data && data.latest) || []).map((item) => ({
-        text: `${item.workspace} · ${(WHAT[item.kind] || {})[item.status] || item.kind}`,
-        hash: hashFor(item.workspace, `&kind=${item.kind}&id=${encodeURIComponent(item.id)}`), at: item.at })),
-      ...((data && data.active) || []).map((item) => ({
-        text: `${item.workspace} · running${item.stage ? ` (${item.stage})` : ''}`,
-        hash: hashFor(item.workspace, `&kind=run&id=${encodeURIComponent(item.id)}`), at: item.at })),
-    ],
-    more: () => 'Open runs…',
   });
 }

@@ -163,17 +163,15 @@ reviewer (term-llm checks a sub-agent against its parent's model rule too). Push
 migration-data proposes findings (schemas, a run's cause); nothing reaches the coding agents
 until you release it. In the web UI:
 
-- A **Findings** tab on the right edge (the `silo-findings` extension) shows how many wait for
-  review; click it for the list, and a link opens one in the **Findings** widget (also under
-  Widgets in the sidebar).
-- The widget lists findings per project: **To review**, **Released**, **Rejected**, **Replaced**,
-  **Withdrawn**, **All**, newest first, 25 per page, with a project filter and search (ID, kind,
-  reviewer, first line). Lists are read straight from the projects' stores, so they stay quick
-  with thousands of findings.
+- The **Project** tab on the right edge (the `silo-findings` extension) shows which projects have
+  something waiting; it links to the **Project** page (also under Widgets in the sidebar), where
+  findings are in the **Findings** tab of that project.
+- The Findings tab lists **To review**, **Released** and **Everything else**, newest first. Lists
+  are read straight from the project's store, so they stay quick with thousands of findings.
 - **To review:** the proposal (read-only) and an editor prefilled with it. Edit it (only invented
   examples), then **Release** (exactly that text, its SHA-256 computed from it) or **Reject**.
 - **Released:** **Amend…** releases corrected text as a new version that replaces it (the coding
-  agents then see only the new one; the widget shows the versions); **Withdraw** takes it back.
+  agents then see only the new one; Details shows the versions); **Withdraw** takes it back.
 - Each decision runs `standard finding release|reject|amend|withdraw` as the account and is
   recorded with your commit identity's name plus "(web UI)" and the time.
 
@@ -181,12 +179,12 @@ until you release it. In the web UI:
 code it wrote). Anyone who can open this node's web UI (directly or through the Hub) can decide
 findings, as they can already chat with every agent: keep that access to engineers.
 
-Why it's safe: the widget runs on a Unix socket that only term-llm's signed-in proxy reaches;
+Why it's safe: the Project page runs on a Unix socket that only term-llm's signed-in proxy reaches;
 term-llm accepts its POSTs only from the web UI's own origin (or with the bearer token), and the
 widget also requires its page's header. No agent has the web UI sign-in, and `read_url` refuses
 local addresses anyway. Only you see proposed text in the browser, as you already do in Frontier
-chats. The widget and extension come from the sealed release; no other widgets or extensions are
-loaded. term-llm 0.9.93 keeps widget sockets in the fixed folder `/tmp/term-llm-widgets` without
+chats. The page and extensions come from the sealed release; nothing else is loaded. The Findings and
+Runs code under `widgets/` is the page's library: same checks and commands as before, no pages of its own. term-llm 0.9.93 keeps widget sockets in the fixed folder `/tmp/term-llm-widgets` without
 checking its owner, so the installer reserves it for the service account (now and at every boot,
 `/etc/tmpfiles.d/silo-migrate-term-llm.conf`), the widget refuses to start unless the folder is the
 account's and private, and doctor's "widget folder" check fails otherwise. Without the widget (doctor's "findings widget" check), use the CLI in

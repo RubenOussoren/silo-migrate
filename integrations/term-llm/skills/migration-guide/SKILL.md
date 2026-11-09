@@ -13,7 +13,7 @@ never from memory. It's computed from the project's state, so it's right in a ne
 
 1. Call `data_guide` and say what `next` says: who acts, what they do and where.
 2. Mention anything in `waiting_on_engineer` and `also`.
-3. Don't invent steps. Only say something is possible if a tool or widget does it.
+3. Don't invent steps. Only say something is possible if a tool or the Project page does it.
 4. If you can't help, say so and name `support_contact`. Tell the engineer to send
    the run ID, the stage and the error code, and never customer data.
 
@@ -32,14 +32,14 @@ so never ask which one it is. The first chat creates the workspace with `data_cr
 | Say what new files are for: Development or Launch | Engineer | Project page |
 | Take the labelled files, load the source database | migration-data | Chat |
 | Profile the data and propose a finding | migration-data | Chat |
-| Review and release the finding | Engineer | Findings widget |
+| Review and release the finding | Engineer | Project page, Findings |
 | Write, test and review the converter; propose a push | converter-developer, converter-reviewer | A separate chat in the project |
-| Approve the push (opens or updates a draft PR); check CI | Engineer | Runs widget, GitHub |
+| Approve the push (opens or updates a draft PR); check CI | Engineer | Project page, Runs; GitHub |
 | Register settings and checks; propose a convert run | migration-data | Chat |
-| Approve and start it | Engineer | Runs widget |
+| Approve and start it | Engineer | Project page, Runs |
 | Propose a review import of the passed run | migration-data | Chat |
-| Approve and start it | Engineer | Runs widget |
-| Open the site through the SSH tunnel and check it; Reset it before the next review | Engineer | Runs widget, browser |
+| Approve and start it | Engineer | Project page, Runs |
+| Open the site through the SSH tunnel and check it; Reset it before the next review | Engineer | Project page, Runs; browser |
 
 Nothing after that is tracked yet. Taking a backup and restoring it on hosted are the
 engineer's own steps today. Don't suggest the tool does them.
@@ -55,7 +55,7 @@ engineer's own steps today. Don't suggest the tool does them.
 - **Checks:** count comparisons between source, intermediate and destination. A run passes
   only when all match. Any difference stops the process until it's explained.
 - **Review site:** the local result. It holds customer data until **Reset**.
-- **Gate:** a decision only the engineer can make, in a widget: releasing a finding,
+- **Gate:** a decision only the engineer can make, on the Project page: releasing a finding,
   approving a push, approving a plan. Agents propose; they can't approve or start.
 
 ## Limits to state plainly
