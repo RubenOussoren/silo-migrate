@@ -193,6 +193,26 @@ class StandardConvertRunTest < SiloMigrateTest
     end
   end
 
+  def test_settings_from_data_of_the_other_kind_are_refused
+    with_convert do
+      source = @named.add_source('synthetic', platform: 'mybb')[:source_id]
+      launch = @named.add_dataset('synthetic', source_id: source)[:dataset_id]
+      deliveries = File.join(@root, '.silo-migrate', 'named', 'deliveries.json')
+      document = JSON.parse(File.read(deliveries))
+      document['deliveries'][launch] = { 'dataset_id' => launch, 'kind' => 'launch', 'version' => 1 }
+      File.write(deliveries, JSON.generate(document))
+      relative = 'inputs/launch-settings.yml'
+      bytes = File.binread(File.join(@root, 'inputs', 'derived', 'settings.yml'))
+      write(File.join(@root, relative), bytes, mode: 'wb')
+      File.chmod(0o400, File.join(@root, relative))
+      settings = @named.add_input('synthetic', dataset_id: launch, path: relative, sha256: Digest::SHA256.hexdigest(bytes), bytes: bytes.bytesize, type: 'converter-settings')[:input_id]
+      standard_error('STANDARD_DELIVERY_MIXED') { propose_convert(settings: settings) }
+      document['deliveries'][@dataset]['replaced_by'] = launch
+      File.write(deliveries, JSON.generate(document))
+      standard_error('STANDARD_DELIVERY_UNLABELLED') { propose_convert }
+    end
+  end
+
   def test_launch_data_can_be_labelled_but_cannot_run_yet
     with_convert do
       label_delivery('launch')

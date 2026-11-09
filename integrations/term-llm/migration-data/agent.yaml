@@ -115,6 +115,7 @@ tools:
           language: {type: string, enum: [ruby, python]}
           code: {type: string, description: "The whole script (max 256 KiB)"}
           into: {type: string, description: "New work folder name: lowercase letters, digits, - and _"}
+          delivery: {type: string, description: "dataset_id of the one delivery the script reads (data_guide lists them). Only that delivery's files are under /in, and the outputs belong to it. Needed once the project has more than one"}
           timeout_minutes: {type: integer, description: "1-360, default 30"}
         required: [code, into]
         additionalProperties: false

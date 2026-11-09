@@ -63,6 +63,7 @@ module SiloMigrate
         end
 
         delivery = delivery_binding!(source_plan.dig("body", "dataset_id"))
+        delivery_roles!(named, roles, delivery)
         limits = review_limits
         review_capacity!(limits, running: false)
         review_port = select_review_port(state, port)

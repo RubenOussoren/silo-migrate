@@ -25,7 +25,7 @@ TOOLS = {
     "data_create": ("create", {"platform", "converter_branch"}, 290),
     "data_take": ("take", {"path", "type", "name"}, 290),
     "data_register": ("register", {"path", "type", "name"}, 290),
-    "data_script": ("script", {"language", "code", "into", "timeout_minutes"}, 150),
+    "data_script": ("script", {"language", "code", "into", "timeout_minutes", "delivery"}, 150),
     "data_extract": ("extract", {"path", "into", "timeout_minutes"}, 150),
     "data_job": ("job", {"job_id"}, 120),
     "data_db_up": ("db_up", {"engine"}, 200),

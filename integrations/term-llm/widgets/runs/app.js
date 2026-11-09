@@ -123,7 +123,7 @@ async function loadList() {
   state.overview = data;
   const plans = data.plans.slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   const runs = data.runs.slice().sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
-  const planItem = (plan) => entry('plan', plan.plan_id, `${operationLabel(plan.operation)}${plan.platform ? ` · ${plan.platform}` : ''}`,
+  const planItem = (plan) => entry('plan', plan.plan_id, `${operationLabel(plan.operation)} · ${dataLabel(plan)}${plan.platform ? ` · ${plan.platform}` : ''}`,
     [badge(plan.status), ` ${short(plan.plan_id, 13)} · ${ago(plan.created_at)}${plan.approved_by ? ` · approved by ${plan.approved_by}` : ''}`]);
   const runItem = (run) => entry('run', run.run_id, `Run ${short(run.run_id, 12)}`,
     [badge(run.status), ` ${run.stage ? `${run.stage} · ` : ''}${ago(run.started_at)}`]);
@@ -193,6 +193,13 @@ function checksView(text) {
       ...(destination ? [el('code', {}, c.destination_sql || '')] : []), c.note || '']));
 }
 
+// Which data a plan runs on, in words: part of what an approval covers.
+const dataLabel = (plan) => {
+  const delivery = plan.delivery;
+  if (!delivery) return 'Not labelled';
+  return delivery.kind === 'launch' ? 'LAUNCH data' : `Development v${delivery.version}`;
+};
+
 function renderPlan(plan) {
   const convert = plan.operation === 'standard_convert';
   const review = plan.operation === 'standard_review';
@@ -203,6 +210,7 @@ function renderPlan(plan) {
       String(input.bytes), el('span', { class: 'mono', title: input.sha256 }, short(input.sha256, 16))];
   });
   const parts = [el('h2', { class: 'mono' }, plan.plan_id), facts([
+    ['Data', el('strong', {}, dataLabel(plan))],
     ['Status', badge(plan.status)],
     ['What', convert ? `Convert run: load the dump, run converters/${plan.platform}, count (no import)` : review ? 'Review import: import a completed convert run into one local site' : 'Full run'],
     ['Converter', review ? null : `${converter.branch || ''} @ ${short(plan.converter_revision, 12)}${converter.repo ? ` (${converter.repo})` : ''}`],
@@ -240,8 +248,8 @@ function renderPlan(plan) {
   const unseen = (convert && (plan.texts || {}).settings == null) || ((convert || review) && (plan.roles || {}).reconciliation && (plan.texts || {}).reconciliation == null);
   if (plan.status === 'proposed') {
     const question = unseen
-      ? `Approve plan ${plan.plan_id}?\nDigest ${plan.digest}\nThe settings or checks could NOT be shown here: you approve them by hash only.`
-      : `Approve plan ${plan.plan_id}?\nDigest ${plan.digest}\nIt runs exactly what this page shows.`;
+      ? `Approve plan ${plan.plan_id} on ${dataLabel(plan)}?\nDigest ${plan.digest}\nThe settings or checks could NOT be shown here: you approve them by hash only.`
+      : `Approve plan ${plan.plan_id} on ${dataLabel(plan)}?\nDigest ${plan.digest}\nIt runs exactly what this page shows.`;
     actions.push(el('button', { type: 'button', class: 'primary', onclick: async () => {
       if (await act('approve', { plan_id: plan.plan_id, digest: plan.digest }, question)) {
         toast('Approved. Start it when you are ready.');

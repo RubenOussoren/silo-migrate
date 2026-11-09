@@ -1,7 +1,10 @@
 // The Project page. Built with DOM calls only: file names are data, never markup.
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...children) => {
-  const node = Object.assign(document.createElement(tag), props);
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (key.includes('-')) node.setAttribute(key, value); else node[key] = value;
+  }
   node.append(...children.filter((child) => child !== null && child !== undefined));
   return node;
 };
@@ -39,7 +42,14 @@ async function api(path, body) {
 const explain = (error) => ERRORS[String(error.message).split(':')[0]] || `That didn't work: ${error.message}`;
 const size = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.round(bytes / 1e3)} KB`);
 const day = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '');
-const widget = (name) => `../${name}/#workspace=${encodeURIComponent(state.project)}`;
+const widget = (name) => `../${name}/#ws=${encodeURIComponent(state.project)}`;
+// File names are data from outside: control and direction characters could disguise them.
+const safe = (text) => String(text).replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '\ufffd');
+const fileText = (record) => {
+  const first = (record.files || [])[0];
+  const more = (record.file_count || 0) - 1;
+  return first ? `${safe(first.path)}${more > 0 ? ` and ${more} more` : ''} · ` : '';
+};
 // IDs and hashes belong in Details, not in the sentence.
 const plain = (text) => text.replace(/\s*\b(?:plan|run|finding)-[0-9a-f]{32}\b/g, '').replace(/\s*\b[0-9a-f]{64}\b/g, '').replace(/ on the Project page/g, '').replace(/\s+([.,])/g, '$1');
 const STAGE_NAMES = { files: 'Files', workspace: 'Workspace', source_db: 'Source DB', finding: 'Finding', converter: 'Converter', convert: 'Convert', review: 'Import', site: 'Check site' };
@@ -64,20 +74,20 @@ function deliveryLabel(record) {
   return record.kind === 'launch' ? 'Launch' : `Development v${record.version}`;
 }
 
-function currentDelivery() {
-  return ((state.files && state.files.deliveries) || [])[0] || null;
+// The newest delivery of a kind, unless it was replaced. Runs use development data until launch
+// runs exist, so that's what the page leads with; launch data shows beside it once it arrives.
+function newest(kind) {
+  return ((state.files && state.files.deliveries) || []).find((record) => record.kind === kind && !record.replaced_by) || null;
 }
 
 function renderData() {
-  const record = currentDelivery();
-  document.body.classList.toggle('is-launch', Boolean(record && record.kind === 'launch'));
-  if (!record) {
-    $('data').replaceChildren(el('span', { className: 'badge none', textContent: 'NO DATA LABELLED' }));
-    return;
-  }
-  const first = (record.files || [])[0];
-  const about = `${first ? `${first.path}${record.files.length > 1 ? ` and ${record.files.length - 1} more` : ''} · ` : ''}labelled ${day(record.labelled_at)}`;
-  $('data').replaceChildren(el('span', { className: `badge ${record.kind === 'launch' ? 'launch' : ''}`, textContent: deliveryLabel(record).toUpperCase() }), about);
+  const development = newest('development');
+  const launch = newest('launch');
+  const parts = [];
+  if (development) parts.push(el('span', { className: 'badge', textContent: deliveryLabel(development).toUpperCase() }), `${fileText(development)}labelled ${day(development.labelled_at)}`);
+  if (launch) parts.push(el('span', { className: 'badge launch', textContent: 'LAUNCH RECEIVED' }));
+  if (!parts.length) parts.push(el('span', { className: 'badge none', textContent: 'NO DATA LABELLED' }));
+  $('data').replaceChildren(...parts);
 }
 
 function renderStages() {
@@ -87,7 +97,9 @@ function renderStages() {
 
 function waitingFiles() {
   const files = state.files;
-  return files ? files.unlabelled_files.length + files.unlabelled_data.length : 0;
+  if (!files) return 0;
+  const counts = files.counts || {};
+  return (counts.unlabelled ?? files.unlabelled_files.length) + (counts.refused || 0) + (counts.not_ready ?? files.not_ready_files.length) + files.unlabelled_data.length;
 }
 
 function renderTabs() {
@@ -136,9 +148,11 @@ async function submitLabel(kind, extra) {
 }
 
 function newFilesCard(files) {
-  const list = el('div', { className: 'files' }, ...files.unlabelled_files.map((item) => el('div', { className: 'file' }, el('span', { textContent: item.path }), el('span', { textContent: `${size(item.bytes)} · ${day(new Date(item.mtime_ns / 1e6).toISOString())}` }))));
+  const list = el('div', { className: 'files' }, ...files.unlabelled_files.map((item) => el('div', { className: 'file' }, el('span', { textContent: safe(item.path) }), el('span', { textContent: `${size(item.bytes)} · ${day(new Date(item.mtime_ns / 1e6).toISOString())}` }))));
+  const hidden = ((files.counts || {}).unlabelled || 0) - files.unlabelled_files.length;
+  if (hidden > 0) list.append(el('p', { className: 'hint', textContent: `and ${hidden} more. Label these first, then the rest.` }));
   const body = { files: files.unlabelled_files };
-  const replacing = files.deliveries.some((record) => record.kind === 'launch');
+  const replacing = files.deliveries.some((record) => record.kind === 'launch' && !record.replaced_by);
   let actions;
   if (state.typing) {
     const box = el('input', { className: 'confirm', placeholder: 'Type LAUNCH', autocomplete: 'off', 'aria-label': 'Type LAUNCH to confirm' });
@@ -164,17 +178,23 @@ function renderFiles() {
     out.push(el('div', { className: 'card' }, el('div', { className: 'eyebrow', textContent: 'EXISTING DATA, FOR YOU' }), el('p', { className: 'say', textContent: 'This project has data from before labels existed.' }),
       el('button', { type: 'button', className: 'btn', textContent: 'Label it Development', onclick: () => submitLabel('development', { dataset_id: dataset }) })));
   }
+  const problem = (title, items, why) => el('div', { className: 'card' }, el('div', { className: 'eyebrow', textContent: 'NEEDS YOU' }), el('p', { className: 'say', textContent: title }),
+    el('div', { className: 'files' }, ...items.map((item) => el('div', { className: 'file' }, el('span', { textContent: safe(item.path) }), el('span', { textContent: why(item) })))));
+  if (files.refused_files.length) {
+    out.push(problem("These labelled files can't be taken: each is identical to data of the other kind. Remove them from the drop folder.", files.refused_files, (item) => item.delivery));
+  }
+  if (files.not_ready_files.length) {
+    out.push(problem(`Not handed over yet: run silo intake ${state.project} as root. Rename any file whose name shows a \ufffd.`, files.not_ready_files, (item) => size(item.bytes)));
+  }
   if (files.unlabelled_files.length) out.push(newFilesCard(files));
   if (files.labelled_files.length) out.push(el('p', { className: 'quiet', textContent: `${files.labelled_files.length} labelled file(s) are waiting for migration-data to take them.` }));
-  const newest = {};
-  for (const record of files.deliveries) newest[record.kind] = newest[record.kind] || record.dataset_id;
+  const isCurrent = (record) => [newest('development'), newest('launch')].some((pick) => pick && pick.dataset_id === record.dataset_id);
   const row = (record, old) => {
-    const first = (record.files || [])[0];
     const label = old ? el('span', { textContent: `${deliveryLabel(record)} · replaced` }) : el('span', { className: `badge ${record.kind === 'launch' ? 'launch' : ''}`, textContent: deliveryLabel(record).toUpperCase() });
-    return el('div', { className: `item ${old ? 'old' : ''}` }, el('div', {}, label, el('small', { textContent: `${first ? `${first.path}${record.files.length > 1 ? ` and ${record.files.length - 1} more` : ''} · ` : ''}labelled ${day(record.labelled_at)} by ${record.labelled_by}` })));
+    return el('div', { className: `item ${old ? 'old' : ''}` }, el('div', {}, label, el('small', { textContent: `${fileText(record)}labelled ${day(record.labelled_at)} by ${safe(record.labelled_by)}` })));
   };
-  const current = files.deliveries.filter((record) => newest[record.kind] === record.dataset_id);
-  const earlier = files.deliveries.filter((record) => newest[record.kind] !== record.dataset_id);
+  const current = files.deliveries.filter(isCurrent);
+  const earlier = files.deliveries.filter((record) => !isCurrent(record));
   if (current.length) out.push(el('h2', { textContent: 'CURRENT' }), ...current.map((record) => row(record, false)));
   if (earlier.length) out.push(el('h2', { textContent: 'EARLIER' }), ...earlier.map((record) => row(record, true)));
   if (!out.length) out.push(el('p', { className: 'quiet', textContent: 'No files yet. Copy them to the drop folder with scp.' }));

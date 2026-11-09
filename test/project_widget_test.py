@@ -50,7 +50,7 @@ with open(os.environ['CALLS'], 'a') as out:
 if os.environ.get('REFUSE'):
     print('Error: ' + os.environ['REFUSE'], file=sys.stderr)
     sys.exit(1)
-print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.argv[2] == 'new-forum' else [], 'delivery': 'Development v1'}))
+print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.argv[2] == 'new-forum' else [], 'unlabelled_data': [], 'delivery': 'Development v1'}))
 ''')
         self.control.chmod(0o700)
         os.environ['CALLS'] = str(self.record)
@@ -85,11 +85,11 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
 
     def test_a_label_passes_only_known_fields_and_the_servers_reviewer_name(self):
         status, _data, _ = self.post({'workspace': 'arc', 'kind': 'development', 'by': 'Someone Else', 'op': 'db_reset', 'via': 'x',
-                                      'files': [{'path': 'a.sql', 'bytes': 1, 'mtime_ns': '2', 'extra': 'x'}]})
+                                      'files': [{'path': 'a.sql', 'bytes': 1, 'mtime_ns': '2', 'ctime_ns': '3', 'ino': '4', 'extra': 'x'}]})
         self.assertEqual(200, status)
         (argv, request), = self.calls()
         self.assertEqual(['data', 'arc'], argv)
-        self.assertEqual({'op': 'delivery_label', 'kind': 'development', 'by': self.m.runs.reviewer_name(), 'files': [{'path': 'a.sql', 'bytes': 1, 'mtime_ns': '2'}]}, request)
+        self.assertEqual({'op': 'delivery_label', 'kind': 'development', 'by': self.m.runs.reviewer_name(), 'files': [{'path': 'a.sql', 'bytes': 1, 'mtime_ns': '2', 'ctime_ns': '3', 'ino': '4'}]}, request)
 
     def test_launch_flags_pass_only_in_their_exact_form(self):
         self.post({'workspace': 'arc', 'kind': 'launch', 'files': [{'path': 'a'}], 'confirm': 'yes', 'replaces_launch': 'true'})

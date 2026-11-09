@@ -719,7 +719,7 @@ def pending_for(ws, relative):
     return ws.data_dir("pending") / (hashlib.sha256(relative.encode("utf-8")).hexdigest()[:32] + ".json")
 
 
-def move_in(ws, meta, src_root, parts, dest_fd, name, relative, kind, provenance, owner_check=True):
+def move_in(ws, meta, src_root, parts, dest_fd, name, relative, kind, provenance, owner_check=True, inode=None):
     """Move one regular file into place, then settle it; resume a pending move of the same file."""
     pending = pending_for(ws, relative)
     record = ws.read_json(pending, None)
@@ -733,6 +733,8 @@ def move_in(ws, meta, src_root, parts, dest_fd, name, relative, kind, provenance
     fd, info = open_regular(src_root, parts)
     parent = walk_dirs(src_root, parts[:-1])
     try:
+        if inode is not None and info.st_ino != inode:  # swapped since its label was checked
+            refuse("STANDARD_DELIVERY_UNLABELLED: the file changed")
         if info.st_nlink != 1 or (owner_check and info.st_uid != os.getuid()):
             # Not yet handed to the account (run `silo intake` as root) or linked elsewhere.
             refuse("STANDARD_PATH_INVALID")
@@ -770,6 +772,11 @@ def move_in(ws, meta, src_root, parts, dest_fd, name, relative, kind, provenance
 
 DELIVERY_KINDS = ("development", "launch")
 MAX_LABELLED_BY = 120
+MAX_DROP_FILES = 10000
+SHOWN_FILES = 200
+# What makes a dropped file the one that was labelled. Times and inode as strings: the page's
+# JavaScript can't hold them as numbers. Changing, replacing or re-copying a file changes these.
+IDENTITY = ("path", "bytes", "mtime_ns", "ctime_ns", "ino")
 
 
 def deliveries_file(ws):
@@ -779,46 +786,71 @@ def deliveries_file(ws):
 def read_deliveries(ws):
     """{dataset_id: record}. Nothing here is written by an agent."""
     path = deliveries_file(ws)
-    if path.is_symlink():
+    if path.is_symlink() or path.parent.is_symlink():
         refuse("STANDARD_PATH_INVALID")
     document = ws.read_json(path, {})
     records = document.get("deliveries") if isinstance(document, dict) else None
-    return records if isinstance(records, dict) else {}
+    return {key: value for key, value in records.items() if isinstance(value, dict)} if isinstance(records, dict) else {}
+
+
+def write_deliveries(ws, records):
+    ws.write_json(deliveries_file(ws), {"version": 1, "deliveries": records})
 
 
 def delivery_label(record):
-    return "%s v%d" % (record["kind"].capitalize(), record["version"]) if record["kind"] == "development" else "Launch"
+    return "Development v%d" % record["version"] if record["kind"] == "development" else "Launch"
 
 
 def drop_listing(ws):
-    """Regular files in the drop folder: relative path, size and modification time."""
+    """Regular files in the drop folder. `ready` is false until `silo intake` has handed a file to this
+    account, or when its name can't be shown; such files can't be labelled."""
     if not ws.intake.is_dir() or ws.intake.is_symlink():
         return []
     files = []
     for folder, _dirs, names, dirfd in os.fwalk(str(ws.intake), follow_symlinks=False):
         for name in names:
             info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
-            if stat.S_ISREG(info.st_mode):
-                relative = os.path.relpath(os.path.join(folder, name), str(ws.intake))
-                # A string: the page's JavaScript can't hold a nanosecond time as a number.
-                files.append({"path": relative, "bytes": info.st_size, "mtime_ns": str(info.st_mtime_ns)})
-    return sorted(files, key=lambda item: item["path"])[:MAX_LIST]
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            relative = os.path.relpath(os.path.join(folder, name), str(ws.intake))
+            try:
+                relative.encode("utf-8")
+                readable = True
+            except UnicodeEncodeError:
+                relative, readable = relative.encode("utf-8", "surrogateescape").decode("utf-8", "replace"), False
+            files.append({"path": relative, "bytes": info.st_size, "mtime_ns": str(info.st_mtime_ns), "ctime_ns": str(info.st_ctime_ns),
+                          "ino": str(info.st_ino), "ready": readable and info.st_uid == os.getuid() and info.st_nlink == 1})
+            if len(files) >= MAX_DROP_FILES:
+                return sorted(files, key=lambda item: item["path"])
+    return sorted(files, key=lambda item: item["path"])
 
 
-def claimed_by(records, path, size, mtime_ns):
-    """The dataset whose delivery holds exactly this file, or None. A changed file isn't claimed."""
+def claim(records, item):
+    """(dataset_id, file entry) of the delivery holding exactly this file, or (None, None). A replaced
+    delivery holds nothing any more, and a file already taken can't be claimed again."""
     for dataset_id, record in records.items():
-        for item in record.get("files") or []:
-            if item.get("path") == path and item.get("bytes") == size and item.get("mtime_ns") == mtime_ns:
-                return dataset_id
-    return None
+        if record.get("replaced_by"):
+            continue
+        for entry in record.get("files") or []:
+            if not entry.get("taken") and all(entry.get(key) == item.get(key) for key in IDENTITY):
+                return dataset_id, entry
+    return None, None
 
 
 def split_drop_files(ws, records):
-    labelled, unlabelled = [], []
+    """Every file in the drop folder, by what's needed next."""
+    groups = {"labelled": [], "unlabelled": [], "refused": [], "not_ready": []}
     for item in drop_listing(ws):
-        (labelled if claimed_by(records, item["path"], item["bytes"], item["mtime_ns"]) else unlabelled).append(item)
-    return labelled, unlabelled
+        dataset, entry = claim(records, item)
+        if entry and entry.get("refused"):
+            groups["refused"].append(dict(item, refused=entry["refused"], delivery=delivery_label(records[dataset])))
+        elif entry:
+            groups["labelled"].append(dict(item, delivery=delivery_label(records[dataset])))
+        elif item["ready"]:
+            groups["unlabelled"].append(item)
+        else:
+            groups["not_ready"].append(item)
+    return groups
 
 
 def unlabelled_data(ws, records):
@@ -828,35 +860,89 @@ def unlabelled_data(ws, records):
     return [dataset_id for dataset_id in (state.get("datasets") or {}) if dataset_id in holding and dataset_id not in records]
 
 
-def delivery_of_take(ws, root, parts, relative):
-    """The dataset this file goes into. Only the engineer's label makes a file takeable."""
+def delivery_of_take(ws, root, parts, dest_fd, name, relative):
+    """(dataset, inode) for a take. Only the engineer's label makes a file takeable."""
     pending = ws.read_json(pending_for(ws, relative), None)
-    if pending:  # finishing an interrupted take: already decided
-        return pending["provenance"].get("dataset_id") or ws.meta()["dataset_id"]
+    if pending:
+        try:
+            os.stat(name, dir_fd=dest_fd, follow_symlinks=False)
+            placed = True
+        except FileNotFoundError:
+            placed = False
+        dataset = (pending.get("provenance") or {}).get("dataset_id")
+        if placed:  # finishing an interrupted take of a file already moved: already decided
+            if not dataset:
+                refuse("STANDARD_DELIVERY_UNLABELLED: a take from before labels was interrupted; ask the engineer")
+            return dataset, None
     records = read_deliveries(ws)
     fd, info = open_regular(root, parts)
     try:
-        dataset = claimed_by(records, "/".join(parts), info.st_size, str(info.st_mtime_ns))
+        item = {"path": "/".join(parts), "bytes": info.st_size, "mtime_ns": str(info.st_mtime_ns), "ctime_ns": str(info.st_ctime_ns), "ino": str(info.st_ino)}
+        dataset, entry = claim(records, item)
         if dataset is None:
             refuse("STANDARD_DELIVERY_UNLABELLED: the engineer labels new files on the Project page")
-        if records[dataset]["kind"] == "launch":
-            refuse_if_development_copy(ws, records, fd, info)
+        if entry.get("refused"):
+            refuse(entry["refused"])
+        refuse_if_copy_of_other_kind(ws, records, records[dataset]["kind"], fd, info, entry)
     finally:
         os.close(fd)
-    return dataset
+    return dataset, info.st_ino
 
 
-def refuse_if_development_copy(ws, records, fd, info):
-    """Launch data identical to a development delivery is almost certainly the wrong file. Only
-    files of the same size are hashed, so this costs nothing in the normal case."""
-    development = {dataset_id for dataset_id, record in records.items() if record["kind"] == "development"}
+def refuse_if_copy_of_other_kind(ws, records, kind, fd, info, entry):
+    """Development and launch data that are byte-for-byte the same is almost certainly the wrong
+    file. Only files of the same size are hashed, so this costs nothing in the normal case. The
+    refusal is kept on the file, so the guide asks the engineer to remove it."""
+    other = {dataset_id for dataset_id, record in records.items() if record["kind"] != kind}
     candidates = [record for record in (ws.named_state().get("inputs") or {}).values()
-                  if record.get("dataset_id") in development and record.get("bytes") == info.st_size]
+                  if record.get("dataset_id") in other and record.get("bytes") == info.st_size]
     if candidates:
         os.lseek(fd, 0, os.SEEK_SET)
         digest = sha256_fd(fd)
         if any(record.get("sha256") == digest for record in candidates):
-            refuse("STANDARD_DELIVERY_SAME_AS_DEVELOPMENT")
+            code = "STANDARD_DELIVERY_SAME_AS_DEVELOPMENT" if kind == "launch" else "STANDARD_DELIVERY_SAME_AS_LAUNCH"
+            entry["refused"] = code
+            write_deliveries(ws, records)
+            refuse(code)
+
+
+def mark_taken(ws, dataset, relative_drop, input_id):
+    records = read_deliveries(ws)
+    for entry in (records.get(dataset) or {}).get("files") or []:
+        if entry.get("path") == relative_drop and not entry.get("taken"):
+            entry["taken"] = input_id
+            write_deliveries(ws, records)
+            return
+
+
+def job_delivery(ws, request):
+    """The one delivery a job reads, and the files of it to mount. Its outputs belong to it."""
+    records = read_deliveries(ws)
+    if not records:  # a project from before labels: everything, as before
+        return None, None
+    wanted = request.get("delivery")
+    if wanted is None:
+        holding = {record.get("dataset_id") for record in (ws.named_state().get("inputs") or {}).values()}
+        candidates = [dataset_id for dataset_id in records if dataset_id in holding]
+        if len(candidates) != 1:
+            refuse("STANDARD_ARGUMENTS_INVALID: delivery (this project has more than one: give the dataset_id from data_guide)")
+        wanted = candidates[0]
+    if not isinstance(wanted, str) or wanted not in records:
+        refuse("STANDARD_ARGUMENTS_INVALID: delivery")
+    return wanted, delivery_mounts(ws, wanted)
+
+
+def delivery_mounts(ws, dataset_id):
+    """Read-only mounts of exactly this delivery's registered inputs, at their usual places under /in."""
+    mounts = []
+    for record in (ws.named_state().get("inputs") or {}).values():
+        if record.get("dataset_id") == dataset_id:
+            relative = base64.b64decode(record["path"]).decode("utf-8")
+            parts = parts_of(relative)
+            if parts[0] != "inputs" or len(parts) < 2:
+                refuse("STANDARD_PATH_INVALID")
+            mounts.append((ws.root.joinpath(*parts), "/in/" + "/".join(parts[1:])))
+    return mounts
 
 
 def engineer_only(ws):
@@ -865,15 +951,27 @@ def engineer_only(ws):
         refuse("STANDARD_DATA_OPERATION_REFUSED")
 
 
+def delivery_summary(record):
+    files = record.get("files") or []
+    return dict({key: record.get(key) for key in ("dataset_id", "kind", "version", "sequence", "labelled_at", "labelled_by", "replaced_by")},
+                label=delivery_label(record), files=files[:5], file_count=len(files))
+
+
 def op_deliveries(ws, request):
     """The engineer's view for the Project page. It holds file names, so it never reaches a chat."""
     engineer_only(ws)
+    empty = {"initialized": False, "deliveries": [], "unlabelled_data": []}
     if not ws.initialized():
-        return {"initialized": False, "deliveries": [], "unlabelled_files": [], "labelled_files": [], "unlabelled_data": []}
+        listing = drop_listing(ws)
+        return dict(empty, unlabelled_files=[item for item in listing if item["ready"]][:SHOWN_FILES], labelled_files=[], refused_files=[],
+                    not_ready_files=[item for item in listing if not item["ready"]][:SHOWN_FILES])
     records = read_deliveries(ws)
-    labelled, unlabelled = split_drop_files(ws, records)
-    return {"initialized": True, "deliveries": sorted(records.values(), key=lambda record: record["labelled_at"], reverse=True),
-            "unlabelled_files": unlabelled, "labelled_files": labelled, "unlabelled_data": unlabelled_data(ws, records)}
+    groups = split_drop_files(ws, records)
+    ordered = sorted(records.values(), key=lambda record: record.get("sequence", 0), reverse=True)
+    return {"initialized": True, "deliveries": [delivery_summary(record) for record in ordered],
+            "unlabelled_files": groups["unlabelled"][:SHOWN_FILES], "labelled_files": groups["labelled"][:SHOWN_FILES],
+            "refused_files": groups["refused"][:SHOWN_FILES], "not_ready_files": groups["not_ready"][:SHOWN_FILES],
+            "counts": {key: len(value) for key, value in groups.items()}, "unlabelled_data": unlabelled_data(ws, records)}
 
 
 def op_delivery_label(ws, request):
@@ -890,7 +988,8 @@ def op_delivery_label(ws, request):
     with ws.lock():
         records, meta = read_deliveries(ws), ws.meta()
         same_kind = [record for record in records.values() if record["kind"] == kind]
-        if kind == "launch" and same_kind and request.get("replaces_launch") is not True:
+        current_launch = [record for record in same_kind if kind == "launch" and not record.get("replaced_by")]
+        if current_launch and request.get("replaces_launch") is not True:
             refuse("STANDARD_DELIVERY_LAUNCH_EXISTS")
         state = ws.named_state()
         untagged = [dataset_id for dataset_id in (state.get("datasets") or {}) if dataset_id not in records]
@@ -906,22 +1005,23 @@ def op_delivery_label(ws, request):
             wanted = request.get("files")
             if not isinstance(wanted, list) or not wanted or not all(isinstance(item, dict) for item in wanted):
                 refuse("STANDARD_ARGUMENTS_INVALID: files")
-            _labelled, unlabelled = split_drop_files(ws, records)
-            current = {item["path"]: item for item in unlabelled}
+            current = {item["path"]: item for item in split_drop_files(ws, records)["unlabelled"]}
             for item in wanted:
-                if current.get(item.get("path")) != {key: item.get(key) for key in ("path", "bytes", "mtime_ns")}:
+                seen = current.get(item.get("path"))
+                if not seen or any(seen[key] != item.get(key) for key in IDENTITY):
                     refuse("STANDARD_DELIVERY_FILES_CHANGED: the files changed since the page loaded")
-            files = [current[item["path"]] for item in wanted]
-            if untagged:
+            files = [{key: current[item["path"]][key] for key in IDENTITY} for item in wanted]
+            if untagged and not any(record.get("dataset_id") == untagged[0] for record in (state.get("inputs") or {}).values()):
                 dataset_id = untagged[0]
             else:
                 dataset_id = json.loads(ws.control(["named", "dataset", "add", ws.name, "--source", meta["source_id"], "--label", kind]))["dataset_id"]
         version = 1 + max((record["version"] for record in same_kind), default=0)
-        record = {"dataset_id": dataset_id, "kind": kind, "version": version, "labelled_at": now(), "labelled_by": by.strip(), "files": files}
+        record = {"dataset_id": dataset_id, "kind": kind, "version": version, "labelled_at": now(), "labelled_by": by.strip(), "files": files,
+                  "sequence": 1 + max((record.get("sequence", 0) for record in records.values()), default=0)}
+        for old in current_launch:  # its files, labelled but not taken, can't be taken any more
+            old["replaced_by"] = dataset_id
         records[dataset_id] = record
-        ws.write_json(deliveries_file(ws), {"version": 1, "deliveries": records})
-        meta["dataset_id"] = dataset_id
-        ws.write_json(ws.data_dir() / "workspace.json", meta)
+        write_deliveries(ws, records)
     return {"dataset_id": dataset_id, "kind": kind, "delivery": delivery_label(record), "files": len(files)}
 
 
@@ -940,9 +1040,10 @@ def op_take(ws, request):
         root, inputs = ws.open_area("intake"), None
         try:
             inputs = ws.open_area("inputs")
-            dataset = delivery_of_take(ws, root, parts, "inputs/" + name)
+            dataset, inode = delivery_of_take(ws, root, parts, inputs, name, "inputs/" + name)
             result = move_in(ws, dict(meta, dataset_id=dataset), root, parts, inputs, name, "inputs/" + name, kind,
-                             {"event": "take", "from": "intake/" + "/".join(parts), "dataset_id": dataset})
+                             {"event": "take", "from": "intake/" + "/".join(parts), "dataset_id": dataset}, inode=inode)
+            mark_taken(ws, dataset, "/".join(parts), result["input_id"])
         finally:
             os.close(root)
             if inputs is not None:
@@ -964,6 +1065,12 @@ def op_register(ws, request):
         if any(job.get("into") == parts[0] and job.get("status") == "running" for job in jobs):
             refuse("STANDARD_BUSY")
         producer = next((job for job in reversed(jobs) if job.get("into") == parts[0]), None)
+        # An output belongs to the delivery its job read, never to whichever was labelled last.
+        if read_deliveries(ws):
+            dataset = producer.get("dataset_id") if producer else None
+            if dataset not in read_deliveries(ws):
+                refuse("STANDARD_DELIVERY_UNLABELLED: this output's job didn't read one labelled delivery; run the job again")
+            meta = dict(meta, dataset_id=dataset)
         root, inputs, derived = ws.open_area("work"), None, None
         try:
             inputs = ws.open_area("inputs")
@@ -1029,14 +1136,16 @@ def mount(src, dst, readonly=True):
     return ["--mount", f"type=bind,src={src},dst={dst}" + (",readonly" if readonly else "")]
 
 
-def sandbox_argv(ws, name, out, extra_mounts, command):
-    """No network, read-only root, this account's uid, no capabilities, bounded resources."""
+def sandbox_argv(ws, name, out, extra_mounts, command, inputs=None):
+    """No network, read-only root, this account's uid, no capabilities, bounded resources. `inputs`
+    lists the files of one delivery to mount under /in; None mounts the whole folder (before labels)."""
     gems = ws.values.get("SILO_CONTROL_GEMS")
     argv = ["run", "-d", "--name", name, "--label", "silo.workspace=" + ws.name, "--label", "silo.role=data-job",
             "--pull=never", "--restart", "no", "--network", "none", "--read-only", "--user", f"{os.getuid()}:{os.getgid()}",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", SANDBOX["cpus"], "--memory", SANDBOX["memory"],
             "--memory-swap", SANDBOX["memory"], "--pids-limit", SANDBOX["pids"], "--log-opt", "max-size=4m", "--log-opt", "max-file=1",
-            "--tmpfs", "/tmp:rw,exec,size=" + SANDBOX["tmp"], *mount(ws.root / "inputs", "/in"), *mount(out, "/out", False),
+            "--tmpfs", "/tmp:rw,exec,size=" + SANDBOX["tmp"],
+            *(mount(ws.root / "inputs", "/in") if inputs is None else [arg for src, dst in inputs for arg in mount(src, dst)]), *mount(out, "/out", False),
             *mount(ws.repo, "/silo")]
     if gems and Path(gems).is_dir():
         argv += [*mount(gems, "/gems"), "-e", "GEM_PATH=/gems:/gems/ruby/3.3.0", "-e", "BUNDLE_PATH=/gems", "-e", "BUNDLE_FROZEN=true",
@@ -1075,6 +1184,7 @@ def op_script(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID: language or code")
     limit = minutes(request)
     with ws.lock():
+        dataset, inputs = job_delivery(ws, request)
         out = work_dir(ws, request.get("into"))
         data = code.encode("utf-8")
         digest = hashlib.sha256(data).hexdigest()
@@ -1086,8 +1196,8 @@ def op_script(ws, request):
         target = "/job/script.rb" if language == "ruby" else "/job/script.py"
         interpreter = ["ruby", target] if language == "ruby" else ["python3", "-I", target]
         record = start_job(ws, "script", out.name,
-                           lambda name: sandbox_argv(ws, name, out, [(script, target)], ["-s", "KILL", str(limit * 60), *interpreter]),
-                           {"language": language, "script_sha256": digest, "inputs": input_digests(ws), "timeout_minutes": limit})
+                           lambda name: sandbox_argv(ws, name, out, [(script, target)], ["-s", "KILL", str(limit * 60), *interpreter], inputs),
+                           {"language": language, "script_sha256": digest, "inputs": input_digests(ws), "timeout_minutes": limit, "dataset_id": dataset})
     return {"job_id": record["id"], "status": "running", "script_sha256": digest, "into": "work/" + out.name,
             "next": "poll data_job until it finishes; outputs land in work/" + out.name}
 
@@ -1099,7 +1209,11 @@ def op_extract(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID: path")
     limit = minutes(request)
     with ws.lock():
-        digest = registered(ws, "/".join(parts))["sha256"]
+        source = registered(ws, "/".join(parts))
+        digest = source["sha256"]
+        dataset = source.get("dataset_id") if read_deliveries(ws) else None
+        if dataset is not None and dataset not in read_deliveries(ws):
+            refuse("STANDARD_DELIVERY_UNLABELLED")
         root = ws.open_area("inputs")
         try:
             fd, _info = open_regular(root, parts[1:])
@@ -1108,8 +1222,9 @@ def op_extract(ws, request):
             os.close(root)
         out = work_dir(ws, request.get("into"))
         command = ["-s", "KILL", str(limit * 60), "python3", "-I", "/silo/bin/data_extract.py", "/in/" + "/".join(parts[1:]), "/out"]
-        record = start_job(ws, "extract", out.name, lambda name: sandbox_argv(ws, name, out, [], command),
-                           {"source": {"path": "/".join(parts), "sha256": digest}, "timeout_minutes": limit})
+        mounts = None if dataset is None else delivery_mounts(ws, dataset)
+        record = start_job(ws, "extract", out.name, lambda name: sandbox_argv(ws, name, out, [], command, mounts),
+                           {"source": {"path": "/".join(parts), "sha256": digest}, "timeout_minutes": limit, "dataset_id": dataset})
     return {"job_id": record["id"], "status": "running", "into": "work/" + out.name, "next": "poll data_job"}
 
 
@@ -1491,7 +1606,8 @@ def op_db_load(ws, request):
                     "bash", "-c", script]
         record = start_job(ws, "db_load", None, argv, {"source": {"path": "/".join(parts), "sha256": record["sha256"], "kind": kind},
                                                         "engine": engine, "charset": charset, "timeout_minutes": limit})
-        state["loads"].append({"job_id": record["id"], "path": "/".join(parts), "sha256": record["source"]["sha256"], "started_at": record["started_at"]})
+        state["loads"].append({"job_id": record["id"], "path": "/".join(parts), "sha256": record["source"]["sha256"], "started_at": record["started_at"],
+                               "dataset_id": (find_registered(ws, "/".join(parts)) or {}).get("dataset_id")})
         ws.write_json(ws.data_dir("db") / "state.json", state)
     return {"job_id": record["id"], "status": "running", "engine": engine, "source_kind": kind,
             "next": "poll data_job; then data_db_status"}
@@ -2034,7 +2150,7 @@ def guide_flow(ws, facts, records):
     copy_files = ("engineer", "Copy the customer's files to the drop folder (%s) with scp, then run `silo intake %s` as root." % (ws.intake, ws.name), "server terminal")
     if not facts["initialized"]:
         if facts["drop_files"]:
-            return ("agent", "Create the workspace with data_create (ask the engineer for the source platform if it isn't clear), then take the files with data_take.", "this chat")
+            return ("agent", "Create the workspace with data_create (ask the engineer for the source platform if it isn't clear). The engineer then labels the files.", "this chat")
         return copy_files
     if facts["labelled_files"]:
         return ("agent", "Take the labelled files in the drop folder with data_take, each with a clear type.", "this chat")
@@ -2091,15 +2207,18 @@ def guide_stages(facts, records):
 
 
 def guide_data(records):
-    """Which delivery is which: labels, versions and IDs only, never file names."""
-    ordered = sorted(records.values(), key=lambda record: record["labelled_at"], reverse=True)
+    """Which delivery is which: labels, versions and IDs only, never file names. The newest of each
+    kind is current; launch work isn't possible yet, so development is what runs use."""
+    ordered = sorted(records.values(), key=lambda record: record.get("sequence", 0), reverse=True)
     newest = {}
     for record in ordered:
-        newest.setdefault(record["kind"], record["dataset_id"])
-    return {"current": delivery_label(ordered[0]) if ordered else None,
+        if not record.get("replaced_by"):
+            newest.setdefault(record["kind"], record["dataset_id"])
+    label_of = lambda kind: delivery_label(records[newest[kind]]) if kind in newest else None  # noqa: E731
+    return {"development": label_of("development"), "launch": label_of("launch"),
             "note": None if ordered else "no data is labelled yet: only the engineer can say what files are for",
             "deliveries": [{"label": delivery_label(record), "kind": record["kind"], "dataset_id": record["dataset_id"], "labelled_at": record["labelled_at"],
-                            "state": "current" if newest[record["kind"]] == record["dataset_id"] else "replaced"} for record in ordered]}
+                            "state": "current" if newest.get(record["kind"]) == record["dataset_id"] else "replaced"} for record in ordered]}
 
 
 def op_guide(ws, request):
@@ -2110,9 +2229,10 @@ def op_guide(ws, request):
         for _path, _dirs, files, _dirfd in os.fwalk(str(ws.intake), follow_symlinks=False):
             drop_files += len(files)
     deliveries = read_deliveries(ws) if ws.initialized() else {}
-    labelled, unlabelled = split_drop_files(ws, deliveries) if ws.initialized() else ([], [])
+    groups = split_drop_files(ws, deliveries) if ws.initialized() else {"labelled": [], "unlabelled": [], "refused": [], "not_ready": []}
+    unlabelled = groups["unlabelled"]
     not_labelled = unlabelled_data(ws, deliveries) if ws.initialized() else []
-    facts = {"initialized": ws.initialized(), "drop_files": drop_files, "labelled_files": len(labelled), "inputs": len(state.get("inputs") or {}),
+    facts = {"initialized": ws.initialized(), "drop_files": drop_files, "labelled_files": len(groups["labelled"]), "inputs": len(state.get("inputs") or {}),
              "db_loaded": bool(db and db.get("loads"))}
     records = guide_records(ws) if ws.initialized() else {"plans": [], "runs": [], "sites": [], "findings": [], "pushes": [], "warning": None}
     contact = support_contact(ws)
@@ -2124,6 +2244,12 @@ def op_guide(ws, request):
     if unlabelled:
         arrived = "1 new file arrived" if len(unlabelled) == 1 else "%d new files arrived" % len(unlabelled)
         waiting.append({"what": arrived + ": say what they're for (Development or Launch) on the Project page.", "where": "Project page"})
+    if groups["refused"]:
+        waiting.append({"what": "%d labelled file(s) can't be taken: each is identical to data of the other kind. Remove them from the drop folder." % len(groups["refused"]),
+                        "where": "server terminal"})
+    if groups["not_ready"]:
+        waiting.append({"what": "%d file(s) in the drop folder aren't handed over yet, or have names that can't be shown: run `silo intake %s` as root, and rename any odd names."
+                        % (len(groups["not_ready"]), ws.name), "where": "server terminal"})
     latest_start = {run["kind"]: run["started_at"] or "" for run in records["runs"]}
     for plan in records["plans"]:
         if plan["status"] not in ("proposed", "approved"):

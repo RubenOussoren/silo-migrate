@@ -49,15 +49,35 @@ module SiloMigrate
       # What the engineer said this data is for, read from the record only they can write. Part of
       # the plan body, so it's covered by the approval.
       def delivery_binding!(dataset_id)
-        path = File.join(@store.workspace_root, ".silo-migrate", "named", "deliveries.json")
-        record = File.file?(path) && !File.symlink?(path) ? JSON.parse(File.read(path)).dig("deliveries", dataset_id) : nil
-        raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED" unless record.is_a?(Hash) && %w[development launch].include?(record["kind"]) && record["version"].is_a?(Integer)
+        record = delivery_record!(dataset_id)
         # A launch run needs an accepted development run, and acceptance isn't built yet.
         raise StandardWorkflowError, "STANDARD_LAUNCH_NOT_READY" if record["kind"] == "launch"
 
         { "dataset_id" => dataset_id, "kind" => record["kind"], "version" => record["version"] }
-      rescue JSON::ParserError, SystemCallError
+      end
+
+      def delivery_record!(dataset_id)
+        path = File.join(@store.workspace_root, ".silo-migrate", "named", "deliveries.json")
+        document = File.file?(path) && !File.symlink?(path) ? JSON.parse(File.read(path)) : nil
+        deliveries = document.is_a?(Hash) ? document["deliveries"] : nil
+        record = deliveries.is_a?(Hash) ? deliveries[dataset_id] : nil
+        unless record.is_a?(Hash) && %w[development launch].include?(record["kind"]) && record["version"].is_a?(Integer) && !record["replaced_by"]
+          raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED"
+        end
+
+        record
+      rescue JSON::ParserError, SystemCallError, TypeError, NoMethodError
         raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED"
+      end
+
+      # Settings and checks may come from an earlier delivery, but never from data of the other kind.
+      def delivery_roles!(named, roles, delivery)
+        roles.each do |role, id|
+          next if role == "source"
+
+          other = delivery_record!(named.fetch("inputs").fetch(id).fetch("dataset_id"))
+          raise StandardWorkflowError, "STANDARD_DELIVERY_MIXED" unless other["kind"] == delivery["kind"]
+        end
       end
 
       def propose_convert_plan(source:, settings:, reconciliation: nil, charset: "utf8mb4", allow_unqualified_runtime: false)
@@ -89,6 +109,7 @@ module SiloMigrate
         settings_template!(read_registered_small(inputs.fetch("settings"), MAX_SPEC_BYTES))
 
         delivery = delivery_binding!(inputs.fetch("source").fetch("dataset_id"))
+        delivery_roles!(named, roles, delivery)
         dataset = named.fetch("datasets").fetch(inputs.fetch("source").fetch("dataset_id"))
         platform = named.fetch("sources").fetch(dataset.fetch("source_id")).fetch("platform").unpack1("m0").force_encoding("UTF-8")
         raise StandardWorkflowError.new("STANDARD_CONVERTER_PLATFORM_MISSING", "platform name") unless platform.valid_encoding? && platform.match?(PLATFORM)

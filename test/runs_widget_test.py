@@ -432,5 +432,14 @@ else:
         self.assertNotIn('innerHTML', extension)
 
 
+
+class ApprovalShowsTheDataTest(unittest.TestCase):
+    def test_every_approval_names_the_delivery_it_runs_on(self):
+        source = (WIDGET / 'app.js').read_text()
+        self.assertIn("['Data', el('strong', {}, dataLabel(plan))]", source)
+        self.assertEqual(2, source.count('on ${dataLabel(plan)}?'))
+        self.assertIn("'Not labelled'", source)
+        self.assertIn('${operationLabel(plan.operation)} · ${dataLabel(plan)}', source)
+
 if __name__ == '__main__':
     unittest.main()

@@ -228,7 +228,7 @@ class DataToolsTest(unittest.TestCase):
         document = json.loads(store.read_text()) if store.exists() else {'version': 1, 'deliveries': {}}
         record = document['deliveries'].setdefault(dataset, {'dataset_id': dataset, 'kind': 'development', 'version': 1, 'labelled_at': 'x', 'labelled_by': 'T', 'files': []})
         info = file.stat()
-        record['files'].append({'path': path, 'bytes': info.st_size, 'mtime_ns': str(info.st_mtime_ns)})
+        record['files'].append({'path': path, 'bytes': info.st_size, 'mtime_ns': str(info.st_mtime_ns), 'ctime_ns': str(info.st_ctime_ns), 'ino': str(info.st_ino)})
         store.write_text(json.dumps(document))
 
     def refused(self, expected_code, op, **request):
@@ -580,7 +580,7 @@ class DataToolsTest(unittest.TestCase):
             fd, info = real_open(root, parts)
             fields = list(info)
             fields[4] = 0
-            return fd, os.stat_result(fields, {'st_mtime_ns': info.st_mtime_ns})
+            return fd, os.stat_result(fields, {'st_mtime_ns': info.st_mtime_ns, 'st_ctime_ns': info.st_ctime_ns})
         with mock.patch.object(self.d, 'open_regular', side_effect=as_root):
             self.refused('STANDARD_PATH_INVALID', 'take', path='root-owned.sql', type='mysql-dump')
         self.assertTrue((self.intake / 'root-owned.sql').exists())
@@ -973,7 +973,7 @@ class DataToolsTest(unittest.TestCase):
 
     def test_guide_always_says_what_it_does_not_track_and_who_to_ask(self):
         guide = self.op('guide')
-        self.assertIsNone(guide['data']['current'])
+        self.assertIsNone(guide['data']['development'])
         self.assertIn('no data is labelled yet', guide['data']['note'])
         self.assertIn('not recorded yet', guide['site_acceptance'])
         self.assertEqual('your node admin', guide['support_contact'])
@@ -1070,7 +1070,7 @@ class DataToolsTest(unittest.TestCase):
         self.op('take', path='two.sql', type='mysql-dump')
         self.assertEqual([first['dataset_id'], second['dataset_id']], self.input_datasets())
         data = self.op('guide')['data']
-        self.assertEqual('Development v2', data['current'])
+        self.assertEqual(('Development v2', None), (data['development'], data['launch']))
         self.assertEqual({'Development v2': 'current', 'Development v1': 'replaced'}, {item['label']: item['state'] for item in data['deliveries']})
 
     def test_labelling_is_never_available_to_a_chat(self):
@@ -1150,6 +1150,125 @@ class DataToolsTest(unittest.TestCase):
         printed = json.dumps(self.op('guide'))
         self.assertNotIn('customer-name', printed)
         self.assertIn('Development v1', printed)
+
+    def two_deliveries(self):
+        """Development v1 and Launch, each with one file taken. Returns their dataset IDs."""
+        self.auto_label = False
+        self.create()
+        self.drop('dev.sql', DUMP)
+        dev = self.label('development')['dataset_id']
+        self.op('take', path='dev.sql', type='mysql-dump')
+        self.drop('final.sql', DUMP + '-- final\n')
+        launch = self.label('launch', confirm='LAUNCH')['dataset_id']
+        self.op('take', path='final.sql', type='mysql-dump')
+        return dev, launch
+
+    def finish(self, started):
+        name = [argv for argv in self.docker.argvs('run') if any(started['job_id'][4:] in arg for arg in argv)][-1]
+        self.docker.state[name[name.index('--name') + 1]] = {'Running': False, 'Status': 'exited', 'ExitCode': 0}
+        self.op('job', job_id=started['job_id'])
+
+    def test_a_script_reads_one_delivery_and_its_output_belongs_to_it(self):
+        dev, launch = self.two_deliveries()
+        self.refused('STANDARD_ARGUMENTS_INVALID: delivery', 'script', code='puts 1', into='x')
+        self.refused('STANDARD_ARGUMENTS_INVALID: delivery', 'script', code='puts 1', into='x', delivery='dataset-' + 'f' * 32)
+        started = self.op('script', code='puts 1', into='fromdev', delivery=dev)
+        argv = ' '.join(self.docker.argvs('run')[-1])
+        self.assertIn('dst=/in/dev.sql,readonly', argv)
+        self.assertNotIn('final.sql', argv)
+        self.assertNotIn('dst=/in,', argv)
+        (self.base / 'arc/work/fromdev/out.sql').write_text('x')
+        self.finish(started)
+        result = self.op('register', path='fromdev/out.sql', type='derived-sql')
+        datasets = {record['id']: record['dataset_id'] for record in json.loads((self.base / 'arc/.silo-migrate/named/state.json').read_text())['inputs'].values()}
+        self.assertEqual(dev, datasets[result['input_id']])
+        # Its derived files are part of that delivery from now on, and only of that one.
+        self.op('script', code='puts 2', into='again', delivery=dev)
+        self.assertIn('dst=/in/derived/fromdev-out.sql,readonly', ' '.join(self.docker.argvs('run')[-1]))
+
+    def test_the_output_of_a_job_from_before_labels_cant_be_registered(self):
+        self.create()
+        started = self.op('script', code='puts 1', into='old')  # no labels yet: reads everything, as before
+        self.assertIn('dst=/in,readonly', ' '.join(self.docker.argvs('run')[-1]))
+        (self.base / 'arc/work/old/out.sql').write_text('x')
+        self.finish(started)
+        self.drop('dev.sql', DUMP)
+        self.op('take', path='dev.sql', type='mysql-dump')  # labels now exist
+        self.refused('STANDARD_DELIVERY_UNLABELLED', 'register', path='old/out.sql', type='derived-sql')
+
+    def test_extract_reads_only_its_archives_delivery(self):
+        dev, _launch = self.two_deliveries()
+        self.op('extract', path='inputs/dev.sql', into='unpacked')
+        argv = ' '.join(self.docker.argvs('run')[-1])
+        self.assertIn('dst=/in/dev.sql,readonly', argv)
+        self.assertNotIn('final.sql', argv)
+
+    def test_db_load_records_which_delivery_is_in_the_database(self):
+        dev, _launch = self.two_deliveries()
+        state = self.base / 'arc/.silo-migrate/data/db/state.json'
+        self.op('db_up', engine='mariadb')
+        self.op('db_load', path='inputs/dev.sql')
+        self.assertEqual(dev, json.loads(state.read_text())['loads'][-1]['dataset_id'])
+
+    def test_a_replaced_file_with_the_same_size_and_time_is_not_labelled(self):
+        self.auto_label = False
+        self.create()
+        self.drop('dump.sql', DUMP)
+        self.label('development')
+        original = (self.intake / 'dump.sql').stat()
+        (self.intake / 'new.tmp').write_text(DUMP.replace('Distrib', 'distrib'))
+        os.utime(self.intake / 'new.tmp', ns=(original.st_atime_ns, original.st_mtime_ns))
+        os.replace(self.intake / 'new.tmp', self.intake / 'dump.sql')
+        self.refused('STANDARD_DELIVERY_UNLABELLED', 'take', path='dump.sql', type='mysql-dump')
+
+    def test_a_taken_file_cant_be_claimed_again_and_a_replaced_launch_holds_nothing(self):
+        self.auto_label = False
+        self.create()
+        self.drop('final.sql', DUMP)
+        first = self.label('launch', confirm='LAUNCH')
+        self.drop('other.sql', DUMP + '-- other\n')
+        self.label('launch', confirm='LAUNCH', replaces_launch=True)
+        self.refused('STANDARD_DELIVERY_UNLABELLED', 'take', path='final.sql', type='mysql-dump')  # its label went with the old launch
+        self.op('take', path='other.sql', type='mysql-dump')
+        records = json.loads((self.base / 'arc/.silo-migrate/named/deliveries.json').read_text())['deliveries']
+        self.assertTrue(records[first['dataset_id']]['replaced_by'])
+        self.assertTrue(all(entry.get('taken') for record in records.values() if not record.get('replaced_by') for entry in record['files']))
+
+    def test_an_interrupted_take_cant_carry_an_unlabelled_file_in(self):
+        self.auto_label = False
+        self.create()
+        self.drop('dump.sql', DUMP)
+        dataset = self.label('development')['dataset_id']
+        pending = self.d.pending_for(self.d.Workspace(self.base, 'arc', ROOT, self.host, self.values, self.control), 'inputs/dump.sql')
+        pending.write_text(json.dumps({'dev': 1, 'ino': 1, 'provenance': {'event': 'take', 'dataset_id': dataset}}))
+        self.drop('other.sql', DUMP + '-- other\n')
+        self.refused('STANDARD_DELIVERY_UNLABELLED', 'take', path='other.sql', type='mysql-dump', name='dump.sql')
+        self.assertTrue((self.intake / 'other.sql').exists())
+
+    def test_development_data_identical_to_launch_is_stopped_too_and_the_guide_asks_to_remove_it(self):
+        self.auto_label = False
+        self.create()
+        self.drop('final.sql', DUMP)
+        self.label('launch', confirm='LAUNCH')
+        self.op('take', path='final.sql', type='mysql-dump')
+        self.drop('dev.sql', DUMP)
+        self.label('development')
+        self.refused('STANDARD_DELIVERY_SAME_AS_LAUNCH', 'take', path='dev.sql', type='mysql-dump')
+        self.refused('STANDARD_DELIVERY_SAME_AS_LAUNCH', 'take', path='dev.sql', type='mysql-dump')  # remembered
+        guide = self.op('guide')
+        self.assertNext('engineer', "can't be taken", guide)
+        self.assertEqual(1, self.op('deliveries')['counts']['refused'])
+        self.assertNotIn('dev.sql', json.dumps(guide))
+
+    def test_files_not_handed_over_or_with_odd_names_cant_be_labelled(self):
+        self.create()
+        name = os.fsdecode(b'odd-\xff.sql')
+        (self.intake / name).write_bytes(DUMP.encode())
+        view = self.op('deliveries')
+        self.assertEqual([], view['unlabelled_files'])
+        self.assertEqual(1, len(view['not_ready_files']))
+        self.assertIn('\ufffd', view['not_ready_files'][0]['path'])
+        self.assertNext('engineer', 'silo intake arc')
 
     def test_refusals_name_the_bad_field(self):
         self.create()

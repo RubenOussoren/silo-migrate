@@ -13,6 +13,7 @@ import re
 import socketserver
 import stat
 import sys
+import time
 from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler
 
@@ -40,10 +41,18 @@ def data(control, workspace, request, timeout=90):
     return runs.control_call(control, ["data", workspace], timeout=timeout, send=json.dumps(request).encode("utf-8"))
 
 
-def project_names(base):
+def intake_folder(control, base):
+    """Where `silo intake` puts drop folders: beside the installed control shim, as data_tools works it out."""
+    shim = Path(control)
+    if shim.name == "silo-migrate-control" and shim.parent.name == "bin" and (shim.parent.parent / "intake").is_dir():
+        return shim.parent.parent / "intake"
+    return base.parent / "intake"
+
+
+def project_names(base, intake):
     """Every project with a workspace or a drop folder (a new project has only the drop folder)."""
     names = set()
-    for folder in (base, base.parent / "intake"):
+    for folder in (base, intake):
         try:
             with os.scandir(folder) as entries:
                 names |= {entry.name for entry in entries if WORKSPACE.fullmatch(entry.name) and entry.is_dir(follow_symlinks=False)}
@@ -52,17 +61,26 @@ def project_names(base):
     return sorted(names)
 
 
+SUMMARY_SECONDS = 20
+_summary = {"at": 0.0, "value": None}
+
+
 def summary(base, control):
-    """For the edge tab: projects with files waiting for a label."""
+    """For the edge tab: projects with files or data waiting for a label. Cached briefly: every open
+    chat page asks for it."""
+    if _summary["value"] is not None and time.monotonic() - _summary["at"] < SUMMARY_SECONDS:
+        return _summary["value"]
     waiting = []
-    for name in project_names(base):
+    for name in project_names(base, intake_folder(control, base)):
         try:
-            files = data(control, name, {"op": "deliveries"}, timeout=20)["unlabelled_files"]
-        except (Refused, KeyError):
+            view = data(control, name, {"op": "deliveries"}, timeout=20)
+            count = len(view["unlabelled_files"]) + len(view["unlabelled_data"]) + len(view.get("not_ready_files") or [])
+        except Exception:  # noqa: BLE001 - one project's trouble mustn't hide the others
             continue
-        if files:
-            waiting.append({"workspace": name, "files": len(files)})
-    return {"waiting": len(waiting), "latest": waiting[:8]}
+        if count:
+            waiting.append({"workspace": name, "files": count})
+    _summary.update(at=time.monotonic(), value={"waiting": len(waiting), "latest": waiting[:8]})
+    return _summary["value"]
 
 
 def label(control, body):
@@ -75,7 +93,8 @@ def label(control, body):
         files = body.get("files")
         if not isinstance(files, list) or not 0 < len(files) <= MAX_FILES or not all(isinstance(item, dict) for item in files):
             raise Refused("STANDARD_ARGUMENTS_INVALID")
-        request["files"] = [{key: item.get(key) for key in ("path", "bytes", "mtime_ns")} for item in files]
+        # What identifies each file, as the page was shown it: data_tools checks it's still the same.
+        request["files"] = [{key: item.get(key) for key in ("path", "bytes", "mtime_ns", "ctime_ns", "ino")} for item in files]
     if body.get("confirm") == "LAUNCH":
         request["confirm"] = "LAUNCH"
     if body.get("replaces_launch") is True:
@@ -111,7 +130,7 @@ class Handler(BaseHTTPRequestHandler):
             if url.path in FONTS:
                 return self.send(200, (HERE.parent.parent / "extensions/varnish/fonts" / FONTS[url.path]).read_bytes(), "font/woff2")
             if url.path == "/api/projects":
-                return self.send(200, {"projects": project_names(base)})
+                return self.send(200, {"projects": project_names(base, intake_folder(control, base))})
             if url.path == "/api/summary":
                 return self.send(200, summary(base, control))
             if url.path == "/api/files":  # quick: reads only files
