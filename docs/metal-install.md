@@ -152,7 +152,7 @@ Confirmed against the **real 0.9.93 binary's help**: `service install web`,
 `--binary`, `--no-start`, `--dry-run`, and serve flags `--host`, `--port`,
 `--auth bearer`, `--approval prompt`, `--projects`, and only the release's own Findings
 widget and extension (`--widgets-dir <prefix>/current/integrations/term-llm/widgets
---extensions-dir <prefix>/current/integrations/term-llm/extensions --extensions silo-findings`;
+--extensions-dir <prefix>/current/integrations/term-llm/extensions --extensions varnish,silo-theme,silo-findings`;
 nothing from `~/.config/term-llm/{widgets,extensions}`). No startup agent is pinned: with `--agent` the web UI hides its
 agent picker. Instead the account's config sets `agents.use_builtin: false`, so the
 picker offers only `migration-operator`, `migration-data`, `server-support`,

@@ -444,10 +444,11 @@ def service_args(dry=False):
             + web_ui_args() + hub)
 
 def web_ui_args():
-    # Only the release's own widget and extension (sealed read-only), named explicitly: the
+    # Only the release's own widgets and extensions (sealed read-only), named explicitly and in
+    # this order: the theme, then our layer on it, then the features. The Findings one is the
     # Findings release gate. Nothing from ~/.config/term-llm/{widgets,extensions}.
     ui = P/"current/integrations/term-llm"
-    return ["--widgets-dir", str(ui/"widgets"), "--extensions-dir", str(ui/"extensions"), "--extensions", "silo-findings"]
+    return ["--widgets-dir", str(ui/"widgets"), "--extensions-dir", str(ui/"extensions"), "--extensions", "varnish,silo-theme,silo-findings"]
 
 def hub_secrets_state(entry):
     # Metadata only: the file holds TERM_LLM_HUB_REGISTRATION_TOKEN and is never read or hashed here.

@@ -1,0 +1,140 @@
+#!/usr/bin/env -S python3 -I
+"""Replace the bundled Varnish theme with one chosen upstream commit.
+
+  script/update-varnish COMMIT          (the full 40-character commit)
+
+The folder integrations/term-llm/extensions/varnish is an unmodified copy of upstream and is never
+edited by hand: our changes live in the silo-theme extension. This fetches the commit, replaces the
+folder as a whole (keeping local.json), records what was installed in
+silo-theme/varnish-upstream.json and shows what changed. Nothing from upstream is run.
+
+Updates are deliberate. This code runs on pages showing customer data, so the known forms of outside
+address stop the update, and the network calls are listed for a person to read. A search can't catch
+everything: read the changes and run the live browser tests before shipping the result.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+UPSTREAM = os.environ.get("VARNISH_UPSTREAM", "https://github.com/keegangeorge/term-llm-varnish.git")
+ROOT = Path(os.environ.get("VARNISH_REPO_ROOT", Path(__file__).resolve().parents[1]))
+EXTENSIONS = ROOT / "integrations/term-llm/extensions"
+TARGET = EXTENSIONS / "varnish"
+RECORD = EXTENSIONS / "silo-theme/varnish-upstream.json"
+# Full commits only: a short hash can resolve to a tag of the same name.
+COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+# Development material the running extension doesn't use.
+LEFT_OUT = re.compile(r"(?:\.github/|docs/|tools/|install\.sh\Z|CONTRIBUTING\.md\Z|\.gitignore\Z)")
+KEPT = "local.json"
+# Every file is one of these kinds; anything else stops an update. Only code is searched: the rest
+# isn't loaded as code by the browser.
+CODE = (".js", ".mjs", ".css")
+INERT = (".woff2", ".woff", ".md", ".txt", ".json", ".yaml")
+INERT_NAMES = ("LICENSE",)
+# Comments are searched too: a line that starts like a comment can still hold code.
+ADDRESS = re.compile(r"""(?:https?|wss?|ftp):(?:\\?/){2}[^\s"'`)]*|["'`]//[^\s"'`/]|url\(\s*["']?//|@import\s+["']?//""", re.I)
+HARMLESS = re.compile(r"https?://www\.w3\.org/|https://simpleicons\.org/?\Z", re.I)
+NETWORK = re.compile(r"\bfetch\(|\bWebSocket\(|\bEventSource\(|\bXMLHttpRequest\b|\bsendBeacon\(|\bimport\(")
+
+
+def git(args, cwd=None):
+    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def scan(folder):
+    """Outside addresses, which stop an update, and the network calls, for a person to read."""
+    outside, network = [], []
+    for path in sorted(folder.rglob("*")):
+        if path.is_file() and path.suffix in CODE:
+            for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                where = "%s:%d" % (path.relative_to(folder), number)
+                if any(not HARMLESS.match(found.group()) for found in ADDRESS.finditer(line)):
+                    outside.append(where)
+                if NETWORK.search(line):
+                    network.append(where)
+    return outside, network
+
+
+def refuse_unknown_files(folder):
+    """Stop on any file type we don't know how to judge, and on an entry that isn't code."""
+    for path in sorted(folder.rglob("*")):
+        if path.is_file() and path.suffix not in CODE + INERT and path.name not in INERT_NAMES:
+            raise SystemExit("update-varnish: %s is a file type this doesn't check; refusing" % path.relative_to(folder))
+    for line in (folder / "extension.yaml").read_text(encoding="utf-8").splitlines():
+        if re.match(r"""\s*["']?(?:js|css)["']?\s*:""", line):
+            entry = re.fullmatch(r"(?:js|css):\s*(\S+)\s*", line)
+            if not entry or not entry[1].endswith(CODE):
+                raise SystemExit("update-varnish: extension.yaml has an entry this can't check: %s" % line.strip())
+
+
+def install(source, commit):
+    listed = git(["ls-tree", "-r", "--full-tree", "HEAD"], cwd=source).splitlines()
+    names = []
+    for entry in listed:
+        info, name = entry.split("\t", 1)
+        if not LEFT_OUT.match(name):
+            if info.split()[0] not in ("100644", "100755"):
+                raise SystemExit("update-varnish: %s isn't a regular file; refusing" % name)
+            names.append(name)
+    fresh, old = TARGET.with_name(".varnish.new"), TARGET.with_name(".varnish.old")
+    shutil.rmtree(fresh, ignore_errors=True)
+    shutil.rmtree(old, ignore_errors=True)
+    try:
+        for name in names:
+            (fresh / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / name, fresh / name)
+        for required in ("LICENSE", "fonts/OFL.txt", "extension.yaml"):
+            if not (fresh / required).is_file():
+                raise SystemExit("update-varnish: upstream has no %s; refusing" % required)
+        refuse_unknown_files(fresh)
+        outside, network = scan(fresh)
+        if outside:
+            raise SystemExit("update-varnish: outside addresses, not installed:\n  " + "\n  ".join(outside))
+        before = json.loads(RECORD.read_text())["files"] if RECORD.is_file() else {}
+        after = {name: sha256(fresh / name) for name in sorted(names)}
+        if (TARGET / KEPT).is_file():
+            shutil.copyfile(TARGET / KEPT, fresh / KEPT)
+        if TARGET.exists():
+            TARGET.rename(old)
+        fresh.rename(TARGET)
+        written = RECORD.with_name(RECORD.name + ".new")
+        written.write_text(json.dumps({"repository": UPSTREAM, "commit": commit, "files": after}, indent=2) + "\n")
+        written.replace(RECORD)
+        shutil.rmtree(old, ignore_errors=True)
+    finally:
+        shutil.rmtree(fresh, ignore_errors=True)
+    print("varnish is now " + commit)
+    for label, changed in (("added", sorted(set(after) - set(before))), ("removed", sorted(set(before) - set(after))),
+                           ("changed", sorted(name for name in set(after) & set(before) if after[name] != before[name]))):
+        if changed:
+            print(label + ": " + ", ".join(changed))
+    print("network calls, read these:\n  " + "\n  ".join(network))
+    print("Next: run the browser tests, then check silo-theme still fits.")
+
+
+def main(args):
+    if len(args) != 1 or not COMMIT.fullmatch(args[0]):
+        raise SystemExit(__doc__.strip())
+    with tempfile.TemporaryDirectory() as temporary:
+        source = Path(temporary) / "varnish"
+        git(["clone", "--quiet", "--no-tags", UPSTREAM, str(source)])
+        git(["checkout", "--quiet", "--detach", args[0]], cwd=source)
+        head = git(["rev-parse", "HEAD"], cwd=source).strip()
+        if head != args[0]:
+            raise SystemExit("update-varnish: got %s instead of the requested commit; refusing" % head)
+        install(source, head)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

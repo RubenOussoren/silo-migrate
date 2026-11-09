@@ -398,7 +398,17 @@ class SiloTest(unittest.TestCase):
         spec.write_text(json.dumps({'args': ['--projects', '--disable-extensions', '--disable-widgets']}))
         self.assertEqual(('WARN', 'silo update'), (self.statuses(self.healthy())['findings widget']['status'], self.statuses(self.healthy())['findings widget']['fix']))
         spec.write_text(json.dumps({'args': ['--projects', '--widgets-dir', ui + '/widgets', '--extensions-dir', ui + '/extensions', '--extensions', 'silo-findings']}))
-        self.assertEqual('OK', self.statuses(self.healthy())['findings widget']['status'])
+        statuses = self.statuses(self.healthy())
+        self.assertEqual('OK', statuses['findings widget']['status'])
+        self.assertEqual(('WARN', 'silo update'), (statuses['theme']['status'], statuses['theme']['fix']))
+        spec.write_text(json.dumps({'args': ['--projects', '--widgets-dir', ui + '/widgets', '--extensions-dir', ui + '/extensions', '--extensions', 'varnish,silo-theme,silo-findings']}))
+        self.assertEqual('WARN', self.statuses(self.healthy())['theme']['status'])  # saved args name it, but the release has no Varnish
+        varnish = Path(ui) / 'extensions/varnish'
+        varnish.mkdir(parents=True)
+        (varnish / 'extension.yaml').write_text('title: V\n')
+        statuses = self.statuses(self.healthy())
+        self.assertEqual('OK', statuses['findings widget']['status'])
+        self.assertEqual('OK', statuses['theme']['status'])
 
     def test_doctor_checks_the_widget_socket_folder_is_private(self):
         runtime, tmpfiles = self.root / 'widgets-run', self.root / 'tmpfiles.conf'

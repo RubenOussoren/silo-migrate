@@ -1,0 +1,11 @@
+{
+  "nodeAccents": {
+    "my-laptop": "graphite",
+    "my-server": "blue",
+    "my-container": "green"
+  },
+  "nodeIcons": {
+    "my-assistant": "core",
+    "my-nas": "home"
+  }
+}

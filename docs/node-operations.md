@@ -104,6 +104,7 @@ and the web UI keeps chats apart:
   it); customer data stays in the workspace. The lock doesn't reach DBHub: MCP servers start in
   the service's home folder, not the project's, so turning on only the chat's own `db-<project>`
   stays your job (migration-data is told to stop if another project's server is on).
+- **Look and feel:** the web UI uses Varnish by Keegan George (`extensions/varnish`, an unmodified copy; `script/update-varnish COMMIT` replaces it) with our changes kept in `extensions/silo-theme`. Updates are deliberate: this code runs on pages showing customer data, so run the browser tests before shipping one.
 - **The guide:** every migration-data chat starts with `data_guide`, which works out from the project's state where it stands and what's next, so a new chat knows as much as an old one. Agents take the project from the chat, so they never need to be told which one it is.
 - **Decisions:** `data_decide` records the engineer's rulings in an append-only log in the workspace; `data_decisions` reads them back.
 - **Project notes** are migration-data's memory: `data_notes` / `data_notes_write` keep one notes
@@ -205,3 +206,14 @@ silo prime                                             # on its own: it asks for
 ```
 
 `silo doctor` shows the socket and cache time. `op-cache stop` (as the account) clears the key at once.
+
+## Checking a change
+
+Before shipping any change, from the repository root:
+
+```sh
+for f in test/*_test.py; do python3 -I -B "$f" || echo "FAILED: $f"; done
+python3 -I -B -m unittest discover -s test/metal -p 'test_*.py'
+```
+
+`test/varnish_bundle_test.py` is what proves the bundled theme is still unmodified.

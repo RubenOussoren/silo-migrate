@@ -109,7 +109,9 @@ class InstallerTests(unittest.TestCase):
         # Only the release's own widget and extension, named explicitly.
         self.assertEqual(str(self.m.P/"current/integrations/term-llm/widgets"), args[args.index("--widgets-dir") + 1])
         self.assertEqual(str(self.m.P/"current/integrations/term-llm/extensions"), args[args.index("--extensions-dir") + 1])
-        self.assertEqual("silo-findings", args[args.index("--extensions") + 1])
+        self.assertEqual("varnish,silo-theme,silo-findings", args[args.index("--extensions") + 1])
+        for name in ("varnish", "silo-theme", "silo-findings"):
+            self.assertTrue((Path(__file__).resolve().parents[2]/"integrations/term-llm/extensions"/name/"extension.yaml").is_file())
         shipped = Path(__file__).resolve().parents[2]/"integrations/term-llm"
         self.assertTrue((shipped/"widgets/findings/widget.yaml").is_file())
         self.assertTrue((shipped/"extensions/silo-findings/extension.yaml").is_file())

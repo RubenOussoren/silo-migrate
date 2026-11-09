@@ -1,0 +1,4 @@
+title: SiloMigrate theme
+description: Our changes on top of the unmodified Varnish theme. Based on Varnish by Keegan George.
+format_version: 1
+js: main.js

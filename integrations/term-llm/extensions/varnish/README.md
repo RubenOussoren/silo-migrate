@@ -1,0 +1,219 @@
+# Varnish
+
+A glossy, calm, chat-first finish for the [term-llm](https://term-llm.com) web UI.
+
+Varnish combines frosted surfaces, soft accent lighting, Geist typography, and a quieter conversation layout with practical additions like a command palette, code wrapping, and context usage. It is a web extension, not a fork: no term-llm rebuild or upstream patches required.
+
+![Varnish in dark mode with a demo conversation](docs/screenshots/hero-dark.png)
+
+## What it does
+
+### A polished workspace
+
+- **Light, Dark, and System** appearance, with seven accents: Indigo, Blue, Green, Orange, Pink, Purple, and Graphite.
+- **Geist and Geist Mono**, bundled locally. No external font service.
+- **Compact or Comfortable** text sizing.
+- Frosted panels, rounded controls, subtle highlights, and a restrained ambient glow.
+- Accent hairlines on the sidebar and diff-panel resize edges, and accent-aware versions of term-llm's theme tokens (send-button states, inline code, content width, message size).
+- A responsive layout and reduced-motion support.
+- Optional neutral or accent-colored browser chrome through the page's theme-color metadata. Browser support varies.
+
+### A quieter composer
+
+- A rounded, chat-first composer whose controls share one height, with a compact model/effort chip (showing the model maker's mark in the accent colour, also beside the provider and model in its popover) that opens term-llm's own runtime controls.
+- A context-usage ring when the server exposes context data, with token details on hover. Clicking it opens term-llm's context card (window, auto-compaction point, **Compact now**, session stats) above the composer, so the header meter is folded into the ring. Near the limit, a **Compact** button runs `/compact` in one click and keeps your draft.
+- Toolbar labels give way in a fixed order as the composer narrows (effort text, then context, then model name), so icons and meters never get squeezed.
+- A rainbow highlight for `ultrathink` when the selected provider is `claude-bin`. This is a visual cue, not a new model capability or an effort override.
+- A glass live-voice card above the composer: an accent orb that breathes while listening, ripples while speaking, and spins a halo while connecting or working, with the live transcript in a quiet inset and a red Stop pill. The dictation strip gets the same finish. Styling only; live voice itself is term-llm's.
+
+![Composer with illustrative context usage and ultrathink highlight](docs/screenshots/composer.png)
+
+### Faster navigation
+
+- **⌘K on macOS / Ctrl+K elsewhere** opens one palette for visible chats, Hub agents, common slash commands, and appearance controls.
+- Filter with text, use **↑ / ↓** to navigate, **Enter** to select, and **Escape** to close.
+- Collapsible sidebar groups and a clearer active-chat treatment.
+- New-chat starter prompts and recent-conversation cards.
+- Hub agent list or compact dock presentation, with accents and a current-node indicator. Hub-specific elements appear only when the host UI provides them.
+- Under a Hub, each agent's tab uses that agent's own sidebar tile as its favicon (its accent plus its glyph or initials), so tabs for different agents are easy to tell apart.
+
+![Command palette](docs/screenshots/palette.png)
+
+### A more readable conversation
+
+- Tool-type icons and a quieter tool-call timeline.
+- Reasoning rows styled like tool headers, with an accent rule down expanded thoughts and a soft sheen on the label while the model is thinking.
+- An estimated “Worked” duration derived from surrounding message timestamps, not authoritative tool execution timing.
+- Header breadcrumbs as quiet pills: the project (with a folder mark) and worktree sit before the title, and fold to a small label line when the header narrows.
+- Code-block language headers and a persistent long-line wrap toggle.
+- User-message copy/edit controls that use the app's existing composer and command behavior.
+- A jump-to-latest button when you scroll away from the bottom.
+- Background-tab title and favicon signals when a reply finishes or input is needed. These are in-page indicators, not operating-system push notifications.
+
+| Light appearance | New-chat shortcuts |
+| --- | --- |
+| ![Light appearance](docs/screenshots/hero-light.png) | ![New-chat starters and recent cards](docs/screenshots/empty.png) |
+
+## Install
+
+Requires a running term-llm web UI with extension support. Tested with **term-llm 0.9.93** in Chromium. Other versions and browsers may work, but are not guaranteed.
+
+```bash
+git clone https://github.com/keegangeorge/term-llm-varnish.git
+cd term-llm-varnish
+./install.sh
+```
+
+In the term-llm web UI, open **Settings → Extensions**, reload the extensions list if necessary, enable **Varnish**, and refresh the page. Disable other full-UI themes to avoid conflicting styles.
+
+The installer copies the runtime into `~/.config/term-llm/extensions/varnish`. It does not modify your term-llm binary, provider settings, approval policy, or conversations. A copy is intentional: the tested extension loader does not discover symlinked extension directories.
+
+### Optional automatic enabling
+
+```bash
+./install.sh --enable
+```
+
+This discovers the first local `term-llm serve` process carrying `--token`, reloads extensions through its authenticated local API, and adds Varnish to its enabled list. It preserves other enabled extensions. If you run multiple servers, prefer the manual Settings flow so you choose the correct one. This helper requires Bash, curl, Python 3, and a Unix-style process listing.
+
+For a custom extension directory:
+
+```bash
+TERM_LLM_EXTENSIONS_DIR=/your/extensions ./install.sh
+```
+
+Install on the machine or container running the web server. For a multi-node Hub, install and enable it on each node where you want the theme.
+
+## Customize
+
+Use the palette icon in the header to choose appearance, accent, text size, and browser-toolbar color. Preferences are stored in your browser's local storage. Hub accents are scoped by node ID; other appearance settings are shared on the same browser origin.
+
+![Appearance controls](docs/screenshots/appearance.png)
+
+### Optional per-node accents and icons
+
+No personal node names or mappings are required. Everyone starts with Indigo unless a saved preference overrides it, and each agent's tile icon is guessed from its name (a laptop for names with "local" or "mac", a cloud for "cloud", and so on), falling back to its initials.
+
+To define your own Hub defaults:
+
+```bash
+cp local.example.json local.json
+```
+
+Edit `local.json` using your Hub's node IDs:
+
+```json
+{
+  "nodeAccents": {
+    "my-laptop": "graphite",
+    "my-server": "blue",
+    "my-container": "green"
+  },
+  "nodeIcons": {
+    "my-assistant": "core",
+    "my-nas": "home"
+  }
+}
+```
+
+`nodeIcons` picks an agent's tile glyph, keyed by node ID or display name: `laptop`, `cloud`, `box`, `sparkle`, `home`, `server`, `core` (an arc-reactor style ring), or `monogram` for initials. The tile is also that agent's tab favicon.
+
+Then run `./install.sh` again and reload extensions. Explicit browser accent choices take precedence. `local.json` is gitignored and is served to browsers as an extension asset, so **never put credentials or other secrets in it**. Updating without a source `local.json` preserves an existing installed copy.
+
+Preferences from the extension's earlier `hub-studio` name are copied automatically when no equivalent Varnish preference exists. Disable the old extension before enabling Varnish.
+
+## Update or remove
+
+Update:
+
+```bash
+git pull --ff-only
+./install.sh
+```
+
+Reload extensions in Settings, then refresh the page.
+
+To return to the stock UI, disable Varnish in **Settings → Extensions** and refresh. You can then delete the installed `varnish` directory if desired. Browser preferences remain available for a later reinstall.
+
+## Privacy and compatibility
+
+- Runtime code and fonts are self-contained. Varnish adds no analytics or third-party runtime service.
+- It uses browser storage and the current server's authenticated, same-origin APIs for UI information such as provider metadata. It does not replace the app's authorization or approval systems.
+- Some features decorate existing DOM selectors rather than stable extension APIs. A term-llm upgrade can require an extension update.
+- Context availability depends on the server/provider. Agent indicators reflect the host UI; they are not independent health checks.
+- Clipboard and browser-chrome features depend on browser permissions and support.
+- README screenshots use **injected fictional demo conversations and agents** in the real themed UI. The composer image includes illustrative context data. These demonstrate appearance, not execution of the example workflow or connectivity to example nodes.
+
+## Development and checks
+
+### Automated CI (isolated fixture)
+
+The [CI tooling and VM handoff](tools/ci/README.md) describe fast, dependency-free
+source checks and a separate read-only browser baseline against the checksum-pinned
+term-llm 0.9.88 fixture. CI uses a fresh synthetic home and loopback-only network
+namespace, never the personal-server tools below. This implementation is currently
+source-reviewed only: the parent must generate the Playwright 1.50.0 lockfile and
+run validation in its dedicated VM before publishing. No browser pass is claimed.
+
+### Optional personal-server checks
+
+Runtime requires no Node.js or build step. The optional browser checks require Node.js, Playwright, and a local term-llm web server with Varnish enabled:
+
+```bash
+cd tools
+npm install
+npx playwright install chromium
+cd ..
+node tools/check.mjs
+```
+
+For the in-progress compaction notice, an additional **CSS-state fixture** uses the loading markup from term-llm 0.9.88 in a real Varnish page:
+
+```bash
+TERM_LLM_TEST_URL=http://127.0.0.1:18080/ui/ node tools/check-compaction.mjs
+```
+
+Use an isolated loopback test server, not a personal chat server. This check blocks non-read requests, inserts synthetic status markup, and verifies dark/light accents, reduced motion, accessibility attributes and mobile fit. It does **not** invoke `/compact`, test backend compaction, or certify other term-llm versions. Set `CHROMIUM_PATH` if the test environment supplies its own browser.
+
+The check verifies extension loading, available UI hooks, injected controls, light-mode token consistency, and basic desktop/mobile behavior without sending a message. It cannot verify conditionally mounted generation controls while idle, real tool execution, or every provider. Its HTML report and screenshots go to ignored `tools/out/`; **these can contain your actual chats and must not be published**.
+
+For an explicit server, set `VARNISH_URL` and `TERM_LLM_TOKEN` in your environment. Otherwise the tooling discovers the first local `term-llm serve` process. To use an existing Playwright installation, set `PLAYWRIGHT_DIR` to its `node_modules/` directory.
+
+```bash
+node tools/screenshots.mjs
+```
+
+The screenshot tool opens unsaved drafts and injects fictional content to regenerate `docs/screenshots/`. Inspect every output before committing, especially after host UI changes.
+
+```bash
+node tools/live-preview.mjs
+```
+
+The live preview injects the live-voice panel markup in every phase (connecting, listening, speaking, working, expanded, failed) in dark and light, without starting a call or using the microphone. It renders over whatever chat the server opens first, so its output in `tools/out/` can show your real conversations: keep it local.
+
+### Files
+
+| File | Purpose |
+| --- | --- |
+| `extension.yaml` | Extension manifest |
+| `style.css` | Design tokens and UI styling |
+| `main.js` | Appearance, sidebar, composer controls, lifecycle |
+| `util.js` | Preferences, node accents, same-origin API helpers |
+| `thread.js` | Conversation, code, timeline, new-chat additions |
+| `composer.js` | Context ring (opens term-llm's context card), Compact button and ultrathink highlighting |
+| `logos.js` | Provider marks for the model chip (Simple Icons, CC0) |
+| `palette.js` | Keyboard command palette |
+| `notify.js` | Background-tab title/favicon signals |
+| `favicon.js` | Per-node tab icon under a Hub |
+| `fonts/` | Locally bundled Geist fonts and license |
+| `tools/` | Optional browser checks and demo screenshot tooling |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for commit message and pull request title conventions.
+
+## License
+
+Code: [MIT](LICENSE). Bundled Geist and Geist Mono fonts: [SIL Open Font License 1.1](fonts/OFL.txt), copyright Vercel in collaboration with basement.studio.
+
+An independent extension for term-llm. Not affiliated with Varnish Cache.
