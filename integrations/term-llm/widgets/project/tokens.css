@@ -1,0 +1,22 @@
+/* Varnish's design values, for pages the theme can't reach (widgets are separate documents).
+   Colours, type and spacing only. Features use these rather than choosing their own. */
+@font-face { font-family: "Geist"; src: url("fonts/Geist-Variable.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+@font-face { font-family: "Geist Mono"; src: url("fonts/GeistMono-Variable.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+:root {
+  --font-sans: "Geist", "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", monospace;
+  --accent: #8b93ff;
+  --bg: #0a0a0c; --surface: #111114; --surface-2: #19191d;
+  --border: rgb(255 255 255 / 7%); --border-strong: rgb(255 255 255 / 13%);
+  --text: #ededef; --text-muted: #8d8d96; --danger: #f87171; --ok: #4ade80;
+  --launch: #ffb454; --launch-ink: #1a1205;
+  --accent-soft: color-mix(in srgb, var(--accent) 15%, transparent);
+  --launch-soft: color-mix(in srgb, var(--launch) 14%, transparent);
+}
+:root[data-scheme="light"] {
+  --accent: #4f46e5;
+  --bg: #fbfbfc; --surface: #ffffff; --surface-2: #f2f2f4;
+  --border: rgb(0 0 0 / 7.5%); --border-strong: rgb(0 0 0 / 13%);
+  --text: #18181b; --text-muted: #6b6b74; --danger: #dc2626; --ok: #15803d;
+  --launch: #b45309; --launch-ink: #fff;
+}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project</title>
+  <link rel="stylesheet" href="tokens.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="band" aria-hidden="true"></div>
+  <main class="wrap">
+    <header>
+      <h1 id="project-name">Project</h1>
+      <label class="pick">Change project
+        <select id="project" aria-label="Change project"></select>
+      </label>
+    </header>
+    <div class="data" id="data"></div>
+    <ol class="stages" id="stages" aria-label="Stages"></ol>
+    <nav class="tabs" id="tabs" aria-label="Sections"></nav>
+    <section id="content" aria-live="polite"></section>
+  </main>
+  <div id="toast" role="status"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

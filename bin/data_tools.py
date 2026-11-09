@@ -800,7 +800,8 @@ def drop_listing(ws):
             info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
             if stat.S_ISREG(info.st_mode):
                 relative = os.path.relpath(os.path.join(folder, name), str(ws.intake))
-                files.append({"path": relative, "bytes": info.st_size, "mtime_ns": info.st_mtime_ns})
+                # A string: the page's JavaScript can't hold a nanosecond time as a number.
+                files.append({"path": relative, "bytes": info.st_size, "mtime_ns": str(info.st_mtime_ns)})
     return sorted(files, key=lambda item: item["path"])[:MAX_LIST]
 
 
@@ -835,7 +836,7 @@ def delivery_of_take(ws, root, parts, relative):
     records = read_deliveries(ws)
     fd, info = open_regular(root, parts)
     try:
-        dataset = claimed_by(records, "/".join(parts), info.st_size, info.st_mtime_ns)
+        dataset = claimed_by(records, "/".join(parts), info.st_size, str(info.st_mtime_ns))
         if dataset is None:
             refuse("STANDARD_DELIVERY_UNLABELLED: the engineer labels new files on the Project page")
         if records[dataset]["kind"] == "launch":
@@ -2121,7 +2122,8 @@ def op_guide(ws, request):
     if not_labelled:
         waiting.append({"what": "Label the data already in this project as Development on the Project page.", "where": "Project page"})
     if unlabelled:
-        waiting.append({"what": "%d new file(s) arrived: say what they're for (Development or Launch) on the Project page." % len(unlabelled), "where": "Project page"})
+        arrived = "1 new file arrived" if len(unlabelled) == 1 else "%d new files arrived" % len(unlabelled)
+        waiting.append({"what": arrived + ": say what they're for (Development or Launch) on the Project page.", "where": "Project page"})
     latest_start = {run["kind"]: run["started_at"] or "" for run in records["runs"]}
     for plan in records["plans"]:
         if plan["status"] not in ("proposed", "approved"):

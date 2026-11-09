@@ -1,0 +1,5 @@
+title: Project
+description: "One project at a glance: which data is in use, where things stand and what to do next. New files are labelled here."
+mount: project
+# A Unix socket, not a TCP port: only term-llm's signed-in proxy can reach it.
+command: ["python3", "-I", "-B", "server.py", "$SOCKET"]

@@ -1,4 +1,4 @@
-.silo-findings-tab, .silo-runs-tab {
+.silo-project-tab, .silo-findings-tab, .silo-runs-tab {
   position: fixed;
   right: 0;
   top: 40%;
@@ -15,7 +15,7 @@
   letter-spacing: 0.03em;
   cursor: pointer;
 }
-.silo-findings-tab.has-pending {
+.silo-project-tab.has-pending, .silo-findings-tab.has-pending {
   color: #fff;
   background: #b7791f;
   border-color: #b7791f;
@@ -27,7 +27,7 @@
   background: #2f6fdb;
   border-color: #2f6fdb;
 }
-.silo-findings-panel, .silo-runs-panel {
+.silo-project-panel, .silo-findings-panel, .silo-runs-panel {
   position: fixed;
   right: 30px;
   top: 25%;
@@ -44,14 +44,18 @@
   font: 13px/1.45 system-ui, sans-serif;
 }
 .silo-runs-panel { top: calc(25% + 120px); }
-.silo-findings-panel h2, .silo-runs-panel h2 { margin: 0 0 8px; font-size: 13px; }
-.silo-findings-panel ul, .silo-runs-panel ul { list-style: none; margin: 0; padding: 0; }
-.silo-findings-panel li, .silo-runs-panel li { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--border, #8882); }
-.silo-findings-panel li span, .silo-runs-panel li span { color: var(--text-muted, #888); font-size: 11px; white-space: nowrap; }
-.silo-findings-panel p, .silo-runs-panel p { margin: 8px 0 0; }
-.silo-findings-panel a, .silo-runs-panel a { color: var(--accent, #2f6fdb); text-decoration: none; }
+.silo-project-panel h2, .silo-findings-panel h2, .silo-runs-panel h2 { margin: 0 0 8px; font-size: 13px; }
+.silo-project-panel ul, .silo-findings-panel ul, .silo-runs-panel ul { list-style: none; margin: 0; padding: 0; }
+.silo-project-panel li, .silo-findings-panel li, .silo-runs-panel li { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--border, #8882); }
+.silo-project-panel li span, .silo-findings-panel li span, .silo-runs-panel li span { color: var(--text-muted, #888); font-size: 11px; white-space: nowrap; }
+.silo-project-panel p, .silo-findings-panel p, .silo-runs-panel p { margin: 8px 0 0; }
+.silo-project-panel a, .silo-findings-panel a, .silo-runs-panel a { color: var(--accent, #2f6fdb); text-decoration: none; }
 @media (max-width: 760px) {
   .silo-findings-tab { top: auto; bottom: 120px; }
   .silo-runs-tab { top: auto; bottom: 230px; }
-  .silo-findings-panel, .silo-runs-panel { right: 8px; left: 8px; width: auto; }
+  .silo-project-panel, .silo-findings-panel, .silo-runs-panel { right: 8px; left: 8px; width: auto; }
 }
+
+/* The Project tab sits above the others. */
+.silo-project-tab { top: calc(40% - 120px); }
+.silo-project-panel { top: 12%; }

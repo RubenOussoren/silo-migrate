@@ -228,7 +228,7 @@ class DataToolsTest(unittest.TestCase):
         document = json.loads(store.read_text()) if store.exists() else {'version': 1, 'deliveries': {}}
         record = document['deliveries'].setdefault(dataset, {'dataset_id': dataset, 'kind': 'development', 'version': 1, 'labelled_at': 'x', 'labelled_by': 'T', 'files': []})
         info = file.stat()
-        record['files'].append({'path': path, 'bytes': info.st_size, 'mtime_ns': info.st_mtime_ns})
+        record['files'].append({'path': path, 'bytes': info.st_size, 'mtime_ns': str(info.st_mtime_ns)})
         store.write_text(json.dumps(document))
 
     def refused(self, expected_code, op, **request):

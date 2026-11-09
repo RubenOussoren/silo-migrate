@@ -222,14 +222,14 @@ class Store:
 
 # -- control ------------------------------------------------------------------------
 
-def control_call(control, argv, timeout=DEFAULT_TIMEOUT):
-    """Run silo-migrate-control; its JSON (the first line, for start-run), or a refusal with its
-    code and the short fixed detail some refusals add."""
+def control_call(control, argv, timeout=DEFAULT_TIMEOUT, send=None):
+    """Run silo-migrate-control, with `send` (bytes) on stdin if given; its JSON (the first line, for
+    start-run), or a refusal with its code and the short fixed detail some refusals add."""
     # Its own process group: on a timeout everything it started (git push, the PR request,
     # the control container's client) is stopped with it, not left to finish unseen.
-    process = subprocess.Popen([control, *argv], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    process = subprocess.Popen([control, *argv], stdin=subprocess.DEVNULL if send is None else subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(input=send, timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)

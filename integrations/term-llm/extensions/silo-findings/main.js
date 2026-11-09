@@ -81,6 +81,14 @@ const hashFor = (workspace, extra) => `#ws=${encodeURIComponent(workspace)}${ext
 
 export function activate(ui) {
   edgeTab(ui, {
+    mount: 'project', className: 'silo-project', label: 'Project',
+    count: (data) => (data ? data.waiting : 0),
+    tooltip: (_data, n) => (n ? `${n} project(s) with new files to label` : 'Open a project'),
+    heading: (_data, n) => (n ? 'New files to label' : 'Projects'),
+    items: (data) => ((data && data.latest) || []).map((item) => ({ text: `${item.workspace} · ${item.files} new file(s)`, hash: `#project=${encodeURIComponent(item.workspace)}&tab=files`, at: '' })),
+    more: () => 'Open the Project page…',
+  });
+  edgeTab(ui, {
     mount: 'findings', className: 'silo-findings', label: 'Findings',
     count: (data) => (data ? data.pending : 0),
     tooltip: (_data, n) => (n ? `${n} finding(s) waiting for your review` : 'No findings waiting; open the history'),
