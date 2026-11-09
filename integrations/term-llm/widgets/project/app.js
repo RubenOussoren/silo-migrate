@@ -44,7 +44,7 @@ const size = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes
 const day = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '');
 const widget = (name) => `../${name}/#ws=${encodeURIComponent(state.project)}`;
 // File names are data from outside: control and direction characters could disguise them.
-const safe = (text) => String(text).replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '\ufffd');
+const safe = (text) => String(text).replace(/[\u0000-\u001f\u007f-\u009f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, '\ufffd');
 const fileText = (record) => {
   const first = (record.files || [])[0];
   const more = (record.file_count || 0) - 1;

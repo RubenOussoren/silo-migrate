@@ -923,11 +923,11 @@ def job_delivery(ws, request):
     wanted = request.get("delivery")
     if wanted is None:
         holding = {record.get("dataset_id") for record in (ws.named_state().get("inputs") or {}).values()}
-        candidates = [dataset_id for dataset_id in records if dataset_id in holding]
+        candidates = [dataset_id for dataset_id in records if dataset_id in holding and not records[dataset_id].get("replaced_by")]
         if len(candidates) != 1:
             refuse("STANDARD_ARGUMENTS_INVALID: delivery (this project has more than one: give the dataset_id from data_guide)")
         wanted = candidates[0]
-    if not isinstance(wanted, str) or wanted not in records:
+    if not isinstance(wanted, str) or wanted not in records or records[wanted].get("replaced_by"):
         refuse("STANDARD_ARGUMENTS_INVALID: delivery")
     return wanted, delivery_mounts(ws, wanted)
 
@@ -1040,10 +1040,13 @@ def op_take(ws, request):
         root, inputs = ws.open_area("intake"), None
         try:
             inputs = ws.open_area("inputs")
+            pending = ws.read_json(pending_for(ws, "inputs/" + name), None)
             dataset, inode = delivery_of_take(ws, root, parts, inputs, name, "inputs/" + name)
             result = move_in(ws, dict(meta, dataset_id=dataset), root, parts, inputs, name, "inputs/" + name, kind,
                              {"event": "take", "from": "intake/" + "/".join(parts), "dataset_id": dataset}, inode=inode)
-            mark_taken(ws, dataset, "/".join(parts), result["input_id"])
+            # A resumed take marks the file it started with, whatever path this call named.
+            started_from = ((pending or {}).get("provenance") or {}).get("from") if inode is None else None
+            mark_taken(ws, dataset, started_from.removeprefix("intake/") if started_from else "/".join(parts), result["input_id"])
         finally:
             os.close(root)
             if inputs is not None:

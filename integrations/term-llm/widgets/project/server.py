@@ -160,7 +160,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw)
             if urlsplit(self.path).path != "/api/label" or not isinstance(body, dict):
                 raise Refused("STANDARD_ARGUMENTS_INVALID")
-            return self.send(200, label(self.server.control, body))
+            result = label(self.server.control, body)
+            _summary["value"] = None  # the tab's count changed
+            return self.send(200, result)
         except (ValueError, UnicodeDecodeError):
             return self.send(400, {"error": "STANDARD_ARGUMENTS_INVALID"})
         except Refused as refused:
