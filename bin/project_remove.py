@@ -336,7 +336,7 @@ class Removal:
     def chats(self):
         """The project's chats in term-llm: IDs (children first), top-level count, how many are
         answering now, and the attachments their messages name."""
-        out = {"project_id": None, "archived": False, "ids": [], "top": 0, "running": 0, "uploads": [], "refs": []}
+        out = {"project_id": None, "archived": False, "ids": [], "top": 0, "running": 0, "uploads": [], "refs": [], "linked": 0}
         db = self.term_data / "sessions.db"
         if not db.is_file() or db.is_symlink():
             return out
@@ -359,13 +359,20 @@ class Removal:
                     if (out["project_id"] and project == out["project_id"])
                     or (isinstance(cwd, str) and any(cwd == folder or cwd.startswith(folder + "/") for folder in folders))}
             links = {sid: {parent, root} - {None, sid} for sid, parent, root, _project, _cwd in rows}
-            others = str(self.home / "projects") + "/"
+            # Where projects' folders live: a chat that ran in another project's is that project's.
+            roots = {str(path) for root in (self.home / "projects", self.ws.base, self.ws.prefix / "intake")
+                     for path in (root, Path(os.path.realpath(root)))}
 
             def not_elsewhere(project, cwd):
                 """An agent's chat belongs here unless it is another project's, or ran in another project's folder."""
                 if project and project != out["project_id"]:
                     return False
-                return not (isinstance(cwd, str) and cwd.startswith(others) and not any(cwd == f or cwd.startswith(f + "/") for f in folders))
+                if not isinstance(cwd, str):
+                    return True
+                for root in roots:
+                    if cwd.startswith(root + "/") and cwd[len(root) + 1:].split("/")[0] != self.ws.name:
+                        return False
+                return True
             free = {sid for sid, _parent, _root, project, cwd in rows if not_elsewhere(project, cwd)}
             grown = True
             while grown:  # every agent's chat started from one of these, however deep
@@ -374,6 +381,8 @@ class Removal:
                     if sid not in mine and sid in free and refs & mine:
                         mine.add(sid)
                         grown = True
+            # Another project's chat started from one of these: its parent can't be deleted under it.
+            out["linked"] = sum(1 for sid, refs in links.items() if sid not in mine and refs & mine)
             left = set(mine)
             while left:  # a chat goes only after every chat that points at it
                 ready = sorted(sid for sid in left if not any(sid in links[other] for other in left if other != sid)) or sorted(left)
@@ -394,7 +403,12 @@ class Removal:
             refs = {ref for ref in refs if self.upload_file(ref) or self.upload_file(ref + ".json", "upload-refs")}
             if "messages" in tables:  # an attachment another chat also names stays with that chat
                 for name in sorted(uploads | refs):
-                    users = {row[0] for row in connection.execute("SELECT DISTINCT session_id FROM messages WHERE instr(parts, ?) > 0", (name,))}
+                    # As stored: plain, JSON-escaped, and as Go escapes <, > and &.
+                    escaped = json.dumps(name, ensure_ascii=False)[1:-1]
+                    forms = {name, escaped, escaped.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")}
+                    users = set()
+                    for form in forms:
+                        users |= {row[0] for row in connection.execute("SELECT DISTINCT session_id FROM messages WHERE instr(parts, ?) > 0", (form,))}
                     if users - mine:
                         uploads.discard(name)
                         refs.discard(name)
@@ -468,6 +482,8 @@ class Removal:
             out.append({"code": "STANDARD_BUSY", "text": "The project is busy right now (an agent or a decision is working on it). Try again in a minute."})
         if facts["chats"]["running"]:
             out.append({"code": "STANDARD_BUSY_CHAT", "text": "A chat in this project is still answering. Stop it or let it finish, then try again."})
+        if facts["chats"]["linked"]:
+            out.append({"code": "STANDARD_REMOVE_LINKED_CHAT", "text": "A chat of another project was started from one of this project's chats. Delete that chat first, or ask for help."})
         if facts.get("foreign"):
             out.append({"code": "STANDARD_REMOVE_NOT_OWNED", "text": "Some of its folders belong to another user (root, say), so this account can't remove them. Ask for help; nothing was changed."})
         if self.keep and any(not item["to"] for item in facts["received"]):
@@ -739,6 +755,8 @@ class Removal:
                 chats = self.chats()
                 if chats["running"]:
                     refuse("STANDARD_BUSY_CHAT: a chat in this project is still answering")
+                if chats["linked"]:
+                    refuse("STANDARD_REMOVE_LINKED_CHAT: a chat of another project was started from one of this project's chats")
                 # The customer's files go back first: a name in the way stops it before anything is removed.
                 if self.keep:
                     received = self.received()
@@ -762,6 +780,9 @@ class Removal:
         except (ValueError, OSError) as error:  # data_tools' refusals too (a file in the way, say)
             code = str(error).split(":")[0] if isinstance(error, ValueError) and str(error).startswith("STANDARD_") else "STANDARD_OPERATION_FAILED"
             self.record({"event": "stopped", "by": by or "unknown", "code": code, **{k: v for k, v in done.items() if k != "web_project"}})
+            if returned:  # say so: the workspace no longer holds them
+                said = str(error) if isinstance(error, ValueError) and str(error).startswith("STANDARD_") else code
+                raise Refusal(said + " (the received files are already back in the drop folder)") from error
             raise
         recorded = self.record({"event": "finished", "by": by or "unknown", **done})
         if self.keep:

@@ -56,7 +56,7 @@ function go(tab, selected = null) {
   if (state.removal) {
     if (state.removal.working) return;  // it finishes on this page
     // After a removal, the same way out as Done: a removed project leaves the list.
-    if (state.removal.result) { closeRemoval().then(() => go(tab, selected)); return; }
+    if (state.removal.result) { closeRemoval().then(() => go(tab, selected)).catch((error) => toast(explain(error), true)); return; }
     state.removal = null;
   }
   state.tab = tab;
@@ -343,6 +343,11 @@ async function refresh(full = true) {
 
 function choose(project) {
   if (!leaving() || (state.removal && state.removal.working)) { $('project').value = state.project; return; }
+  if (state.removal && state.removal.result) {  // the same way out as Done, then the chosen project
+    closeRemoval().then(() => { if (state.projects.includes(project) && project !== state.project) choose(project); })
+      .catch((error) => toast(explain(error), true));
+    return;
+  }
   state.project = project;
   state.files = state.guide = null;
   state.counts = {};

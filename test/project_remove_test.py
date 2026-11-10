@@ -496,7 +496,7 @@ class RemoveTest(unittest.TestCase):
     def test_a_stuck_container_stops_before_the_work_goes_and_a_second_run_finishes(self):
         self.docker.stuck.add('c-web-a')
         with mock.patch.object(self.pr.time, 'sleep'):
-            with self.assertRaisesRegex(ValueError, 'STANDARD_REMOVE_INCOMPLETE'):
+            with self.assertRaisesRegex(ValueError, r'STANDARD_REMOVE_INCOMPLETE: .*run it again \(the received files are already back in the drop folder\)'):
                 self.removal(keep=True).run('arc', None)
         # The customer's file went back first; the work, the chats and the drop folder are all still there.
         self.assertEqual(b'customer bytes', (self.top / 'intake/arc/sub/dump.sql.gz').read_bytes())
@@ -586,10 +586,36 @@ class RemoveTest(unittest.TestCase):
         ids = self.removal().chats()['ids']
         self.assertNotIn('s-theirs', ids)
         self.assertNotIn('s-there', ids)
-        # Its parent can't go while they point at it: it stops, and nothing of theirs is lost.
-        with self.assertRaisesRegex(ValueError, 'STANDARD_REMOVE_INCOMPLETE: 1 chat'):
-            self.removal().run('arc', None)
+        # Its parent can't go while they point at it: it says so before anything is touched.
+        self.check_refused('STANDARD_REMOVE_LINKED_CHAT', 'A chat of another project was started from one of this project')
         self.assertTrue({'s-other', 's-theirs', 's-there'} <= set(self.sessions()))
+
+    def test_agent_chats_that_ran_in_another_projects_folders_are_theirs(self):
+        con = sqlite3.connect(self.data / 'sessions.db')
+        con.execute("INSERT INTO sessions VALUES ('s-ws', NULL, ?, 's-main', NULL)", (str(self.base / 'other/work'),))
+        con.execute("INSERT INTO sessions VALUES ('s-drop', NULL, ?, 's-main', NULL)", (str(self.top / 'intake/other'),))
+        con.execute("INSERT INTO sessions VALUES ('s-mine', NULL, ?, 's-main', NULL)", (str(self.base / 'arc/work'),))
+        con.commit()
+        con.close()
+        chats = self.removal().chats()
+        self.assertIn('s-mine', chats['ids'])
+        self.assertEqual(2, chats['linked'])
+        self.assertNotIn('s-ws', chats['ids'])
+
+    def test_a_shared_attachment_is_found_however_it_was_escaped(self):
+        name = 'a&b<c>_9.png'
+        (self.data / 'uploads' / name).write_text('shared')
+        uploads = str(self.data / 'uploads')
+        con = sqlite3.connect(self.data / 'sessions.db')
+        con.execute('INSERT INTO messages (session_id, parts) VALUES (?, ?)', ('s-main', json.dumps([{'image_path': uploads + '/' + name}])))
+        # As Go stores it in another chat: <, > and & escaped.
+        go = json.dumps([{'image_path': uploads + '/' + name}]).replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
+        con.execute('INSERT INTO messages (session_id, parts) VALUES (?, ?)', ('s-other', go))
+        con.commit()
+        con.close()
+        self.assertNotIn(name, self.removal().chats()['uploads'])
+        self.removal(keep=True).run('arc', None)
+        self.assertTrue((self.data / 'uploads' / name).exists())
 
     def test_folders_of_another_user_block_it(self):
         real = self.pr.tree_facts
