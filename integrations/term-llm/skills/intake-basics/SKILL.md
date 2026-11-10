@@ -22,8 +22,9 @@ type label and checksum so every later step is traceable.
 3. **Ask, don't guess,** when something is missing or odd: no uploads for a forum with
    attachments, two dumps of different dates, unknown encodings, password-protected
    archives. The engineer talks to the customer.
-4. **Create the workspace once:** `data_create` with the source platform label
-   (`mybb`, `phpbb`, `discourse`, …). It clones discourse-converters for converter work.
+4. **The workspace:** the engineer normally creates it on the Project page's Files tab
+   (source platform) and labels the files there. Only if they ask you to: `data_create`
+   with the platform they name (the folder `converters/<platform>` in discourse-converters).
 5. **Take each file** with `data_take` and a clear type: `mysql-dump`, `postgres-dump`,
    `discourse-backup`, `archive`, `xml-export`, `json-export`, `csv-export`, `uploads`.
    Files become read-only in `inputs/`; provenance records where they came from.

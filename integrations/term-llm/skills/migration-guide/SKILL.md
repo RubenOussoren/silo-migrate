@@ -21,15 +21,14 @@ never from memory. It's computed from the project's state, so it's right in a ne
 
 Each customer is one **project** in the web UI. `silo intake PROJECT` (as root) makes its
 drop folder and web UI project. Every chat in that project works on that project only,
-so never ask which one it is. The first chat creates the workspace with `data_create`.
+so never ask which one it is. The engineer creates the workspace on the Files tab.
 
 ## The stages
 
 | Stage | Who | Where |
 | --- | --- | --- |
 | Copy files to the drop folder (`scp`), then `silo intake PROJECT` | Engineer | Server terminal |
-| Create the workspace | migration-data | Chat |
-| Say what new files are for: Development, Launch or Base site | Engineer | Project page |
+| Create the workspace (source platform), then say what new files are for: Development, Launch or Base site | Engineer | Project page |
 | Take the labelled files, load the source database | migration-data | Chat |
 | Profile the data and propose a finding | migration-data | Chat |
 | Review and release the finding | Engineer | Project page, Findings |

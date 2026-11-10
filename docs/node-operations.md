@@ -35,8 +35,13 @@ scp -r EXPORT-FILES SERVER:/srv/silo-migrate/intake/mybb-acme/
 ssh SERVER silo intake mybb-acme          # hands the files to the service account, shows a count
 ```
 
-Then open a chat with **migration-data** (Frontier only) in the web UI, for example:
-"Workspace mybb-acme: take the export from the drop folder, register it, load it into the
+Then, in the web UI, open the **Project** page for the project. On the **Files** tab, create the
+workspace (first time only: type the source platform, which must match the converter's folder
+`converters/PLATFORM` in discourse-converters, and press **Create workspace**) and say what the
+files are for (Development, Launch or Base site). No chat is needed for either.
+
+Then open a chat with **migration-data** (Frontier only) in that project, for example:
+"Take the export from the drop folder, register it, load it into the
 source database, and tell me the forum software and version, table prefix, charset and the
 main row counts. Then propose a schema finding with invented examples."
 
@@ -47,7 +52,7 @@ each is a fixed operation of `silo-migrate-control data WS`) can:
 
 - look at the drop folder: list, head/tail/search (gzip/bzip2/xz decompressed on the fly),
   archive listings;
-- create the workspace once (named workspace, source + platform label, dataset, a clone of
+- create the workspace when the engineer asks in chat instead of using the Files tab's **Create workspace** (named workspace, source + platform label, dataset, a clone of
   discourse-converters with your GitHub token, the standard workflow binding);
 - **take** files: moved into `workspaces/WS/inputs/`, read-only, SHA-256, registered, with a
   provenance record. Bytes are never changed;

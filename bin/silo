@@ -653,8 +653,10 @@ def intake(entry, project):
     print("contents: %d file(s), %.1f MB" % (count, total / 1e6))
     print(web_project(entry, project))
     if count and is_root():
-        print("These files now belong to " + entry.pw_name + ". Next: in the web UI, open project " + project + ", start a chat with\n"
-              "migration-data and ask it to take the export. To add more files later, copy them in and run `silo intake " + project + "` again.")
+        print("These files now belong to " + entry.pw_name + ". Next, in the web UI:\n"
+              "  1. Project page, project " + project + ", Files tab: create the workspace (first time only) and say what the files are for.\n"
+              "  2. In a chat with migration-data in project " + project + ": ask it to take the files.\n"
+              "To add more files later, copy them in and run `silo intake " + project + "` again.")
     elif count:
         print("Run `silo intake " + project + "` as root after copying files in, so they belong to " + entry.pw_name + ".")
     else:

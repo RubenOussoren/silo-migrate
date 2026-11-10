@@ -925,11 +925,29 @@ class DataToolsTest(unittest.TestCase):
         self.assertIn(str(self.base.parent / 'intake/arc'), guide['next']['action'])
         self.assertEqual([], self.control.calls)  # nothing exists yet, so nothing is asked of the workbench
 
-    def test_guide_for_a_new_project_with_files_tells_the_agent_to_create_the_workspace(self):
+    def test_guide_for_a_new_project_with_files_sends_the_engineer_to_create_the_workspace_on_the_page(self):
         self.drop('dump.sql', DUMP)
         guide = self.op('guide')
         self.assertEqual('workspace', guide['stage'])
-        self.assertNext('agent', 'data_create', guide)
+        self.assertNext('engineer', 'On the Files tab, create the workspace', guide)
+        self.assertEqual('Project page', guide['next']['where'])
+
+    def test_the_files_view_says_whether_workspace_setup_is_done_and_the_guide_follows(self):
+        self.auto_label = False
+        self.drop('dump.sql', DUMP)
+        self.assertEqual({'complete': False, 'platform': None}, self.op('deliveries')['setup'])
+        self.assertEqual([], self.control.calls)  # looking creates nothing
+        self.create()
+        self.assertEqual({'complete': True, 'platform': 'mybb'}, self.op('deliveries')['setup'])
+        self.assertNext('engineer', "say what they're for")
+        # A setup that stopped at the clone: the platform is known, the rest is still to do.
+        standard = self.base / 'arc/.silo-migrate/named/standard/state.json'
+        kept = standard.read_text()
+        standard.unlink()
+        self.assertEqual({'complete': False, 'platform': 'mybb'}, self.op('deliveries')['setup'])
+        self.assertNext('engineer', 'Finish creating the workspace on the Files tab')
+        standard.write_text(kept)
+        self.assertEqual({'complete': True, 'platform': 'mybb'}, self.op('deliveries')['setup'])
 
     def test_guide_walks_the_whole_flow(self):
         self.create()
@@ -1479,7 +1497,7 @@ class DataToolsTest(unittest.TestCase):
         labelled = self.label('base_site')
         self.assertNotIn('input', labelled)
         self.assertTrue((self.intake / name).exists())
-        self.assertIn('Create the workspace', self.op('guide')['next']['action'])
+        self.assertIn('create the workspace', self.op('guide')['next']['action'])
         self.create()
         self.refused('STANDARD_BASE_SITE_TYPE', 'take', path=name, type='sql')
         input_id = self.op('take', path=name, type='base_site')['input_id']

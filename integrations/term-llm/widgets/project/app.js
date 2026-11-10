@@ -6,7 +6,7 @@ import { findingsView } from './findings.js';
 const POLL_MS = 15000;
 const TABS = [['overview', 'Overview'], ['files', 'Files'], ['findings', 'Findings'], ['runs', 'Runs']];
 const STAGE_NAMES = { files: 'Files', workspace: 'Workspace', source_db: 'Source DB', finding: 'Finding', converter: 'Converter', convert: 'Convert', review: 'Import', site: 'Check site', release: 'Release backup' };
-const state = { projects: [], project: null, tab: 'overview', selected: null, files: null, guide: null, counts: {}, details: false, typing: false, generation: 0, findings: { filter: 'proposed', q: '' }, removal: null, labelResult: null, selectedFiles: null };
+const state = { projects: [], project: null, tab: 'overview', selected: null, files: null, guide: null, counts: {}, details: false, typing: false, generation: 0, findings: { filter: 'proposed', q: '' }, removal: null, labelResult: null, selectedFiles: null, setup: null };
 
 const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 const size = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.round(bytes / 1e3)} KB`);
@@ -306,17 +306,57 @@ function newFilesCard(files) {
   return card('NEW FILES, FOR YOU', 'What are these files for?', list, hidden > 0 ? el('p', { class: 'hint' }, `and ${hidden} more. Label these first, then the rest.`) : null, actions, el('p', { class: 'hint' }, 'Base site · a backup of the customer’s sandbox, without uploads. Review sites are built on top of it.'));
 }
 
+const PLATFORM = /^[a-z][a-z0-9_.-]{0,31}$/;
+
+async function submitSetup(platform) {
+  const setup = state.setup;
+  if (!setup || setup.working || !PLATFORM.test(platform)) return;
+  const project = state.project;
+  setup.working = true;
+  render();
+  try {
+    await api('api/workspace/create', { workspace: project, platform });
+    toast('Workspace created. Now say what the files are for.');
+  } catch (error) {
+    toast(explain(error), true);
+  }
+  setup.working = false;
+  if (state.project === project) { state.setup = null; refresh(); }
+}
+
+// The workspace is created here, with the one thing only the engineer knows: the source platform.
+// The same card finishes a setup that stopped half way (a failed clone, say); the platform is then fixed.
+function setupCard(files, known) {
+  const setup = state.setup || (state.setup = { platform: '', working: false });
+  const say = files.initialized ? 'Workspace setup isn\u2019t finished.' : 'Files have arrived. Create the workspace.';
+  const rows = files.initialized ? null : fileRows(files.unlabelled_files, (entry) => size(entry.bytes));
+  if (setup.working) {
+    return card('NEXT, FOR YOU', say, rows, el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', disabled: true }, 'Creating\u2026')),
+      el('p', { class: 'hint' }, 'This copies discourse-converters from GitHub and can take a few minutes. Keep this page open.'));
+  }
+  if (known) {
+    return card('NEXT, FOR YOU', say, rows, el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', onclick: () => submitSetup(known) }, 'Finish setup')),
+      el('p', { class: 'hint' }, `Source platform: ${safe(known)}. What was already done is kept. If it stops again, check the server\u2019s GitHub token for discourse-converters (silo use-github, as root), then ask for help.`));
+  }
+  const box = el('input', { class: 'confirm', placeholder: 'e.g. mybb', autocomplete: 'off', spellcheck: 'false', value: setup.platform, 'aria-label': 'Source platform' });
+  const create = el('button', { type: 'button', class: 'btn', disabled: !PLATFORM.test(setup.platform), onclick: () => submitSetup(setup.platform) }, 'Create workspace');
+  box.addEventListener('input', () => { setup.platform = box.value.trim(); create.disabled = !PLATFORM.test(setup.platform); });
+  box.addEventListener('keydown', (event) => { if (event.key === 'Enter') submitSetup(setup.platform); });
+  return card('NEXT, FOR YOU', say, rows, el('label', { class: 'typed' }, 'Source platform'), el('div', { class: 'actions' }, box, create),
+    el('p', { class: 'hint' }, 'Lowercase, and the same as the converter\u2019s folder in discourse-converters (converters/PLATFORM). It can\u2019t be changed later without starting over. After this you say what the files are for.'));
+}
+
 function renderFiles() {
   const files = state.files;
   if (!files) return [el('p', { class: 'quiet' }, 'Loading…')];
-  if (!files.initialized && !files.not_ready_files.length) {
-    // No label buttons before the workspace exists: a lone enabled button reads as the only choice.
-    return files.unlabelled_files.length
-      ? [card('NEXT, FOR YOU', 'Files have arrived. Create the workspace first.', fileRows(files.unlabelled_files, (entry) => size(entry.bytes)),
-        el('p', { class: 'hint' }, 'Open a migration-data chat in this project and ask it to create the workspace. Then come back here to say what the files are for.'))]
-      : [el('p', { class: 'quiet' }, 'No files yet. Copy them to the drop folder with scp, then run silo intake as root.')];
+  const setup = files.setup || { complete: files.initialized, platform: null };
+  if (!files.initialized && !files.not_ready_files.length && !files.unlabelled_files.length) {
+    return [el('p', { class: 'quiet' }, 'No files yet. Copy them to the drop folder with scp, then run silo intake as root.')];
   }
   const out = [];
+  // Labels come after the workspace: Development and Launch data belong to its source.
+  if (!setup.complete && (files.initialized || files.unlabelled_files.length)) out.push(setupCard(files, setup.platform));
+  const labels = files.initialized && (setup.complete || setup.platform);
   const labelled = state.labelResult;
   if (labelled && labelled.checks) out.push(card(labelled.delivery, 'SQL-only backup checked.',
     facts([['File checks', 'Original SQL-only backup name · gzip · regular file'], ['Discourse', labelled.checks.discourse_version || 'Version will be checked in the plan'],
@@ -331,7 +371,7 @@ function renderFiles() {
   if (files.not_ready_files.length) {
     out.push(card('NEEDS YOU', `Not handed over yet: run silo intake ${state.project} as root. Rename any file whose name shows �.`, fileRows(files.not_ready_files, (entry) => size(entry.bytes))));
   }
-  if (files.initialized && files.unlabelled_files.length) out.push(newFilesCard(files));
+  if (labels && files.unlabelled_files.length) out.push(newFilesCard(files));
   if (files.labelled_files.length) out.push(el('p', { class: 'quiet' }, `${files.labelled_files.length} labelled file(s) are waiting for migration-data to take them.`));
   const current = [newest('development'), newest('launch'), newest('base_site')].filter(Boolean);
   const row = (record, old) => el('div', { class: `item static ${old ? 'old' : ''}` }, el('div', {},
@@ -346,7 +386,7 @@ function renderFiles() {
 
 function render() {
   const typing = document.activeElement && document.activeElement.classList.contains('confirm');
-  if ((state.typing || state.removal) && typing) return;  // don't wipe what's being typed
+  if ((state.typing || state.removal || state.setup) && typing) return;  // don't wipe what's being typed
   $('project-name').textContent = state.project || 'No projects yet';
   renderData();
   renderStages();
@@ -396,7 +436,7 @@ function choose(project) {
     return;
   }
   state.project = project;
-  state.selectedFiles = null; state.labelResult = null;
+  state.selectedFiles = null; state.labelResult = null; state.setup = null;
   state.files = state.guide = null;
   state.counts = {};
   state.selected = null;

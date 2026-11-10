@@ -130,6 +130,21 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         self.assertEqual(['data', 'arc'], argv)
         self.assertEqual({'op': 'delivery_label', 'kind': 'development', 'by': self.m.runs.reviewer_name(), 'files': [{'path': 'a.sql', 'bytes': 1, 'mtime_ns': '2', 'ctime_ns': '3', 'ino': '4'}]}, request)
 
+    def test_creating_the_workspace_passes_only_the_platform_and_the_servers_reviewer_name(self):
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        body = {'workspace': 'new-forum', 'platform': 'mybb', 'by': 'Someone Else', 'via': 'chat', 'op': 'db_reset',
+                'converter_repo': 'https://github.com/other/repo.git', 'converter_branch': 'other'}
+        self.assertEqual(200, self.request('POST', '/api/workspace/create', body, headers)[0])
+        (argv, request), = self.calls()
+        self.assertEqual(['data', 'new-forum'], argv)
+        self.assertEqual({'op': 'create', 'platform': 'mybb', 'by': self.m.runs.reviewer_name()}, request)
+        for bad in ({'workspace': 'new-forum'}, {'workspace': 'new-forum', 'platform': 'MyBB'}, {'workspace': 'new-forum', 'platform': 'mybb; rm'},
+                    {'workspace': 'new-forum', 'platform': ['mybb']}, {'workspace': 'new-forum', 'platform': 'mybb\n'}, {'workspace': '../x', 'platform': 'mybb'}):
+            with self.subTest(body=bad):
+                self.assertEqual(400, self.request('POST', '/api/workspace/create', bad, headers)[0])
+        self.assertEqual(403, self.request('POST', '/api/workspace/create', body, {'Content-Type': 'application/json'})[0])
+        self.assertEqual(1, len(self.calls()))
+
     def test_launch_flags_pass_only_in_their_exact_form(self):
         self.post({'workspace': 'arc', 'kind': 'launch', 'files': [{'path': 'a'}], 'confirm': 'yes', 'replaces_launch': 'true'})
         self.assertNotIn('confirm', self.calls()[0][1])

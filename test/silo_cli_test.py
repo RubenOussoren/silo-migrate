@@ -290,7 +290,8 @@ class SiloTest(unittest.TestCase):
         text = out.getvalue()
         self.assertIn('1 file(s)', text)
         self.assertIn('now belong to silomig', text)
-        self.assertIn('migration-data', text)
+        self.assertIn('Files tab: create the workspace', text)  # the page first, then the chat
+        self.assertLess(text.index('Files tab'), text.index('migration-data'))
         self.assertNotIn('scp FILES', text)
 
     def test_doctor_checks_the_skills_link(self):

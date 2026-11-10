@@ -980,10 +980,19 @@ def delivery_summary(record):
                 label=delivery_label(record), files=files[:5], file_count=len(files))
 
 
+def setup_view(ws):
+    """For the Files tab's Create workspace card: whether every step of op_create is done, and the
+    platform once it is set (it can't change afterwards)."""
+    meta = ws.meta() if ws.initialized() else {}
+    complete = bool(meta.get("source_id") and meta.get("dataset_id") and (ws.root / "converter").exists()
+                    and (ws.root / ".silo-migrate/named/standard/state.json").is_file())
+    return {"complete": complete, "platform": meta.get("platform")}
+
+
 def op_deliveries(ws, request):
     """The engineer's view for the Project page. It holds file names, so it never reaches a chat."""
     engineer_only(ws)
-    empty = {"initialized": False, "deliveries": [], "unlabelled_data": []}
+    empty = {"initialized": False, "setup": setup_view(ws), "deliveries": [], "unlabelled_data": []}
     if not ws.initialized():
         listing = drop_listing(ws)
         return dict(empty, unlabelled_files=[item for item in listing if item["ready"]][:SHOWN_FILES], labelled_files=[], refused_files=[],
@@ -991,7 +1000,7 @@ def op_deliveries(ws, request):
     records = read_deliveries(ws)
     groups = split_drop_files(ws, records)
     ordered = sorted(records.values(), key=lambda record: record.get("sequence", 0), reverse=True)
-    return {"initialized": True, "deliveries": [delivery_summary(record) for record in ordered],
+    return {"initialized": True, "setup": setup_view(ws), "deliveries": [delivery_summary(record) for record in ordered],
             "unlabelled_files": groups["unlabelled"][:SHOWN_FILES], "labelled_files": groups["labelled"][:SHOWN_FILES],
             "refused_files": groups["refused"][:SHOWN_FILES], "not_ready_files": groups["not_ready"][:SHOWN_FILES],
             "counts": {key: len(value) for key, value in groups.items()}, "unlabelled_data": unlabelled_data(ws, records)}
@@ -2773,7 +2782,7 @@ def guide_flow(ws, facts, records, site=NO_SITE):
     copy_files = ("engineer", "Copy the customer's files to the drop folder (%s) with scp, then run `silo intake %s` as root." % (ws.intake, ws.name), "server terminal")
     if not facts["initialized"]:
         if facts["drop_files"]:
-            return ("agent", "Create the workspace with data_create (ask the engineer for the source platform if it isn't clear). The engineer then labels the files.", "this chat")
+            return ("engineer", "On the Files tab, create the workspace (it asks for the source platform), then say what the files are for.", "Project page")
         return copy_files
     if facts["labelled_files"]:
         return ("agent", "Take the labelled files in the drop folder with data_take, each with a clear type." +
@@ -2877,7 +2886,9 @@ def op_guide(ws, request):
     waiting, also = [], []
     if not_labelled:
         waiting.append({"what": "Label the data already in this project as Development on the Project page.", "where": "Project page"})
-    if unlabelled:
+    if unlabelled and not facts["initialized"]:  # a workspace begun but not finished (a failed clone, say)
+        waiting.append({"what": "Finish creating the workspace on the Files tab, then say what the new files are for.", "where": "Project page"})
+    elif unlabelled:
         arrived = "1 new file arrived" if len(unlabelled) == 1 else "%d new files arrived" % len(unlabelled)
         waiting.append({"what": arrived + ": say what they're for (Development, Launch or Base site) on the Project page.", "where": "Project page"})
     if groups["refused"]:

@@ -4,7 +4,7 @@
 Reached only through term-llm's signed-in proxy, by the engineer. It shows file names, so it never
 serves an agent. The decisions are the Findings and Runs modules' own, called unchanged (their
 server.py files stay as libraries): exact-digest approvals, exact-text releases, the same refusals.
-Labels and the guide go through `silo-migrate-control data WS`, in bin/data_tools.py.
+Workspace creation, labels and the guide go through `silo-migrate-control data WS`, in bin/data_tools.py.
 """
 import importlib.util
 import json
@@ -48,6 +48,7 @@ RUN_PATHS = {"/api/runs/" + action for action in RUN_ACTIONS}
 FINDING_PATHS = {"/api/findings/" + action for action in FINDING_ACTIONS}
 RUN_VIEWS = {"plan": runs.plan_detail, "run": runs.run_detail, "push": runs.push_detail}
 MAX_FILES = 400
+PLATFORM = re.compile(r"[a-z][a-z0-9_.-]{0,31}\Z")  # as bin/data_tools.py
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/ui.js": ("ui.js", "text/javascript; charset=utf-8"), "/runs.js": ("runs.js", "text/javascript; charset=utf-8"),
           "/findings.js": ("findings.js", "text/javascript; charset=utf-8"),
@@ -246,6 +247,16 @@ def label(control, body):
     return data(control, body.get("workspace"), request, timeout=3600 if request["kind"] == "base_site" else 90)
 
 
+def create_workspace(control, body):
+    """The Files tab's Create workspace: the operation migration-data's data_create calls, with only
+    the platform passed on (the converter repository and branch stay the defaults)."""
+    platform = body.get("platform")
+    if not isinstance(platform, str) or not PLATFORM.fullmatch(platform):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    # Cloning discourse-converters is most of the time: data_tools allows the clone 240 s.
+    return data(control, body.get("workspace"), {"op": "create", "platform": platform, "by": runs.reviewer_name()}, timeout=300)
+
+
 def release_backup(control, body):
     workspace, run_id = body.get("workspace"), body.get("run_id")
     acknowledge = body.get("acknowledge", False)
@@ -390,6 +401,8 @@ class Handler(BaseHTTPRequestHandler):
             action = path.rsplit("/", 1)[-1]
             if path == "/api/label":
                 result = label(self.server.control, body)
+            elif path == "/api/workspace/create":
+                result = create_workspace(self.server.control, body)
             elif path == "/api/project/remove":
                 result = remove(self.server.control, body)
             elif path == "/api/site/review":
