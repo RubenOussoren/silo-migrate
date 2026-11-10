@@ -3,9 +3,9 @@
 
   script/update-varnish COMMIT          (the full 40-character commit)
 
-The folder integrations/term-llm/extensions/varnish is a copy of upstream, unmodified except for one
-checked compatibility patch this script applies (PATCHES below; the same one the Development node's
-update helper uses). Nobody edits the folder by hand: our changes live in the silo-theme extension. The
+The folder integrations/term-llm/extensions/varnish is a copy of upstream, unmodified except for the
+checked compatibility patches this script applies (PATCHES below; the same ones the Development node's
+update helper uses). Nobody edits the folder by hand: our changes live in the silo-theme extension. Each
 patch recognises the exact upstream code or its already-fixed form and refuses anything else, so an
 upstream change gets a person's review. This fetches the commit, replaces the folder as a whole (keeping
 local.json), records what was installed (with each patch and the upstream hashes of the files it
@@ -80,7 +80,14 @@ FIXED_MARK_CSS = '''.runtime-popover-field .vn-field-mark svg { width: 14px; hei
   padding-left: 33px;
 }
 '''
-PATCHES = {"runtime_marks": (("main.js", OLD_MARK_LOOKUP, FIXED_MARK_LOOKUP), ("style.css", OLD_MARK_CSS, FIXED_MARK_CSS))}
+# Through the Hub, a node's web UI is at /hub/node/<id>/, but upstream finds the node only at
+# /node/<id>/ (start of the path), so the node's own accent, favicon and per-node settings don't
+# apply there. The same one-expression change as the Development node's (infrastructure
+# scripts/update_varnish.py, "hub_compatibility"); drop it once upstream supports prefixed paths.
+OLD_NODE_ID = r'location.pathname.match(/^\/node\/([^/]+)\//)'
+FIXED_NODE_ID = r'location.pathname.match(/\/node\/([^/]+)\//)'
+PATCHES = {"runtime_marks": (("main.js", OLD_MARK_LOOKUP, FIXED_MARK_LOOKUP), ("style.css", OLD_MARK_CSS, FIXED_MARK_CSS)),
+           "hub_node_id": (("util.js", OLD_NODE_ID, FIXED_NODE_ID),)}
 NETWORK = re.compile(r"\bfetch\(|\bWebSocket\(|\bEventSource\(|\bXMLHttpRequest\b|\bsendBeacon\(|\bimport\(")
 
 

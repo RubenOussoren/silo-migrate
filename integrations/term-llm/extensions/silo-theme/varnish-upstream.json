@@ -18,7 +18,7 @@
     "palette.js": "762e519c0373577d784779bc6b675a400b4ecc9c80f93e936ae972acb4e9e065",
     "style.css": "9650c50e259b8219fd344214f3943257485b0c675a7a0aaaae626ce0ae4b85f3",
     "thread.js": "ebb108e77e7f36795a39a4231eac92c52e0c437e999a4612c479871179fe1cd4",
-    "util.js": "5755a7ce8b1bc45bc0950d391c10f1e520f4c4616215e2b8e5e6682b41fa56ed"
+    "util.js": "86a0a626ca9aea82c001cd183b352aab84c7d437575220db96e6074c23b1e5d0"
   },
   "patches": {
     "runtime_marks": {
@@ -26,6 +26,12 @@
       "upstream_files": {
         "main.js": "bca7bba3312ccf53a1df928120ffc995103997c20bff11bace0d4189db17143a",
         "style.css": "c6aa3af9df1d8231d1ec9d113662bad3e771f1cea3e8038d14e10f26002b51a1"
+      }
+    },
+    "hub_node_id": {
+      "status": "patched",
+      "upstream_files": {
+        "util.js": "5755a7ce8b1bc45bc0950d391c10f1e520f4c4616215e2b8e5e6682b41fa56ed"
       }
     }
   },

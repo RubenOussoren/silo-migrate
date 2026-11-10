@@ -36,6 +36,13 @@ class ShippedVarnishTest(unittest.TestCase):
         self.assertEqual(record['files'], found)
         self.assertEqual([], [str(path) for path in VARNISH.rglob('*') if path.is_symlink()])
 
+    def test_the_shipped_copy_finds_the_node_behind_the_hub(self):
+        # Through the Hub the web UI is at /hub/node/<id>/: the node's own accent, favicon and settings.
+        record = json.loads((THEME / 'varnish-upstream.json').read_text())
+        self.assertIn(record['patches']['hub_node_id']['status'], ('patched', 'already-supported'))
+        self.assertIn(r'location.pathname.match(/\/node\/([^/]+)\//)', (VARNISH / 'util.js').read_text())
+        self.assertNotIn(r'match(/^\/node\/', (VARNISH / 'util.js').read_text())
+
     def test_the_shipped_copy_has_the_runtime_marks_fix(self):
         # term-llm 0.9.99's Runtime popover: one icon-sized provider mark per field (the live check counts them).
         record = json.loads((THEME / 'varnish-upstream.json').read_text())
@@ -85,6 +92,7 @@ class UpdateTest(unittest.TestCase):
         # As upstream 002f10e has them: the code the runtime-marks patch fixes.
         self.write('main.js', 'export function activate() {}\n' + MARK)
         self.write('style.css', '.a { color: red; }\n.runtime-popover-field > .vn-field-mark svg { width: 14px; height: 14px; }\n')
+        self.write('util.js', 'export const NODE_ID = ' + r'location.pathname.match(/^\/node\/([^/]+)\//)' + '?.[1] ?? null;\n')
         self.write('tools/check.mjs', 'dev only\n')
         self.write('install.sh', 'dev only\n')
         self.first = self.commit()
@@ -189,6 +197,21 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256((self.upstream / 'main.js').read_bytes()).hexdigest(), record['patches']['runtime_marks']['upstream_files']['main.js'])
         self.assertEqual(hashlib.sha256(main.encode()).hexdigest(), record['files']['main.js'])  # the record is what ships
         self.assertIn(':scope > .vn-field-mark', (self.upstream / 'main.js').read_text())  # upstream itself untouched
+
+    def test_the_hub_node_patch_is_applied_and_recorded_on_its_own(self):
+        self.assertEqual(0, self.update(self.first).returncode)
+        self.assertEqual('export const NODE_ID = ' + self.script.FIXED_NODE_ID + '?.[1] ?? null;\n', (self.target / 'util.js').read_text())
+        record = json.loads(self.record.read_text())['patches']
+        self.assertEqual(['util.js'], list(record['hub_node_id']['upstream_files']))
+        self.assertEqual('patched', record['hub_node_id']['status'])
+        # Upstream fixes it one way or another: the same fix is left alone; anything else stops the update.
+        self.write('util.js', 'export const NODE_ID = ' + self.script.FIXED_NODE_ID + '?.[1] ?? null;\n')
+        self.assertEqual(0, self.update(self.commit()).returncode)
+        self.assertEqual('already-supported', json.loads(self.record.read_text())['patches']['hub_node_id']['status'])
+        self.write('util.js', 'export const NODE_ID = new URL(location.href).pathname.split("/node/")[1] ?? null;\n')
+        result = self.update(self.commit())
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('hub_node_id patch', result.stderr)
 
     def test_an_upstream_that_has_the_fix_is_left_as_it_is(self):
         self.write('main.js', 'export function activate() {}\n' + self.script.FIXED_MARK_LOOKUP)

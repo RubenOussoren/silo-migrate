@@ -61,7 +61,7 @@ export async function loadLocalConfig() {
 
 // Every node shares the Hub's origin, and so its localStorage; the node id in
 // /node/<id>/ is what tells them apart. Direct (non-Hub) visits get null.
-export const NODE_ID = location.pathname.match(/^\/node\/([^/]+)\//)?.[1] ?? null;
+export const NODE_ID = location.pathname.match(/\/node\/([^/]+)\//)?.[1] ?? null;
 
 export const html = document.documentElement;
 export const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
