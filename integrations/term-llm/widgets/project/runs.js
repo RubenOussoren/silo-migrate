@@ -120,11 +120,11 @@ export function runsView(ctx) {
       const b = data.banner;
       nodes.push(el('div', { class: 'banner' }, b.kind === 'converter'
         ? el('span', {}, el('b', {}, 'Converter updated'), ` since the last pass: ${b.head} “${safe(b.title || '')}”. Nothing has run on it yet.`)
-        : el('span', {}, el('b', {}, 'New data'), `: ${b.label} hasn't been run yet. Ask migration-data to propose a convert run on it.`),
-      b.kind === 'converter' ? el('button', { type: 'button', class: 'btn', onclick: async () => {
+        : el('span', {}, el('b', {}, 'New data'), `: ${safe(b.label)} hasn't been run yet. Ask migration-data to propose a convert run on it.`),
+      b.kind === 'converter' ? el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', onclick: async () => {
         const outcome = await act('again', { run_id: b.run_id }, `Start pass ${b.next} of ${ctx.project} with the newest converter (${b.head}) and the same data, settings and checks as the last pass? This only proposes it: you approve it next.`);
         if (outcome && outcome.plan_id) { toast('Proposed. Check it and approve.'); ctx.open('plan', outcome.plan_id); }
-      } }, `Start pass ${b.next}`) : null));
+      } }, `Start pass ${b.next}`)) : null));
     }
     const waitingPushes = data.updates.filter((update) => update.status === 'proposed');
     if (waitingPushes.length) {
@@ -158,7 +158,7 @@ export function runsView(ctx) {
     const changed = before ? el('p', { class: 'changed' }, `Changed since pass ${before.number}: `, el('b', {}, changes.length ? changes.join(', ') : 'nothing'), '.') : null;
     const more = details(facts([['Convert run', group.convert.run_id, true], ['Convert plan', group.convert.plan_id, true],
       ...group.imports.map((step, i) => [`Import ${i + 1}`, step.run_id || step.plan_id, true]), ['Converter', group.converter, true], ['Branch', group.branch, true]]));
-    ctx.mount([back('Runs', ctx.close), card(`PASS ${group.number} · ${(group.delivery || 'DATA NOT LABELLED').toUpperCase()}`, group.status[0], changed,
+    ctx.mount([back('Runs', ctx.close), card(`PASS ${group.number} · ${safe(group.delivery || 'DATA NOT LABELLED').toUpperCase()}`, group.status[0], changed,
       el('div', { class: 'steps' }, steps(group)), passActions(group, true), more)]);
   }
 
@@ -300,6 +300,7 @@ export function runsView(ctx) {
     const commits = data.commits || [];
     const say = data.status === 'proposed' ? `Push ${commits.length} commit(s) and open or update the draft PR?` : data.status === 'superseded' ? 'A newer proposal replaced this one.' : `This push is ${data.status}.`;
     const summary = facts([['Title', safe(data.title)], ['Branch', `${safe(data.branch)} → ${safe(data.base)}`, true], ['Repository', data.repository],
+      ['Addresses', (data.findings || []).length ? `${data.findings.length} finding(s): ${data.findings.join(', ')}` : 'no finding named'],
       ['Pull request', pull && pull.url ? el('a', { href: pull.url, target: '_blank', rel: 'noopener noreferrer' }, `#${pull.number} (draft)`) : null]]);
     const commitLine = (c) => (typeof c === 'string' ? safe(c) : `${short(c.sha, 10)}  ${safe(c.subject || '')}${c.author ? ` (${safe(String(c.author).replace(/\s*<[^>]*>$/, ''))})` : ''}`);
     const commitList = el('ul', { class: 'commits' }, commits.map((c) => el('li', { class: 'mono' }, commitLine(c))));

@@ -5,7 +5,21 @@ made from it; converter updates are the pushes; a finding moves from released to
 as the pushes that name it are pushed and a later pass passes.
 """
 
+from datetime import datetime, timezone
+
 ACTIVE = ("claimed", "running")
+_EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _t(value):
+    """An ISO time as a comparable instant, whatever its format (Z or +00:00, fractions, offsets)."""
+    if not isinstance(value, str) or not value:
+        return _EARLIEST
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return _EARLIEST
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 WAITING = ("proposed", "approved")
 
 
@@ -42,8 +56,9 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries):
             continue  # discarded, never run: not part of any pass
         step = _step("convert", plan, run)
         delivery = body.get("delivery") or {}
-        groups[run.get("run_id") if run else plan.get("plan_id")] = {
-            "key": run.get("run_id") if run else plan.get("plan_id"), "convert": step, "imports": [],
+        # Keyed by the convert plan: the same before and after it runs.
+        groups[plan.get("plan_id")] = {
+            "key": plan.get("plan_id"), "convert": step, "imports": [],
             "delivery": ("Launch" if delivery.get("kind") == "launch" else "Development v%s" % delivery.get("version")) if delivery else None,
             "dataset_id": delivery.get("dataset_id") or body.get("dataset_id"),
             "converter": body.get("converter_revision"), "branch": (body.get("converter") or {}).get("branch"),
@@ -56,15 +71,16 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries):
         if not run and plan.get("status") not in WAITING + ("stale",):
             continue
         source = (body.get("from_run") or {}).get("run_id")
-        if source in groups:
+        group = next((candidate for candidate in groups.values() if candidate["convert"]["run_id"] and candidate["convert"]["run_id"] == source), None)
+        if group:
             step = _step("import", plan, run)
             step["site_up"] = bool(run and review_sites.get(run.get("run_id")))
-            groups[source]["imports"].append(step)
+            group["imports"].append(step)
     # Numbered in the order they were proposed, so a pass keeps its number when it runs.
-    ordered = sorted(groups.values(), key=lambda group: (group["created_at"], group["key"]))
+    ordered = sorted(groups.values(), key=lambda group: (_t(group["created_at"]), group["key"]))
     for number, group in enumerate(ordered, 1):
         group["number"] = number
-        group["imports"].sort(key=lambda step: step["started_at"])
+        group["imports"].sort(key=lambda step: _t(step["started_at"]))
         group["status"] = pass_status(group)
     used = {}
     for group in ordered:
@@ -75,9 +91,9 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries):
         proposal = record.get("proposal") or {}
         head = proposal.get("head")
         updates.append({"digest": record.get("digest"), "status": record.get("status"), "title": proposal.get("title"), "head": _short(head),
-                        "full_head": head, "pushed_at": record.get("pushed_at"), "proposed_at": record.get("proposed_at"),
+                        "full_head": head, "branch": proposal.get("branch"), "pushed_at": record.get("pushed_at"), "proposed_at": record.get("proposed_at"),
                         "findings": proposal.get("findings") or [], "used_by": used.get(head, [])})
-    updates.sort(key=lambda update: update.get("pushed_at") or update.get("proposed_at") or "", reverse=True)
+    updates.sort(key=lambda update: _t(update.get("pushed_at") or update.get("proposed_at")), reverse=True)
     return {"passes": ordered[::-1], "updates": updates, "banner": banner(ordered, updates, deliveries)}
 
 
@@ -109,7 +125,7 @@ def banner(ordered, updates, deliveries):
     if not ran or any(group["status"][0] in ("Waiting for your approval", "Running") for group in ordered):
         return None
     last = ran[-1]
-    pushed = [update for update in updates if update["status"] == "pushed" and update["full_head"] and (update["pushed_at"] or "") > last["started_at"]]
+    pushed = [update for update in updates if update["status"] == "pushed" and update["full_head"] and _t(update["pushed_at"]) > _t(last["started_at"])]
     if pushed and not pushed[0]["used_by"]:
         return {"kind": "converter", "head": pushed[0]["head"], "title": pushed[0]["title"], "run_id": last["convert"]["run_id"], "next": last["number"] + 1}
     newest = [record for record in sorted(deliveries.values(), key=lambda record: record.get("sequence", 0)) if record.get("kind") == "development" and not record.get("replaced_by")]
@@ -135,22 +151,34 @@ def build_findings(records, passes, updates, marks):
             cursor = by_id[cursor["supersedes"]]
             lineage.add(cursor["id"])
         fixes = [update for update in updates if lineage & set(update["findings"]) and update["status"] in ("proposed", "pushed")]
-        pushed = sorted((update for update in fixes if update["status"] == "pushed"), key=lambda update: update["pushed_at"] or "")
+        pushed = sorted((update for update in fixes if update["status"] == "pushed"), key=lambda update: _t(update["pushed_at"]))
         first_fix = pushed[0] if pushed else None
+
+        def carries_fix(group):
+            # The pass ran the fix itself, or a later commit of the same branch pushed after it. A pass
+            # on another branch (a new topic from main, say) doesn't count.
+            if not group["convert"]["run_id"]:
+                return False
+            if any(group["converter"] == fix["full_head"] for fix in pushed):
+                return True
+            return any(fix["branch"] and group.get("branch") == fix["branch"] and _t(group["started_at"]) >= _t(fix["pushed_at"]) for fix in pushed)
         checked = None
-        if first_fix:
-            for group in sorted(passes, key=lambda group: group["number"]):
-                last = (group["imports"] or [group["convert"]])[-1]
-                if group["started_at"] >= (first_fix["pushed_at"] or "") and _passed(group["convert"]) and _passed(last):
-                    checked = group["number"]
-                    break
-        later = first_fix and any(group["started_at"] >= (first_fix["pushed_at"] or "") and group["convert"]["run_id"] for group in passes)
+        for group in sorted(passes, key=lambda group: group["number"]):
+            last = (group["imports"] or [group["convert"]])[-1]
+            if carries_fix(group) and _passed(group["convert"]) and _passed(last):
+                checked = group["number"]
+                break
+        later = any(carries_fix(group) for group in passes)
         origin = run_pass.get(record.get("run_id"))
         item = {"id": record["id"], "title": record.get("title") or record["id"], "kind": record.get("kind"), "status": record["status"],
                 "proposed_at": record.get("proposed_at"), "decided_at": record.get("decided_at"),
                 "origin": {"pass": origin[0], "step": origin[1]} if origin else None,
                 "fix": {"head": first_fix["head"], "title": first_fix["title"]} if first_fix else ({"proposed": True} if fixes else None),
-                "ran": bool(later), "checked_in": checked, "marked": marks.get(record["id"])}
+                "ran": bool(later), "checked_in": checked}
+        # A mark follows the finding through its corrections.
+        marked_id = next((finding_id for finding_id in [record["id"]] + sorted(lineage - {record["id"]}) if marks.get(finding_id)), None)
+        item["marked"] = marks.get(marked_id) if marked_id else None
+        item["marked_id"] = marked_id
         if record["status"] == "proposed":
             groups["review"].append(item)
         elif record["status"] == "released":
@@ -158,5 +186,5 @@ def build_findings(records, passes, updates, marks):
         else:
             groups["other"].append(item)
     for items in groups.values():
-        items.sort(key=lambda item: item.get("decided_at") or item.get("proposed_at") or "", reverse=True)
+        items.sort(key=lambda item: _t(item.get("decided_at") or item.get("proposed_at")), reverse=True)
     return groups

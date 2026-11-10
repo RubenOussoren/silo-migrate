@@ -197,7 +197,7 @@ export function findingsView(ctx) {
     const story = entry && record.status !== 'proposed' ? [track(entry), el('p', { class: 'changed' }, `${origin(entry)}. ${nextStep(entry)}.`)] : [];
     const mark = (undo) => el('button', { type: 'button', class: 'btn q', onclick: async () => {
       if (!confirm(undo ? `Reopen this finding of ${ctx.project}? It goes back to In progress.` : `Mark this finding of ${ctx.project} done? Use this when it needed no converter change, or was fixed before fixes named their findings.`)) return;
-      try { await api('api/findings/done', { workspace: ctx.project, id: record.id, undo }); toast(undo ? 'Reopened.' : 'Marked done.'); board = null; ctx.refresh(); } catch (error) { toast(explain(error), true); }
+      try { await api('api/findings/done', { workspace: ctx.project, id: undo && entry.marked_id ? entry.marked_id : record.id, undo }); toast(undo ? 'Reopened.' : 'Marked done.'); board = null; ctx.refresh(); } catch (error) { toast(explain(error), true); }
     } }, undo ? 'Reopen' : 'Mark done');
     const more = details(facts([['Finding', record.id, true], ['Kind', record.kind + (record.run_id ? ` (run ${record.run_id})` : '')], ['Proposed', record.proposed_at],
       ['Decided', record.decided_at ? `${record.decided_at}${record.reviewer ? ` by ${record.reviewer}` : ''}` : null], ['SHA-256', record.sha256, true]]),

@@ -123,3 +123,4 @@ input.search { font: inherit; font-size: 13px; background: var(--surface-2); col
 .tstep.now { color: var(--accent); } .tstep.now i { background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
 .tstep:not(:last-child)::after { content: ""; width: 14px; height: 1px; background: var(--border-strong); margin-left: 4px; }
 .hint.footer { margin-top: 14px; }
+.banner .actions { margin: 0; }

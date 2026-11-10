@@ -152,7 +152,10 @@ def propose_again(base, control, body, import_next=False):
             raise Refused("STANDARD_ARGUMENTS_INVALID")
         # The checks of this pass's last import, else of the project's last import (they carry the site
         # queries), else the convert run's own.
-        reviews = sorted((plan for plan in plans.values() if (plan.get("body") or {}).get("operation") == "standard_review"),
+        kind = (plan_body.get("delivery") or {}).get("kind")
+        ran = {other.get("plan_id") for other in store.runs(workspace).values()}
+        reviews = sorted((plan for plan_id, plan in plans.items() if (plan.get("body") or {}).get("operation") == "standard_review"
+                          and plan_id in ran and ((plan.get("body") or {}).get("delivery") or {}).get("kind") == kind),
                          key=lambda plan: plan.get("created_at") or "")
         here = [plan for plan in reviews if ((plan.get("body") or {}).get("from_run") or {}).get("run_id") == run_id]
         chosen = (here or reviews)[-1:]

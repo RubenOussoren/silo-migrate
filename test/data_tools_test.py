@@ -1283,7 +1283,10 @@ class DataToolsTest(unittest.TestCase):
         self.assertTrue(self.op('finding_done', finding_id=released, by='Reviewer')['done'])
         marks = json.loads((self.base / 'arc/.silo-migrate/named/finding-progress.json').read_text())['done']
         self.assertEqual('Reviewer', marks[released]['by'])
+        state['findings'][released]['status'] = 'superseded'  # corrected since: its mark can still be taken back
+        state_file.write_text(json.dumps(state))
         self.assertFalse(self.op('finding_done', finding_id=released, by='Reviewer', undo=True)['done'])
+        self.refused('STANDARD_ARGUMENTS_INVALID: finding_id', 'finding_done', finding_id=released, by='Reviewer')
 
     def test_refusals_name_the_bad_field(self):
         self.create()

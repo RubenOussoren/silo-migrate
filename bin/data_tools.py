@@ -1043,7 +1043,8 @@ def op_finding_done(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID: by")
     with ws.lock():
         state = ws.read_json(ws.root / ".silo-migrate/named/standard/state.json", {}) or {}
-        if ((state.get("findings") or {}).get(finding_id) or {}).get("status") != "released":
+        # Marking needs a released finding; taking a mark back works whatever became of it since.
+        if request.get("undo") is not True and ((state.get("findings") or {}).get(finding_id) or {}).get("status") != "released":
             refuse("STANDARD_ARGUMENTS_INVALID: finding_id (only a released finding)")
         path = finding_marks_file(ws)
         if path.is_symlink():

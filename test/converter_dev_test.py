@@ -581,6 +581,24 @@ class ConverterDevTest(unittest.TestCase):
             named = self.call('push-propose', title='Fix', findings=[released, released])
             self.assertEqual([released], named['proposal']['findings'])
             self.assertNotEqual(plain['digest'], named['digest'])
+            push = lambda d: self.dev.main(['converter', 'push', self.ws, '--sha256', d], {}, self.base, ROOT, self.host, io.StringIO(''), home=str(self.home))
+            self.token()
+            # A finding withdrawn since the proposal: the push is out of date.
+            self.state['findings'][released]['status'] = 'withdrawn'
+            (self.root / '.silo-migrate/named/standard/state.json').write_text(json.dumps(self.state))
+            with self.assertRaises(self.dev.Refusal):
+                push(named['digest'])
+            self.state['findings'][released]['status'] = 'released'
+            (self.root / '.silo-migrate/named/standard/state.json').write_text(json.dumps(self.state))
+            # A record whose findings were changed after approval no longer matches its digest.
+            record_path = self.root / '.silo-migrate/named/standard/converter-pushes' / (named['digest'] + '.json')
+            tampered = json.loads(record_path.read_text())
+            tampered['proposal']['findings'] = []
+            record_path.write_text(json.dumps(tampered))
+            with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_PUSH_STALE'):
+                push(named['digest'])
+            record_path.write_text(json.dumps(dict(tampered, proposal=dict(tampered['proposal'], findings=[released]))))
+            self.assertEqual('pushed', push(named['digest'])['status'])
 
     def test_push_refuses_a_stale_proposal(self):
         self.commit_fix()

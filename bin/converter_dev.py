@@ -1530,6 +1530,10 @@ def push(checkout, digest, home, open_pr=True):
     proposal = record["proposal"]
     with Locked(checkout):
         current = current_proposal(checkout, proposal["base"], proposal["title"], proposal["body"]) if record["status"] == "proposed" else None
+        if current is not None and "findings" in proposal:
+            # The findings it names are part of what was approved, not of the branch: carry them over,
+            # and they must still be released findings now.
+            current["findings"] = addressed_findings(checkout, {"findings": proposal["findings"]}) if isinstance(proposal["findings"], list) else None
         if current is not None and (current != proposal or hashlib.sha256(canonical(current).encode("utf-8")).hexdigest() != digest):
             refuse("STANDARD_PUSH_STALE")
         target = github_target(checkout)

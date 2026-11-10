@@ -50,6 +50,7 @@ class PassesTest(unittest.TestCase):
         self.assertEqual([2, 1], [group['number'] for group in result['passes']])
         latest = result['passes'][0]
         self.assertEqual(('run-3', ['run-4']), (latest['convert']['run_id'], [step['run_id'] for step in latest['imports']]))
+        self.assertEqual('plan-3', latest['key'])  # the same before and after it runs
         self.assertEqual(('Ready to check', 'now'), latest['status'])
         self.assertEqual(('All checks matched', 'ok'), result['passes'][1]['status'])
         self.assertEqual('Development v1', latest['delivery'])
@@ -119,6 +120,27 @@ class FindingsTrackTest(unittest.TestCase):
                 self.assertEqual(['finding-2'], [item['id'] for item in groups['progress']])
                 self.assertEqual(expected, groups['progress'][0]['fix'])
                 self.assertIsNone(groups['progress'][0]['checked_in'])
+
+    def test_a_pass_on_another_branch_does_not_check_a_fix(self):
+        fix = push('d1', 'f' * 40, pushed='2026-01-05T00:00:00+00:00', findings=['finding-2'])
+        fix['proposal']['branch'] = 'migration/x/first-fix'
+        passes, updates = self.passes([fix])  # pass 2 runs 'c'*40 on migration/x, after the push
+        groups = self.b.build_findings([self.record(2)], passes, updates, {})
+        self.assertEqual(['finding-2'], [item['id'] for item in groups['progress']])
+        self.assertFalse(groups['progress'][0]['ran'])
+        fix['proposal']['branch'] = 'migration/x'  # a later commit of the same branch carries it
+        passes, updates = self.passes([fix])
+        self.assertEqual(2, self.b.build_findings([self.record(2)], passes, updates, {})['done'][0]['checked_in'])
+
+    def test_times_compare_as_instants_whatever_their_format(self):
+        self.assertTrue(self.b._t('2026-01-05T00:00:01Z') > self.b._t('2026-01-05T00:00:00+00:00'))
+        self.assertTrue(self.b._t('2026-01-05T01:00:00+02:00') < self.b._t('2026-01-05T00:00:00Z'))
+        self.assertEqual(self.b._t(''), self.b._t(None))
+
+    def test_a_mark_follows_the_finding_through_a_correction(self):
+        passes, updates = self.passes()
+        groups = self.b.build_findings([self.record(2, 'superseded'), self.record(5, supersedes='finding-2')], passes, updates, {'finding-2': {'by': 'R'}})
+        self.assertEqual((['finding-5'], 'finding-2'), ([item['id'] for item in groups['done']], groups['done'][0]['marked_id']))
 
     def test_a_correction_keeps_the_fix_of_the_finding_it_replaced(self):
         passes, updates = self.passes([push('d1', 'c' * 40, pushed='2026-01-05T00:00:00Z', findings=['finding-2'])])
