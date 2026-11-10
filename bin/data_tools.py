@@ -1839,6 +1839,15 @@ def silo_servers(servers):
             if isinstance(name, str) and name.startswith("db-") and isinstance(server, dict) and (server.get("args") or [None])[0] == "dbhub"}
 
 
+def write_mcp_config(path, config):
+    temporary = path.with_name("." + path.name + ".silo-" + secrets.token_hex(4))
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(config, handle, indent=2)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
 def mcp_lock():
     path = mcp_config_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1850,19 +1859,28 @@ def mcp_rules_main(args, values, base, repo):
     term-llm can enforce them). Prints counts only: project names can identify customers."""
     if args != ["mcp-rules"]:
         refuse("STANDARD_ARGUMENTS_INVALID")
+    path = mcp_config_path()
     with mcp_lock():
         try:
-            servers = json.loads(mcp_config_path().read_text()).get("servers") or {}
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                refuse("STANDARD_OPERATION_FAILED: mcp.json is not a plain file")
+            config = json.loads(path.read_text())
         except FileNotFoundError:
-            servers = {}
-        except (OSError, ValueError, AttributeError):
+            config = {}
+        except (OSError, ValueError):
             refuse("STANDARD_OPERATION_FAILED: mcp.json can't be read")
+        servers = config.get("servers") if isinstance(config, dict) else None
         ours = silo_servers(servers if isinstance(servers, dict) else {})
         term = term_llm_command(Workspace.repo_prefix(Path(repo), Path(base)))
-        limited = sum(1 for name in ours if mcp_rule(name, term))
-    print(json.dumps({"version": 1, "project_servers": len(ours), "limited_to_migration_data": limited}))
-    if limited != len(ours):
-        refuse("STANDARD_OPERATION_FAILED: not every project database could be limited to migration-data")
+        open_ = [name for name in ours if not mcp_rule(name, term)]
+        # One that can't be limited comes out (data_db_status puts it back with its rule).
+        for name in open_:
+            del servers[name]
+        if open_:
+            write_mcp_config(path, config)
+    print(json.dumps({"version": 1, "project_servers": len(ours), "limited_to_migration_data": len(ours) - len(open_), "taken_out": len(open_)}))
+    if open_:
+        refuse("STANDARD_OPERATION_FAILED: not every project database could be limited to migration-data; those were taken out of mcp.json")
     return 0
 
 
@@ -1912,12 +1930,13 @@ def mcp_register(ws, present=True):
             servers[name] = entry
         else:
             del servers[name]
-        temporary = path.with_name("." + path.name + ".silo-" + secrets.token_hex(4))
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            json.dump(config, handle, indent=2)
-            handle.write("\n")
-        os.replace(temporary, path)
+        write_mcp_config(path, config)
+        # config.yaml has other writers (the web UI, an engineer's config set): if the rule went
+        # meanwhile, the server comes back out rather than staying open to every agent.
+        if present and not mcp_rule_present(name):
+            del servers[name]
+            write_mcp_config(path, config)
+            return "not changed: its rule left term-llm's config.yaml while it was being added; run this again"
     finally:
         os.close(lock)
     ws.append("audit.jsonl", {"at": now(), "op": "mcp_register", "server": name, "result": "added" if present else "removed"})

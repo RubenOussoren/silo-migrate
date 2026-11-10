@@ -623,8 +623,12 @@ def trust_agents(as_account=True):
     if edited is not None:
         atomic_write(config, edited, stat.S_IMODE(info.st_mode) & 0o600 or 0o600)
         if not agents_ready(as_account=as_account, expected=shipped_agents(P/"current") or MIGRATION_AGENTS):
-            atomic_write(config, text, stat.S_IMODE(info.st_mode) & 0o600 or 0o600)
-            print("METAL_AGENTS_CONFIG: the agents weren't listed without the search path; config.yaml put back (silo doctor shows the fix)", flush=True)
+            # Only what this wrote: a change someone made meanwhile is kept.
+            if config.read_text() == edited:
+                atomic_write(config, text, stat.S_IMODE(info.st_mode) & 0o600 or 0o600)
+                print("METAL_AGENTS_CONFIG: the agents weren't listed without the search path; config.yaml put back (silo doctor shows the fix)", flush=True)
+            else:
+                print("METAL_AGENTS_CONFIG: the agents weren't listed without the search path, and config.yaml changed meanwhile; left as it is (silo doctor shows the fix)", flush=True)
             return False
     return agents_trusted(as_account=as_account, expected=shipped_agents(P/"current") or MIGRATION_AGENTS)
 
@@ -1194,7 +1198,9 @@ def account_apply(saved):
         datadir.mkdir(parents=True, mode=0o700)
     agents = configdir/"agents"
     # Once linked to the release (link_agents, after the switch), the folders in it are the release's own.
-    if not (agents.is_symlink() and os.readlink(agents) == agents_path()):
+    if agents.is_symlink() and os.readlink(agents) != agents_path():
+        refuse("METAL_AGENT_CONFLICT", str(agents) + " links elsewhere; move it aside, then re-plan")
+    if not agents.is_symlink():
         agents.mkdir(exist_ok=True, mode=0o700)
         for name in MIGRATION_AGENTS + LEGACY_AGENTS:
             dest = agents/name
@@ -1213,8 +1219,10 @@ def account_apply(saved):
         os.close(fd)
     previous = switch(release)
     link_skills()
-    trust_agents(as_account=False)
-    project_default_agent(as_account=False)
+    if not trust_agents(as_account=False):
+        refuse("METAL_AGENTS_CONFIG", AGENTS_HELP + " (" + agents_path() + "); then re-plan")
+    if not project_default_agent(as_account=False):
+        refuse("METAL_DEFAULT_AGENT", "web.project_default_agent must name one of the node's agents (term-llm config set web.project_default_agent migration-data); then re-plan")
     mcp_rules()
     if C["TERM_LLM_SERVICE"] != "skip":
         unit = home()/".config/systemd/user/term-llm-web.service"
@@ -1334,6 +1342,42 @@ def term_llm_current():
     print("METAL_TERM_UPDATED: term-llm " + C["TERM_LLM_VERSION"], flush=True)
     return True
 
+def previous_term_llm_back():
+    """Point bin/term-llm back at the version it replaced (as rollback --term-llm does)."""
+    previous_bin = P/"bin/term-llm.previous"
+    if previous_bin.is_symlink() and previous_bin.resolve().is_file():
+        active = (P/"bin/term-llm").resolve()
+        symlink(previous_bin.resolve(), P/"bin/term-llm")
+        symlink(active, previous_bin)
+
+def node_term_llm():
+    """After the switch, in this order: the agents where term-llm trusts them; then this release's
+    term-llm, only once they are (0.9.99 won't start a search-path agent's chats); then the project
+    default agent it needs (0.9.99 won't serve web UI projects without one), else the previous
+    term-llm goes back; then the project databases' rules. True if term-llm changed (restart)."""
+    if not trust_agents():
+        if (P/"bin/term-llm").resolve() != P/"term-llm"/C["TERM_LLM_VERSION"]/"term-llm":
+            print("METAL_TERM_NOT_UPDATED: term-llm stays at its current version until its agents are in ~/.config/term-llm/agents "
+                  "(silo doctor shows the fix), then silo update again", flush=True)
+        mcp_rules()
+        return False
+    changed = term_llm_current()
+    if not project_default_agent():
+        if changed:
+            previous_term_llm_back()
+            print("METAL_TERM_KEPT_PREVIOUS: the new term-llm needs web.project_default_agent; the previous version is back in place", flush=True)
+        mcp_rules()
+        return False
+    mcp_rules()
+    return changed
+
+def rules_supported(release):
+    """The release writes the MCP rules term-llm 0.9.96+ enforces (bin/data_tools.py mcp_rules_main)."""
+    try:
+        return "def mcp_rules_main(" in (Path(release)/"bin/data_tools.py").read_text()
+    except OSError:
+        return False
+
 def account_update(rollback=False, branch=None, term=False):
     with idle_guard():
         # Releases are cloned into, switched to and pruned from here: never via a link.
@@ -1355,13 +1399,10 @@ def account_update(rollback=False, branch=None, term=False):
             if commit == old["commit"]:
                 # The service settings, term-llm and the agents' trust are still checked, so an
                 # interrupted update finishes.
-                changed = term_llm_current()
+                changed = node_term_llm()
                 if changed:
                     kept = {key: value for key, value in old.items() if key not in ("installed_at", "operation", "previous_commit")}
                     record(dict(kept, term_llm_version=C["TERM_LLM_VERSION"]), "update", old.get("previous_commit"))
-                trust_agents()
-                project_default_agent()
-                mcp_rules()
                 if refresh_service(force=changed):
                     print("METAL_SERVICE_UPDATED", flush=True)
                 print("METAL_UNCHANGED")
@@ -1380,16 +1421,16 @@ def account_update(rollback=False, branch=None, term=False):
             symlink(previous_bin.resolve(), P/"bin/term-llm")
             symlink(active, previous_bin)
             target["term_llm_version"] = (P/"bin/term-llm").resolve().parent.name
+        if rollback and not term and not rules_supported(release) and (P/"bin/term-llm").resolve().parent.name not in TERM_LLM_SUPERSEDED:
+            # That release registers project databases without the rule this term-llm enforces.
+            refuse("METAL_ROLLBACK_TERM_LLM", "that release doesn't write the MCP rules term-llm " + (P/"bin/term-llm").resolve().parent.name
+                   + " enforces, so a new project database would be open to every agent; roll back with --term-llm")
         changed = False
-        if not rollback:
-            changed = term_llm_current()
-            target["term_llm_version"] = C["TERM_LLM_VERSION"]
         previous = switch(release)
         link_skills()
         if not rollback:
-            trust_agents()
-            project_default_agent()
-            mcp_rules()
+            changed = node_term_llm()
+            target["term_llm_version"] = (P/"bin/term-llm").resolve().parent.name
         for key in ("installed_at", "operation", "previous_commit"):
             target.pop(key, None)
         record(target, "rollback" if rollback else "update", previous)

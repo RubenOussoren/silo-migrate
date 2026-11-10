@@ -252,7 +252,8 @@ def dbhub_check(add, entry, runner, trusted):
     try:
         rules = tools.mcp_rules_of((config / "config.yaml").read_text())
     except (OSError, ValueError, UnicodeDecodeError):
-        add("WARN", "DBHub", "the agents rules in ~/.config/term-llm/config.yaml can't be read", "check its mcp: section, then silo update")
+        add("WARN", "DBHub", "the agents rules in ~/.config/term-llm/config.yaml can't be read: no project database can be added until they can",
+            "check its mcp: section, then silo update")
         return
     open_ = sum(1 for name in ours if rules.get(name) != ["migration-data"])
     if open_:

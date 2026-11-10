@@ -129,7 +129,14 @@ and release `checksums.txt`. A binary hash receipt detects later corruption.
 (and so `silo update`) installs it when `bin/term-llm` is another one, keeps the old one as
 `bin/term-llm.previous` (for `metal rollback --term-llm`) and re-installs the service once. A
 `metal.conf` still naming 0.9.93 (the old example) gets the release's version, with a note; any
-other unpinned version is refused (`METAL_VERSION_UNPINNED`).
+other unpinned version is refused (`METAL_VERSION_UNPINNED`). The new term-llm goes in only after the agents are
+trusted (otherwise `METAL_TERM_NOT_UPDATED`, and the old one stays), and the old one comes back if
+`web.project_default_agent` can't be set (`METAL_TERM_KEPT_PREVIOUS`). **Rollback:** `metal rollback
+--term-llm` puts 0.9.93 back; it reads the updated config and lists the linked agents, but ignores the
+MCP rules. A rollback to a release that doesn't write MCP rules, while term-llm stays at 0.9.99, is
+refused (`METAL_ROLLBACK_TERM_LLM`): new project databases would be open to every agent. Because this
+release pins 0.9.99, a later `silo update` installs it again; that release's own `metal apply`
+refuses the linked agents folder (`METAL_AGENT_CONFLICT`).
 `etc/silo-control.env` provides:
 
 - `SILO_MIGRATE_BASE_PATH`: workspace root;

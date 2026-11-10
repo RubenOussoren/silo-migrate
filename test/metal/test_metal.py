@@ -467,7 +467,8 @@ class InstallerTests(unittest.TestCase):
         os.symlink(binary, P/"bin/term-llm")
         with self.plan_stubs():
             saved = self.m.envelope(self.m.make_plan())
-            with patch.object(self.m, "install_term"), patch.object(self.m, "fetch_release", return_value=release), patch.object(self.m, "extract_artifacts", return_value=([], "skipped-no-package", "")):
+            with patch.object(self.m, "install_term"), patch.object(self.m, "fetch_release", return_value=release), patch.object(self.m, "extract_artifacts", return_value=([], "skipped-no-package", "")), \
+                    patch.object(self.m, "trust_agents", return_value=True), patch.object(self.m, "project_default_agent", return_value=True), patch.object(self.m, "mcp_rules"):
                 self.m.account_apply(saved)
             self.assertEqual("# sentinel: never overwrite\n", (configdir/"config.yaml").read_text())
             plan = self.m.make_plan()
@@ -546,7 +547,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual([], [p for p in new.parent.iterdir() if p.name == "internal"])  # only the binary is taken
         self.assertIn("METAL_TERM_UPDATED", out.getvalue())
 
-    def test_update_order_term_llm_then_switch_then_agents_and_rules(self):
+    def test_update_order_switch_then_agents_then_term_llm_then_rules(self):
         P = self.m.P
         for path in (P/"releases", P/"state/logs"):
             path.mkdir(parents=True)
@@ -557,6 +558,10 @@ class InstallerTests(unittest.TestCase):
             (P/"releases"/commit).mkdir()
         os.symlink(P/"releases"/a, P/"current")
         self.m.record({"commit": a, "term_llm_version": "0.9.93"}, "apply")
+        (P/"bin").mkdir()
+        (P/"term-llm"/self.m.TERM_LLM_PINNED).mkdir(parents=True)
+        (P/"term-llm"/self.m.TERM_LLM_PINNED/"term-llm").write_text("new")
+        os.symlink(P/"term-llm"/self.m.TERM_LLM_PINNED/"term-llm", P/"bin/term-llm")  # as the (faked) install leaves it
         switched = []
         real_switch = self.m.switch
         with patch.object(self.m, "resolve", return_value=b), patch.object(self.m, "fetch_release", return_value=P/"releases"/b), \
@@ -564,15 +569,22 @@ class InstallerTests(unittest.TestCase):
                 patch.object(self.m, "refresh_service", return_value=True) as refresh, self.node_steps(changed=True) as steps, \
                 contextlib.redirect_stdout(io.StringIO()):
             self.m.account_update(False)
-        self.assertEqual(["term_llm_current", "trust_agents", "project_default_agent", "mcp_rules"], steps)
-        self.assertEqual([1], switched)  # after term-llm, before the agents and rules
+        self.assertEqual(["trust_agents", "term_llm_current", "project_default_agent", "mcp_rules"], steps)
+        self.assertEqual([0], switched)  # the switch first: the agents link to the new release
         refresh.assert_called_once_with(force=True)  # a new term-llm re-installs the service
         manifest = json.loads((P/"state/install-manifest.json").read_text())
         self.assertEqual(self.m.TERM_LLM_PINNED, manifest["term_llm_version"])
-        # A rollback leaves term-llm, the agents and the rules alone.
+        # A rollback to a release that writes no MCP rules, on a term-llm that enforces them, needs --term-llm.
+        with self.assertRaisesRegex(self.m.Refusal, "METAL_ROLLBACK_TERM_LLM"), contextlib.redirect_stdout(io.StringIO()):
+            self.m.account_update(True)
+        self.assertEqual(b, (P/"current").resolve().name)  # refused before anything changed
+        # One that writes them: a rollback leaves term-llm, the agents and the rules alone.
+        (P/"releases"/a/"bin").mkdir()
+        (P/"releases"/a/"bin/data_tools.py").write_text("def mcp_rules_main(args):\n    pass\n")
         with patch.object(self.m, "refresh_service") as refresh, self.node_steps() as steps, contextlib.redirect_stdout(io.StringIO()):
             self.m.account_update(True)
         self.assertEqual([], steps)
+        self.assertEqual(a, (P/"current").resolve().name)
 
     def test_project_default_agent_is_the_lead_agent_unless_an_available_one_is_chosen(self):
         for name in self.m.MIGRATION_AGENTS:
@@ -589,6 +601,33 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse(self.m.project_default_agent(as_account=False))
         self.assertIn("METAL_DEFAULT_AGENT_SKIPPED", out.getvalue())
         self.assertIn("web:\n  project_default_agent: migration-data\n", self.m.fresh_config())
+
+    def test_new_term_llm_only_with_trusted_agents_and_a_default_agent(self):
+        P = self.m.P
+        (P/"bin").mkdir(parents=True)
+        old, new = P/"term-llm/0.9.93/term-llm", P/"term-llm"/self.m.TERM_LLM_PINNED/"term-llm"
+        for binary in (old, new):
+            binary.parent.mkdir(parents=True)
+            binary.write_text("x")
+        os.symlink(old, P/"bin/term-llm")
+        def install():
+            self.m.symlink(old, P/"bin/term-llm.previous")
+            self.m.symlink(new, P/"bin/term-llm")
+        cases = (("agents not trusted", False, True, old, "METAL_TERM_NOT_UPDATED", False),
+                 ("no default agent", True, False, old, "METAL_TERM_KEPT_PREVIOUS", False),
+                 ("both", True, True, new, "", True))
+        for name, trusted, default, active, message, changed in cases:
+            if (P/"bin/term-llm").resolve() != old:
+                self.m.symlink(old, P/"bin/term-llm")
+            rules = []
+            with self.subTest(name), patch.object(self.m, "trust_agents", return_value=trusted), patch.object(self.m, "project_default_agent", return_value=default), \
+                    patch.object(self.m, "install_term", side_effect=install) as installed, patch.object(self.m, "mcp_rules", side_effect=lambda: rules.append(1)), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(changed, self.m.node_term_llm())
+                self.assertEqual(active, (P/"bin/term-llm").resolve())
+                self.assertIn(message, out.getvalue())
+                self.assertEqual(trusted, installed.called)
+                self.assertEqual([1], rules)  # the rules are written whatever happened
 
     def test_agents_folder_is_linked_to_the_release_and_never_replaced(self):
         config = self.home/".config/term-llm"
@@ -736,7 +775,7 @@ class InstallerTests(unittest.TestCase):
                     patch.object(self.m, "fetch_release") as fetch, contextlib.redirect_stdout(io.StringIO()) as out:
                 self.m.account_update(False)
             refresh.assert_called_once_with(force=False)
-            self.assertEqual(["term_llm_current", "trust_agents", "project_default_agent", "mcp_rules"], steps)
+            self.assertEqual(["trust_agents", "term_llm_current", "project_default_agent", "mcp_rules"], steps)
             fetch.assert_not_called()
             self.assertEqual(expected, out.getvalue())
 
@@ -754,7 +793,7 @@ class InstallerTests(unittest.TestCase):
         backup.write_bytes(b"do-not-touch")
         stat = backup.stat()
         with patch.object(self.m, "resolve", return_value=b), patch.object(self.m, "fetch_release", return_value=P/"releases"/b), \
-                self.node_steps(), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(self.m, "rules_supported", return_value=True), self.node_steps(), contextlib.redirect_stdout(io.StringIO()):
             self.m.account_update(False)
             self.m.account_update(True)
         self.assertEqual(a, (P/"current").resolve().name)

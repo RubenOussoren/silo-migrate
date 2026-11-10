@@ -788,6 +788,16 @@ class DataToolsTest(unittest.TestCase):
         self.assertEqual('added', self.op('db_status')['queries']['registration'])
         self.assertEqual(['migration-data'], self.rules()['db-arc'])
 
+    def test_a_rule_that_goes_while_the_server_is_added_takes_it_back_out(self):
+        self.create()
+        (self.config_home / 'term-llm').mkdir(parents=True)
+        real = self.d.mcp_rule_present
+        answers = iter([True, False])  # there when checked, gone once mcp.json was written
+        with mock.patch.object(self.d, 'mcp_rule_present', side_effect=lambda name: next(answers, real(name))):
+            queries = self.op('db_up', engine='mariadb')['queries']
+        self.assertIn('its rule left', queries['registration'])
+        self.assertNotIn('db-arc', self.mcp()['servers'])
+
     def test_mcp_rules_limits_every_project_database_and_names_none(self):
         (self.config_home / 'term-llm').mkdir(parents=True)
         servers = {'db-arc': {'command': 'c', 'args': ['dbhub', 'arc']}, 'db-other': {'command': 'c', 'args': ['dbhub', 'other']},
@@ -797,14 +807,18 @@ class DataToolsTest(unittest.TestCase):
         out = io.StringIO()
         with mock.patch('sys.stdout', out):
             self.assertEqual(0, self.d.mcp_rules_main(['mcp-rules'], self.values, self.base, ROOT))
-        self.assertEqual({'version': 1, 'project_servers': 2, 'limited_to_migration_data': 2}, json.loads(out.getvalue()))
+        self.assertEqual({'version': 1, 'project_servers': 2, 'limited_to_migration_data': 2, 'taken_out': 0}, json.loads(out.getvalue()))
         self.assertEqual({'db-arc': ['migration-data'], 'db-other': ['migration-data']}, self.rules())
         self.assertEqual(['config set mcp.servers.db-other.agents migration-data'], self.term_calls_made())  # only the missing one
         self.assertNotIn('arc', out.getvalue())
-        (self.config_home / 'term-llm/config.yaml').write_text('providers: {}\n')
+        # One that can't be limited comes out of mcp.json: never open to every agent.
+        (self.config_home / 'term-llm/config.yaml').write_text('providers: {}\nmcp:\n  servers:\n    db-arc:\n      agents:\n        - migration-data\n')
         (self.term_calls.parent / 'term-fails').touch()
-        with mock.patch('sys.stdout', io.StringIO()), self.assertRaisesRegex(self.d.Refusal, 'not every project database'):
+        out = io.StringIO()
+        with mock.patch('sys.stdout', out), self.assertRaisesRegex(self.d.Refusal, 'not every project database'):
             self.d.mcp_rules_main(['mcp-rules'], self.values, self.base, ROOT)
+        self.assertEqual({'version': 1, 'project_servers': 2, 'limited_to_migration_data': 1, 'taken_out': 1}, json.loads(out.getvalue()))
+        self.assertEqual({'db-arc', 'db-mine', 'playwright'}, set(self.mcp()['servers']))
 
     def test_reads_the_rules_term_llm_writes_and_refuses_what_it_cant_read(self):
         text = ('providers:\n  x:\n    api_key: $(op read "op://a/b")\nmcp:\n  servers:\n    db-arc:\n      agents:\n        - migration-data\n'
