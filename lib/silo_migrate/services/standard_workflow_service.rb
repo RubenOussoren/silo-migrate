@@ -76,6 +76,11 @@ module SiloMigrate
         "STANDARD_SETTINGS_INVALID" => "The converter settings input is not valid YAML with ${SILO_DB_*} placeholders. Register corrected settings, then propose a new plan.",
         "STANDARD_RECONCILIATION_INVALID" => "The reconciliation input is invalid. Register a corrected one, then propose a new plan.",
         "STANDARD_REVIEW_SOURCE_INVALID" => "The convert run this review imports is missing, not completed, or its intermediate database changed. Propose a review of a completed convert run.",
+        "STANDARD_BASE_SITE_INVALID" => "Register a SQL-only base-site backup with its original Discourse/schema version suffix, then re-plan.",
+        "STANDARD_BASE_SITE_NEWER" => "The sandbox backup is newer than the local Discourse runtime. Use a compatible runtime or older backup.",
+        "STANDARD_ARTIFACT_CHANGED" => "The recorded backup is missing or changed. Do not release it; investigate and re-run.",
+        "STANDARD_RELEASE_NOT_READY" => "Release requires a completed base-site review and safe output directories.",
+        "STANDARD_RELEASE_CHECKS" => "Review reconciliation differences or missing checks and explicitly acknowledge them before release.",
         "STANDARD_INTERNAL" => "An unexpected failure occurred. Inspect private evidence, reset this run, then re-plan."
       }.freeze
 
@@ -83,7 +88,7 @@ module SiloMigrate
       EXECUTE_LOCK_WAIT = 120
       # Longer than EXECUTE_LOCK_WAIT, so a queued executor isn't called never-started.
       CLAIM_GRACE_SECONDS = 180
-      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb].freeze
+      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb review_access.rb review_state.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
       attr_reader :store
@@ -1169,11 +1174,12 @@ module SiloMigrate
       def stage_site_up(run_id)
         body = plan_for(run_id).fetch("body")
         # Review runs import real data: their stack is sized per host and bound by the plan.
-        stack = create_stack(run_id, "review", body.dig("instances", "review"), limits: body["operation"] == REVIEW_OPERATION ? body.fetch("limits") : nil)
+        stack = create_stack(run_id, "review", body.dig("instances", "review"), limits: body["operation"] == REVIEW_OPERATION ? body.fetch("limits") : nil,
+                             extra_env: body["base_site"] ? review_environment(body.dig("instances", "review", "port")) : {})
         assert_runtime_identity!(run_id, stack, "review")
       end
 
-      def create_stack(run_id, role, target, limits: nil)
+      def create_stack(run_id, role, target, limits: nil, extra_env: {})
         name = target.fetch("name")
         db_password = SecureRandom.hex(24)
         env_file = @store.run_dir(run_id, "private", "#{role}.env")
@@ -1185,7 +1191,7 @@ module SiloMigrate
         selected = resolved_lock(run_id)
         selected.fetch("limits")["stack"] = limits if limits
         stack = PrebuiltStack.new(runtime: @runtime, lock: selected, name: name, record: @store.load.fetch("instances").fetch(name), sleeper: @sleeper)
-        stack.create!(hostname: target.fetch("hostname"), port: target.fetch("port"), env_file: env_file,
+        stack.create!(hostname: target.fetch("hostname"), port: target.fetch("port"), env_file: env_file, extra_env: extra_env,
                       labels: { "silo-migrate.run" => run_id, "silo-migrate.role" => role }) do |record|
           @store.update { |state| state.fetch("instances")[name] = record }
         end
@@ -1609,10 +1615,10 @@ module SiloMigrate
         record_results(run_id, review_url: result.fetch("base_url"))
       end
 
-      def restore_archive(run_id, stack, archive, label, expected_sha256:)
+      def restore_archive(run_id, stack, archive, label, expected_sha256:, safe_filename: nil)
         raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "archive bytes changed") unless Digest::SHA256.file(archive).hexdigest == expected_sha256
 
-        filename = File.basename(archive)
+        filename = safe_filename || File.basename(archive)
         ensure_dir = stack.web_exec(["sh", "-c", "mkdir -p #{PrebuiltStack::DISCOURSE_ROOT}/public/backups/default && chown -R discourse:discourse #{PrebuiltStack::DISCOURSE_ROOT}/public/backups /shared/backups"], timeout: 30)
         raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "backup dir") unless ensure_dir.success?
 
@@ -1646,11 +1652,16 @@ module SiloMigrate
         wait_restored_web(stack)
       end
 
-      def wait_restored_web(stack)
+      def wait_restored_web(stack, internal: false)
         deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 120
         loop do
-          response = @http.call("http://127.0.0.1:#{stack.record.fetch('port')}/srv/status", 256)
-          return if response.fetch(:status) == 200
+          if internal
+            result = stack.web_exec(["curl", "-s", "-o", "/dev/null", "-m", "5", "-w", "%{http_code}", "http://127.0.0.1/srv/status"], timeout: 15)
+            return if result.success? && result.stdout.to_s.strip == "200"
+          else
+            response = @http.call("http://127.0.0.1:#{stack.record.fetch('port')}/srv/status", 256)
+            return if response.fetch(:status) == 200
+          end
           raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "web unavailable") if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
           nap(2)
@@ -1719,7 +1730,7 @@ module SiloMigrate
           runtime_qualified: body["runtime_qualified"], allow_unqualified_runtime: body["allow_unqualified_runtime"], converter: body["converter"],
           operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
           platform: body["platform"], roles: body["roles"], source_charset: body["source_charset"], converter_deps: body.dig("converter_deps", "key"),
-          reconciliation_policy: body["reconciliation_policy"],
+          reconciliation_policy: body["reconciliation_policy"], base_site: body["base_site"]&.slice("input_id", "delivery", "discourse_version", "schema_version", "site_schema_version", "ahead"),
           from_run: body["from_run"]&.slice("run_id", "plan_id", "converter_revision", "intermediate_sha256", "intermediate_bytes"), limits: body["limits"],
           collision_policy: body["collision_policy"], inputs: body["input_binding"].map { |input| input.slice("id", "type", "bytes", "sha256") },
           app_revision: body["app_revision"], converter_revision: body["converter_revision"], code_identity: body["code_identity"],
@@ -1744,7 +1755,7 @@ module SiloMigrate
           # Never the per-check reconciliation numbers: they are derived from customer data.
           assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments",
                                                                        "conversion_summary", "reconciliation_checks", "reconciliation_matched", "reconciliation_differs", "reconciliation_errors",
-                                                                       "review_url", "import_issues"),
+                                                                       "review_url", "import_issues", "base_site", "base_site_ahead", "base_site_unknown_migrations", "site_schema_version", "base_discourse_version", "base_schema_version", "discourse_version", "schema_version", "backup_discourse_version", "backup_schema_version"),
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
         if status == "not_started"
@@ -1753,12 +1764,21 @@ module SiloMigrate
         if status == "abandoned"
           result[:recovery] = "The executing process is gone. Run: silo-migrate standard run recover #{@workspace} #{run['id']}, then reset and re-plan."
         end
+        if run["release"]
+          released = run.fetch("release")
+          filename = run.dig("artifacts", "backup", "filename")
+          result[:release] = released.slice("released_at", "released_by", "sha256", "path").merge(
+            "filename" => filename, "outbox" => File.dirname(released.fetch("path")),
+            "manifest" => filename.delete_suffix(".sql.gz") + ".manifest.json",
+            "acknowledged_differences" => released.fetch("acknowledged_differences") { released.fetch("differences_acknowledged") }
+          )
+        end
         result[:failure] = run["failure"] if run["failure"]
         result
       end
 
       def public_artifacts(artifacts)
-        %w[intermediate uploads_db baseline final].each_with_object({}) do |key, result|
+        %w[intermediate uploads_db baseline final backup].each_with_object({}) do |key, result|
           next unless artifacts[key]
 
           result[key] = artifacts[key].slice("filename", "sha256", "bytes", "label")

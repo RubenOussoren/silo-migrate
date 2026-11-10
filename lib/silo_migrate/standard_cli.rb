@@ -27,7 +27,7 @@ module SiloMigrate
         plan propose WORKSPACE --dataset ID [--baseline seed|BASELINE_ID] [--ports A,B] [--allow-unqualified-runtime]
         plan propose WORKSPACE --operation convert --source INPUT_ID --settings INPUT_ID [--reconciliation INPUT_ID] [--charset NAME]
                                                        (real data: convert and reconcile counts only; no import)
-        plan propose WORKSPACE --operation review --from-run RUN_ID [--reconciliation INPUT_ID] [--port N]
+        plan propose WORKSPACE --operation review --from-run RUN_ID [--reconciliation INPUT_ID] [--base-site INPUT_ID] [--port N]
                                                        (real data: import a completed convert run into a local review site)
         plan show WORKSPACE PLAN_ID
         plan approve WORKSPACE PLAN_ID --sha256 DIGEST --reviewer NAME
@@ -38,6 +38,7 @@ module SiloMigrate
         run execute WORKSPACE RUN_ID
         run show WORKSPACE RUN_ID
         run private-paths WORKSPACE RUN_ID
+        run release WORKSPACE RUN_ID --reviewer NAME [--acknowledge-differences]
         run admin-password WORKSPACE RUN_ID                  (engineer: a review site's admin sign-in)
         run recover WORKSPACE RUN_ID
         run reset WORKSPACE RUN_ID --yes
@@ -191,11 +192,11 @@ module SiloMigrate
         end
         if args[0, 2] == %w[--operation review]
           args.shift(2)
-          opts = options!(args, "--from-run", "--reconciliation", "--port", optional: %w[--reconciliation --port])
+          opts = options!(args, "--from-run", "--reconciliation", "--base-site", "--port", optional: %w[--reconciliation --base-site --port])
           port = opts["--port"]
           invalid! if port && !port.match?(/\A[1-9]\d{0,4}\z/)
           return service(workspace).propose_review_plan(from_run: opts.fetch("--from-run"), reconciliation: opts["--reconciliation"],
-                                                        port: port&.to_i, allow_unqualified_runtime: !allow.nil?)
+                                                        base_site: opts["--base-site"], port: port&.to_i, allow_unqualified_runtime: !allow.nil?)
         end
         opts = options!(args, "--dataset", "--baseline", "--ports", optional: %w[--baseline --ports])
         service(workspace).propose_plan(dataset_id: opts.fetch("--dataset"), baseline: opts.fetch("--baseline", "seed"), ports: ports(opts["--ports"]), allow_unqualified_runtime: !allow.nil?)
@@ -237,6 +238,11 @@ module SiloMigrate
       when "show" then no_more!(args); service(workspace).show_run(identifier)
       when "private-paths" then no_more!(args); service(workspace).private_paths(identifier)
       when "admin-password" then no_more!(args); service(workspace).admin_password(identifier)
+      when "release"
+        invalid! if args.count("--acknowledge-differences") > 1
+        acknowledge = args.delete("--acknowledge-differences")
+        opts = options!(args, "--reviewer")
+        service(workspace).release_backup(run_id: identifier, reviewer: opts.fetch("--reviewer"), acknowledge_differences: !acknowledge.nil?)
       when "recover" then no_more!(args); service(workspace).recover(run_id: identifier)
       when "reset"
         expect!(args.shift, "--yes")

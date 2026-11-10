@@ -36,7 +36,7 @@ module SiloMigrate
       # Yields after each owned resource is created so the caller can persist the
       # record durably before any fallible next step: every resource stays
       # removable even if this process dies mid-creation.
-      def create!(hostname:, port:, env_file:, labels: {}, &progress)
+      def create!(hostname:, port:, env_file:, labels: {}, extra_env: {}, &progress)
         limits = @lock.fetch("limits").fetch("stack")
         images = @lock.fetch("images")
         label_args = labels.merge(LABEL_MANAGED => "true", LABEL_INSTANCE => @name)
@@ -81,6 +81,7 @@ module SiloMigrate
           "-e", "DISCOURSE_REDIS_HOST=redis", "-e", "DISCOURSE_HOSTNAME=#{hostname}",
           "-e", "DISCOURSE_DEVELOPER_EMAILS=sandbox_admin@example.invalid",
           "-e", "DISCOURSE_SMTP_ADDRESS=smtp.invalid", "-e", "DISCOURSE_SMTP_PORT=25",
+          *extra_env.flat_map { |key, value| ["-e", "#{key}=#{value}"] },
           "-e", "DISCOURSE_DISABLE_EMAILS=yes", "-e", "UNICORN_WORKERS=1", "-e", "UNICORN_SIDEKIQS=1"
         ], [], &progress)
 

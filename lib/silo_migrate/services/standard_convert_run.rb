@@ -52,6 +52,7 @@ module SiloMigrate
         record = delivery_record!(dataset_id)
         # A launch run repeats the accepted process (site-reviews.json); running on launch data isn't built yet.
         raise StandardWorkflowError, "STANDARD_LAUNCH_NOT_READY" if record["kind"] == "launch"
+        raise StandardWorkflowError, "STANDARD_DELIVERY_MIXED" if record["kind"] == "base_site"
 
         { "dataset_id" => dataset_id, "kind" => record["kind"], "version" => record["version"] }
       end
@@ -61,7 +62,7 @@ module SiloMigrate
         document = File.file?(path) && !File.symlink?(path) ? JSON.parse(File.read(path)) : nil
         deliveries = document.is_a?(Hash) ? document["deliveries"] : nil
         record = deliveries.is_a?(Hash) ? deliveries[dataset_id] : nil
-        unless record.is_a?(Hash) && %w[development launch].include?(record["kind"]) && record["version"].is_a?(Integer) && !record["replaced_by"]
+        unless record.is_a?(Hash) && %w[development launch base_site].include?(record["kind"]) && record["version"].is_a?(Integer) && !record["replaced_by"]
           raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED"
         end
 
@@ -76,7 +77,7 @@ module SiloMigrate
           next if role == "source"
 
           other = delivery_record!(named.fetch("inputs").fetch(id).fetch("dataset_id"))
-          raise StandardWorkflowError, "STANDARD_DELIVERY_MIXED" unless other["kind"] == delivery["kind"]
+          raise StandardWorkflowError, "STANDARD_DELIVERY_MIXED" unless other["kind"] == (role == "base_site" ? "base_site" : delivery["kind"]) && (role == "base_site" || other["kind"] != "base_site")
         end
       end
 

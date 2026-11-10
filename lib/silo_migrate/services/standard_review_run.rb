@@ -1,5 +1,9 @@
 # frozen_string_literal: true
 
+require "zlib"
+require "rubygems/version"
+require "set"
+
 module SiloMigrate
   module Services
     # Review runs on real data (operation "standard_review"): a completed convert run's
@@ -14,10 +18,12 @@ module SiloMigrate
     # by a SELECT-only role in read-only transactions. Per-check numbers stay private;
     # public status shows totals, the review URL and the importer's issue count.
     #
-    # Not included: uploads and avatars, backups, restore proof, hosted review, DNS.
+    # Base-site mode restores a sandbox and takes a portable SQL-only backup before
+    # local access setup. Uploads, hosted restore and cutover remain out of scope.
     module StandardReviewRun
       REVIEW_OPERATION = "standard_review"
       REVIEW_STAGES = %w[preflight site_up site_setup import verify review_url].freeze
+      BASE_SITE_STAGES = %w[preflight site_up base_restore import verify backup site_setup review_url].freeze
       REVIEW_ADMIN = "silo_review_admin"
       # The importer, its consistency pass and up to 10 minutes of waiting for background jobs.
       REVIEW_IMPORT_TIMEOUT = 12 * 3600
@@ -38,7 +44,7 @@ module SiloMigrate
 
       # -- planning -------------------------------------------------------------
 
-      def propose_review_plan(from_run:, reconciliation: nil, port: nil, allow_unqualified_runtime: false)
+      def propose_review_plan(from_run:, reconciliation: nil, base_site: nil, port: nil, allow_unqualified_runtime: false)
         state = @store.load
         raise StandardWorkflowError, "STANDARD_SIZE_LIMIT" if state.fetch("plans").size >= self.class::MAX_PLANS
         raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless profile_current?(state.fetch("config"))
@@ -62,6 +68,23 @@ module SiloMigrate
           roles["reconciliation"] = recon_id
         end
 
+        base_binding = nil
+        if base_site
+          raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless base_site.is_a?(String)
+          input = named.fetch("inputs")[base_site] || raise(StandardWorkflowError, "STANDARD_REFERENCE_INVALID")
+          raise StandardWorkflowError.new("STANDARD_INPUTS_INCOMPLETE", "base_site") unless input["type"] == "base_site"
+          raise StandardWorkflowError, "STANDARD_INPUT_CHANGED" unless inputs_unchanged?([input])
+
+          record = delivery_record!(input.fetch("dataset_id"))
+          raise StandardWorkflowError, "STANDARD_DELIVERY_MIXED" unless record["kind"] == "base_site"
+
+          versions = base_site_versions!(input.fetch("path").unpack1("m0"))
+          base_site_compatible!(versions, { "discourse_version" => lock.fetch("app").fetch("version") })
+          migrations = review_image_migrations
+          base_binding = { "input_id" => base_site, "delivery" => record.slice("kind", "version"),
+                           "site_schema_version" => migrations.last, "ahead" => versions.fetch("schema_version") > migrations.last }.merge(versions)
+          roles["base_site"] = base_site
+        end
         delivery = delivery_binding!(source_plan.dig("body", "dataset_id"))
         delivery_roles!(named, roles, delivery)
         limits = review_limits
@@ -101,6 +124,16 @@ module SiloMigrate
           ],
           "not_included" => ["uploads and avatars", "backups", "restore proof", "hosted review", "DNS or cutover", "remote pushes"]
         }
+        if base_binding
+          body["base_site"] = base_binding
+          body["outputs"] = { "backup" => "validated SQL-only sandbox plus imported data for #{plan_id}; engineer release to outbox" }
+          body["mutations"].insert(1, "restore the bound sandbox SQL backup before importing; preserve sandbox settings and theme")
+          body["mutations"].insert(-2, "take a SQL-only backup before creating the local review admin")
+          if base_binding["ahead"]
+            body["mutations"] << "The base site's schema version (#{base_binding.fetch('schema_version')}) is newer than this server's Discourse (#{base_binding.fetch('site_schema_version')}); hosted sites carry migrations from plugins this image doesn't have. It will be restored anyway."
+          end
+          body["not_included"] = ["uploads and avatars", "hosted restore", "DNS or cutover", "remote pushes"]
+        end
         digest = Digest::SHA256.hexdigest(canonical_json(body))
         @store.update do |current|
           current.fetch("plans")[plan_id] = {
@@ -175,7 +208,328 @@ module SiloMigrate
         { version: 1, run_id: run_id, side: side, count: count, error: error }
       end
 
+      # Engineer-only release: never consumes a page/chat approval and never restores
+      # remotely. The execution lock also serializes reset and repeated releases.
+      def release_backup(run_id:, reviewer:, acknowledge_differences: false)
+        unless reviewer.is_a?(String) && reviewer.match?(/\A[[:print:]]{1,120}\z/)
+          raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID"
+        end
+        @store.with_op_lock do
+          state = @store.load
+          run = state.fetch("runs")[run_id]
+          plan = run && state.fetch("plans")[run["plan_id"]]
+          unless run && plan && review_plan?(plan) && plan.dig("body", "base_site") && run["status"] == "completed" && run.dig("artifacts", "backup")
+            raise StandardWorkflowError, "STANDARD_RELEASE_NOT_READY"
+          end
+          artifact = run.fetch("artifacts").fetch("backup")
+          source = release_artifact!(artifact)
+          results = run.fetch("results")
+          checks = results.fetch("reconciliation_checks", 0)
+          unless acknowledge_differences || run.dig("release", "acknowledged_differences") || run.dig("release", "differences_acknowledged") || (checks.positive? && results["reconciliation_matched"] == checks && results.fetch("reconciliation_errors", 0).zero?)
+            raise StandardWorkflowError, "STANDARD_RELEASE_CHECKS"
+          end
+          body = plan.fetch("body")
+          outbox = File.join(@store.workspace_root, "outbox")
+          release_directory!(outbox)
+          filename = artifact.fetch("filename")
+          output = File.join(outbox, filename)
+          manifest_name = filename.delete_suffix(".sql.gz") + ".manifest.json"
+          previous = run["release"]
+          released_at = previous ? previous.fetch("released_at") : now
+          released_by = previous ? previous.fetch("released_by") : reviewer
+          acknowledged = previous ? previous.fetch("acknowledged_differences") { previous.fetch("differences_acknowledged") } : acknowledge_differences
+          base = body.fetch("base_site")
+          input = body.fetch("input_binding").find { |entry| entry["id"] == base.fetch("input_id") }
+          manifest = {
+            "workspace" => @workspace, "run_id" => run_id, "plan_id" => plan.fetch("id"), "plan_digest" => plan.fetch("digest"),
+            "delivery" => body.fetch("delivery").slice("kind", "version"),
+            "base_site" => base.merge("sha256" => input.fetch("sha256")),
+            "converter_revision" => body.dig("from_run", "converter_revision"), "app_revision" => body["app_revision"],
+            "discourse_version" => results["discourse_version"], "schema_version" => results["schema_version"],
+            "check_totals" => { "checks" => checks, "matched" => results.fetch("reconciliation_matched", 0),
+                                "differs" => results.fetch("reconciliation_differs", 0), "errors" => results.fetch("reconciliation_errors", 0) },
+            "differences_acknowledged" => acknowledged,
+            "imported_totals" => results.slice("imported_users", "imported_topics", "imported_posts", "imported_attachments"),
+            "backup" => artifact.slice("filename", "sha256", "bytes"), "released_at" => released_at, "released_by" => released_by,
+            "restore_note" => "Restore on a site at schema version #{results.fetch('backup_schema_version')} or newer (same or newer Discourse)."
+          }
+          release_backup_file!(source, output, artifact)
+          # Re-hash the delivered bytes, too: a source modified during the copy is never released.
+          release_artifact!(artifact.merge("path" => output))
+          release_write!(File.join(outbox, manifest_name)) { |file| file.write(JSON.pretty_generate(manifest) + "\n") }
+          release = { "released_at" => released_at, "released_by" => released_by, "sha256" => artifact.fetch("sha256"),
+                      "path" => output, "filename" => filename, "outbox" => outbox, "manifest" => manifest_name,
+                      "acknowledged_differences" => acknowledged }
+          @store.update { |current| current.fetch("runs").fetch(run_id)["release"] = release }
+          { run_id: run_id, outbox: outbox, filename: filename, sha256: artifact.fetch("sha256"), bytes: artifact.fetch("bytes"),
+            manifest: manifest_name, released_at: released_at, released_by: released_by }
+        end
+      end
+
       private
+
+      # The review module precedes the convert module in method lookup; all other plans
+      # retain the existing stage selector.
+      def stages_for(plan)
+        return BASE_SITE_STAGES if review_plan?(plan) && plan.dig("body", "base_site")
+
+        super
+      end
+
+      def review_environment(port)
+        { "DISCOURSE_LOGIN_REQUIRED" => "true", "DISCOURSE_BACKUP_LOCATION" => "local",
+          "DISCOURSE_ENABLE_S3_UPLOADS" => "false", "DISCOURSE_FORCE_HTTPS" => "false",
+          "DISCOURSE_ENABLE_LOCAL_LOGINS" => "true", "DISCOURSE_ENABLE_DISCOURSE_CONNECT" => "false",
+          "DISCOURSE_DOWNLOAD_REMOTE_IMAGES_TO_LOCAL" => "false", "DISCOURSE_ENFORCE_SECOND_FACTOR" => "no",
+          "DISCOURSE_PORT" => port.to_s }
+      end
+
+      def base_site_versions!(filename)
+        match = File.basename(filename).match(/-v(?:(?<discourse_version>\d{4}-\d{1,2}-\d+(?:-latest(?:-\d+)?)?)-)?(?<schema_version>\d{14})\.sql\.gz\z/)
+        raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID" unless match
+
+        { "discourse_version" => match[:discourse_version]&.sub(/\A(\d+)-(\d+)-(\d+)/, '\1.\2.\3'), "schema_version" => match[:schema_version] }
+      end
+
+      def base_site_compatible!(backup, site)
+        if backup["discourse_version"] && Gem::Version.new(backup.fetch("discourse_version")) > Gem::Version.new(site.fetch("discourse_version"))
+          raise StandardWorkflowError, "STANDARD_BASE_SITE_NEWER"
+        end
+      rescue ArgumentError
+        raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID"
+      end
+
+      # Image files, not a mutable tag or a pinned profile edit. The resolved image
+      # content ID keys this process-local cache; runtime staleness remains digest-bound.
+      def review_image_migrations
+        image = lock.fetch("images").fetch("web")
+        @review_image_migrations ||= {}
+        @review_image_migrations[image.fetch("content_id")] ||= begin
+          id = ImageIdentity.resolve(@runtime, image)
+          script = 'require "json"; root = "/var/www/discourse"; paths = %w[db/migrate db/post_migrate plugins/*/db/migrate plugins/*/db/post_migrate]; puts JSON.generate(paths.flat_map { |p| Dir.glob("#{root}/#{p}/[0-9]*_*.rb") }.filter_map { |p| File.basename(p)[/\A(\d{14})_/, 1] }.uniq.sort)'
+          result = @runtime.run(["docker", "run", "--rm", "--pull=never", "--network", "none", "--entrypoint", "ruby", id, "-e", script], capture: true, timeout: 60)
+          versions = result.success? ? JSON.parse(result.stdout) : nil
+          unless versions.is_a?(Array) && !versions.empty? && versions.all? { |version| version.is_a?(String) && version.match?(/\A\d{14}\z/) }
+            raise StandardWorkflowError, "STANDARD_RUNTIME_MISMATCH"
+          end
+          versions.uniq.sort
+        end
+      rescue JSON::ParserError
+        raise StandardWorkflowError, "STANDARD_RUNTIME_MISMATCH"
+      end
+
+      # PostgreSQL's SQL-only dump uses COPY for schema_migrations. Never buffer a
+      # dump line without a limit: other tables can contain multi-GB text values.
+      def base_site_dump_migrations!(path)
+        versions = Set.new
+        buffer = +"".b
+        oversized = false
+        inside = false
+        complete = false
+        Zlib::GzipReader.open(path) do |gzip|
+          while (chunk = gzip.read(64 * 1024)) && !chunk.empty?
+            chunk.each_line do |part|
+              if buffer.bytesize + part.bytesize > 1024
+                oversized = true
+                buffer.clear
+              end
+              buffer << part unless oversized
+              next unless part.end_with?("\n")
+
+              line = buffer.strip
+              if inside
+                if !oversized && line == '\\.'
+                  inside = false
+                  complete = true
+                elsif !oversized && line.match?(/\A\d{14}\z/)
+                  versions << line
+                  raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID" if versions.size > 100_000
+                else
+                  raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID"
+                end
+              elsif !oversized && line.match?(/\ACOPY (?:public\.)?schema_migrations \(version\) FROM stdin;\z/)
+                raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID" if complete
+
+                # A COPY-header-looking data row can only cause refusal, never bypass validation.
+                inside = true
+              end
+              buffer.clear
+              oversized = false
+            end
+          end
+          raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID" unless gzip.unused.to_s.empty?
+        end
+        raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID" unless complete && !inside && !versions.empty?
+
+        versions.to_a.sort
+      rescue Zlib::Error, EOFError, SystemCallError
+        raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID"
+      end
+
+      def stage_base_restore(run_id)
+        binding = plan_for(run_id).fetch("body").fetch("base_site")
+        stack = stack_for(run_id, "review")
+        site = stack.rails_runner("/tmp/review_state.rb")
+        base_site_compatible!(binding, site)
+        ahead = binding.fetch("schema_version") > site.fetch("schema_version").to_s
+        unless ahead == binding.fetch("ahead") && site.fetch("schema_version").to_s == binding.fetch("site_schema_version")
+          raise StandardWorkflowError, "STANDARD_BASE_SITE_NEWER"
+        end
+        input = role_input(run_inputs(run_id), "base_site")
+        archive = input_path(run_id, input)
+        versions = base_site_dump_migrations!(archive)
+        raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID" unless versions.last == binding.fetch("schema_version")
+
+        known = site.fetch("migration_versions").to_set
+        record_results(run_id, base_site_unknown_migrations: versions.count { |version| !known.include?(version) },
+                       base_site_newer_migrations: versions.select { |version| version > site.fetch("schema_version").to_s }.first(50))
+        restore_versions = ahead ? site : binding
+        suffix = "-v#{restore_versions["discourse_version"]&.tr(".", "-")&.+("-")}#{restore_versions.fetch("schema_version")}.sql.gz"
+        restore_archive(run_id, stack, archive, "base-restore", expected_sha256: input.fetch("sha256"), safe_filename: "silo-base#{suffix}")
+        wait_restored_web(stack, internal: true)
+        restored = stack.rails_runner("/tmp/review_state.rb")
+        unless restored.dig("settings", "allow_restore") == false && (review_image_migrations - restored.fetch("migration_versions")).empty?
+          raise StandardWorkflowError, "STANDARD_RESTORE_FAILED"
+        end
+        record_results(run_id, base_site: true, base_site_ahead: ahead, base_discourse_version: binding["discourse_version"], base_schema_version: binding["schema_version"],
+                       discourse_version: site.fetch("discourse_version"), site_schema_version: site.fetch("schema_version"),
+                       schema_version: restored.fetch("schema_version"), prior_import_id_rows: restored.fetch("prior_import_id_rows"))
+      end
+
+      # Stream the entire gzip, including its trailer, in bounded memory. Preserve a
+      # small overlap so forbidden identities crossing a chunk boundary cannot escape.
+      def validate_sql_backup!(path)
+        versions = base_site_versions!(path)
+        raise StandardWorkflowError, "STANDARD_BACKUP_FAILED" unless File.file?(path) && !File.symlink?(path) && File.size(path).positive?
+
+        bytes = 0
+        header = +"".b
+        tail = +"".b
+        Zlib::GzipReader.open(path) do |gzip|
+          while (chunk = gzip.read(64 * 1024)) && !chunk.empty?
+            bytes += chunk.bytesize
+            header << chunk.byteslice(0, [8192 - header.bytesize, 0].max)
+            scan = tail + chunk
+            if scan.include?(REVIEW_ADMIN) || scan.include?("review-admin@example.invalid")
+              raise StandardWorkflowError.new("STANDARD_BACKUP_FAILED", "local review identity in backup")
+            end
+            tail = scan.byteslice(-64, 64) || scan
+          end
+          raise StandardWorkflowError, "STANDARD_BACKUP_FAILED" unless gzip.unused.to_s.empty?
+        end
+        unless bytes.positive? && header.include?("PostgreSQL database dump")
+          raise StandardWorkflowError.new("STANDARD_BACKUP_FAILED", "not a PostgreSQL dump")
+        end
+        versions
+      rescue Zlib::Error, EOFError, SystemCallError
+        raise StandardWorkflowError.new("STANDARD_BACKUP_FAILED", "invalid SQL gzip")
+      end
+
+      def stage_backup(run_id)
+        stack = stack_for(run_id, "review")
+        stem = "#{@workspace}-#{run_id}"
+        remote = "/shared/silo-review-backup"
+        made = stack.web_exec(["sh", "-c", "mkdir -m 700 #{remote} && chown discourse:discourse #{remote}"], timeout: 30)
+        raise StandardWorkflowError, "STANDARD_BACKUP_FAILED" unless made.success?
+
+        result = stack.discourse_shell(["bundle", "exec", "script/discourse", "backup", "#{remote}/#{stem}.sql.gz", "--sql-only"], timeout: 3600)
+        log(run_id, "review-backup", result)
+        raise StandardWorkflowError, "STANDARD_BACKUP_FAILED" unless result.success?
+
+        listing = stack.web_exec(["find", remote, "-mindepth", "1", "-maxdepth", "1", "-printf", "%f\n"], timeout: 30)
+        files = listing.stdout.to_s.lines.map(&:strip)
+        unless listing.success? && files.size == 1 && files.first.start_with?("#{stem}-v") && File.basename(files.first) == files.first
+          raise StandardWorkflowError, "STANDARD_BACKUP_FAILED"
+        end
+        base_site_versions!(files.first)
+        dir = @store.run_dir(run_id, "artifacts")
+        FileUtils.mkdir_p(dir, mode: 0o700)
+        path = File.join(dir, files.first)
+        stack.copy_out("#{remote}/#{files.first}", path)
+        versions = validate_sql_backup!(path)
+        File.chmod(0o400, path)
+        identity = artifact_identity(path).merge("path" => path, "label" => "sql-validated")
+        @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["backup"] = identity }
+        record_results(run_id, backup_discourse_version: versions["discourse_version"], backup_schema_version: versions["schema_version"])
+      end
+
+      def release_artifact!(artifact)
+        filename = artifact.fetch("filename")
+        unless File.basename(filename) == filename && filename.match?(/\A[a-zA-Z0-9_.-]+\.sql\.gz\z/)
+          raise StandardWorkflowError, "STANDARD_ARTIFACT_CHANGED"
+        end
+        path = artifact.fetch("path")
+        File.open(path, File::RDONLY | File::NOFOLLOW) do |file|
+          stat = file.stat
+          digest = Digest::SHA256.new
+          while (chunk = file.read(1024 * 1024))
+            digest.update(chunk)
+          end
+          unless stat.file? && stat.size == artifact.fetch("bytes") && digest.hexdigest == artifact.fetch("sha256")
+            raise StandardWorkflowError, "STANDARD_ARTIFACT_CHANGED"
+          end
+        end
+        path
+      rescue SystemCallError, KeyError
+        raise StandardWorkflowError, "STANDARD_ARTIFACT_CHANGED"
+      end
+
+      def release_directory!(path)
+        begin
+          Dir.mkdir(path, 0o700)
+        rescue Errno::EEXIST
+          # Refuse links even when they point to the expected location.
+        end
+        File.open(path, File::RDONLY | File::NOFOLLOW) do |directory|
+          raise StandardWorkflowError, "STANDARD_RELEASE_NOT_READY" unless directory.stat.directory?
+
+          directory.chmod(0o700)
+        end
+      rescue Errno::ELOOP, Errno::ENOTDIR
+        raise StandardWorkflowError, "STANDARD_RELEASE_NOT_READY"
+      end
+
+      # Completed backup artifacts are immutable (0400); reset only unlinks them.
+      # A hard link therefore survives reset without either path being rewritten.
+      def release_backup_file!(source, output, artifact)
+        raise StandardWorkflowError, "STANDARD_RELEASE_NOT_READY" if File.symlink?(output)
+        if File.exist?(output)
+          release_artifact!(artifact.merge("path" => output))
+          return
+        end
+        temporary = "#{output}.tmp-#{SecureRandom.hex(12)}"
+        begin
+          begin
+            File.link(source, temporary)
+          rescue Errno::EXDEV, Errno::EPERM, Errno::EACCES, Errno::ENOTSUP
+            release_write!(temporary) do |file|
+              File.open(source, File::RDONLY | File::NOFOLLOW) { |input| IO.copy_stream(input, file) }
+            end
+          end
+          release_artifact!(artifact.merge("path" => temporary))
+          File.rename(temporary, output)
+        ensure
+          FileUtils.rm_f(temporary)
+        end
+      end
+
+      def release_write!(path)
+        raise StandardWorkflowError, "STANDARD_RELEASE_NOT_READY" if File.symlink?(path)
+
+        temporary = "#{path}.tmp-#{SecureRandom.hex(12)}"
+        begin
+          File.open(temporary, File::WRONLY | File::CREAT | File::EXCL | File::NOFOLLOW, 0o600) do |file|
+            yield file
+            file.chmod(0o400)
+            file.flush
+            file.fsync
+          end
+          File.rename(temporary, path)
+        ensure
+          FileUtils.rm_f(temporary)
+        end
+      end
+
 
       def review_plan?(plan)
         plan.dig("body", "operation") == REVIEW_OPERATION
@@ -219,6 +573,12 @@ module SiloMigrate
         return "inputs" unless ids.all? { |id| named.fetch("inputs").key?(id) }
         return "inputs" unless @store.named.input_binding(named, ids) == body.fetch("input_stat_binding")
         return "inputs" unless inputs_unchanged?(ids.map { |id| named.fetch("inputs").fetch(id) })
+        delivery_roles!(named, body.fetch("roles"), delivery_binding!(body.fetch("dataset_id")))
+        if body["base_site"]
+          input = named.fetch("inputs").fetch(body.dig("roles", "base_site"))
+          record = delivery_record!(input.fetch("dataset_id"))
+          return "delivery" unless record.slice("kind", "version") == body.dig("base_site", "delivery")
+        end
         return "code" unless code_identity == body.fetch("code_identity")
         return "runtime" unless profile_current?(state.fetch("config")) && state.dig("config", "discourse_profile_sha256") == body.fetch("runtime_lock_sha256")
 
@@ -293,6 +653,10 @@ module SiloMigrate
       end
 
       def review_site_setup(run_id)
+        base = plan_for(run_id).dig("body", "base_site")
+        if base && !@store.load.dig("runs", run_id, "artifacts", "backup")
+          raise StandardWorkflowError, "STANDARD_RELEASE_NOT_READY"
+        end
         stack = stack_for(run_id, "review")
         secrets = @store.run_dir(run_id, "private", "review-setup.env")
         FileUtils.rm_f(secrets)
@@ -301,7 +665,8 @@ module SiloMigrate
         @store.write_private(secrets, "SILO_ADMIN_PASSWORD=#{password}\n")
         port = stack.record.fetch("port")
         result = begin
-          stack.rails_runner("/tmp/review_setup.rb", env: { "SILO_SITE_PORT" => port.to_s }, env_file: secrets)
+          stack.rails_runner(base ? "/tmp/review_access.rb" : "/tmp/review_setup.rb",
+                             env: { "SILO_SITE_PORT" => port.to_s, "SILO_BACKUP_RECORDED" => base ? "true" : "false" }, env_file: secrets)
         ensure
           FileUtils.rm_f(secrets)
         end
@@ -386,7 +751,7 @@ module SiloMigrate
 
       def review_verify(run_id, plan)
         stack = stack_for(run_id, "review")
-        failures = review_safety_failures(stack)
+        failures = review_safety_failures(stack, base_site: !!plan.dig("body", "base_site"))
         assert_clean!(run_id, "review_site", failures, "STANDARD_VERIFY_FAILED")
         review_reconcile(run_id, plan, stack)
         set_instance_state(stack, "review")
@@ -412,7 +777,23 @@ module SiloMigrate
       end
 
       # Read straight from the database, after the import and its consistency pass.
-      def review_safety_failures(stack)
+      def review_safety_failures(stack, base_site: false)
+        if base_site
+          facts = stack.rails_runner("/tmp/review_state.rb")
+          effective = facts.fetch("settings")
+          environment = stack.web_exec(%w[printenv DISCOURSE_DISABLE_EMAILS], timeout: 30)
+          failures = []
+          failures << "review-email-not-disabled" unless environment.success? && environment.stdout.to_s.strip == "yes" && effective["disable_emails"] == "yes"
+          failures << "review-login-not-required" unless effective["login_required"] == true
+          failures << "review-restore-enabled" unless effective["allow_restore"] == false
+          review_environment(stack.record.fetch("port")).each do |key, value|
+            setting = key.delete_prefix("DISCOURSE_").downcase
+            expected = %w[true false].include?(value) ? value == "true" : value
+            matches = setting == "port" ? effective[setting].to_s == value : effective[setting] == expected
+            failures << "review-shadow-#{setting}" unless matches
+          end
+          return failures
+        end
         result = stack.db_query("SELECT name || '=' || value FROM site_settings WHERE name IN ('disable_emails', 'login_required', 'allow_restore') ORDER BY name", timeout: 60)
         return ["review-settings-unreadable"] unless result.success?
 
