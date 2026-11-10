@@ -222,7 +222,11 @@ else:
 
     def test_every_declared_tool_maps_to_one_data_request(self):
         import re
-        declared = re.findall(r'(?m)^    - name: ([a-z_]+)$', (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text())
+        definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
+        blocks = re.split(r'(?m)^    - name: ', definition)[1:]
+        # The four branch tools use a separate reader-role adapter, tested in converter_dev_adapter_test.
+        self.assertEqual(26, len(blocks))
+        declared = [block.splitlines()[0] for block in blocks if 'script: scripts/data_tool.py' in block]
         self.assertEqual(22, len(declared))
         for tool in declared:
             with self.subTest(tool=tool):

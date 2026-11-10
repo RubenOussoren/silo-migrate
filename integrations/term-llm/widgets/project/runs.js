@@ -2,6 +2,10 @@
 // The decisions are those of widgets/runs/server.py, unchanged: same checks, same exact-digest approval.
 import { el, safe, short, badge, ago, toast, api, explain, facts, block, table, details, card, back, item } from './ui.js';
 
+const baseLabel = (base) => base ? `Base site v${(base.delivery || {}).version}` : 'None: fresh site';
+const bytes = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`;
+const resetNote = (release) => release ? 'The released backup stays in the output folder.' : 'The unreleased backup is kept with the run.';
+
 const RUN_DONE = new Set(['completed', 'failed', 'interrupted']);
 const operationLabel = (operation) => (operation === 'standard_review' ? 'Import into a review site' : operation === 'standard_convert' ? 'Convert run' : 'Run');
 // Which data a plan runs on, in words: part of what an approval covers.
@@ -20,7 +24,7 @@ export function runsView(ctx) {
     // One decision at a time: no second click while this one runs (a push can take minutes).
     const buttons = [...document.querySelectorAll('#content .actions button')];
     for (const button of buttons) button.disabled = true;
-    toast(action === 'push' ? 'Pushing… this can take a few minutes.' : 'Working…');
+    toast(action === 'release' ? 'Releasing… this can take a few minutes.' : action === 'push' ? 'Pushing… this can take a few minutes.' : 'Working…');
     try {
       return await api(`api/runs/${action}`, { workspace: ctx.project, ...body });
     } catch (error) {
@@ -58,10 +62,11 @@ export function runsView(ctx) {
     const last = group.imports[group.imports.length - 1];
     const busy = [convert, ...group.imports].some((step) => !step.run_status || ['claimed', 'running'].includes(step.run_status));
     const actions = [];
+    if (last) { const release = releaseButton(last); if (release) actions.push(release); }
     if (last && last.site_up) {
       actions.push(el('button', { type: 'button', class: 'btn', onclick: () => ctx.open('run', last.run_id) }, 'Open the site'));
       actions.push(el('button', { type: 'button', class: 'btn q', onclick: async () => {
-        if (await act('reset', { run_id: last.run_id }, `Reset the review site of pass ${group.number} (${ctx.project})? It holds customer data; evidence and plans stay.`)) { toast('Reset.'); ctx.refresh(); }
+        if (await act('reset', { run_id: last.run_id }, `Reset the review site of pass ${group.number} (${ctx.project})? It holds customer data; evidence and plans stay. ${resetNote(last && last.release)}`)) { toast('Reset.'); ctx.refresh(); }
       } }, 'Reset the site'));
     }
     const convertPassed = convert.run_status === 'completed' && convert.checks && convert.matched === convert.checks;
@@ -101,11 +106,46 @@ export function runsView(ctx) {
       el('span', { class: 'what' }, last.site_up ? 'Up · check it through the tunnel, then decide' : 'Reset · decide from what you saw'), el('span', { class: 'pill now' }, 'for you'));
   }
 
+  function releaseButton(step) {
+    if (step.run_status !== 'completed' || !step.backup || step.release) return null;
+    const matched = step.checks > 0 && step.matched === step.checks;
+    const differs = Math.max(0, step.checks - step.matched);
+    const question = matched ? 'Release this backup for review? It copies the backup and a manifest to this project’s output folder. Nothing is sent anywhere.'
+      : `${step.checks ? `${differs} of ${step.checks} checks ${differs === 1 ? 'differs' : 'differ'}.` : 'There are no count checks.'} Release this backup for review anyway?`;
+    return el('button', { type: 'button', class: matched ? 'btn' : 'btn q', onclick: async () => {
+      if (await act('release', { run_id: step.run_id, acknowledge: !matched }, question)) { toast('Backup released.'); ctx.refresh(); }
+    } }, matched ? 'Release backup' : 'Release anyway…');
+  }
+
+  function backupRows(last) {
+    if (!last || !last.base_site) return [];
+    const base = last.base_site_details || {};
+    const backup = last.backup;
+    const row = (name, text, state) => el('div', { class: 'step static' }, el('span', { class: 'dot' }), el('span', {}, name),
+      el('span', { class: 'what' }, text), state ? el('span', { class: 'pill ok' }, state) : null);
+    const ahead = base.ahead || (last.results || {}).base_site_ahead;
+    return [row('Base site', `${last.base_site} · Discourse ${base.discourse_version || 'unknown'}${ahead ? ' · newer schema than this server, as approved' : ''} · restored before the import`, ''),
+      row('Backup', backup ? `Sandbox + imported data, no uploads · ${bytes(backup.bytes)} · taken before the review sign-in was added` : 'Not taken yet', last.backup_state)];
+  }
+
+  function releasedDetails(last) {
+    const release = last && last.release;
+    if (!release) return null;
+    const manifest = String(release.manifest || '').split('/').pop();
+    const version = (last.results || {}).backup_discourse_version || (last.results || {}).discourse_version;
+    const schema = (last.results || {}).backup_schema_version;
+    return block('Released for review', el('p', {}, 'Copy the backup from the server and restore it on the migration site.'),
+      facts([['Output folder', safe(release.outbox), true], ['Backup', safe(release.filename), true], ['Manifest', safe(manifest), true],
+        ['Released', `by ${safe(release.released_by)} · ${safe(release.released_at)}`], ['SHA-256', short(release.sha256, 12), true]]),
+      el('p', { class: 'hint' }, version ? `Restores on Discourse ${safe(version)} or newer${schema ? ` (schema version ${safe(schema)} or newer)` : ''}. Restore on the hosted migration site is outside this tool.` : 'Restore on the hosted migration site is outside this tool. Use the Discourse version in the manifest or newer.'));
+  }
+
   function steps(group) {
     const rows = [stepRow('Convert run', group.convert, false), ...group.imports.map((step, i) => stepRow(group.imports.length > 1 ? `Import ${i + 1}` : 'Import', step, true))];
     const last = group.imports[group.imports.length - 1];
     if (last && passed(last) && passed(group.convert)) rows.push(siteRow(last));
     else if (last && last.site_up) rows.push(el('div', { class: 'step static' }, el('span', { class: 'dot run' }), el('span', {}, 'Review site'), el('span', { class: 'what' }, 'Up · holds customer data until reset'), el('span', { class: 'pill now' }, 'check it')));
+    rows.push(...backupRows(last));
     return rows;
   }
 
@@ -121,10 +161,18 @@ export function runsView(ctx) {
         el('button', { type: 'button', class: 'btn q', onclick: () => ctx.open('changes', last.run_id) }, 'Needs changes\u2026')));
   }
 
+  function passSay(group) {
+    const last = group.imports[group.imports.length - 1];
+    if (!last || !last.base_site || last.run_status !== 'completed') return group.status[0];
+    if (last.release) return 'Released for review. Copy the backup from the server and restore it on the migration site.';
+    return passed(last) ? 'Imported on top of the sandbox. Every check matches. Check the site, then release the backup.'
+      : `Imported on top of the sandbox. ${last.checks ? `${last.checks - last.matched} of ${last.checks} checks ${last.checks - last.matched === 1 ? 'differs' : 'differ'}.` : 'No count checks.'}`;
+  }
+
   function passCard(group, open) {
     const head = el('button', { type: 'button', class: 'pass-head', onclick: () => ctx.open('pass', group.key) },
       el('div', {}, el('span', { class: 'name' }, `Pass ${group.number}`), el('small', {}, passMeta(group))), el('span', { class: `pill ${tone(group)}` }, group.status[0]));
-    return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, steps(group), decideBox(group), passActions(group, false)) : null);
+    return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, group.base_site ? el('p', { class: 'hint' }, passSay(group)) : null, steps(group), decideBox(group), passActions(group, false), releasedDetails(group.imports[group.imports.length - 1])) : null);
   }
 
   function updatesList(all) {
@@ -190,8 +238,8 @@ export function runsView(ctx) {
     const changed = before ? el('p', { class: 'changed' }, `Changed since pass ${before.number}: `, el('b', {}, changes.length ? changes.join(', ') : 'nothing'), '.') : null;
     const more = details(facts([['Convert run', group.convert.run_id, true], ['Convert plan', group.convert.plan_id, true],
       ...group.imports.map((step, i) => [`Import ${i + 1}`, step.run_id || step.plan_id, true]), ['Converter', group.converter, true], ['Branch', group.branch, true]]));
-    ctx.mount([back('Runs', ctx.close), card(`PASS ${group.number} · ${safe(group.delivery || 'DATA NOT LABELLED').toUpperCase()}`, group.status[0], changed,
-      el('div', { class: 'steps' }, steps(group)), decideBox(group), passActions(group, true), more)]);
+    ctx.mount([back('Runs', ctx.close), card(`PASS ${group.number} · ${safe(group.delivery || 'DATA NOT LABELLED').toUpperCase()}${group.base_site ? ` ON ${group.base_site.toUpperCase()}` : ''}`, passSay(group), changed,
+      el('div', { class: 'steps' }, steps(group)), decideBox(group), passActions(group, true), group.backup_state === 'ready' ? el('p', { class: 'hint' }, 'Release copies the backup and a manifest to this project’s output folder on the server. Nothing is sent anywhere.') : null, releasedDetails(group.imports[group.imports.length - 1]), more)]);
   }
 
   function plan(data) {
@@ -200,10 +248,11 @@ export function runsView(ctx) {
     const converter = data.converter || {};
     const texts = data.texts || {};
     const unseen = (convert && texts.settings == null) || ((convert || review) && (data.roles || {}).reconciliation && texts.reconciliation == null);
-    const say = data.status === 'proposed' ? `Approve this ${convert ? 'convert run' : review ? 'import' : 'run'} on ${dataLabel(data)}?`
+    const say = data.status === 'proposed' ? `Approve this ${convert ? 'convert run' : review ? 'import' : 'run'} on ${dataLabel(data)}${review ? ` · ${baseLabel(data.base_site)}` : ''}?`
       : data.status === 'approved' ? 'Approved. Start it when you are ready.' : `This plan is ${data.status === 'stale' ? 'out of date' : data.status.replace('_', ' ')}.`;
     const summary = facts([
       ['Data', el('strong', {}, dataLabel(data))],
+      ['Base site', review ? `${baseLabel(data.base_site)}${data.base_site ? ` · Discourse ${data.base_site.discourse_version}` : ''}` : null],
       ['What', convert ? `Converts the data with converters/${data.platform} and checks the counts. Nothing is imported yet.` : review ? 'Imports the converted data into a new local review site and checks the counts there.' : operationLabel(data.operation)],
       ['Converter', review ? null : `${converter.branch || ''} @ ${short(data.converter_revision, 12)}`, true],
       ['Proposed', ago(data.created_at)],
@@ -228,8 +277,8 @@ export function runsView(ctx) {
     const actions = [];
     if (data.status === 'proposed') {
       const question = unseen
-        ? `Approve this run of ${ctx.project} on ${dataLabel(data)}?\nApproval code ${short(data.digest, 16)}…\nThe settings or checks could NOT be shown here: you approve them by their checksum only.`
-        : `Approve this run of ${ctx.project} on ${dataLabel(data)}?\nApproval code ${short(data.digest, 16)}…\nIt runs exactly what this page shows.`;
+        ? `Approve this run of ${ctx.project} on ${dataLabel(data)}${review ? ` · ${baseLabel(data.base_site)}` : ''}?\nApproval code ${short(data.digest, 16)}…\nThe settings or checks could NOT be shown here: you approve them by their checksum only.`
+        : `Approve this run of ${ctx.project} on ${dataLabel(data)}${review ? ` · ${baseLabel(data.base_site)}` : ''}?\nApproval code ${short(data.digest, 16)}…\nIt runs exactly what this page shows.`;
       actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
         if (await act('approve', { plan_id: data.plan_id, digest: data.digest }, question)) { toast('Approved. Start it when you are ready.'); ctx.refresh(); }
       } }, 'Approve'));
@@ -246,6 +295,8 @@ export function runsView(ctx) {
       } }, 'Discard'));
     }
     const notes = [];
+    if (review && data.base_site && data.base_site.ahead) notes.push(el('p', { class: 'note' },
+      `The sandbox is on a newer schema (${data.base_site.schema_version}) than this server's Discourse (${data.base_site.site_schema_version}). Normal for hosted sandboxes. It will be restored anyway.`));
     if (data.status === 'stale') notes.push(el('p', { class: 'note' }, 'Something this plan uses changed since it was proposed, so it can\'t run. Discard it and ask migration-data to propose it again.'));
     if (unseen) notes.push(el('p', { class: 'note' }, 'The settings or checks couldn\'t be shown here: an approval would cover them by checksum only.'));
     return [card(data.status === 'proposed' || data.status === 'approved' ? 'FOR YOU' : 'PLAN', say, summary, ...notes, actions.length ? el('div', { class: 'actions' }, actions) : null, details(...more))];
@@ -269,6 +320,11 @@ export function runsView(ctx) {
       : data.status === 'completed' ? (bad.length ? `${bad.map((row) => safe(row.name)).join(', ')} ${bad.length === 1 ? 'doesn\'t' : 'don\'t'} match.` : rows.length ? 'Finished. Every check matches.' : 'Finished.')
         : data.status === 'failed' ? `Stopped at ${data.stage || 'a stage'}.` : `This run is ${data.status.replace('_', ' ')}.`;
     const parts = [];
+    const backupStep = { run_id: data.run_id, run_status: data.status, checks: results.reconciliation_checks || 0,
+      matched: results.reconciliation_matched || 0, base_site: data.base_site ? baseLabel(data.base_site) : null,
+      base_site_details: data.base_site, backup: (data.artifacts || {}).backup, release: data.release, results,
+      backup_state: data.release ? 'released' : (data.artifacts || {}).backup ? 'ready' : 'none' };
+    parts.push(...backupRows(backupStep), releasedDetails(backupStep));
     if (rows.length) {
       parts.push(table(['Check', 'Source', 'Converted', ...(destination ? ['Site'] : []), ''],
         rows.map((r) => [safe(r.name), r.source, r.intermediate, ...(destination ? [r.destination] : []), badge(r.status === 'matched' ? 'ok' : 'differs', r.status)]),
@@ -299,6 +355,7 @@ export function runsView(ctx) {
         el('p', { class: 'note' }, 'This site holds customer data until it is reset.')));
     }
     const actions = [];
+    const release = releaseButton(backupStep); if (release) actions.push(release);
     if (['abandoned', 'not_started'].includes(data.status)) {
       actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
         if (await act('recover', { run_id: data.run_id }, `Mark this run of ${ctx.project} as interrupted? Only do this if its process is gone, for example after a restart. Then reset it.`)) { toast('Marked interrupted.'); ctx.refresh(); }
@@ -308,10 +365,10 @@ export function runsView(ctx) {
     // didn't finish cleanly may have left. A convert run cleans up after itself when it ends.
     const review = data.operation === 'standard_review';
     const leftovers = review ? data.review_site_available : data.status !== 'completed';
-    if (RUN_DONE.has(data.status) && !leftovers) parts.push(el('p', { class: 'hint' }, review ? 'Its site has been reset: nothing is left to remove.' : 'Nothing to clean up: it tidied up after itself.'));
+    if (RUN_DONE.has(data.status) && !leftovers) parts.push(el('p', { class: 'hint' }, review ? 'Its site has been reset. Evidence and backups stay with the run; released backups stay in the output folder.' : 'Nothing to clean up: it tidied up after itself.'));
     if (RUN_DONE.has(data.status) && leftovers) {
       actions.push(el('button', { type: 'button', class: 'btn q', onclick: async () => {
-        if (await act('reset', { run_id: data.run_id }, `Reset this run of ${ctx.project}? Its review site, containers and leftovers are removed. Evidence, plans and backups stay.`)) { toast('Reset.'); ctx.refresh(); }
+        if (await act('reset', { run_id: data.run_id }, `Reset this run of ${ctx.project}? Its review site, containers and leftovers are removed. Evidence and plans stay. ${resetNote(data.release)}`)) { toast('Reset.'); ctx.refresh(); }
       } }, data.operation === 'standard_review' ? 'Reset the site' : 'Reset'));
     }
     const more = [facts([['Run', data.run_id, true], ['Plan', data.plan_id, true], ['Started', data.started_at], ['Finished', data.finished_at],
@@ -420,13 +477,15 @@ export function runsView(ctx) {
   // After accepting: the site still holds customer data, so Reset is offered straight away.
   async function done(runId, basis) {
     let up = false;
+    let last = null;
     try {
       const data = await api(`api/runs/passes?${new URLSearchParams({ workspace: ctx.project })}`);
       board = data;
-      up = data.passes.some((group) => group.imports.some((step) => step.run_id === runId && step.site_up));
+      last = data.passes.flatMap((group) => group.imports).find((step) => step.run_id === runId);
+      up = Boolean(last && last.site_up);
     } catch { /* the Runs list shows it */ }
     const reset = up ? el('button', { type: 'button', class: 'btn', onclick: async () => {
-      if (await act('reset', { run_id: runId }, `Reset this review site of ${ctx.project}? It holds customer data; evidence and plans stay.`)) { toast('Reset.'); ctx.close(); }
+      if (await act('reset', { run_id: runId }, `Reset this review site of ${ctx.project}? It holds customer data; evidence and plans stay. ${resetNote(last && last.release)}`)) { toast('Reset.'); ctx.close(); }
     } }, 'Reset the site') : null;
     ctx.mount([back('Runs', ctx.close), card('ACCEPTED', basis === 'customer' ? 'Accepted: this is the process launch will repeat.' : 'Recorded as your own check.',
       el('p', { class: 'hint' }, up ? 'The review site still holds customer data. Reset it now unless you still need it.' : 'Its review site is already gone.'),

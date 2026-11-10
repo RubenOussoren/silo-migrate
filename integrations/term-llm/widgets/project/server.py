@@ -243,7 +243,38 @@ def label(control, body):
         request["confirm"] = "LAUNCH"
     if body.get("replaces_launch") is True:
         request["replaces_launch"] = True
-    return data(control, body.get("workspace"), request)
+    return data(control, body.get("workspace"), request, timeout=3600 if request["kind"] == "base_site" else 90)
+
+
+def release_backup(control, body):
+    workspace, run_id = body.get("workspace"), body.get("run_id")
+    acknowledge = body.get("acknowledge", False)
+    if (not isinstance(workspace, str) or not WORKSPACE.fullmatch(workspace)
+            or not isinstance(run_id, str) or not RUN.fullmatch(run_id) or not isinstance(acknowledge, bool)):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    argv = ["standard", "run", "release", workspace, run_id, "--reviewer", runs.reviewer_name()]
+    if acknowledge:
+        argv.append("--acknowledge-differences")
+    return runs.control_call(control, argv, timeout=3600)
+
+
+def plan_detail(store, control, workspace, plan_id):
+    result = runs.plan_detail(store, control, workspace, plan_id)
+    # Base-site plans name the delivery/version, never the original backup file.
+    base_id = (result.get("roles") or {}).get("base_site")
+    if base_id:
+        result["input_paths"] = {key: value for key, value in (result.get("input_paths") or {}).items() if key != base_id}
+    return result
+
+
+def run_detail(store, control, workspace, run_id):
+    result = runs.run_detail(store, control, workspace, run_id)
+    plan = store.plans(workspace).get(result.get("plan_id")) or {}
+    return dict(result, base_site=(plan.get("body") or {}).get("base_site"))
+
+
+RUN_VIEWS["plan"] = plan_detail
+RUN_VIEWS["run"] = run_detail
 
 
 def removal_plan(control, workspace, keep):
@@ -373,6 +404,8 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("undo") is True:
                     request["undo"] = True
                 result = data(self.server.control, body.get("workspace"), request)
+            elif path == "/api/runs/release":
+                result = release_backup(self.server.control, body)
             elif path in RUN_PATHS:
                 result = runs.decide(runs.Store(self.server.base), self.server.control, action, body)
             elif path in FINDING_PATHS:

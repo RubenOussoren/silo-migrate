@@ -506,7 +506,7 @@ class Removal:
             checkout = ws.root / "converter"
             converter = tree_size(checkout)[0] if plain_dir(checkout, "the converter checkout") else 0
             work = [plural(len(state.get("plans") or {}), "plan"), plural(len(state.get("runs") or {}), "run"),
-                    plural(len(state.get("findings") or {}), "finding"), "labels, notes and decisions"]
+                    plural(len(state.get("findings") or {}), "finding"), "labels, notes and decisions", "backups (including released backups in the output folder)"]
             removed.append(item("Work: " + ", ".join(work), max(total - converter - received_bytes, 0)))
             if converter:
                 unsaved = self.converter_unsaved()

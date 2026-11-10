@@ -8,6 +8,7 @@ import socket
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 WIDGET = ROOT / 'integrations/term-llm/widgets/project'
@@ -80,6 +81,41 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
 
     def calls(self):
         return [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+
+    def test_base_plan_uses_delivery_identity_not_original_backup_filename(self):
+        base_id, checks_id = 'input-' + 'a' * 32, 'input-' + 'b' * 32
+        shown = {'roles': {'base_site': base_id, 'reconciliation': checks_id},
+                 'base_site': {'delivery': {'kind': 'base_site', 'version': 1}},
+                 'input_paths': {base_id: 'inputs/original-sandbox-v20261110123456.sql.gz', checks_id: 'inputs/derived/checks.json'}}
+        with mock.patch.object(self.m.runs, 'plan_detail', return_value=shown):
+            result = self.m.RUN_VIEWS['plan'](None, str(self.control), 'arc', 'plan-' + 'c' * 32)
+        self.assertNotIn('original-sandbox', json.dumps(result))
+        self.assertEqual({checks_id: 'inputs/derived/checks.json'}, result['input_paths'])
+        self.assertEqual(base_id, result['roles']['base_site'])
+
+    def test_release_is_engineer_stamped_validated_and_uses_long_timeout(self):
+        run_id = 'run-' + 'a' * 32
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        result = {'run_id': run_id, 'outbox': '/invented/arc/outbox', 'filename': 'site-v20261110123456.sql.gz',
+                  'sha256': 'a' * 64, 'bytes': 123, 'manifest': 'site-v20261110123456.manifest.json',
+                  'released_at': '2026-11-10T12:00:00Z', 'released_by': 'Engineer'}
+        with mock.patch.object(self.m.runs, 'control_call', return_value=result) as call:
+            for ack in (False, True):
+                status, data, _ = self.request('POST', '/api/runs/release',
+                    {'workspace': 'arc', 'run_id': run_id, 'acknowledge': ack, 'reviewer': 'Injected'}, headers)
+                self.assertEqual((200, result), (status, json.loads(data)))
+                argv = ['standard', 'run', 'release', 'arc', run_id, '--reviewer', self.m.runs.reviewer_name()]
+                call.assert_called_with(str(self.control), argv + (['--acknowledge-differences'] if ack else []), timeout=3600)
+            for bad in ({'workspace': '../x', 'run_id': run_id}, {'workspace': 'arc', 'run_id': 'run-x'},
+                        {'workspace': 'arc', 'run_id': run_id, 'acknowledge': 'yes'}):
+                self.assertEqual(400, self.request('POST', '/api/runs/release', bad, headers)[0])
+            self.assertEqual(2, call.call_count)
+        for headers in ({}, {'Content-Type': 'application/json'}, {'X-Silo-Project': '1', 'Content-Type': 'text/plain'}):
+            self.assertEqual(403, self.request('POST', '/api/runs/release', {'workspace': 'arc', 'run_id': run_id}, headers)[0])
+        with mock.patch.object(self.m.runs, 'control_call', side_effect=self.m.Refused('STANDARD_ARTIFACT_CHANGED')):
+            status, data, _ = self.request('POST', '/api/runs/release', {'workspace': 'arc', 'run_id': run_id},
+                                           {'X-Silo-Project': '1', 'Content-Type': 'application/json'})
+            self.assertEqual((400, 'STANDARD_ARTIFACT_CHANGED'), (status, json.loads(data)['error']))
 
     def test_lists_workspaces_and_new_projects_but_nothing_else(self):
         status, data, _ = self.request('GET', '/api/projects')

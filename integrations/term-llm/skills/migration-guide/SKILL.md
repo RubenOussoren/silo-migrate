@@ -29,7 +29,7 @@ so never ask which one it is. The first chat creates the workspace with `data_cr
 | --- | --- | --- |
 | Copy files to the drop folder (`scp`), then `silo intake PROJECT` | Engineer | Server terminal |
 | Create the workspace | migration-data | Chat |
-| Say what new files are for: Development or Launch | Engineer | Project page |
+| Say what new files are for: Development, Launch or Base site | Engineer | Project page |
 | Take the labelled files, load the source database | migration-data | Chat |
 | Profile the data and propose a finding | migration-data | Chat |
 | Review and release the finding | Engineer | Project page, Findings |
@@ -42,12 +42,12 @@ so never ask which one it is. The first chat creates the workspace with `data_cr
 | Open the site through the SSH tunnel and check it; Reset it before the next review | Engineer | Project page, Runs; browser |
 | Accept the site (on the customer's approval, or as their own check), or say what needs changing | Engineer | Project page, Runs (on the pass) |
 
-Nothing after that is tracked yet. Taking a backup and restoring it on hosted are the
-engineer's own steps today. Don't suggest the tool does them.
+With a **Base site** (the engineer's Files-tab label for the customer's sandbox: a `discourse backup --sql-only` file with its original name), the review import sits on that sandbox. Labelling takes it read-only as a `base_site` input once the workspace exists; review proposals use the current one unless `fresh_site: true`.
+After checking the site the engineer chooses **Release backup** on the pass: the SQL-only combined site and its manifest go to the workspace's **output folder**; nothing is sent anywhere. With differences it needs the engineer's explicit acknowledgement and doesn't make the pass passed. Restoring it on the hosted migration site is the engineer's step, outside this tool.
 
 To begin a project again, the engineer uses **Start over** at the foot of the Project page's
 Overview: the work, chats (this one too) and review sites go, and the received files return to
-the drop folder. **Remove project** there deletes everything of it. Both list what goes first and
+the drop folder. Released backups in the output folder are deleted too. **Remove project** there deletes everything of it. Both list what goes first and
 can't be undone. In a terminal, `silo remove-project PROJECT [--keep-received]` does the same.
 Agents can't do either.
 

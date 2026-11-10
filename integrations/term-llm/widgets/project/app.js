@@ -5,8 +5,8 @@ import { findingsView } from './findings.js';
 
 const POLL_MS = 15000;
 const TABS = [['overview', 'Overview'], ['files', 'Files'], ['findings', 'Findings'], ['runs', 'Runs']];
-const STAGE_NAMES = { files: 'Files', workspace: 'Workspace', source_db: 'Source DB', finding: 'Finding', converter: 'Converter', convert: 'Convert', review: 'Import', site: 'Check site' };
-const state = { projects: [], project: null, tab: 'overview', selected: null, files: null, guide: null, counts: {}, details: false, typing: false, generation: 0, findings: { filter: 'proposed', q: '' }, removal: null };
+const STAGE_NAMES = { files: 'Files', workspace: 'Workspace', source_db: 'Source DB', finding: 'Finding', converter: 'Converter', convert: 'Convert', review: 'Import', site: 'Check site', release: 'Release backup' };
+const state = { projects: [], project: null, tab: 'overview', selected: null, files: null, guide: null, counts: {}, details: false, typing: false, generation: 0, findings: { filter: 'proposed', q: '' }, removal: null, labelResult: null, selectedFiles: null };
 
 const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 const size = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.round(bytes / 1e3)} KB`);
@@ -14,7 +14,7 @@ const day = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { month:
 // IDs and hashes belong in Details, not in the sentence.
 const plain = (text) => text.replace(/\s*\b(?:plan|run|finding)-[0-9a-f]{32}\b/g, '').replace(/\s*\b[0-9a-f]{64}\b/g, '')
   .replace(/ (?:on the Project page|in the (?:Runs|Findings) (?:tab|widget))/g, '').replace(/\s+([.,])/g, '$1');
-const deliveryLabel = (record) => (record.kind === 'launch' ? 'Launch' : `Development v${record.version}`);
+const deliveryLabel = (record) => (record.kind === 'base_site' ? `Base site v${record.version}` : record.kind === 'launch' ? 'Launch' : `Development v${record.version}`);
 const fileText = (record) => {
   const first = (record.files || [])[0];
   const more = (record.file_count || 0) - 1;
@@ -88,12 +88,14 @@ function renderData() {
   if (development) parts.push(el('span', { class: 'badge' }, deliveryLabel(development).toUpperCase()), `${fileText(development)}labelled ${day(development.labelled_at)}`);
   if (launch) parts.push(el('span', { class: 'badge launch' }, 'LAUNCH RECEIVED'));
   if (!parts.length) parts.push(el('span', { class: 'badge none' }, 'NO DATA LABELLED'));
+  const base = newest('base_site');
+  if (base) parts.push(el('span', { class: 'badge' }, deliveryLabel(base)), `sandbox backup · labelled ${day(base.labelled_at)}`);
   $('data').replaceChildren(...parts);
 }
 
 function renderStages() {
   const stages = (state.guide && state.guide.stages) || [];
-  $('stages').replaceChildren(...stages.map((stage) => el('li', { class: stage.state }, STAGE_NAMES[stage.id] || stage.label)));
+  $('stages').replaceChildren(...stages.map((stage) => el('li', { class: stage.state }, stage.id === 'review' && stage.label.startsWith('Import on Base site') ? stage.label : STAGE_NAMES[stage.id] || stage.label)));
 }
 
 function filesWaiting() {
@@ -231,7 +233,7 @@ function renderRemoval() {
     const result = removal.result;
     const done = result.removed || {};
     const lines = (result.returned || []).map((entry) => ({ text: `${entry.to} is back in the drop folder`, bytes: entry.bytes }));
-    lines.push({ text: keep ? 'Work, review sites and the source database removed' : 'Work, files, review sites and the source database removed' });
+    lines.push({ text: keep ? 'Work, released backups, review sites and the source database removed' : 'Work, files, released backups, review sites and the source database removed' });
     if (done.chats) lines.push({ text: `${count(done.chats, 'chat')}${done.attachments ? ` and ${count(done.attachments, 'attachment')}` : ''} removed` });
     return [card(null, null, el('div', { class: 'eyebrow ok' }, keep ? 'STARTED OVER' : 'REMOVED'),
       el('p', { class: 'say' }, keep ? `${project} is ready to start again.` : `${project} has been removed from this server.`),
@@ -254,7 +256,7 @@ function renderRemoval() {
   return [backButton, dangerCard(title, keep ? `Start ${project} again from the beginning?` : `Remove ${project} from this server?`,
     plan.removed.length ? [el('h2', {}, 'REMOVED'), itemList(plan.removed)] : null,
     plan.kept.length ? [el('h2', {}, 'KEPT'), itemList(plan.kept)] : null,
-    el('p', { class: 'hint' }, 'This can\u2019t be undone. A short record of who did it and when is kept.'),
+    el('p', { class: 'hint' }, 'This can\u2019t be undone. Released backups in the output folder are deleted too. A short record of who did it and when is kept.'),
     el('label', { class: 'typed' }, 'Type ', el('b', {}, project), ' to confirm', box),
     el('div', { class: 'actions' }, confirmButton, removal.working ? null : button('Cancel', closeRemoval)),
     removal.working ? el('p', { class: 'hint' }, 'This can take a few minutes. Keep this page open.') : null,
@@ -264,7 +266,9 @@ function renderRemoval() {
 async function submitLabel(kind, extra) {
   try {
     const result = await api('api/label', { workspace: state.project, kind, ...extra });
-    toast(`Labelled as ${result.delivery}.`);
+    toast(`Labelled as ${result.delivery}.${result.checks ? ` Original SQL-only name and gzip checked.${result.checks.discourse_version ? ` Discourse ${result.checks.discourse_version}.` : ''}${result.input ? ' Registered read-only as base_site.' : ' Ready to take as base_site.'}` : ''}`);
+    state.labelResult = result;
+    state.selectedFiles = null;
     state.typing = false;
   } catch (error) {
     toast(explain(error), true);
@@ -277,32 +281,43 @@ function fileRows(items, right) {
 }
 
 function newFilesCard(files) {
-  const list = fileRows(files.unlabelled_files, (entry) => `${size(entry.bytes)} · ${day(new Date(entry.mtime_ns / 1e6).toISOString())}`);
+  const selected = state.selectedFiles || new Set(files.unlabelled_files.map((entry) => entry.path));
+  state.selectedFiles = selected;
+  const list = el('div', { class: 'files' }, files.unlabelled_files.map((entry) => {
+    const box = el('input', { type: 'checkbox', checked: selected.has(entry.path), 'aria-label': `Select ${safe(entry.path)}` });
+    box.addEventListener('change', () => { if (box.checked) selected.add(entry.path); else selected.delete(entry.path); });
+    return el('label', { class: 'file' }, el('span', {}, box, ' ', safe(entry.path)), el('span', {}, `${size(entry.bytes)} · ${day(new Date(entry.mtime_ns / 1e6).toISOString())}`));
+  }));
   const hidden = ((files.counts || {}).unlabelled || 0) - files.unlabelled_files.length;
-  const body = { files: files.unlabelled_files };
+  const body = () => ({ files: files.unlabelled_files.filter((entry) => selected.has(entry.path)) });
   const replacing = files.deliveries.some((record) => record.kind === 'launch' && !record.replaced_by);
   let actions;
   if (state.typing) {
     const box = el('input', { class: 'confirm', placeholder: 'Type LAUNCH', autocomplete: 'off', 'aria-label': 'Type LAUNCH to confirm' });
-    const confirmButton = el('button', { type: 'button', class: 'btn launch', disabled: true, onclick: () => submitLabel('launch', { ...body, confirm: 'LAUNCH', replaces_launch: replacing }) },
+    const confirmButton = el('button', { type: 'button', class: 'btn launch', disabled: true, onclick: () => submitLabel('launch', { ...body(), confirm: 'LAUNCH', replaces_launch: replacing }) },
       replacing ? 'Replace the launch data' : 'These are the launch files');
     box.addEventListener('input', () => { confirmButton.disabled = box.value !== 'LAUNCH'; });
     actions = el('div', { class: 'actions' }, box, confirmButton, el('button', { type: 'button', class: 'btn q', onclick: () => { state.typing = false; render(); } }, 'Cancel'));
   } else {
-    actions = el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', onclick: () => submitLabel('development', body) }, 'Development'),
-      el('button', { type: 'button', class: 'btn q', onclick: () => { state.typing = true; render(); } }, 'Launch'));
+    actions = el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', disabled: !files.initialized, onclick: () => submitLabel('development', body()) }, 'Development'),
+      el('button', { type: 'button', class: 'btn q', disabled: !files.initialized, onclick: () => { state.typing = true; render(); } }, 'Launch'),
+      el('button', { type: 'button', class: 'btn q', onclick: () => submitLabel('base_site', body()) }, 'Base site'));
   }
-  return card('NEW FILES, FOR YOU', 'What are these files for?', list, hidden > 0 ? el('p', { class: 'hint' }, `and ${hidden} more. Label these first, then the rest.`) : null, actions);
+  return card('NEW FILES, FOR YOU', 'What are these files for?', list, hidden > 0 ? el('p', { class: 'hint' }, `and ${hidden} more. Label these first, then the rest.`) : null, actions, el('p', { class: 'hint' }, 'Base site · a backup of the customer’s sandbox, without uploads. Review sites are built on top of it.'));
 }
 
 function renderFiles() {
   const files = state.files;
   if (!files) return [el('p', { class: 'quiet' }, 'Loading…')];
   if (!files.initialized && !files.not_ready_files.length) {
-    return [el('p', { class: 'quiet' }, files.unlabelled_files.length ? 'Files have arrived. Ask migration-data in a chat in this project to create the workspace; then label them here.'
+    return [files.unlabelled_files.length ? newFilesCard(files) : null, el('p', { class: 'quiet' }, files.unlabelled_files.length ? 'Files have arrived. Ask migration-data in a chat in this project to create the workspace; then label them here.'
       : 'No files yet. Copy them to the drop folder with scp, then run silo intake as root.')];
   }
   const out = [];
+  const labelled = state.labelResult;
+  if (labelled && labelled.checks) out.push(card(labelled.delivery, 'SQL-only backup checked.',
+    facts([['File checks', 'Original SQL-only backup name · gzip · regular file'], ['Discourse', labelled.checks.discourse_version || 'Version will be checked in the plan'],
+      ['Input', labelled.input ? 'Registered read-only as base_site' : 'Label recorded; take as base_site after workspace setup']])));
   for (const dataset of files.unlabelled_data) {
     out.push(card('EXISTING DATA, FOR YOU', 'This project has data from before labels existed.',
       el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', onclick: () => submitLabel('development', { dataset_id: dataset }) }, 'Label it Development'))));
@@ -315,7 +330,7 @@ function renderFiles() {
   }
   if (files.initialized && files.unlabelled_files.length) out.push(newFilesCard(files));
   if (files.labelled_files.length) out.push(el('p', { class: 'quiet' }, `${files.labelled_files.length} labelled file(s) are waiting for migration-data to take them.`));
-  const current = [newest('development'), newest('launch')].filter(Boolean);
+  const current = [newest('development'), newest('launch'), newest('base_site')].filter(Boolean);
   const row = (record, old) => el('div', { class: `item static ${old ? 'old' : ''}` }, el('div', {},
     old ? el('span', {}, `${deliveryLabel(record)} · replaced`) : el('span', { class: `badge ${record.kind === 'launch' ? 'launch' : ''}` }, deliveryLabel(record).toUpperCase()),
     el('small', {}, `${fileText(record)}labelled ${day(record.labelled_at)} by ${safe(record.labelled_by)}`)));
@@ -378,6 +393,7 @@ function choose(project) {
     return;
   }
   state.project = project;
+  state.selectedFiles = null; state.labelResult = null;
   state.files = state.guide = null;
   state.counts = {};
   state.selected = null;

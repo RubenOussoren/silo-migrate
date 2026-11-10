@@ -39,6 +39,12 @@ def _step(kind, plan, run):
             "finished_at": run.get("finished_at"), "checks": results.get("reconciliation_checks") or 0,
             "matched": results.get("reconciliation_matched") or 0, "differ": results.get("reconciliation_differs") or 0,
             "errors": results.get("reconciliation_errors") or 0, "import_issues": results.get("import_issues")}
+    base = plan.get("base_site") or {}
+    delivery = base.get("delivery") or {}
+    step.update(base_site=("Base site v%s" % delivery.get("version")) if base else None,
+                base_site_details=base, backup=(run.get("artifacts") or {}).get("backup"), release=run.get("release"),
+                backup_state="released" if run.get("release") else "ready" if (run.get("artifacts") or {}).get("backup") else "none",
+                results=results)
     return step
 
 
@@ -92,7 +98,7 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=
         source = (body.get("from_run") or {}).get("run_id")
         group = next((candidate for candidate in groups.values() if candidate["convert"]["run_id"] and candidate["convert"]["run_id"] == source), None)
         if group:
-            step = _step("import", plan, run)
+            step = _step("import", dict(plan, base_site=body.get("base_site")), run)
             step["site_up"] = bool(run and review_sites.get(run.get("run_id")))
             step["review"] = verdicts.get(run.get("run_id")) if run else None
             group["imports"].append(step)
@@ -102,6 +108,9 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=
         group["number"] = number
         group["imports"].sort(key=lambda step: _t(step["started_at"]))
         group["status"] = pass_status(group)
+        latest = group["imports"][-1] if group["imports"] else {}
+        for key in ("base_site", "backup_state", "release"):
+            group[key] = latest.get(key, "none" if key == "backup_state" else None)
     used = {}
     for group in ordered:
         if group["convert"]["run_id"]:

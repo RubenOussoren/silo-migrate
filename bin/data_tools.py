@@ -397,13 +397,15 @@ def op_status(ws, request):
     meta = ws.meta()
     state = ws.named_state()
     inputs = []
+    deliveries = read_deliveries(ws)
     for record in list(state.get("inputs", {}).values())[:200]:
         try:
             path = base64.b64decode(record["path"]).decode("utf-8", "replace")
         except (ValueError, KeyError):
             path = None
         inputs.append({"input_id": record.get("id"), "path": path, "type": record.get("type"), "bytes": record.get("bytes"),
-                       "sha256": record.get("sha256"), "dataset_id": record.get("dataset_id")})
+                       "sha256": record.get("sha256"), "dataset_id": record.get("dataset_id"),
+                       "delivery": delivery_label(deliveries[record["dataset_id"]]) if record.get("dataset_id") in deliveries else None})
     result.update(platform=meta.get("platform"), source_id=meta.get("source_id"), dataset_id=meta.get("dataset_id"),
                   converter=(ws.root / "converter").is_dir(), standard=(ws.root / ".silo-migrate/named/standard/state.json").is_file(),
                   inputs=inputs)
@@ -414,6 +416,12 @@ def op_status(ws, request):
     db = ws.read_json(ws.data / "db" / "state.json", None) if (ws.data / "db").is_dir() else None
     result["source_db"] = {key: db.get(key) for key in ("engine", "created_at", "loads")} if db else None
     return result
+
+
+def input_identity(ws, relative):
+    record = find_registered(ws, relative) or {}
+    delivery = read_deliveries(ws).get(record.get("dataset_id"))
+    return {"input_type": record.get("type"), "delivery": delivery_label(delivery) if delivery else None}
 
 
 def op_list(ws, request):
@@ -449,6 +457,8 @@ def op_list(ws, request):
                         os.close(child)
                 except OSError:
                     entry["kind"] = "unreadable"
+                if area == "inputs":
+                    entry.update(input_identity(ws, "/".join([area, *parts, name])))
                 entries.append(entry)
             else:
                 entries.append({"name": name, "type": "symlink" if stat.S_ISLNK(info.st_mode) else "other", "note": "ignored by every tool"})
@@ -476,6 +486,8 @@ def op_peek(ws, request):
         os.close(root)
     try:
         result = {"area": area, "path": "/".join(parts), "bytes": info.st_size, "mode": mode, **describe(fd)}
+        if area == "inputs":
+            result.update(input_identity(ws, "/".join([area, *parts])))
         if mode == "head":
             offset = request.get("offset", 0)
             if not isinstance(offset, int) or offset < 0:
@@ -772,7 +784,7 @@ def move_in(ws, meta, src_root, parts, dest_fd, name, relative, kind, provenance
 # dataset. The record is kept beside the workspace's registry rather than in it, so that a rollback
 # to a release that doesn't know about deliveries can still read the registry.
 
-DELIVERY_KINDS = ("development", "launch")
+DELIVERY_KINDS = ("development", "launch", "base_site")
 MAX_LABELLED_BY = 120
 MAX_DROP_FILES = 10000
 SHOWN_FILES = 200
@@ -800,7 +812,8 @@ def write_deliveries(ws, records):
 
 
 def delivery_label(record):
-    return "Development v%d" % record["version"] if record["kind"] == "development" else "Launch"
+    return ("Base site v%d" % record["version"] if record["kind"] == "base_site" else
+            "Development v%d" % record["version"] if record["kind"] == "development" else "Launch")
 
 
 def drop_listing(ws):
@@ -895,7 +908,9 @@ def refuse_if_copy_of_other_kind(ws, records, kind, fd, info, entry):
     """Development and launch data that are byte-for-byte the same is almost certainly the wrong
     file. Only files of the same size are hashed, so this costs nothing in the normal case. The
     refusal is kept on the file, so the guide asks the engineer to remove it."""
-    other = {dataset_id for dataset_id, record in records.items() if record["kind"] != kind}
+    if kind == "base_site":
+        return
+    other = {dataset_id for dataset_id, record in records.items() if record["kind"] not in (kind, "base_site")}
     candidates = [record for record in (ws.named_state().get("inputs") or {}).values()
                   if record.get("dataset_id") in other and record.get("bytes") == info.st_size]
     if candidates:
@@ -923,9 +938,15 @@ def job_delivery(ws, request):
     if not records:  # a project from before labels: everything, as before
         return None, None
     wanted = request.get("delivery")
+    if wanted is None and all(record.get("kind") == "base_site" for record in records.values()):
+        # A Base site label must not switch pre-label source-data jobs into labelled mode,
+        # nor add the sandbox to their old whole-inputs mount.
+        datasets = {item.get("dataset_id") for item in (ws.named_state().get("inputs") or {}).values()
+                    if item.get("dataset_id") not in records}
+        return None, [mount for dataset in datasets for mount in delivery_mounts(ws, dataset)]
     if wanted is None:
         holding = {record.get("dataset_id") for record in (ws.named_state().get("inputs") or {}).values()}
-        candidates = [dataset_id for dataset_id in records if dataset_id in holding and not records[dataset_id].get("replaced_by")]
+        candidates = [dataset_id for dataset_id in records if dataset_id in holding and records[dataset_id].get("kind") != "base_site" and not records[dataset_id].get("replaced_by")]
         if len(candidates) != 1:
             refuse("STANDARD_ARGUMENTS_INVALID: delivery (this project has more than one: give the dataset_id from data_guide)")
         wanted = candidates[0]
@@ -976,10 +997,35 @@ def op_deliveries(ws, request):
             "counts": {key: len(value) for key, value in groups.items()}, "unlabelled_data": unlabelled_data(ws, records)}
 
 
+BASE_SITE_NAME = re.compile(r"-v(?:(\d{4}-\d{1,2}-\d+(?:-latest(?:-\d+)?)?)-)?(\d{14})\.sql\.gz$")
+
+
+def validate_base_site(ws, files):
+    if len(files) != 1:
+        refuse("STANDARD_BASE_SITE_INVALID: select exactly one SQL-only Discourse backup")
+    parts = parts_of(files[0]["path"])
+    match = BASE_SITE_NAME.search(parts[-1])
+    if not match:
+        refuse("STANDARD_BASE_SITE_INVALID: keep the original backup name and take it without uploads (discourse backup --sql-only)")
+    root = ws.open_area("intake")
+    try:
+        fd, info = open_regular(root, parts)
+        try:
+            identity = {"path": "/".join(parts), "bytes": info.st_size, "mtime_ns": str(info.st_mtime_ns),
+                        "ctime_ns": str(info.st_ctime_ns), "ino": str(info.st_ino)}
+            if (info.st_uid != os.getuid() or info.st_nlink != 1
+                    or any(identity[key] != files[0].get(key) for key in IDENTITY) or os.read(fd, 2) != b"\x1f\x8b"):
+                refuse("STANDARD_BASE_SITE_INVALID: not an unchanged gzip SQL-only backup")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root)
+    return {"filename": True, "gzip": True, "sql_only_name": True, "discourse_version": match[1].replace("-", ".", 2) if match[1] else None}
+
+
 def op_delivery_label(ws, request):
     """Set what a delivery is for. Engineer only, from the Project page. A label never changes."""
     engineer_only(ws)
-    ws.require(standard=False)
     kind, by = request.get("kind"), request.get("by")
     if kind not in DELIVERY_KINDS:
         refuse("STANDARD_ARGUMENTS_INVALID: kind")
@@ -987,6 +1033,14 @@ def op_delivery_label(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID: by")
     if kind == "launch" and request.get("confirm") != "LAUNCH":
         refuse("STANDARD_DELIVERY_CONFIRM_LAUNCH")
+    if not ws.initialized():
+        if kind != "base_site":
+            refuse("STANDARD_NOT_INITIALIZED")
+        wanted = request.get("files")
+        if not isinstance(wanted, list) or not all(isinstance(item, dict) for item in wanted):
+            refuse("STANDARD_BASE_SITE_INVALID: select exactly one SQL-only Discourse backup")
+        validate_base_site(ws, wanted)  # before even creating the named workspace
+        ws.control(["named", "init", ws.name])
     with ws.lock():
         records, meta = read_deliveries(ws), ws.meta()
         same_kind = [record for record in records.values() if record["kind"] == kind]
@@ -1002,7 +1056,7 @@ def op_delivery_label(ws, request):
             if kind != "development" or dataset_id not in holding or "files" in request:
                 refuse("STANDARD_ARGUMENTS_INVALID: dataset_id")
         else:
-            if holding:
+            if holding and kind != "base_site":
                 refuse("STANDARD_DELIVERY_LABEL_EXISTING_FIRST")
             wanted = request.get("files")
             if not isinstance(wanted, list) or not wanted or not all(isinstance(item, dict) for item in wanted):
@@ -1013,18 +1067,29 @@ def op_delivery_label(ws, request):
                 if not seen or any(seen[key] != item.get(key) for key in IDENTITY):
                     refuse("STANDARD_DELIVERY_FILES_CHANGED: the files changed since the page loaded")
             files = [{key: current[item["path"]][key] for key in IDENTITY} for item in wanted]
-            if untagged and not any(record.get("dataset_id") == untagged[0] for record in (state.get("inputs") or {}).values()):
+            checks = validate_base_site(ws, files) if kind == "base_site" else None
+            if kind != "base_site" and untagged and not any(record.get("dataset_id") == untagged[0] for record in (state.get("inputs") or {}).values()):
                 dataset_id = untagged[0]
             else:
-                dataset_id = json.loads(ws.control(["named", "dataset", "add", ws.name, "--source", meta["source_id"], "--label", kind]))["dataset_id"]
+                source_id = meta.get("source_id")
+                if not source_id and kind == "base_site":
+                    source_id = json.loads(ws.control(["named", "source", "add", ws.name, "--platform", "discourse"]))["source_id"]
+                if not source_id:
+                    refuse("STANDARD_NOT_INITIALIZED")
+                dataset_id = json.loads(ws.control(["named", "dataset", "add", ws.name, "--source", source_id, "--label", kind]))["dataset_id"]
         version = 1 + max((record["version"] for record in same_kind), default=0)
         record = {"dataset_id": dataset_id, "kind": kind, "version": version, "labelled_at": now(), "labelled_by": by.strip(), "files": files,
                   "sequence": 1 + max((record.get("sequence", 0) for record in records.values()), default=0)}
-        for old in current_launch:  # its files, labelled but not taken, can't be taken any more
+        for old in ([r for r in same_kind if not r.get("replaced_by")] if kind == "base_site" else current_launch):  # its files, labelled but not taken, can't be taken any more
             old["replaced_by"] = dataset_id
         records[dataset_id] = record
         write_deliveries(ws, records)
-    return {"dataset_id": dataset_id, "kind": kind, "delivery": delivery_label(record), "files": len(files)}
+    result = {"dataset_id": dataset_id, "kind": kind, "delivery": delivery_label(record), "files": len(files)}
+    if kind == "base_site":
+        result["checks"] = checks
+        if (ws.root / ".silo-migrate/named/standard/state.json").is_file():
+            result["input"] = op_take(ws, {"path": files[0]["path"], "type": "base_site"})
+    return result
 
 
 # -- findings the engineer marks done ---------------------------------------------------------
@@ -1296,13 +1361,18 @@ def op_take(ws, request):
     name = dest_name(request.get("name"), parts[-1])
     with ws.lock():
         meta = ws.meta()
-        if not meta.get("dataset_id"):
+        # A labelled Base site supplies its own dataset, including in workspaces
+        # created through the Ruby CLI without migration-data's default dataset.
+        if not meta.get("dataset_id") and kind != "base_site":
             refuse("STANDARD_NOT_INITIALIZED")
         root, inputs = ws.open_area("intake"), None
         try:
             inputs = ws.open_area("inputs")
             pending = ws.read_json(pending_for(ws, "inputs/" + name), None)
             dataset, inode = delivery_of_take(ws, root, parts, inputs, name, "inputs/" + name)
+            base = (read_deliveries(ws).get(dataset) or {}).get("kind") == "base_site"
+            if base != (kind == "base_site"):
+                refuse("STANDARD_BASE_SITE_TYPE: Base site files must be taken as base_site; other deliveries cannot use that type")
             result = move_in(ws, dict(meta, dataset_id=dataset), root, parts, inputs, name, "inputs/" + name, kind,
                              {"event": "take", "from": "intake/" + "/".join(parts), "dataset_id": dataset}, inode=inode)
             # A resumed take marks the file it started with, whatever path this call named.
@@ -1322,6 +1392,8 @@ def op_register(ws, request):
     kind = request.get("type")
     if not isinstance(kind, str) or not TYPE.fullmatch(kind) or len(parts) < 2 or not WORK_NAME.fullmatch(parts[0]):
         refuse("STANDARD_ARGUMENTS_INVALID: type or path")
+    if kind == "base_site":
+        refuse("STANDARD_BASE_SITE_TYPE: only the engineer can label an original Base site backup")
     name = dest_name(request.get("name"), parts[0] + "-" + parts[-1])
     with ws.lock():
         meta = ws.meta()
@@ -1330,9 +1402,10 @@ def op_register(ws, request):
             refuse("STANDARD_BUSY")
         producer = next((job for job in reversed(jobs) if job.get("into") == parts[0]), None)
         # An output belongs to the delivery its job read, never to whichever was labelled last.
-        if read_deliveries(ws):
-            dataset = producer.get("dataset_id") if producer else None
-            if dataset not in read_deliveries(ws):
+        records = read_deliveries(ws)
+        dataset = producer.get("dataset_id") if producer else None
+        if any(record.get("kind") != "base_site" for record in records.values()) or dataset in records:
+            if dataset not in records:
                 refuse("STANDARD_DELIVERY_UNLABELLED: this output's job didn't read one labelled delivery; run the job again")
             meta = dict(meta, dataset_id=dataset)
         root, inputs, derived = ws.open_area("work"), None, None
@@ -1475,8 +1548,10 @@ def op_extract(ws, request):
     with ws.lock():
         source = registered(ws, "/".join(parts))
         digest = source["sha256"]
-        dataset = source.get("dataset_id") if read_deliveries(ws) else None
-        if dataset is not None and dataset not in read_deliveries(ws):
+        records = read_deliveries(ws)
+        labelled_mode = any(record.get("kind") != "base_site" for record in records.values()) or source.get("dataset_id") in records
+        dataset = source.get("dataset_id") if labelled_mode else None
+        if dataset is not None and dataset not in records:
             refuse("STANDARD_DELIVERY_UNLABELLED")
         root = ws.open_area("inputs")
         try:
@@ -1486,7 +1561,7 @@ def op_extract(ws, request):
             os.close(root)
         out = work_dir(ws, request.get("into"))
         command = ["-s", "KILL", str(limit * 60), "python3", "-I", "/silo/bin/data_extract.py", "/in/" + "/".join(parts[1:]), "/out"]
-        mounts = None if dataset is None else delivery_mounts(ws, dataset)
+        mounts = job_delivery(ws, {})[1] if dataset is None else delivery_mounts(ws, dataset)
         record = start_job(ws, "extract", out.name, lambda name: sandbox_argv(ws, name, out, [], command, mounts),
                            {"source": {"path": "/".join(parts), "sha256": digest}, "timeout_minutes": limit, "dataset_id": dataset})
     return {"job_id": record["id"], "status": "running", "into": "work/" + out.name, "next": "poll data_job"}
@@ -1818,6 +1893,7 @@ def op_db_load(ws, request):
     limit = minutes({"timeout_minutes": request.get("timeout_minutes", 120)})
     if charset not in CHARSETS:
         refuse("STANDARD_ARGUMENTS_INVALID: charset")
+    refuse_base_roles(ws, [(registered(ws, "/".join(parts)) or {}).get("id")])
     names = db_names(ws)
     with ws.lock():
         state = db_state(ws)
@@ -1829,6 +1905,7 @@ def op_db_load(ws, request):
         if network_safe(ws) is not True:
             refuse("STANDARD_DB_NETWORK_UNSAFE")
         record = registered(ws, "/".join(parts))
+        refuse_base_roles(ws, [record.get("id")])
         root = ws.open_area("inputs")
         try:
             fd, info = open_regular(root, parts[1:])
@@ -2288,7 +2365,20 @@ def run_of(ws, request):
 
 def op_run_evidence(ws, request):
     run_id = run_of(ws, request)
-    return {"run_id": run_id, "evidence": json.loads(ws.control(["standard", "analyst", "evidence", ws.name, run_id]))}
+    evidence = json.loads(ws.control(["standard", "analyst", "evidence", ws.name, run_id]))
+    run = (standard_state(ws).get("runs") or {}).get(run_id) or {}
+    # Private analyst evidence, never the engineer/public run projection.
+    results = run.get("results") or {}
+    if results.get("base_site"):
+        evidence["base_site"] = {key: results.get(key) for key in
+                                 ("base_site_newer_migrations", "prior_import_id_rows")}
+    # Backup identity and release metadata, not arbitrary private artifact paths.
+    if (run.get("artifacts") or {}).get("backup"):
+        evidence["backup"] = {key: run["artifacts"]["backup"].get(key) for key in ("filename", "sha256", "bytes", "label")}
+    if run.get("release"):
+        evidence["release"] = {key: run["release"].get(key) for key in
+                               ("released_at", "released_by", "sha256", "filename", "outbox", "manifest", "acknowledged_differences")}
+    return {"run_id": run_id, "evidence": evidence}
 
 
 def op_run_count(ws, request):
@@ -2307,6 +2397,44 @@ def op_run_count(ws, request):
 INPUT_ID = re.compile(r"input-[0-9a-f]{32}\Z")
 
 
+def refuse_base_roles(ws, ids):
+    state = ws.named_state().get("inputs") or {}
+    records = read_deliveries(ws)
+    if any(key in ids and (item.get("type") == "base_site" or (records.get(item.get("dataset_id")) or {}).get("kind") == "base_site")
+           for key, item in state.items()):
+        refuse("STANDARD_BASE_SITE_ROLE: a Base site is not source data, settings or count checks")
+
+
+def base_site_warning(base):
+    return ("The sandbox is on a newer schema (%s) than this server's Discourse (%s). Normal for hosted sandboxes. It will be restored anyway." %
+            (base.get("schema_version"), base.get("site_schema_version")))
+
+
+def review_base_site(ws, request):
+    fresh, explicit = request.get("fresh_site", False), request.get("base_site")
+    if not isinstance(fresh, bool) or ("fresh_site" in request and "base_site" in request):
+        refuse("STANDARD_ARGUMENTS_INVALID: choose base_site or fresh_site, not both")
+    inputs = ws.named_state().get("inputs") or {}
+    records = read_deliveries(ws)
+    if "base_site" in request:
+        if not isinstance(explicit, str) or not INPUT_ID.fullmatch(explicit):
+            refuse("STANDARD_ARGUMENTS_INVALID: base_site must be an input id")
+        item = inputs.get(explicit)
+        if not item or item.get("type") != "base_site":
+            refuse("STANDARD_BASE_SITE_INVALID: base_site must name a registered Base site input")
+        return explicit
+    if fresh:
+        return None
+    current = sorted((r for r in records.values() if r.get("kind") == "base_site" and not r.get("replaced_by")), key=lambda r: r.get("sequence", 0))
+    if not current:
+        return None
+    record = current[-1]
+    found = next((key for key, item in inputs.items() if item.get("dataset_id") == record["dataset_id"] and item.get("type") == "base_site"), None)
+    if not found:
+        refuse("STANDARD_BASE_SITE_NOT_TAKEN: take the labelled Base site file with data_take type=base_site, then propose again (or choose fresh_site=true)")
+    return found
+
+
 def op_plan_propose(ws, request):
     """Propose conversion from inputs or review from a completed convert run.
     Only a proposal: the engineer approves and starts it."""
@@ -2319,21 +2447,31 @@ def op_plan_propose(ws, request):
         reconciliation = request.get("reconciliation")
         if reconciliation is not None and (not isinstance(reconciliation, str) or not INPUT_ID.fullmatch(reconciliation)):
             refuse("STANDARD_ARGUMENTS_INVALID: reconciliation")
+        refuse_base_roles(ws, [reconciliation])
+        base_input = review_base_site(ws, request)
         argv = ["standard", "plan", "propose", ws.name, "--operation", "review", "--from-run", from_run]
+        if base_input:
+            argv += ["--base-site", base_input]
         if reconciliation is not None:
             argv += ["--reconciliation", reconciliation]
         # The proposal hashes the convert run's intermediate database (can be GBs).
         plan = json.loads(ws.control(argv, timeout=120))
         return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "platform", "from_run",
-                                                  "roles", "inputs", "limits", "mutations", "not_included")},
+                                                  "roles", "inputs", "limits", "mutations", "not_included", "base_site")},
                 "instances": {"review": {"port": ((plan.get("instances") or {}).get("review") or {}).get("port")}},
-                "next": "Tell the engineer the plan is waiting in the Project page's Runs tab, where they approve and start it. Access the review site via an SSH tunnel; it stays until Reset."}
+                "next": ("Tell the engineer the review %s is waiting in the Project page's Runs tab, where they approve and start it. " %
+                         ("on " + delivery_label((plan.get("base_site") or {}).get("delivery") or {"kind": "base_site", "version": 1}) if plan.get("base_site") else "on a fresh site") +
+                         (base_site_warning(plan["base_site"]) + " " if (plan.get("base_site") or {}).get("ahead") else "") +
+                         "Access the review site via an SSH tunnel; it stays until Reset.")}
     roles = {key: request.get(key) for key in ("source", "settings", "reconciliation")}
     charset = request.get("charset", "utf8mb4")
     if roles["reconciliation"] is None:
         del roles["reconciliation"]
     if not all(isinstance(value, str) and INPUT_ID.fullmatch(value) for value in roles.values()) or charset not in CHARSETS:
         refuse("STANDARD_ARGUMENTS_INVALID: source, settings, reconciliation or charset")
+    refuse_base_roles(ws, roles.values())
+    if "base_site" in request or "fresh_site" in request:
+        refuse("STANDARD_ARGUMENTS_INVALID: base_site and fresh_site are review options")
     argv = ["standard", "plan", "propose", ws.name, "--operation", "convert", "--charset", charset,
             *[flag for key, value in roles.items() for flag in ("--" + key, value)]]
     prepared = None
@@ -2542,6 +2680,7 @@ def guide_records(ws):
                      "stage": run.get("stage"), "started_at": run.get("started_at") or "", "finished_at": run.get("finished_at"),
                      "checks": results.get("reconciliation_checks") or 0, "matched": results.get("reconciliation_matched") or 0,
                      "differ": results.get("reconciliation_differs") or 0, "errors": results.get("reconciliation_errors") or 0,
+                     "release": run.get("release"), "backup": (run.get("artifacts") or {}).get("backup"),
                      "import_issues": results.get("import_issues"), "failure": failure.get("code") if isinstance(failure, dict) else None})
     sites = [{"run_id": site.get("run_id"), "state": site.get("state"), "live": site.get("live"), "port": site.get("port")}
              for site in status.get("instances", []) if site.get("role") == "review" and site.get("state") != "removed"]
@@ -2637,7 +2776,8 @@ def guide_flow(ws, facts, records, site=NO_SITE):
             return ("agent", "Create the workspace with data_create (ask the engineer for the source platform if it isn't clear). The engineer then labels the files.", "this chat")
         return copy_files
     if facts["labelled_files"]:
-        return ("agent", "Take the labelled files in the drop folder with data_take, each with a clear type.", "this chat")
+        return ("agent", "Take the labelled files in the drop folder with data_take, each with a clear type." +
+                (" Base site files must use type=base_site; never load them as source data." if facts.get("base_site") else ""), "this chat")
     if not facts["inputs"]:
         return copy_files
     runs = records["runs"]
@@ -2684,8 +2824,15 @@ def guide_stages(facts, records, site=NO_SITE):
             "convert": guide_passed(convert), "review": guide_passed(review) and review["started_at"] >= (convert or {}).get("started_at", "")}
     # Accepted on the customer's approval, for the latest import.
     done["site"] = bool(done["review"] and site["accepted"] and site["accepted"]["run_id"] == review["run_id"])
-    current = next((key for key, _label in GUIDE_STAGES if not done[key]), "accepted")
-    stages = [{"id": key, "label": label, "state": "done" if done[key] else "current" if key == current else "to_do"} for key, label in GUIDE_STAGES]
+    stages_spec = GUIDE_STAGES
+    if facts.get("base_site"):
+        stages_spec = tuple((key, "Import on " + facts["base_site"] if key == "review" else "Check site" if key == "site" else label)
+                            for key, label in GUIDE_STAGES) + (("release", "Release backup"),)
+        done["site"] = bool(done["review"] and any((site.get(key) or {}).get("run_id") == review["run_id"] for key in ("checked", "accepted")))
+        passed = [run for run in runs if run.get("kind") == "review" and guide_passed(run)]
+        done["release"] = bool(passed and passed[-1].get("release"))
+    current = next((key for key, _label in stages_spec if not done[key]), "accepted")
+    stages = [{"id": key, "label": label, "state": "done" if done[key] else "current" if key == current else "to_do"} for key, label in stages_spec]
     return current, stages
 
 
@@ -2698,7 +2845,7 @@ def guide_data(records):
         if not record.get("replaced_by"):
             newest.setdefault(record["kind"], record["dataset_id"])
     label_of = lambda kind: delivery_label(records[newest[kind]]) if kind in newest else None  # noqa: E731
-    return {"development": label_of("development"), "launch": label_of("launch"),
+    return {"development": label_of("development"), "launch": label_of("launch"), "base_site": label_of("base_site"),
             "note": None if ordered else "no data is labelled yet: only the engineer can say what files are for",
             "deliveries": [{"label": delivery_label(record), "kind": record["kind"], "dataset_id": record["dataset_id"], "labelled_at": record["labelled_at"],
                             "state": "current" if newest.get(record["kind"]) == record["dataset_id"] else "replaced"} for record in ordered]}
@@ -2715,8 +2862,9 @@ def op_guide(ws, request):
     groups = split_drop_files(ws, deliveries) if ws.initialized() else {"labelled": [], "unlabelled": [], "refused": [], "not_ready": []}
     unlabelled = groups["unlabelled"]
     not_labelled = unlabelled_data(ws, deliveries) if ws.initialized() else []
-    facts = {"initialized": ws.initialized(), "drop_files": drop_files, "labelled_files": len(groups["labelled"]), "inputs": len(state.get("inputs") or {}),
-             "db_loaded": bool(db and db.get("loads"))}
+    facts = {"initialized": ws.initialized() and (ws.root / ".silo-migrate/named/standard/state.json").is_file(), "drop_files": drop_files, "labelled_files": len(groups["labelled"]), "inputs": sum(1 for item in (state.get("inputs") or {}).values()
+                           if item.get("type") != "base_site" and (deliveries.get(item.get("dataset_id")) or {}).get("kind") != "base_site"),
+             "db_loaded": bool(db and db.get("loads")), "base_site": guide_data(deliveries)["base_site"]}
     records = guide_records(ws) if ws.initialized() else {"plans": [], "runs": [], "sites": [], "findings": [], "pushes": [], "warning": None}
     site_warning = None
     try:
@@ -2731,7 +2879,7 @@ def op_guide(ws, request):
         waiting.append({"what": "Label the data already in this project as Development on the Project page.", "where": "Project page"})
     if unlabelled:
         arrived = "1 new file arrived" if len(unlabelled) == 1 else "%d new files arrived" % len(unlabelled)
-        waiting.append({"what": arrived + ": say what they're for (Development or Launch) on the Project page.", "where": "Project page"})
+        waiting.append({"what": arrived + ": say what they're for (Development, Launch or Base site) on the Project page.", "where": "Project page"})
     if groups["refused"]:
         waiting.append({"what": "%d labelled file(s) can't be taken: each is identical to data of the other kind. Remove them from the drop folder." % len(groups["refused"]),
                         "where": "server terminal"})
@@ -2767,6 +2915,15 @@ def op_guide(ws, request):
     else:
         step = guide_flow(ws, facts, records, site)
     current, stages = guide_stages(facts, records, site)
+    if facts.get("base_site") and not active and not waiting and not records["warning"]:
+        if current == "review" and step[0] == "agent" and step[1].startswith("Propose a review import"):
+            step = ("agent", "Propose the review import on %s with data_plan_propose; the engineer approves and starts it on the Project page." % facts["base_site"], "this chat")
+        elif current == "site" and step[0] == "engineer":
+            step = ("engineer", "Check the site through the SSH tunnel, then record your own check on its pass. Next, release the backup for customer review.", "Runs tab")
+        elif current == "release":
+            step = ("engineer", "Release backup on the newest passed pass. Then copy it from the output folder and restore it on the hosted migration site; that restore is outside this tool.", "Runs tab")
+        elif current == "accepted":
+            step = ("engineer", "Copy the released backup from the output folder and restore it on the hosted migration site. That restore is outside this tool.", "Runs tab")
     return {"project": ws.name, "stage": current, "stages": stages, "happening": happening, "waiting_on_engineer": waiting,
             "next": {"who": step[0], "action": step[1], "where": step[2]}, "also": also,
             "plans": records["plans"][-GUIDE_RECENT:][::-1], "runs": records["runs"][-GUIDE_RECENT:][::-1],

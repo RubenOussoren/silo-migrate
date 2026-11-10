@@ -282,7 +282,7 @@ class RemoveTest(unittest.TestCase):
         self.assertEqual('start_over', plan['mode'])
         removed = [item['text'] for item in plan['removed']]
         kept = [item['text'] for item in plan['kept']]
-        self.assertEqual('Work: 2 plans, 2 runs, 1 finding, labels, notes and decisions', removed[0])
+        self.assertEqual('Work: 2 plans, 2 runs, 1 finding, labels, notes and decisions, backups (including released backups in the output folder)', removed[0])
         self.assertIn('Converter checkout on this server', removed)
         self.assertEqual(9, len(self.mine()))
         self.assertIn('1 review site and the source database (9 Docker objects)', removed)
@@ -327,6 +327,11 @@ class RemoveTest(unittest.TestCase):
     # -- start over ------------------------------------------------------------------------------
 
     def test_start_over_returns_the_received_files_and_removes_everything_else(self):
+        outbox = self.base / 'arc/outbox'
+        outbox.mkdir()
+        (outbox / 'released.sql.gz').write_bytes(b'invented backup')
+        (outbox / 'released.manifest.json').write_text('{}')
+        self.assertIn('released backups', str(self.removal(keep=True).plan()))
         result = self.removal(keep=True).run('arc', 'Ruben')
         self.assertEqual('done', result['status'])
         # The received file is back where it came from, the account's to label again.
@@ -402,6 +407,11 @@ class RemoveTest(unittest.TestCase):
     # -- remove ----------------------------------------------------------------------------------
 
     def test_remove_takes_everything_and_archives_the_web_ui_project(self):
+        outbox = self.base / 'arc/outbox'
+        outbox.mkdir()
+        (outbox / 'released.sql.gz').write_bytes(b'invented backup')
+        (outbox / 'released.manifest.json').write_text('{}')
+        self.assertIn('released backups', str(self.removal().plan()))
         server = http.server.HTTPServer(('127.0.0.1', 0), Archive)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)

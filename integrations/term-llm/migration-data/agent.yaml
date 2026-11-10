@@ -6,7 +6,8 @@ allowed_models:
   - cdck_frontier:CDCK/MoM
 workspace: none
 agents_md: "false"
-search: false
+# Public reference only; customer values must never leave in web requests.
+search: true
 max_turns: 60
 # Skills shipped with the release (integrations/term-llm/skills, linked as the account's
 # ~/.config/term-llm/skills). term-llm 0.9.93 can't give an agent a subset: a bare name list
@@ -210,7 +211,7 @@ tools:
         required: [run_id, side, sql]
         additionalProperties: false
     - name: data_plan_propose
-      description: "Propose a local review import with from_run (completed convert run ID; no source/settings/charset), or a convert-only workflow run on real data (no import): the registered source dump, the converter settings (type converter-settings, with ${SILO_DB_*} placeholders) and optionally reconciliation checks (type reconciliation), by input ID. Convert proposals prepare the converter's locked gems first if needed; review proposals skip refresh/dependencies. Returns the plan ID and digest; the engineer approves and starts it."
+      description: "Propose a local review import with from_run (completed convert run ID; no source/settings/charset), or a convert-only workflow run on real data (no import): the registered source dump, the converter settings (type converter-settings, with ${SILO_DB_*} placeholders) and optionally reconciliation checks (type reconciliation), by input ID. Convert proposals prepare the converter's locked gems first if needed; review proposals skip refresh/dependencies. Review proposals automatically use the current registered Base site. Use base_site to select a specific input, or fresh_site: true to opt out; never supply both. Base site inputs cannot be source, settings or reconciliation. Returns the plan ID and digest; the engineer approves and starts it."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 295
@@ -222,6 +223,8 @@ tools:
           settings: {type: string, description: "Input ID of the converter settings (type converter-settings)"}
           reconciliation: {type: string, description: "Input ID of the reconciliation checks (type reconciliation); optional"}
           charset: {type: string, enum: [utf8mb4, utf8mb3, utf8, latin1, binary], description: "Client character set for loading the dump; default utf8mb4"}
+          base_site: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Review only: registered Base site input ID; mutually exclusive with fresh_site. Omit both to use the current Base site automatically."}
+          fresh_site: {type: boolean, description: "Review only: true proposes on a fresh site instead of the current Base site; mutually exclusive with base_site."}
         additionalProperties: false
     - name: data_propose_finding
       description: "Propose a finding privately for the engineer. Without run_id: a schema finding (tables, columns, counts, invented example rows) for converter work. With run_id: the cause of a failed run. Never include real customer values. The engineer decides what is released to coding agents."
@@ -273,4 +276,52 @@ tools:
         properties:
           text: {type: string, description: "The whole notes document, not a diff"}
         required: [text]
+        additionalProperties: false
+
+    - name: data_branch_resolve
+      description: "Resolve a private converter repository URL or PR number without web tools: pull, tree, blob, compare or commit. Returns branch/path/lines/base/sha as applicable; pass sha as branch when there is no branch head. Shares the branches fetch throttle."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 90
+      input:
+        type: object
+        properties:
+          link: {type: string, maxLength: 2048, description: "Full github.com URL for this workspace's origin, or a PR number as a string"}
+        required: [link]
+        additionalProperties: false
+    - name: data_branches
+      description: "List the converter's branches on GitHub, newest first, with how far each is ahead of and behind main (and the pull request, when this project opened it). Fetches from GitHub first (at most once a minute). Read-only: use it to find another migration's branch or a pull request's branch, such as one the engineer names."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 90
+      input:
+        type: object
+        properties:
+          fetch: {type: boolean, description: "false to skip fetching (default true)"}
+        additionalProperties: false
+    - name: data_branch_diff
+      description: "A branch on GitHub compared with main (or base), as its pull request shows it: its commits, the diff stat and the diff. Read-only; nothing in your checkout changes."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          branch: {type: string, description: "Origin branch name, e.g. migration/arc/mybb-staged-activation, or a downloaded SHA returned by the resolver"}
+          base: {type: string, description: "Branch to compare with (default main)"}
+          path: {type: string, description: "One file or directory, when the diff is truncated"}
+        required: [branch]
+        additionalProperties: false
+    - name: data_branch_read
+      description: "Read one file as it is on a branch on GitHub (not your checkout). Read-only."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          branch: {type: string, description: "Origin branch name or a downloaded SHA returned by the resolver"}
+          path: {type: string, description: "Relative to the repository root"}
+          start_line: {type: integer, minimum: 1}
+        required: [branch, path]
         additionalProperties: false

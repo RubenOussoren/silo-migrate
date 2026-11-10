@@ -49,6 +49,14 @@ export async function api(path, body) {
 }
 
 const ERRORS = {
+  STANDARD_BASE_SITE_NEWER: "The Base site is from a newer Discourse release than this server. Ask your node admin to update the server first.",
+  STANDARD_BASE_SITE_INVALID: 'Choose one original Discourse SQL-only backup, with its original name. Take it without uploads: discourse backup --sql-only.',
+  STANDARD_BASE_SITE_TYPE: 'Only an original backup labelled Base site can be taken as base_site. It cannot be registered as a derived output.',
+  STANDARD_BASE_SITE_ROLE: 'A Base site is not source data, settings or count checks.',
+  STANDARD_BASE_SITE_NOT_TAKEN: 'Ask migration-data to take the labelled backup as base_site, then propose again.',
+  STANDARD_RELEASE_NOT_READY: 'Only a completed Base site import with a backup can be released.',
+  STANDARD_RELEASE_CHECKS: 'Not every check matched, or there are no checks. Review them and choose Release anyway… to acknowledge this.',
+  STANDARD_ARTIFACT_CHANGED: 'The backup changed since it was recorded. Nothing was released. Ask your node admin to investigate.',
   STANDARD_BUSY: 'The project is busy (a run or another decision). Try again in a moment.',
   STANDARD_REVIEW_SOURCE_INVALID: 'Review needs a completed convert run with an unchanged intermediate database. Ask migration-data to check the source run.',
   STANDARD_STALE_PLAN: 'This plan is out of date: something it uses changed. Discard it and ask migration-data to propose it again.',

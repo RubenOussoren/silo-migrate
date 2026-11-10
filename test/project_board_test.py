@@ -43,6 +43,22 @@ class PassesTest(unittest.TestCase):
     def build(self, plans, runs, bodies, sites=None, pushes=(), deliveries=None, reviews=()):
         return self.b.build_passes(plans, runs, bodies, sites or {}, list(pushes), deliveries or {}, list(reviews))
 
+    def test_base_backup_release_is_separate_from_passed_checks(self):
+        body = dict(review_body('run-1'), base_site={'delivery': {'kind': 'base_site', 'version': 2}, 'discourse_version': '2026.10.0'})
+        review = run(2, 2, checks=6, matched=5)
+        review['artifacts'] = {'backup': {'filename': 'invented.sql.gz', 'sha256': 'a' * 64, 'bytes': 42}}
+        args = ([plan(1), plan(2)], [run(1, 1), review], {'plan-1': convert_body(), 'plan-2': body})
+        group = self.build(*args)['passes'][0]
+        self.assertEqual(('Base site v2', 'ready', None), (group['base_site'], group['backup_state'], group['release']))
+        self.assertEqual(('Import needs a look', 'warn'), group['status'])
+        release = {'released_by': 'Engineer', 'outbox': '/invented/outbox', 'acknowledged_differences': True}
+        review['release'] = release
+        group = self.build(*args)['passes'][0]
+        self.assertEqual(('released', release), (group['backup_state'], group['release']))
+        self.assertEqual(('Import needs a look', 'warn'), group['status'])
+        review['results']['reconciliation_matched'] = 6
+        self.assertEqual(('All checks matched', 'ok'), self.build(*args)['passes'][0]['status'])
+
     def test_a_convert_run_and_its_imports_make_one_pass_newest_first(self):
         result = self.build([plan(1), plan(2), plan(3), plan(4)], [run(1, 1), run(2, 2), run(3, 3), run(4, 4)],
                             {'plan-1': convert_body('a' * 40), 'plan-2': review_body('run-1'), 'plan-3': convert_body('b' * 40), 'plan-4': review_body('run-3')},

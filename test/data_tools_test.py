@@ -1357,6 +1357,219 @@ class DataToolsTest(unittest.TestCase):
     def input_datasets(self):
         return [record['dataset_id'] for record in json.loads((self.base / 'arc/.silo-migrate/named/state.json').read_text())['inputs'].values()]
 
+    def base_backup(self, stamp='20261110123456'):
+        name = 'sandbox-v2026-10-0-' + stamp + '.sql.gz'
+        (self.intake / name).write_bytes(gzip.compress(b'-- PostgreSQL database dump\nCREATE TABLE users(id int);'))
+        return name
+
+    def test_base_label_does_not_change_accepted_data_or_launch_gate(self):
+        run_id = self.site_state()
+        self.accept(run_id)
+        before = self.op('site_process', run_id=run_id)
+        self.base_backup()
+        self.label('base_site')
+        after = self.op('site_process', run_id=run_id)
+        self.assertEqual(before['process_digest'], after['process_digest'])
+        self.assertTrue(after['can_accept'])
+        guide = self.op('guide')
+        self.assertEqual(run_id, guide['site_acceptance']['accepted']['run_id'])
+        self.assertEqual([], guide['site_acceptance']['changed_since_acceptance'])
+        self.assertEqual('Development v2', guide['data']['development'])
+
+    def test_base_label_auto_takes_and_does_not_change_data_identity(self):
+        self.auto_label = False
+        self.create()
+        self.drop('data.sql', DUMP)
+        data = self.label('development')
+        source = self.op('take', path='data.sql', type='mysql-dump')['input_id']
+        meta = (self.base / 'arc/.silo-migrate/data/workspace.json').read_bytes()
+        name = self.base_backup()
+        base = self.label('base_site')
+        self.assertEqual('Base site v1', base['delivery'])
+        self.assertTrue(base['checks']['gzip'])
+        self.assertTrue(base['checks']['sql_only_name'])
+        self.assertNotIn('sql_only', base['checks'])
+        self.assertEqual('2026.10.0', base['checks']['discourse_version'])
+        input_id = base['input']['input_id']
+        self.assertFalse((self.intake / name).exists())
+        self.assertFalse((self.base / 'arc/inputs' / name).stat().st_mode & 0o222)
+        self.assertEqual(meta, (self.base / 'arc/.silo-migrate/data/workspace.json').read_bytes())
+        status = self.op('status')
+        record = next(r for r in status['inputs'] if r['input_id'] == input_id)
+        self.assertEqual(('base_site', 'Base site v1'), (record['type'], record['delivery']))
+        ws = self.d.Workspace(self.base, 'arc', ROOT, self.host, self.values, self.control)
+        dataset, mounts = self.d.job_delivery(ws, {})
+        self.assertEqual(data['dataset_id'], dataset)
+        self.assertFalse(any(name in str(path) for path, _ in mounts))
+        self.assertEqual('Base site v1', self.op('guide')['data']['base_site'])
+        self.assertEqual('Development v1', self.op('guide')['data']['development'])
+        self.assertEqual('Base site v1', self.op('peek', area='inputs', path=name)['delivery'])
+        self.assertEqual('base_site', next(r for r in self.op('list', area='inputs')['entries'] if r['name'] == name)['input_type'])
+        for role in ('source', 'settings', 'reconciliation'):
+            args = dict(source=source, settings=source)
+            args[role] = input_id
+            self.refused('STANDARD_BASE_SITE_ROLE', 'plan_propose', **args)
+        self.refused('STANDARD_BASE_SITE_ROLE', 'db_load', path='inputs/' + name)
+        self.refused('STANDARD_BASE_SITE_TYPE', 'register', path='analysis/result.sql', type='base_site')
+        for area in ('list', 'peek'):
+            self.refused('STANDARD_ARGUMENTS_INVALID', area, area='outbox', path='backup.sql.gz')
+
+    def test_base_label_does_not_switch_legacy_data_jobs_or_outputs_into_labelled_mode(self):
+        self.create()
+        self.drop('old.sql', DUMP)
+        self.op('take', path='old.sql', type='sql')
+        (self.base / 'arc/.silo-migrate/named/deliveries.json').unlink()
+        self.base_backup()
+        self.label('base_site')
+        ws = self.d.Workspace(self.base, 'arc', ROOT, self.host, self.values, self.control)
+        dataset, mounts = self.d.job_delivery(ws, {})
+        self.assertIsNone(dataset)
+        self.assertEqual(['/in/old.sql'], [target for _, target in mounts])
+        self.op('extract', path='inputs/old.sql', into='legacy-extract')
+        argv = ' '.join(self.docker.calls[-1][0])
+        self.assertNotIn('sandbox-v', argv)
+        # A completed pre-label job's derived output still belongs to the data metadata,
+        # never to the newly labelled Base site.
+        job = next((self.base / 'arc/.silo-migrate/data/jobs').glob('*.json'))
+        doc = json.loads(job.read_text()); doc['status'] = 'completed'; job.write_text(json.dumps(doc))
+        out = self.base / 'arc/work/legacy-extract/result.json'
+        out.write_text('{}')
+        registered = self.op('register', path='legacy-extract/result.json', type='json')
+        item = next(item for item in self.op('status')['inputs'] if item['input_id'] == registered['input_id'])
+        self.assertEqual(ws.meta()['dataset_id'], item['dataset_id'])
+        self.assertNotEqual('base_site', item['type'])
+
+    def test_base_versions_replace_only_base_and_preserve_data_versions(self):
+        self.auto_label = False
+        self.create()
+        self.drop('data.sql', DUMP)
+        dev = self.label('development')
+        self.op('take', path='data.sql', type='sql')
+        self.base_backup()
+        base1 = self.label('base_site')
+        self.base_backup('20261111123456')
+        base2 = self.label('base_site')
+        self.assertEqual('Base site v2', base2['delivery'])
+        records = json.loads((self.base / 'arc/.silo-migrate/named/deliveries.json').read_text())['deliveries']
+        self.assertEqual(base2['dataset_id'], records[base1['dataset_id']]['replaced_by'])
+        self.assertNotIn('replaced_by', records[dev['dataset_id']])
+        self.drop('next.sql', DUMP + '-- different')
+        self.assertEqual('Development v2', self.label('development')['delivery'])
+        self.assertNotIn('replaced_by', json.loads((self.base / 'arc/.silo-migrate/named/deliveries.json').read_text())['deliveries'][base2['dataset_id']])
+
+    def test_base_label_auto_takes_in_cli_workspace_without_data_metadata(self):
+        self.auto_label = False
+        self.create()
+        (self.base / 'arc/.silo-migrate/data/workspace.json').unlink()
+        name = self.base_backup()
+        labelled = self.label('base_site')
+        self.assertEqual('base_site', labelled['input']['type'])
+        self.assertFalse((self.intake / name).exists())
+        item = next(item for item in self.op('status')['inputs'] if item['input_id'] == labelled['input']['input_id'])
+        self.assertEqual(labelled['dataset_id'], item['dataset_id'])
+        self.assertIn((['named', 'source', 'add', 'arc', '--platform', 'discourse'], None), self.control.calls)
+
+    def test_base_label_validates_before_writing_and_can_wait_for_workspace_setup(self):
+        self.auto_label = False
+        self.drop('sandbox.tar.gz', 'not gzip')
+        self.refused('STANDARD_BASE_SITE_INVALID', 'delivery_label', kind='base_site', by='Engineer', files=self.listing())
+        self.assertEqual([], self.control.calls)
+        (self.intake / 'sandbox.tar.gz').unlink()
+        name = self.base_backup()
+        labelled = self.label('base_site')
+        self.assertNotIn('input', labelled)
+        self.assertTrue((self.intake / name).exists())
+        self.assertIn('Create the workspace', self.op('guide')['next']['action'])
+        self.create()
+        self.refused('STANDARD_BASE_SITE_TYPE', 'take', path=name, type='sql')
+        input_id = self.op('take', path=name, type='base_site')['input_id']
+        self.assertEqual(labelled['dataset_id'], next(r['dataset_id'] for r in self.op('status')['inputs'] if r['input_id'] == input_id))
+        self.drop('data.sql', DUMP)
+        self.label('development')
+        self.refused('STANDARD_BASE_SITE_TYPE', 'take', path='data.sql', type='base_site')
+
+    def test_base_label_rejects_bad_magic_multiple_files_and_symlinks(self):
+        self.auto_label = False
+        self.create()
+        name = self.base_backup()
+        (self.intake / name).write_bytes(b'not gzip')
+        self.refused('STANDARD_BASE_SITE_INVALID', 'delivery_label', kind='base_site', by='Engineer', files=self.listing())
+        self.assertFalse((self.base / 'arc/.silo-migrate/named/deliveries.json').exists())
+        (self.intake / name).unlink()
+        name = self.base_backup()
+        self.base_backup('20261111123456')
+        self.refused('STANDARD_BASE_SITE_INVALID', 'delivery_label', kind='base_site', by='Engineer', files=self.listing())
+        self.refused('STANDARD_DATA_OPERATION_REFUSED', 'delivery_label', via='chat', kind='base_site', by='Engineer', files=self.listing())
+        (self.intake / name).unlink()
+        (self.intake / name).symlink_to(self.intake / 'sandbox-v2026-10-0-20261111123456.sql.gz')
+        self.assertEqual(1, len(self.listing()))
+
+    def test_base_guide_adds_release_only_for_base_projects_and_tracks_newest_pass(self):
+        facts = {'drop_files': 0, 'inputs': 2, 'initialized': True, 'db_loaded': True, 'base_site': 'Base site v1'}
+        convert = {'kind': 'convert', 'run_id': 'run-convert', 'status': 'completed', 'checks': 6, 'matched': 6, 'started_at': '1'}
+        review = dict(convert, kind='review', run_id='run-review', started_at='2')
+        records = {'runs': [convert, review], 'findings': [], 'pushes': []}
+        site = dict(self.d.NO_SITE, checked={'run_id': 'run-review'})
+        current, stages = self.d.guide_stages(facts, records, site)
+        self.assertEqual('release', current)
+        self.assertEqual(['Import on Base site v1', 'Check site', 'Release backup'], [stage['label'] for stage in stages[-3:]])
+        review['release'] = {'released_by': 'Engineer'}
+        self.assertEqual('accepted', self.d.guide_stages(facts, records, site)[0])
+        records['runs'].append(dict(review, run_id='run-new', started_at='3', release=None))
+        site['checked'] = {'run_id': 'run-new'}
+        self.assertEqual('release', self.d.guide_stages(facts, records, site)[0])
+        facts.pop('base_site')
+        self.assertEqual(list(self.d.GUIDE_STAGES), [(stage['id'], stage['label']) for stage in self.d.guide_stages(facts, records, site)[1]])
+
+    def test_evidence_adds_backup_identity_and_release_without_extra_customer_counts(self):
+        self.create()
+        run_id = 'run-' + 'a' * 32
+        path = self.base / 'arc/.silo-migrate/named/standard/state.json'
+        state = json.loads(path.read_text())
+        backup = {'filename': 'invented-v20261110123456.sql.gz', 'sha256': 'a' * 64, 'bytes': 42, 'label': 'sql-only', 'path': '/private/not-exposed'}
+        release = {'released_at': '2026-11-10T12:00:00Z', 'released_by': 'Engineer', 'sha256': 'a' * 64, 'filename': backup['filename'],
+                   'outbox': '/invented/arc/outbox/', 'manifest': 'invented.manifest.json', 'acknowledged_differences': True}
+        state['runs'] = {run_id: {'artifacts': {'backup': backup}, 'release': release, 'results': {'base_site': True, 'base_site_newer_migrations': ['20261109000000'], 'prior_import_id_rows': 7, 'customer_table_count': 999}}}
+        path.write_text(json.dumps(state))
+        result = self.op('run_evidence', run_id=run_id)['evidence']
+        self.assertEqual({k: v for k, v in backup.items() if k != 'path'}, result['backup'])
+        self.assertEqual(release, result['release'])
+        self.assertEqual({'base_site_newer_migrations': ['20261109000000'], 'prior_import_id_rows': 7}, result['base_site'])
+        self.assertNotIn('999', json.dumps(result))
+
+    def test_review_base_default_explicit_fresh_and_missing_input(self):
+        self.auto_label = False
+        self.create()
+        self.base_backup()
+        labelled = self.label('base_site')
+        input_id = labelled['input']['input_id']
+        original = self.control
+        calls = []
+        def control(argv, input=None, timeout=120):
+            if argv[:3] == ['standard', 'plan', 'propose']:
+                calls.append(argv)
+                base = {'input_id': input_id, 'delivery': {'kind': 'base_site', 'version': 1},
+                        'schema_version': 100, 'site_schema_version': 90, 'ahead': True}
+                return json.dumps({'base_site': base if '--base-site' in argv else None})
+            return original(argv, input=input, timeout=timeout)
+        self.control = control
+        run = 'run-' + 'a' * 32
+        result = self.op('plan_propose', from_run=run)
+        self.assertEqual(['--base-site', input_id], calls[-1][-2:])
+        self.assertIn('on Base site v1', result['next'])
+        self.assertIn('Normal for hosted sandboxes', result['next'])
+        result = self.op('plan_propose', from_run=run, fresh_site=True)
+        self.assertNotIn('--base-site', calls[-1])
+        self.assertIn('on a fresh site', result['next'])
+        self.op('plan_propose', from_run=run, base_site=input_id)
+        self.assertEqual(['--base-site', input_id], calls[-1][-2:])
+        self.refused('STANDARD_ARGUMENTS_INVALID', 'plan_propose', from_run=run, base_site=input_id, fresh_site=False)
+        self.refused('STANDARD_BASE_SITE_INVALID', 'plan_propose', from_run=run, base_site='input-' + 'f' * 32)
+        self.refused('STANDARD_BASE_SITE_ROLE', 'plan_propose', from_run=run, reconciliation=input_id)
+        state = self.base / 'arc/.silo-migrate/named/state.json'
+        doc = json.loads(state.read_text()); doc['inputs'] = {}; state.write_text(json.dumps(doc))
+        self.refused('STANDARD_BASE_SITE_NOT_TAKEN', 'plan_propose', from_run=run)
+
     def test_files_must_be_labelled_before_they_can_be_taken(self):
         self.auto_label = False
         self.create()

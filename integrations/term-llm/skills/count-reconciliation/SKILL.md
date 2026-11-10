@@ -69,6 +69,7 @@ count, no backslashes, no `pg_*`/`SET`/`COPY`). No `destination_sql`: null, not 
   Seeded topics and the review admin have none. `posts` includes first posts.
 - Users without an intermediate email get a random `<32 hex>@email.invalid` primary address
   (`user_emails`, `"primary" = true`). `users.staged` is a boolean. Old URLs: `permalinks`.
+- **On a base site** the sandbox has its own rows: count imported rows only, never whole tables. A source user whose email already exists there is merged into that account and gets no import id, so split the users check: imported as new + merged into existing accounts = source users. migration-data may read the base-site input to work out the matches. Check `data_run_evidence` → `base_site.prior_import_id_rows`: existing sandbox import ids need baseline-aware destination checks.
 - Invented examples:
 
 ```sql
