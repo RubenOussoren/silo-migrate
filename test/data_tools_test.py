@@ -819,6 +819,16 @@ class DataToolsTest(unittest.TestCase):
         self.assertIn('db-arc', self.mcp()['servers'])  # nothing taken out
         self.assertEqual([], self.term_calls_made())
 
+    def test_a_version_that_cant_be_read_still_requires_the_rule(self):
+        (self.term.parent / 'term-version').write_text('garbled')
+        self.assertTrue(self.d.term_llm_enforces(str(self.term)))
+        self.assertNotIn(str(self.term), self.d._enforcing)  # not remembered
+        self.create()
+        (self.config_home / 'term-llm').mkdir(parents=True)
+        (self.term_calls.parent / 'term-fails').touch()
+        self.assertIn("couldn't be limited", self.op('db_up', engine='mariadb')['queries']['registration'])
+        self.assertNotIn('db-arc', (self.mcp() if (self.config_home / 'term-llm/mcp.json').exists() else {'servers': {}})['servers'])
+
     def test_mcp_rules_limits_every_project_database_and_names_none(self):
         (self.config_home / 'term-llm').mkdir(parents=True)
         servers = {'db-arc': {'command': 'c', 'args': ['dbhub', 'arc']}, 'db-other': {'command': 'c', 'args': ['dbhub', 'other']},

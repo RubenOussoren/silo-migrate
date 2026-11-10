@@ -1821,16 +1821,20 @@ _enforcing = {}
 
 
 def term_llm_enforces(term):
-    """True if this term-llm enforces config.yaml's MCP rules (0.9.96+). An older one would write the
-    rule as a plain value, which 0.9.99 then refuses to read: it is never asked to."""
-    if term not in _enforcing:
-        try:
-            result = subprocess.run([term, "--version"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
-                                    env={"HOME": os.path.expanduser("~"), "PATH": os.environ.get("PATH") or "/usr/bin:/bin"})
-            match = re.search(r"version (\d+)\.(\d+)\.(\d+)", result.stdout or "")
-        except (OSError, subprocess.TimeoutExpired):
-            match = None
-        _enforcing[term] = bool(match) and tuple(int(part) for part in match.groups()) >= MCP_RULES_SINCE
+    """False only for a term-llm known to be older than 0.9.96, which doesn't enforce config.yaml's MCP
+    rules and would write one as a plain value that 0.9.99 refuses to read. A version that can't be
+    read counts as enforcing (the rule is then required), and isn't remembered."""
+    if term in _enforcing:
+        return _enforcing[term]
+    try:
+        result = subprocess.run([term, "--version"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                                env={"HOME": os.path.expanduser("~"), "PATH": os.environ.get("PATH") or "/usr/bin:/bin", "LANG": "C.UTF-8"})
+        match = re.search(r"version (\d+)\.(\d+)\.(\d+)", result.stdout or "")
+    except (OSError, subprocess.TimeoutExpired):
+        match = None
+    if not match:
+        return True
+    _enforcing[term] = tuple(int(part) for part in match.groups()) >= MCP_RULES_SINCE
     return _enforcing[term]
 
 

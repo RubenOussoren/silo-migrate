@@ -1177,6 +1177,7 @@ def account_apply(saved):
     plan = saved["plan"]
     verify_installer(plan)
     STAGE = "TERM_DOWNLOAD"
+    before = (P/"bin/term-llm").resolve() if (P/"bin/term-llm").is_symlink() else None
     install_term()
     print("METAL_TERM_VERIFIED", flush=True)
     STAGE = "RELEASE_CLONE"
@@ -1219,12 +1220,16 @@ def account_apply(saved):
         os.close(fd)
     previous = switch(release)
     link_skills()
-    # Refusing here puts the term-llm this apply replaced back, so a restart still finds a working web UI.
+    # Refusing here puts back a term-llm this apply replaced (never one an earlier update did), so a
+    # restart still finds a working web UI.
+    replaced = before is not None and (P/"bin/term-llm").resolve() != before
     if not trust_agents(as_account=False):
-        previous_term_llm_back()
+        if replaced:
+            previous_term_llm_back()
         refuse("METAL_AGENTS_CONFIG", AGENTS_HELP + " (" + agents_path() + "); then re-plan")
     if not project_default_agent(as_account=False):
-        previous_term_llm_back()
+        if replaced:
+            previous_term_llm_back()
         refuse("METAL_DEFAULT_AGENT", "web.project_default_agent must name one of the node's agents (term-llm config set web.project_default_agent migration-data); then re-plan")
     mcp_rules()
     if C["TERM_LLM_SERVICE"] != "skip":

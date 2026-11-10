@@ -645,6 +645,36 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(new, (P/"bin/term-llm").resolve())
         rules.assert_called_once_with()
 
+    def test_apply_refusal_puts_back_only_a_term_llm_it_replaced(self):
+        P = self.m.P
+        for path in [P, self.m.W] + [P/p for p in ("bin", "etc", "releases", "term-llm", "control", "control/gems", "control/site-cache", "state", "state/logs", "state/tmp", "state/runtime-profiles")]:
+            path.mkdir(parents=True, exist_ok=True)
+        release = P/"releases"/("a"*40)
+        release.mkdir()
+        (self.home/".config/term-llm").mkdir(parents=True)
+        (self.home/".config/term-llm/config.yaml").write_text("providers: {}\n")
+        old, new = P/"term-llm/0.9.93/term-llm", P/"term-llm"/self.m.TERM_LLM_PINNED/"term-llm"
+        for binary in (old, new):
+            binary.parent.mkdir(parents=True)
+            binary.write_text("x")
+        def install():
+            if (P/"bin/term-llm").resolve() != new:
+                self.m.symlink((P/"bin/term-llm").resolve(), P/"bin/term-llm.previous")
+                self.m.symlink(new, P/"bin/term-llm")
+        saved = {"plan": {"target": {"commit": "a"*40, "artifact_package": ""}}, "sha256": "x"}
+        for start, expected in ((old, old), (new, new)):  # replaced by this apply: put back; already there: left alone
+            for link in (P/"bin/term-llm", P/"bin/term-llm.previous"):
+                if link.is_symlink():
+                    link.unlink()
+            os.symlink(start, P/"bin/term-llm")
+            if start == new:
+                os.symlink(old, P/"bin/term-llm.previous")  # from an earlier update
+            with self.subTest(start=start.parent.name), patch.object(self.m, "verify_installer"), patch.object(self.m, "install_term", side_effect=install), \
+                    patch.object(self.m, "fetch_release", return_value=release), patch.object(self.m, "extract_artifacts", return_value=([], "skipped-no-package", "")), \
+                    patch.object(self.m, "trust_agents", return_value=False), self.assertRaisesRegex(self.m.Refusal, "METAL_AGENTS_CONFIG"):
+                self.m.account_apply(saved)
+            self.assertEqual(expected, (P/"bin/term-llm").resolve())
+
     def test_agents_folder_is_linked_to_the_release_and_never_replaced(self):
         config = self.home/".config/term-llm"
         agents = config/"agents"
