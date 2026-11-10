@@ -586,7 +586,7 @@ class ConverterDevTest(unittest.TestCase):
             # A finding withdrawn since the proposal: the push is out of date.
             self.state['findings'][released]['status'] = 'withdrawn'
             (self.root / '.silo-migrate/named/standard/state.json').write_text(json.dumps(self.state))
-            with self.assertRaises(self.dev.Refusal):
+            with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_PUSH_FINDING_CHANGED'):
                 push(named['digest'])
             self.state['findings'][released]['status'] = 'released'
             (self.root / '.silo-migrate/named/standard/state.json').write_text(json.dumps(self.state))

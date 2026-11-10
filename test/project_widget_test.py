@@ -155,7 +155,7 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         convert = {'operation': 'standard_convert', 'roles': {'source': 'input-1', 'settings': 'input-2', 'reconciliation': 'input-3'}, 'source_charset': 'latin1'}
         review = {'operation': 'standard_review', 'from_run': {'run_id': 'run-' + 'a' * 32}, 'roles': {'reconciliation': 'input-4'}}
         state = {'plans': {'plan-' + 'a' * 32: {'body': convert, 'created_at': '1'}, 'plan-' + 'b' * 32: {'body': review, 'created_at': '2'}},
-                 'runs': {'run-' + 'a' * 32: {'plan_id': 'plan-' + 'a' * 32}, 'run-' + 'b' * 32: {'plan_id': 'plan-' + 'b' * 32}}}
+                 'runs': {'run-' + 'a' * 32: {'plan_id': 'plan-' + 'a' * 32, 'status': 'completed'}, 'run-' + 'b' * 32: {'plan_id': 'plan-' + 'b' * 32, 'status': 'completed'}}}
         (base / 'state.json').write_text(json.dumps(state))
         headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
         self.assertEqual(200, self.request('POST', '/api/runs/again', {'workspace': 'arc', 'run_id': 'run-' + 'a' * 32}, headers)[0])

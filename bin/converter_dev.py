@@ -1533,7 +1533,10 @@ def push(checkout, digest, home, open_pr=True):
         if current is not None and "findings" in proposal:
             # The findings it names are part of what was approved, not of the branch: carry them over,
             # and they must still be released findings now.
-            current["findings"] = addressed_findings(checkout, {"findings": proposal["findings"]}) if isinstance(proposal["findings"], list) else None
+            try:
+                current["findings"] = addressed_findings(checkout, {"findings": proposal["findings"]}) if isinstance(proposal["findings"], list) else None
+            except Refusal:
+                refuse("STANDARD_PUSH_FINDING_CHANGED")
         if current is not None and (current != proposal or hashlib.sha256(canonical(current).encode("utf-8")).hexdigest() != digest):
             refuse("STANDARD_PUSH_STALE")
         target = github_target(checkout)

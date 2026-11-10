@@ -153,7 +153,7 @@ def propose_again(base, control, body, import_next=False):
         # The checks of this pass's last import, else of the project's last import (they carry the site
         # queries), else the convert run's own.
         kind = (plan_body.get("delivery") or {}).get("kind")
-        ran = {other.get("plan_id") for other in store.runs(workspace).values()}
+        ran = {other.get("plan_id") for other in store.runs(workspace).values() if other.get("status") == "completed"}
         reviews = sorted((plan for plan_id, plan in plans.items() if (plan.get("body") or {}).get("operation") == "standard_review"
                           and plan_id in ran and ((plan.get("body") or {}).get("delivery") or {}).get("kind") == kind),
                          key=lambda plan: plan.get("created_at") or "")

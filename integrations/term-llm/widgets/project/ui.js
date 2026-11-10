@@ -60,6 +60,7 @@ const ERRORS = {
   STANDARD_DIRTY_INSTANCE: 'An earlier run left a site behind: reset that run first.',
   STANDARD_PUSH_STALE: 'The branch changed since this push was proposed. Ask converter-developer to propose again.',
   STANDARD_PUSH_REJECTED: 'GitHub rejected the push (the branch moved on GitHub). Nothing was changed there.',
+  STANDARD_PUSH_FINDING_CHANGED: 'A finding this push names was corrected or withdrawn since. Ask converter-developer to propose the push again.',
   STANDARD_PUSH_TOKEN_MISSING: 'No GitHub token for this repository owner on the server.',
   STANDARD_REQUEST_REFUSED: 'The request was refused. Reload the page.',
   STANDARD_OPERATION_TIMEOUT: 'No answer in time. It may still have happened: refresh before trying again.',
