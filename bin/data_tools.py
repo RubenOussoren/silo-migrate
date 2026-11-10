@@ -1816,12 +1816,30 @@ def term_llm_command(prefix):
     return str(installed) if installed.is_file() else shutil.which("term-llm")
 
 
+MCP_RULES_SINCE = (0, 9, 96)
+_enforcing = {}
+
+
+def term_llm_enforces(term):
+    """True if this term-llm enforces config.yaml's MCP rules (0.9.96+). An older one would write the
+    rule as a plain value, which 0.9.99 then refuses to read: it is never asked to."""
+    if term not in _enforcing:
+        try:
+            result = subprocess.run([term, "--version"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                                    env={"HOME": os.path.expanduser("~"), "PATH": os.environ.get("PATH") or "/usr/bin:/bin"})
+            match = re.search(r"version (\d+)\.(\d+)\.(\d+)", result.stdout or "")
+        except (OSError, subprocess.TimeoutExpired):
+            match = None
+        _enforcing[term] = bool(match) and tuple(int(part) for part in match.groups()) >= MCP_RULES_SINCE
+    return _enforcing[term]
+
+
 def mcp_rule(name, term):
     """Only migration-data may use MCP server NAME: config.yaml's mcp.servers.NAME.agents, written with
     term-llm's own `config set` (it keeps the rest of the file as it is). True once the file says so."""
     if mcp_rule_present(name):
         return True
-    if not term or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", name):
+    if not term or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", name) or not term_llm_enforces(term):
         return False
     env = {"HOME": os.path.expanduser("~"), "PATH": os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
     if os.environ.get("XDG_CONFIG_HOME"):
@@ -1872,6 +1890,9 @@ def mcp_rules_main(args, values, base, repo):
         servers = config.get("servers") if isinstance(config, dict) else None
         ours = silo_servers(servers if isinstance(servers, dict) else {})
         term = term_llm_command(Workspace.repo_prefix(Path(repo), Path(base)))
+        if not (term and term_llm_enforces(term)):
+            print(json.dumps({"version": 1, "project_servers": len(ours), "enforced": False}))
+            refuse("STANDARD_OPERATION_FAILED: this term-llm doesn't enforce MCP rules (0.9.96+ does); nothing was changed")
         open_ = [name for name in ours if not mcp_rule(name, term)]
         # One that can't be limited comes out (data_db_status puts it back with its rule).
         for name in open_:
@@ -1919,8 +1940,12 @@ def mcp_register(ws, present=True):
         existing = servers.get(name)
         if existing is not None and not (isinstance(existing, dict) and (existing.get("args") or [None])[0] == "dbhub"):
             return "not changed: an existing " + name + " server isn't silo-migrate's; rename it"
-        # The rule first: the server is never listed for a chat that may not use it.
-        if present and not mcp_rule(name, term_llm_command(ws.prefix)):
+        # The rule first: the server is never listed for a chat that may not use it. A term-llm that
+        # doesn't enforce rules (before 0.9.96, e.g. after a rollback) gets the server as before;
+        # silo doctor warns about that.
+        term = term_llm_command(ws.prefix)
+        enforced = bool(term) and term_llm_enforces(term)
+        if present and enforced and not mcp_rule(name, term):
             return "not changed: it couldn't be limited to migration-data in term-llm's config.yaml"
         if present and existing == entry:
             return "registered"
@@ -1933,9 +1958,10 @@ def mcp_register(ws, present=True):
         write_mcp_config(path, config)
         # config.yaml has other writers (the web UI, an engineer's config set): if the rule went
         # meanwhile, the server comes back out rather than staying open to every agent.
-        if present and not mcp_rule_present(name):
+        if present and enforced and not mcp_rule_present(name):
             del servers[name]
             write_mcp_config(path, config)
+            ws.append("audit.jsonl", {"at": now(), "op": "mcp_register", "server": name, "result": "removed: rule missing"})
             return "not changed: its rule left term-llm's config.yaml while it was being added; run this again"
     finally:
         os.close(lock)

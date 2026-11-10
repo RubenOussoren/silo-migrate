@@ -1219,9 +1219,12 @@ def account_apply(saved):
         os.close(fd)
     previous = switch(release)
     link_skills()
+    # Refusing here puts the term-llm this apply replaced back, so a restart still finds a working web UI.
     if not trust_agents(as_account=False):
+        previous_term_llm_back()
         refuse("METAL_AGENTS_CONFIG", AGENTS_HELP + " (" + agents_path() + "); then re-plan")
     if not project_default_agent(as_account=False):
+        previous_term_llm_back()
         refuse("METAL_DEFAULT_AGENT", "web.project_default_agent must name one of the node's agents (term-llm config set web.project_default_agent migration-data); then re-plan")
     mcp_rules()
     if C["TERM_LLM_SERVICE"] != "skip":
@@ -1343,12 +1346,14 @@ def term_llm_current():
     return True
 
 def previous_term_llm_back():
-    """Point bin/term-llm back at the version it replaced (as rollback --term-llm does)."""
+    """Point bin/term-llm back at the version it replaced (as rollback --term-llm does). False if there's none."""
     previous_bin = P/"bin/term-llm.previous"
-    if previous_bin.is_symlink() and previous_bin.resolve().is_file():
-        active = (P/"bin/term-llm").resolve()
-        symlink(previous_bin.resolve(), P/"bin/term-llm")
-        symlink(active, previous_bin)
+    if not (previous_bin.is_symlink() and previous_bin.resolve().is_file()):
+        return False
+    active = (P/"bin/term-llm").resolve()
+    symlink(previous_bin.resolve(), P/"bin/term-llm")
+    symlink(active, previous_bin)
+    return True
 
 def node_term_llm():
     """After the switch, in this order: the agents where term-llm trusts them; then this release's
@@ -1359,14 +1364,20 @@ def node_term_llm():
         if (P/"bin/term-llm").resolve() != P/"term-llm"/C["TERM_LLM_VERSION"]/"term-llm":
             print("METAL_TERM_NOT_UPDATED: term-llm stays at its current version until its agents are in ~/.config/term-llm/agents "
                   "(silo doctor shows the fix), then silo update again", flush=True)
-        mcp_rules()
+        else:
+            print("METAL_AGENTS_UNTRUSTED: term-llm " + C["TERM_LLM_VERSION"] + " won't start the agents' web chats until they're in "
+                  "~/.config/term-llm/agents (silo doctor shows the fix), then silo update again", flush=True)
+            mcp_rules()
         return False
     changed = term_llm_current()
     if not project_default_agent():
-        if changed:
-            previous_term_llm_back()
+        if changed and previous_term_llm_back():
             print("METAL_TERM_KEPT_PREVIOUS: the new term-llm needs web.project_default_agent; the previous version is back in place", flush=True)
-        mcp_rules()
+        elif changed:
+            print("METAL_DEFAULT_AGENT: the new term-llm needs web.project_default_agent and no previous version could be put back: "
+                  "the web UI won't start after a restart until it's set (silo doctor shows the fix)", flush=True)
+        if (P/"bin/term-llm").resolve() == P/"term-llm"/C["TERM_LLM_VERSION"]/"term-llm":
+            mcp_rules()
         return False
     mcp_rules()
     return changed

@@ -102,6 +102,9 @@ class FakeControl:
 
 FAKE_TERM_LLM = """#!/usr/bin/env python3
 import os, sys
+if sys.argv[1:] == ['--version']:
+    print(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'term-version')).read().strip())
+    sys.exit(0)
 top = os.path.dirname(os.environ['XDG_CONFIG_HOME'])  # term-llm gets only HOME, PATH, LANG and this
 with open(os.path.join(top, 'term-calls'), 'a') as out:
     out.write(' '.join(sys.argv[1:]) + '\\n')
@@ -229,6 +232,8 @@ class DataToolsTest(unittest.TestCase):
         self.term = top / 'fake-term-llm'
         self.term.write_text(FAKE_TERM_LLM)
         self.term.chmod(0o700)
+        (top / 'term-version').write_text('term-llm version 0.9.99 (commit: x)')
+        self.d._enforcing.clear()
         self.term_calls = top / 'term-calls'
         term = mock.patch.object(self.d, 'term_llm_command', return_value=str(self.term))
         term.start()
@@ -797,6 +802,22 @@ class DataToolsTest(unittest.TestCase):
             queries = self.op('db_up', engine='mariadb')['queries']
         self.assertIn('its rule left', queries['registration'])
         self.assertNotIn('db-arc', self.mcp()['servers'])
+
+    def test_a_term_llm_that_doesnt_enforce_rules_is_never_asked_to_write_one(self):
+        # 0.9.93 (a rollback) would write the rule as a plain value, which 0.9.99 refuses to read.
+        (self.term.parent / 'term-version').write_text('term-llm version 0.9.93 (commit: x)')
+        self.create()
+        (self.config_home / 'term-llm').mkdir(parents=True)
+        self.assertEqual('added', self.op('db_up', engine='mariadb')['queries']['registration'])  # as before rules existed
+        self.assertIn('db-arc', self.mcp()['servers'])
+        self.assertEqual([], self.term_calls_made())
+        self.assertEqual({}, self.rules())
+        out = io.StringIO()
+        with mock.patch('sys.stdout', out), self.assertRaisesRegex(self.d.Refusal, "doesn't enforce MCP rules"):
+            self.d.mcp_rules_main(['mcp-rules'], self.values, self.base, ROOT)
+        self.assertEqual({'version': 1, 'project_servers': 1, 'enforced': False}, json.loads(out.getvalue()))
+        self.assertIn('db-arc', self.mcp()['servers'])  # nothing taken out
+        self.assertEqual([], self.term_calls_made())
 
     def test_mcp_rules_limits_every_project_database_and_names_none(self):
         (self.config_home / 'term-llm').mkdir(parents=True)

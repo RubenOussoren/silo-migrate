@@ -613,10 +613,11 @@ class InstallerTests(unittest.TestCase):
         def install():
             self.m.symlink(old, P/"bin/term-llm.previous")
             self.m.symlink(new, P/"bin/term-llm")
-        cases = (("agents not trusted", False, True, old, "METAL_TERM_NOT_UPDATED", False),
-                 ("no default agent", True, False, old, "METAL_TERM_KEPT_PREVIOUS", False),
-                 ("both", True, True, new, "", True))
-        for name, trusted, default, active, message, changed in cases:
+        # (case, trusted, default agent set, term-llm afterwards, message, changed, rules written: only by the new term-llm)
+        cases = (("agents not trusted", False, True, old, "METAL_TERM_NOT_UPDATED", False, []),
+                 ("no default agent", True, False, old, "METAL_TERM_KEPT_PREVIOUS", False, []),
+                 ("both", True, True, new, "", True, [1]))
+        for name, trusted, default, active, message, changed, written in cases:
             if (P/"bin/term-llm").resolve() != old:
                 self.m.symlink(old, P/"bin/term-llm")
             rules = []
@@ -627,7 +628,22 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(active, (P/"bin/term-llm").resolve())
                 self.assertIn(message, out.getvalue())
                 self.assertEqual(trusted, installed.called)
-                self.assertEqual([1], rules)  # the rules are written whatever happened
+                self.assertEqual(written, rules)
+        # Already on the new term-llm: untrusted agents are said plainly, and the rules still written.
+        with patch.object(self.m, "trust_agents", return_value=False), patch.object(self.m, "mcp_rules") as rules, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(self.m.node_term_llm())
+        self.assertIn("METAL_AGENTS_UNTRUSTED", out.getvalue())
+        rules.assert_called_once_with()
+        # No previous version to put back: said plainly, the new one stays, its rules are written.
+        (P/"bin/term-llm.previous").unlink()
+        with patch.object(self.m, "trust_agents", return_value=True), patch.object(self.m, "project_default_agent", return_value=False), \
+                patch.object(self.m, "term_llm_current", return_value=True), patch.object(self.m, "mcp_rules") as rules, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(self.m.node_term_llm())
+        self.assertIn("no previous version could be put back", out.getvalue())
+        self.assertEqual(new, (P/"bin/term-llm").resolve())
+        rules.assert_called_once_with()
 
     def test_agents_folder_is_linked_to_the_release_and_never_replaced(self):
         config = self.home/".config/term-llm"
