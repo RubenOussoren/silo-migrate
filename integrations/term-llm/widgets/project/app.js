@@ -299,8 +299,8 @@ function newFilesCard(files) {
     box.addEventListener('input', () => { confirmButton.disabled = box.value !== 'LAUNCH'; });
     actions = el('div', { class: 'actions' }, box, confirmButton, el('button', { type: 'button', class: 'btn q', onclick: () => { state.typing = false; render(); } }, 'Cancel'));
   } else {
-    actions = el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', disabled: !files.initialized, onclick: () => submitLabel('development', body()) }, 'Development'),
-      el('button', { type: 'button', class: 'btn q', disabled: !files.initialized, onclick: () => { state.typing = true; render(); } }, 'Launch'),
+    actions = el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', onclick: () => submitLabel('development', body()) }, 'Development'),
+      el('button', { type: 'button', class: 'btn q', onclick: () => { state.typing = true; render(); } }, 'Launch'),
       el('button', { type: 'button', class: 'btn q', onclick: () => submitLabel('base_site', body()) }, 'Base site'));
   }
   return card('NEW FILES, FOR YOU', 'What are these files for?', list, hidden > 0 ? el('p', { class: 'hint' }, `and ${hidden} more. Label these first, then the rest.`) : null, actions, el('p', { class: 'hint' }, 'Base site · a backup of the customer’s sandbox, without uploads. Review sites are built on top of it.'));
@@ -310,8 +310,11 @@ function renderFiles() {
   const files = state.files;
   if (!files) return [el('p', { class: 'quiet' }, 'Loading…')];
   if (!files.initialized && !files.not_ready_files.length) {
-    return [files.unlabelled_files.length ? newFilesCard(files) : null, el('p', { class: 'quiet' }, files.unlabelled_files.length ? 'Files have arrived. Ask migration-data in a chat in this project to create the workspace; then label them here.'
-      : 'No files yet. Copy them to the drop folder with scp, then run silo intake as root.')];
+    // No label buttons before the workspace exists: a lone enabled button reads as the only choice.
+    return files.unlabelled_files.length
+      ? [card('NEXT, FOR YOU', 'Files have arrived. Create the workspace first.', fileRows(files.unlabelled_files, (entry) => size(entry.bytes)),
+        el('p', { class: 'hint' }, 'Open a migration-data chat in this project and ask it to create the workspace. Then come back here to say what the files are for.'))]
+      : [el('p', { class: 'quiet' }, 'No files yet. Copy them to the drop folder with scp, then run silo intake as root.')];
   }
   const out = [];
   const labelled = state.labelResult;
