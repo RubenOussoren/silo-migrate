@@ -1165,6 +1165,14 @@ def site_verdicts(reviews):
     return {run_id: entry for run_id, entry in latest.items() if entry.get("id") not in withdrawn}
 
 
+def current_acceptance(reviews, verdicts=None):
+    """The accepted process: the newest acceptance on the customer's approval, while it is still its
+    run's verdict. Never an older one (board.current_acceptance matches it)."""
+    verdicts = site_verdicts(reviews) if verdicts is None else verdicts
+    newest = next((entry for entry in reversed(reviews) if entry.get("verdict") == "accepted" and entry.get("basis") == "customer"), None)
+    return newest if newest and verdicts.get(newest.get("run_id")) is newest else None
+
+
 def site_summary(ws, state=None, deliveries=None):
     """The current acceptance (the customer's, which launch repeats), the engineer's own latest check,
     the latest verdict per run, and what changed since the acceptance."""
@@ -1172,8 +1180,7 @@ def site_summary(ws, state=None, deliveries=None):
     current = site_verdicts(reviews)
     # The accepted process is the newest acceptance on the customer's approval. Once that one is
     # withdrawn (or its run has a later verdict), nothing is accepted: an older one never comes back.
-    newest = next((entry for entry in reversed(reviews) if entry.get("verdict") == "accepted" and entry.get("basis") == "customer"), None)
-    accepted = newest if newest and current.get(newest.get("run_id")) is newest else None
+    accepted = current_acceptance(reviews, current)
     own = next((entry for entry in reversed(reviews) if entry.get("verdict") == "accepted" and entry.get("basis") == "engineer"), None)
     checked = own if own and current.get(own.get("run_id")) is own else None
     by_run = {run_id: site_entry_summary(entry) for run_id, entry in current.items()}
@@ -1249,8 +1256,8 @@ def op_site_review(ws, request):
         else:
             state = standard_state(ws)
             process, digest, passed = site_process(state, request.get("run_id"))
-            standing = site_verdicts(reviews).get(process["run_id"])
-            if standing and standing.get("verdict") == "accepted" and standing.get("basis") == "customer":
+            standing = current_acceptance(reviews)
+            if standing and standing.get("run_id") == process["run_id"]:
                 refuse("STANDARD_SITE_ACCEPTED: this site's acceptance stands; withdraw it first (on the Overview)")
             run = (state.get("runs") or {}).get(process["run_id"]) or {}
             if run.get("status") != "completed":

@@ -71,6 +71,11 @@ class PassesTest(unittest.TestCase):
                 self.assertEqual(verdict, (step['review'] or {}).get('verdict'))
                 self.assertEqual(status, group['status'])
                 self.assertNotIn('process', step['review'] or {})  # the page gets the verdict, not the stored process
+        # A pass whose acceptance a later pass replaced says so.
+        newer = {'id': 'review-9', 'verdict': 'accepted', 'basis': 'customer', 'run_id': 'run-4'}
+        built = self.build(plans + [plan(3), plan(4)], runs + [run(3, 3), run(4, 4)], dict(bodies, **{'plan-3': convert_body('b' * 40), 'plan-4': review_body('run-3')}),
+                           reviews=[accepted, newer])
+        self.assertEqual([('Accepted', 'ok'), ('Accepted earlier', 'wait')], [group['status'] for group in built['passes']])
         # Another run's verdict doesn't count for this one.
         other = dict(accepted, run_id='run-9')
         self.assertIsNone(self.build(plans, runs, bodies, reviews=[other])['passes'][0]['imports'][0]['review'])

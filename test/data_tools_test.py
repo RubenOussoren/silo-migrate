@@ -1087,9 +1087,22 @@ class DataToolsTest(unittest.TestCase):
         self.assertEqual(second, self.op('guide')['site_acceptance']['accepted']['run_id'])
         self.op('site_review', verdict='withdrawn', review_id=newer['id'], by='A (web UI)')
         self.assertIsNone(self.op('guide')['site_acceptance']['accepted'])  # the older acceptance doesn't come back
-        # The older one is still its own pass's verdict, so it can be withdrawn there; nothing comes back either way.
+        # The older pass's acceptance was replaced, so it doesn't stand: it can be withdrawn, or take a
+        # new verdict, without anything coming back.
         self.op('site_review', verdict='withdrawn', review_id=older['id'], by='A (web UI)')
+        self.op('site_review', run_id=first, verdict='needs_changes', by='A (web UI)', note='a later look found an issue')
         self.assertIsNone(self.op('guide')['site_acceptance']['accepted'])
+
+    def test_a_replaced_acceptance_takes_a_new_verdict(self):
+        first = self.site_state()
+        self.accept(first)
+        second = self.second_review_run()
+        self.accept(second)
+        # First's acceptance no longer stands (second's does): a new verdict on it is allowed.
+        self.op('site_review', run_id=first, verdict='needs_changes', by='A (web UI)', note='a later look found an issue')
+        self.assertEqual(second, self.op('guide')['site_acceptance']['accepted']['run_id'])
+        with self.assertRaisesRegex(self.d.Refusal, 'STANDARD_SITE_ACCEPTED'):
+            self.op('site_review', run_id=second, verdict='needs_changes', by='A (web UI)', note='n')
 
     def test_a_standing_acceptance_takes_no_other_verdict_until_withdrawn(self):
         run_id = self.site_state()
@@ -1116,13 +1129,16 @@ class DataToolsTest(unittest.TestCase):
         a = lambda i, run, basis='customer': {'id': 'review-%d' % i, 'verdict': 'accepted', 'basis': basis, 'run_id': run}
         n = lambda i, run: {'id': 'review-%d' % i, 'verdict': 'needs_changes', 'run_id': run, 'note': 'x'}
         w = lambda i, of, run: {'id': 'review-%d' % i, 'verdict': 'withdrawn', 'of': of, 'run_id': run}
-        sequences = [[], [a(1, 'r1')], [a(1, 'r1'), w(2, 'review-1', 'r1')], [a(1, 'r1', 'engineer'), n(2, 'r1')], [n(1, 'r1'), a(2, 'r1')],
+        sequences = [[], [a(1, 'r1')], [a(1, 'r1'), w(2, 'review-1', 'r1')], [a(1, 'r1'), a(2, 'r2')], [a(1, 'r1', 'engineer'), n(2, 'r1')], [n(1, 'r1'), a(2, 'r1')],
                      [a(1, 'r1'), a(2, 'r2'), w(3, 'review-2', 'r2')], [a(1, 'r1'), w(2, 'review-1', 'r1'), n(3, 'r1'), a(4, 'r2', 'engineer')]]
         for reviews in sequences:
             with self.subTest(reviews=[entry['id'] for entry in reviews]):
                 ours = {run: (entry['verdict'], entry.get('basis')) for run, entry in self.d.site_verdicts(reviews).items()}
                 page = {run: (entry['verdict'], entry.get('basis')) for run, entry in board.site_verdicts(reviews).items()}
                 self.assertEqual(ours, page)
+                current = self.d.current_acceptance(reviews)
+                standing = [run for run, entry in board.site_verdicts(reviews).items() if entry['verdict'] == 'accepted' and entry['basis'] == 'customer' and not entry['replaced']]
+                self.assertEqual([current['run_id']] if current else [], standing)
 
     def test_an_unreadable_record_is_said_not_read_as_nothing_accepted(self):
         run_id = self.site_state()

@@ -51,8 +51,13 @@ def site_verdicts(reviews):
     for entry in reviews:
         if entry.get("verdict") in ("accepted", "needs_changes"):
             latest[entry.get("run_id")] = entry
-    return {run_id: {key: entry.get(key) for key in ("id", "verdict", "basis", "by", "at", "note")}
-            for run_id, entry in latest.items() if entry.get("id") not in withdrawn}
+    current = {run_id: entry for run_id, entry in latest.items() if entry.get("id") not in withdrawn}
+    # The accepted process (data_tools.current_acceptance): the newest customer acceptance, while it stands.
+    newest = next((entry for entry in reversed(reviews) if entry.get("verdict") == "accepted" and entry.get("basis") == "customer"), None)
+    standing = newest.get("id") if newest and current.get(newest.get("run_id")) is newest else None
+    return {run_id: dict({key: entry.get(key) for key in ("id", "verdict", "basis", "by", "at", "note")},
+                         replaced=entry.get("verdict") == "accepted" and entry.get("basis") == "customer" and entry.get("id") != standing)
+            for run_id, entry in current.items()}
 
 
 def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=()):
@@ -133,6 +138,8 @@ def pass_status(group):
     if review.get("verdict") == "needs_changes":
         return ("Needs changes", "warn")
     if review.get("verdict") == "accepted":
+        if review.get("replaced"):
+            return ("Accepted earlier", "wait")
         return ("Accepted", "ok") if review.get("basis") == "customer" else ("Checked by you", "ok")
     if latest.get("site_up"):
         return ("Ready to check", "now")

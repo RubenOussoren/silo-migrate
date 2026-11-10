@@ -89,9 +89,9 @@ export function runsView(ctx) {
     const review = last.review;
     const up = last.site_up ? ' · up, holds customer data until reset' : '';
     if (review && review.verdict === 'accepted') {
-      const basis = review.basis === 'customer' ? 'customer approved' : 'your own check';
+      const basis = review.replaced ? 'customer approved; a later pass is now the accepted one' : review.basis === 'customer' ? 'customer approved' : 'your own check';
       return el('div', { class: 'step static' }, el('span', { class: 'dot' }), el('span', {}, 'Site'), el('span', { class: 'what' }, `Accepted by ${safe(review.by)} ${ago(review.at)} · ${basis}${up}`),
-        el('span', { class: 'pill ok' }, review.basis === 'customer' ? 'accepted' : 'checked'));
+        el('span', { class: `pill ${review.replaced ? '' : 'ok'}` }, review.replaced ? 'accepted earlier' : review.basis === 'customer' ? 'accepted' : 'checked'));
     }
     if (review && review.verdict === 'needs_changes') {
       return el('div', { class: 'step static' }, el('span', { class: 'dot warn' }), el('span', {}, 'Site'), el('span', { class: 'what' }, `Needs changes: ${safe(review.note || '')}${up}`),
@@ -115,7 +115,7 @@ export function runsView(ctx) {
     const last = group.imports[group.imports.length - 1];
     if (!last || !passed(last) || !passed(group.convert) || !/^Development/.test(group.delivery || '')) return null;
     const review = last.review;
-    if (review && !(review.verdict === 'accepted' && review.basis === 'engineer')) return null;
+    if (review && !(review.verdict === 'accepted' && (review.basis === 'engineer' || review.replaced))) return null;
     return el('div', { class: 'decide' }, el('span', {}, review ? 'Has the customer approved it?' : 'Is this site right?'),
       el('span', { class: 'btns' }, el('button', { type: 'button', class: 'btn', onclick: () => ctx.open('accept', last.run_id) }, 'Accept site\u2026'),
         el('button', { type: 'button', class: 'btn q', onclick: () => ctx.open('changes', last.run_id) }, 'Needs changes\u2026')));
