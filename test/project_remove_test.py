@@ -196,7 +196,7 @@ class RemoveTest(unittest.TestCase):
         d.add('container', 'c-job', {'silo.workspace': name, 'silo.role': 'data-job'}, state='exited')
         d.add('container', 'c-web-a', {'silo-migrate.run': RUN_A, 'silo-migrate.role': 'review', 'silo-migrate.instance': 'site-a'})
         d.add('container', 'c-conv-b', {'silo-migrate.run': RUN_B, 'silo-migrate.instance': 'b-conversion'}, state='exited')
-        d.add('container', 'c-legacy', {'silo-migrate.instance': 'site-old'})
+        d.add('container', 'c-legacy', {'silo-migrate.instance': 'site-old'})  # a site record names it, but no label of this project's
         d.add('container', 'c-other', {'silo.workspace': 'other', 'silo.role': 'source-db'})
         d.add('container', 'c-other-run', {'silo-migrate.run': OTHER_RUN, 'silo-migrate.role': 'review'})
         d.add('network', 'n-src', {'silo.workspace': name}, name='silo-src-' + name)
@@ -284,9 +284,8 @@ class RemoveTest(unittest.TestCase):
         kept = [item['text'] for item in plan['kept']]
         self.assertEqual('Work: 2 plans, 2 runs, 1 finding, labels, notes and decisions', removed[0])
         self.assertIn('Converter checkout on this server', removed)
-        self.assertEqual(10, len(self.mine()))
-        # Its two review sites: one found by its run's label, one only by its site record's IDs.
-        self.assertIn('2 review sites and the source database (10 Docker objects)', removed)
+        self.assertEqual(9, len(self.mine()))
+        self.assertIn('1 review site and the source database (9 Docker objects)', removed)
         self.assertIn('2 chats in the web UI, with 3 attachments', removed)  # s-main and s-old; the rest are agents' and side chats
         self.assertIn('1 file in the chats\' folder', removed)
         self.assertIn('Received files: dump.sql.gz, back in the drop folder to label again', kept)
@@ -298,7 +297,7 @@ class RemoveTest(unittest.TestCase):
     def mine(self):
         return [i for k in self.docker.objects.values() for i, r in k.items()
                 if r['labels'].get('silo.workspace') == 'arc' or r['labels'].get('silo-migrate.run') in (RUN_A, RUN_B)
-                or i in ('silo-src-arc-data', 'c-legacy')]
+                or i == 'silo-src-arc-data']
 
     def test_a_full_removal_plan_lists_the_received_files_and_drop_folder_as_going(self):
         plan = self.removal().plan()
@@ -352,7 +351,8 @@ class RemoveTest(unittest.TestCase):
         self.assertEqual([self.pr.handover_name(str(self.home / 'projects/other'))], [p.name for p in (self.data / 'handover').iterdir()])
         # Docker: its objects went, by label, by name and by recorded ID; another project's didn't.
         left = sorted(i for kind in self.docker.objects.values() for i in kind)
-        self.assertEqual(['c-other', 'c-other-run', 'n-other', 'silo-src-other-data'], left)
+        # Only exact labels count: an object a site record names without one of them stays.
+        self.assertEqual(['c-legacy', 'c-other', 'c-other-run', 'n-other', 'silo-src-other-data'], left)
         self.assertEqual(['db-other', 'github'], self.mcp())
         self.assertEqual('kept', result['removed']['web_project'])
         self.assertNotIn('service token', self.log.read_text())  # nothing is archived on Start over
@@ -493,13 +493,15 @@ class RemoveTest(unittest.TestCase):
 
     # -- stopped part-way, then run again ---------------------------------------------------------
 
-    def test_a_stuck_container_stops_before_any_file_goes_and_a_second_run_finishes(self):
+    def test_a_stuck_container_stops_before_the_work_goes_and_a_second_run_finishes(self):
         self.docker.stuck.add('c-web-a')
         with mock.patch.object(self.pr.time, 'sleep'):
             with self.assertRaisesRegex(ValueError, 'STANDARD_REMOVE_INCOMPLETE'):
                 self.removal(keep=True).run('arc', None)
-        self.assertTrue((self.base / 'arc/inputs/dump.sql.gz').exists())
-        self.assertEqual(6, len(self.sessions()))  # no chat went either
+        # The customer's file went back first; the work, the chats and the drop folder are all still there.
+        self.assertEqual(b'customer bytes', (self.top / 'intake/arc/sub/dump.sql.gz').read_bytes())
+        self.assertTrue((self.base / 'arc/.silo-migrate/named/standard/state.json').exists())
+        self.assertEqual(6, len(self.sessions()))
         record = [json.loads(line) for line in (self.top / 'state/removed-projects.jsonl').read_text().splitlines()]
         self.assertEqual(('stopped', 'STANDARD_REMOVE_INCOMPLETE'), (record[-1]['event'], record[-1]['code']))
         self.docker.stuck.clear()
@@ -519,7 +521,100 @@ class RemoveTest(unittest.TestCase):
         con.close()
         with self.assertRaisesRegex(ValueError, 'STANDARD_REMOVE_INCOMPLETE: 1 chat'):
             self.removal(keep=True).run('arc', None)
-        self.assertTrue((self.base / 'arc/inputs/dump.sql.gz').exists())
+        self.assertTrue((self.base / 'arc/.silo-migrate/named/standard/state.json').exists())
+        self.assertTrue((self.top / 'intake/arc/sub/dump.sql.gz').exists())
+
+    # -- from the independent review ------------------------------------------------------------
+
+    def test_an_attachment_another_chat_also_names_stays(self):
+        con = sqlite3.connect(self.data / 'sessions.db')
+        uploads = str(self.data / 'uploads')
+        con.execute('INSERT INTO messages (session_id, parts) VALUES (?, ?)', ('s-other', json.dumps([{'type': 'text', 'text': 'same file: ' + uploads + '/shot_1.png and ' + REF}])))
+        # A chat of this project quoting another chat's file doesn't make it this project's either.
+        con.execute('INSERT INTO messages (session_id, parts) VALUES (?, ?)', ('s-main', json.dumps([{'type': 'text', 'text': 'look at ' + uploads + '/theirs_3.png'}])))
+        con.commit()
+        con.close()
+        plan = self.removal(keep=True).plan()
+        self.assertIn('2 chats in the web UI, with 1 attachment', [item['text'] for item in plan['removed']])
+        self.removal(keep=True).run('arc', None)
+        self.assertEqual(sorted([OTHER_REF, REF, 'shot_1.png', 'theirs_3.png']), sorted(p.name for p in (self.data / 'uploads').iterdir()))
+
+    def test_busy_after_the_plan_was_shown_stops_before_anything_is_touched(self):
+        removal = self.removal(keep=True)
+        plan = removal.plan()
+        self.assertEqual([], plan['blocked'])
+        with mock.patch.object(self.pr.Removal, 'plan', return_value=plan):  # it was free when the engineer read it
+            con = sqlite3.connect(self.data / 'sessions.db')
+            con.execute("INSERT INTO serve_response_lifecycle VALUES ('r1', 's-child', 'running')")
+            con.commit()
+            con.close()
+            before = self.everything_on_disk()
+            with self.assertRaisesRegex(ValueError, 'STANDARD_BUSY_CHAT'):
+                self.removal(keep=True).run('arc', None)
+            unlocked = lambda paths: [p for p in paths if not p.startswith('state') and not p.endswith('lock')]  # it held the locks, then let go
+            self.assertEqual(unlocked(before), unlocked(self.everything_on_disk()))
+            self.assertEqual([], self.docker.removed())
+            self.assertIn('db-arc', self.mcp())
+            con = sqlite3.connect(self.data / 'sessions.db')
+            con.execute("DELETE FROM serve_response_lifecycle")
+            con.commit()
+            con.close()
+            self.docker.objects['container']['c-job']['state'] = 'running'
+            with self.assertRaisesRegex(ValueError, 'STANDARD_BUSY_JOB'):
+                self.removal(keep=True).run('arc', None)
+            self.assertEqual([], self.docker.removed())
+
+    def test_a_folder_in_projects_alone_is_not_a_project(self):
+        (self.home / 'projects/tools').mkdir()
+        (self.home / 'projects/tools/clone.txt').write_text('not a project')
+        con = sqlite3.connect(self.data / 'sessions.db')
+        con.execute("INSERT INTO sessions VALUES ('s-tools', NULL, ?, NULL, NULL)", (str(self.home / 'projects/tools'),))
+        con.commit()
+        con.close()
+        self.assertFalse(self.removal('tools').plan()['exists'])
+        with self.assertRaisesRegex(ValueError, 'STANDARD_REFERENCE_INVALID'):
+            self.removal('tools').run('tools', None)
+        self.assertTrue((self.home / 'projects/tools/clone.txt').exists())
+        self.assertIn('s-tools', self.sessions())
+
+    def test_another_projects_chat_started_from_this_one_is_not_taken(self):
+        con = sqlite3.connect(self.data / 'sessions.db')
+        con.execute("INSERT INTO sessions VALUES ('s-theirs', ?, ?, 's-main', NULL)", ('prj_' + 'f' * 16, str(self.home / 'projects/other')))
+        con.execute("INSERT INTO sessions VALUES ('s-there', NULL, ?, 's-main', NULL)", (str(self.home / 'projects/other/sub'),))
+        con.commit()
+        con.close()
+        ids = self.removal().chats()['ids']
+        self.assertNotIn('s-theirs', ids)
+        self.assertNotIn('s-there', ids)
+        # Its parent can't go while they point at it: it stops, and nothing of theirs is lost.
+        with self.assertRaisesRegex(ValueError, 'STANDARD_REMOVE_INCOMPLETE: 1 chat'):
+            self.removal().run('arc', None)
+        self.assertTrue({'s-other', 's-theirs', 's-there'} <= set(self.sessions()))
+
+    def test_folders_of_another_user_block_it(self):
+        real = self.pr.tree_facts
+        workspace = self.base / 'arc'
+        with mock.patch.object(self.pr, 'tree_facts', side_effect=lambda path: (0, 0, 1) if Path(path) == workspace else real(path)):
+            self.check_refused('STANDARD_REMOVE_NOT_OWNED', 'belong to another user')
+
+    def test_odd_records_are_skipped_and_an_unwritable_record_is_reported(self):
+        provenance = self.base / 'arc/.silo-migrate/data/provenance.jsonl'
+        provenance.write_text('[1]\n"x"\n' + provenance.read_text())
+        (self.base / 'arc/.silo-migrate/data/pending/odd.json').write_text('{"provenance": "x"}')
+        (self.top / 'state').write_text('a file where the folder should be')
+        result = self.removal(keep=True).run('arc', None)
+        self.assertEqual(1, len(result['returned']))
+        self.assertEqual(["The record of this removal couldn't be written to " + str(self.top / 'state/removed-projects.jsonl') + '.'], result['notes'])
+
+    def test_a_full_removal_stopped_before_its_last_step_is_found_and_finished(self):
+        removal = self.removal()
+        with mock.patch.object(self.pr.Removal, 'archive_web_project', side_effect=OSError('stopped')):
+            with self.assertRaises(OSError):
+                removal.run('arc', None)
+        self.assertFalse((self.base / 'arc').exists())
+        plan = self.removal().plan()
+        self.assertTrue(plan['exists'])  # its web UI project is still there
+        self.removal().run('arc', None)
 
     # -- entry point -----------------------------------------------------------------------------
 

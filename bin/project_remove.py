@@ -21,8 +21,11 @@ it. Everything a project leaves belongs to this account:
 
 Start over (--keep-received) first puts each file taken from the drop folder back where it was, then
 keeps the drop folder, the chats' folder (emptied) and the web UI project (with no chats). It refuses
-while a run, a data job or one of the project's chats is busy. Every step can run again: a removal
-stopped part-way is finished by running it again. Each removal appends a line to
+while a run, a data job or one of the project's chats is busy, or when something of it belongs to
+another user. A folder in ~/projects alone isn't a project: there must be a workspace, a drop folder,
+a web UI project, an MCP entry or Docker objects of that name. Every step can run again: a removal
+stopped part-way is finished by running it again (a full removal archives the web UI project last,
+so that until then it is still found). Each removal appends a line to
 <prefix>/state/removed-projects.jsonl: who, when, which project and counts, never file names.
 """
 import contextlib
@@ -81,8 +84,22 @@ def plain_dir(path, what):
 
 def tree_size(path):
     """(bytes, files) of the regular files below a folder, links not followed."""
-    total = files = 0
-    for _folder, _dirs, names, dirfd in os.fwalk(str(path), follow_symlinks=False):
+    total, files, _foreign = tree_facts(path)
+    return total, files
+
+
+def tree_facts(path):
+    """(bytes, files, folders owned by another user) below a folder, links not followed. A folder of
+    another user (a container's bind mount, a copy made as root) can't be emptied by this account."""
+    total = files = foreign = 0
+    for _folder, dirs, names, dirfd in os.fwalk(str(path), follow_symlinks=False):
+        for name in dirs:
+            try:
+                info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(info.st_mode) and info.st_uid != os.getuid():
+                foreign += 1
         for name in names:
             try:
                 info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
@@ -91,7 +108,7 @@ def tree_size(path):
             if stat.S_ISREG(info.st_mode):
                 total += info.st_size
                 files += 1
-    return total, files
+    return total, files, foreign
 
 
 def remove_tree(path):
@@ -231,7 +248,9 @@ class Removal:
                 record = json.loads(line)
             except ValueError:
                 continue
-            path, origin = (record.get("path"), record.get("from")) if isinstance(record, dict) else (None, None)
+            if not isinstance(record, dict):
+                continue
+            path, origin = record.get("path"), record.get("from")
             if record.get("event") == "take" and isinstance(path, str) and path.startswith("inputs/") and isinstance(origin, str) and origin.startswith("intake/"):
                 add(path[len("inputs/"):], origin[len("intake/"):])
         # A take stopped after its move but before its record: its pending note knows where the file
@@ -239,9 +258,13 @@ class Removal:
         pending = ws.data / "pending"
         if pending.is_dir() and not pending.is_symlink():
             for note in sorted(pending.glob("*.json")):
-                record = self.ws.read_json(note, {}) if not note.is_symlink() else {}
-                origin = ((record.get("provenance") or {}) if isinstance(record, dict) else {}).get("from")
-                if not (isinstance(origin, str) and origin.startswith("intake/") and record["provenance"].get("event") == "take"):
+                try:
+                    record = self.ws.read_json(note, {}) if not note.is_symlink() else {}
+                except ValueError:
+                    continue
+                provenance = record.get("provenance") if isinstance(record, dict) else None
+                origin = provenance.get("from") if isinstance(provenance, dict) else None
+                if not (isinstance(origin, str) and origin.startswith("intake/") and provenance.get("event") == "take"):
                     continue
                 with os.scandir(str(inputs)) as entries:
                     for entry in entries:
@@ -267,7 +290,9 @@ class Removal:
         return [line.split("\t") for line in result.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
 
     def docker_objects(self, state):
-        """Every container, network and volume of this project: {kind: {id: {state, role, run}}}."""
+        """Every container, network and volume of this project: {kind: {id: {state, role, run}}}. Only exact
+        labels count (a review site's stack carries its run's label from creation), and the source
+        database's volume by its exact name."""
         names = self.dt.db_names(self.ws)
         runs = {run_id for run_id in (state.get("runs") or {}) if isinstance(run_id, str) and RUN.fullmatch(run_id)}
         labels = '\t{{.Label "silo.workspace"}}\t{{.Label "silo-migrate.run"}}\t{{.Label "silo.role"}}\t{{.Label "silo-migrate.role"}}'
@@ -281,27 +306,6 @@ class Removal:
                 mine = workspace == self.ws.name or run in runs or (kind == "volumes" and identity == names["volume"])
                 if identity and mine:
                     found[kind][identity] = {"state": extra if kind == "containers" else "", "role": role or run_role, "run": run}
-        # What a site record holds whose run label went missing: exact IDs, still labelled as that site.
-        for record in (state.get("instances") or {}).values():
-            if not isinstance(record, dict) or record.get("state") == "removed" or not isinstance(record.get("name"), str):
-                continue
-            for kind, ids in (("container", list((record.get("containers") or {}).values())), ("network", record.get("networks") or []),
-                              ("volume", record.get("volumes") or [])):
-                for identity in ids:
-                    if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", identity):
-                        continue
-                    key = "{{.Id}}" if kind != "volume" else "{{.Name}}"
-                    labels_of = "{{json .Config.Labels}}" if kind == "container" else "{{json .Labels}}"
-                    result = self.dt.docker([kind, "inspect", "--format", key + "\t" + labels_of, identity], timeout=30)
-                    if result.returncode:
-                        continue
-                    exact, _, raw = result.stdout.decode("utf-8", "replace").strip().partition("\t")
-                    try:
-                        owned = (json.loads(raw) or {}).get("silo-migrate.instance") == record["name"]
-                    except (ValueError, AttributeError):
-                        owned = False
-                    if owned and exact not in found[kind + "s"]:
-                        found[kind + "s"][exact] = {"state": "", "role": record.get("role") or "", "run": record.get("run_id") or ""}
         return found
 
     def mcp_present(self):
@@ -355,11 +359,19 @@ class Removal:
                     if (out["project_id"] and project == out["project_id"])
                     or (isinstance(cwd, str) and any(cwd == folder or cwd.startswith(folder + "/") for folder in folders))}
             links = {sid: {parent, root} - {None, sid} for sid, parent, root, _project, _cwd in rows}
+            others = str(self.home / "projects") + "/"
+
+            def not_elsewhere(project, cwd):
+                """An agent's chat belongs here unless it is another project's, or ran in another project's folder."""
+                if project and project != out["project_id"]:
+                    return False
+                return not (isinstance(cwd, str) and cwd.startswith(others) and not any(cwd == f or cwd.startswith(f + "/") for f in folders))
+            free = {sid for sid, _parent, _root, project, cwd in rows if not_elsewhere(project, cwd)}
             grown = True
             while grown:  # every agent's chat started from one of these, however deep
                 grown = False
                 for sid, refs in links.items():
-                    if sid not in mine and refs & mine:
+                    if sid not in mine and sid in free and refs & mine:
                         mine.add(sid)
                         grown = True
             left = set(mine)
@@ -378,8 +390,15 @@ class Removal:
                     chunk = ids[start:start + 400]
                     for (parts,) in connection.execute("SELECT parts FROM messages WHERE session_id IN (%s)" % ",".join("?" * len(chunk)), chunk):
                         self.attachments(parts, uploads, refs)
-            out["uploads"] = sorted(name for name in uploads if self.upload_file(name))
-            out["refs"] = sorted(ref for ref in refs if self.upload_file(ref) or self.upload_file(ref + ".json", "upload-refs"))
+            uploads = {name for name in uploads if self.upload_file(name)}
+            refs = {ref for ref in refs if self.upload_file(ref) or self.upload_file(ref + ".json", "upload-refs")}
+            if "messages" in tables:  # an attachment another chat also names stays with that chat
+                for name in sorted(uploads | refs):
+                    users = {row[0] for row in connection.execute("SELECT DISTINCT session_id FROM messages WHERE instr(parts, ?) > 0", (name,))}
+                    if users - mine:
+                        uploads.discard(name)
+                        refs.discard(name)
+            out["uploads"], out["refs"] = sorted(uploads), sorted(refs)
         except sqlite3.Error:
             refuse("STANDARD_CHATS_UNREADABLE: term-llm's chat database can't be read; try again")
         finally:
@@ -431,6 +450,11 @@ class Removal:
         facts["docker"] = self.docker_objects(facts["state"])
         facts["chats"] = self.chats()
         facts["mcp"] = self.mcp_present()
+        # Only folders that will be emptied: Start over keeps the drop folder.
+        places = [ws.root] if self.has_workspace else []
+        places += [] if self.keep or not facts["drop"] else [ws.intake]
+        places += [self.chats_folder] if facts["chats_folder"] else []
+        facts["foreign"] = sum(tree_facts(place)[2] for place in places)
         return facts
 
     def blockers(self, facts):
@@ -444,6 +468,8 @@ class Removal:
             out.append({"code": "STANDARD_BUSY", "text": "The project is busy right now (an agent or a decision is working on it). Try again in a minute."})
         if facts["chats"]["running"]:
             out.append({"code": "STANDARD_BUSY_CHAT", "text": "A chat in this project is still answering. Stop it or let it finish, then try again."})
+        if facts.get("foreign"):
+            out.append({"code": "STANDARD_REMOVE_NOT_OWNED", "text": "Some of its folders belong to another user (root, say), so this account can't remove them. Ask for help; nothing was changed."})
         if self.keep and any(not item["to"] for item in facts["received"]):
             out.append({"code": "STANDARD_REMOVE_DROP_TAKEN", "text": "A received file can't go back: the drop folder already has files of those names. Move them away, then try again."})
         return out
@@ -511,8 +537,8 @@ class Removal:
                 removed.append(item("The web UI project (archived: term-llm can't delete projects)", None))
         if self.has_workspace and (ws.root / "converter").is_dir():
             kept.append(item("The converter's branch and pull requests on GitHub", None))
-        exists = bool(self.has_workspace or facts["drop"] or facts["chats_folder"] or count or chats["ids"] or facts["mcp"]
-                      or (chats["project_id"] and not chats["archived"]))
+        # A folder in ~/projects (or chats run in one) isn't a project by itself.
+        exists = bool(self.has_workspace or facts["drop"] or count or facts["mcp"] or (chats["project_id"] and not chats["archived"]))
         return {"version": 1, "project": ws.name, "mode": "start_over" if self.keep else "remove", "exists": exists,
                 "blocked": self.blockers(facts), "removed": removed, "kept": kept}
 
@@ -550,6 +576,8 @@ class Removal:
         return first
 
     def term_llm(self):
+        """The node's term-llm, <prefix>/bin/term-llm; else the one on PATH (`silo` sets PATH to <prefix>/bin
+        first, and the web service runs with it)."""
         installed = self.ws.prefix / "bin/term-llm"
         if installed.is_file() and os.access(installed, os.X_OK):
             return str(installed)
@@ -661,13 +689,15 @@ class Removal:
         return returned
 
     def record(self, entry):
+        """True once the line is written."""
         try:
             self.record_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             fd = os.open(str(self.record_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             with os.fdopen(fd, "a") as handle:
                 handle.write(json.dumps(dict(entry, at=now(), project=self.ws.name, mode="start_over" if self.keep else "remove"), sort_keys=True) + "\n")
         except OSError:
-            pass
+            return False
+        return True
 
     def locks(self):
         """New workspaces, agents' data operations and the workbench all wait while this runs."""
@@ -700,24 +730,26 @@ class Removal:
             with contextlib.ExitStack() as stack:
                 for path in self.locks():
                     stack.enter_context(hold(path))
-                state = self.standard()  # again, now that nothing else can start
+                # Again, now that nothing new can start, and before anything is touched.
+                state = self.standard()
                 if any(isinstance(run, dict) and run.get("status") in BUSY for run in (state.get("runs") or {}).values()):
                     refuse("STANDARD_BUSY_RUN: a run is still running")
-                done["mcp_entry"] = self.remove_mcp()
-                done["docker_objects"] = self.remove_docker(state)
+                if any(item["role"] == "data-job" and item["state"] == "running" for item in self.docker_objects(state)["containers"].values()):
+                    refuse("STANDARD_BUSY_JOB: a data job is still running")
                 chats = self.chats()
                 if chats["running"]:
                     refuse("STANDARD_BUSY_CHAT: a chat in this project is still answering")
-                done["attachments"] = len(set(chats["uploads"]) | set(chats["refs"]))
-                done["chats"] = self.remove_chats(chats)
-                if not self.keep:
-                    done["web_project"] = self.archive_web_project(chats["project_id"]) if not chats["archived"] else "archived before"
+                # The customer's files go back first: a name in the way stops it before anything is removed.
                 if self.keep:
                     received = self.received()
                     if any(not entry["to"] for entry in received):
                         refuse("STANDARD_REMOVE_DROP_TAKEN: the drop folder already has files of those names")
                     returned = self.return_received(received)
                     done["returned"] = len(returned)
+                done["mcp_entry"] = self.remove_mcp()
+                done["docker_objects"] = self.remove_docker(state)
+                done["attachments"] = len(set(chats["uploads"]) | set(chats["refs"]))
+                done["chats"] = self.remove_chats(chats)
                 if self.has_workspace:
                     remove_tree(ws.root)
             if self.keep:
@@ -725,11 +757,13 @@ class Removal:
             else:
                 remove_tree(ws.intake)
                 remove_tree(self.chats_folder)
+                # Last: until it's archived, a removal stopped part-way is still found and finished.
+                done["web_project"] = self.archive_web_project(chats["project_id"]) if not chats["archived"] else "archived before"
         except (ValueError, OSError) as error:  # data_tools' refusals too (a file in the way, say)
             code = str(error).split(":")[0] if isinstance(error, ValueError) and str(error).startswith("STANDARD_") else "STANDARD_OPERATION_FAILED"
             self.record({"event": "stopped", "by": by or "unknown", "code": code, **{k: v for k, v in done.items() if k != "web_project"}})
             raise
-        self.record({"event": "finished", "by": by or "unknown", **done})
+        recorded = self.record({"event": "finished", "by": by or "unknown", **done})
         if self.keep:
             # As for a new project: migration-data sets the workspace up, then the engineer labels the files.
             following = ("Next: start a new chat with migration-data in project " + ws.name + " and ask what's next. It sets up the workspace; "
@@ -740,6 +774,8 @@ class Removal:
         notes = []
         if not self.keep and done["web_project"] not in ("archived", "none", "archived before"):
             notes.append("The web UI project is still listed: " + done["web_project"] + ".")
+        if not recorded:
+            notes.append("The record of this removal couldn't be written to " + str(self.record_file) + ".")
         return {"version": 1, "project": ws.name, "mode": plan["mode"], "status": "done", "returned": returned, "removed": done,
                 "next": following, "notes": notes}
 
