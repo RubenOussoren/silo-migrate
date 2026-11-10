@@ -105,7 +105,7 @@ and the web UI keeps chats apart:
   the service's home folder, not the project's, so turning on only the chat's own `db-<project>`
   stays your job (migration-data is told to stop if another project's server is on).
 - **Look and feel:** the web UI uses Varnish by Keegan George (`extensions/varnish`, a copy of upstream with two checked compatibility patches; `script/update-varnish COMMIT` replaces it and applies them) with our changes kept in `extensions/silo-theme`. Updates are deliberate: this code runs on pages showing customer data, so run the browser tests before shipping one.
-- **The Project page** (a Project tab, and under Widgets) shows one project at a time: which data is in use, where it stands, what to do next. New files are labelled there as Development or Launch, and only there: the agent can't take a file until it's labelled, a plan's approval covers which delivery it uses, and a launch run is refused until accepting a site is built.
+- **The Project page** (a Project tab, and under Widgets) shows one project at a time: which data is in use, where it stands, what to do next. New files are labelled there as Development or Launch, and only there: the agent can't take a file until it's labelled, a plan's approval covers which delivery it uses, and a launch run is refused until running on launch data is built (the accepted process it will repeat is already recorded: see Accepting a site).
 - **What labels guard against:** mixing up data by accident. A script reads one delivery and its outputs belong to it, but migration-data can still read every delivery, so the labels don't stop an agent deliberately copying one delivery's content into another's script.
 - **Rollback and labels:** a release from before labels ignores them. After rolling back, the agent can take unlabelled files again until you roll forward. If a take from before labels was interrupted and shows "ask the engineer", finish it by hand: as the service account, check `.silo-migrate/data/pending/` in the workspace and the file already in `inputs/`, then ask for help.
 - **The guide:** every migration-data chat starts with `data_guide`, which works out from the project's state where it stands and what's next, so a new chat knows as much as an old one. Agents take the project from the chat, so they never need to be told which one it is.
@@ -214,6 +214,38 @@ checking its owner, so the installer reserves it for the service account (now an
 account's and private, and doctor's "widget folder" check fails otherwise. Without the widget (doctor's "findings widget" check), use the CLI in
 `docs/standard-workbench.md` as the service account (`silo shell`; `silo-migrate-control` refuses
 root).
+
+## Accepting a site (web UI)
+
+When a pass's convert and import runs both matched every check on development data, its card in the
+Project page's **Runs** tab asks "Is this site right?":
+
+- **Accept site…** shows what is accepted: data, converter commit, settings, checks and Discourse
+  version (IDs under Details). Choose the basis: **the customer approved it** (this becomes the
+  *accepted process* that launch will repeat) or **I checked it myself** (recorded and shown; the
+  pass then asks whether the customer has approved it). The acceptance names exactly the process
+  shown: if anything changed meanwhile it's refused (`STANDARD_APPROVAL_MISMATCH`). Reset is offered
+  straight after, because the review site holds customer data.
+- **Needs changes…** keeps a short note. migration-data gets it as its next step (`data_guide`) and
+  is told never to quote it to the coding agents (a finding with invented examples instead).
+- The Overview shows the accepted process with **Withdraw acceptance…**, and a banner when the
+  converter, data or Discourse version changed since. Withdrawing leaves nothing accepted (never an
+  older acceptance); an older pass whose acceptance a later one replaced shows "Accepted earlier".
+- The record is append-only, in `.silo-migrate/named/site-reviews.json`, and only the engineer's
+  page writes it (no agent tool maps to it; chat calls are refused). Notes are in the audit log by
+  hash only.
+
+## Removing a project or starting over
+
+At the foot of a project's Overview: **Start over…** (everything goes except the customer's received
+files, which return to the drop folder; the web UI project stays, without chats) and **Remove
+project…** (everything, including the drop folder; the web UI project is archived, because
+term-llm can't delete one, and `silo intake NAME` brings it back empty). Both list what goes and
+what stays, with sizes, and ask you to type the project's name; they refuse while a run, a data job
+or one of the project's chats is busy. The same as a root command: `silo remove-project` (lists the
+projects), `silo remove-project NAME [--keep-received]`. A stopped removal finishes when run again;
+each removal adds a line (who, when, counts, no file names) to `removed-projects.jsonl` in the
+install's state folder. The converter's GitHub branches and pull requests stay.
 
 ## op-cache (Frontier's key)
 
