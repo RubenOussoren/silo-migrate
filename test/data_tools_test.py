@@ -964,11 +964,121 @@ class DataToolsTest(unittest.TestCase):
         self.guide_state(findings=released, pushes=pushes, runs=[convert, review], sites=[site])
         guide = self.op('guide')
         self.assertNext('engineer', 'SSH tunnel', guide)
+        self.assertNext('engineer', 'accept it or say what needs changing', guide)
         self.assertEqual('site', guide['stage'])
-        self.assertEqual('not_recorded', guide['stages'][-1]['state'])
+        self.assertEqual('current', guide['stages'][-1]['state'])
         self.assertTrue(any('holds customer data' in line for line in guide['also']))
         self.guide_state(findings=released, pushes=pushes, runs=[convert, review])
-        self.assertNext('nobody', 'next pass')
+        self.assertNext('engineer', 'its site is gone: accept it on its pass')
+
+    def site_state(self, review_passed=True, kind='development'):
+        """Plans and runs stored the way the workbench stores them: a passed convert and a review import."""
+        self.guide_ready()
+        dataset = next(iter(json.loads((self.base / 'arc/.silo-migrate/named/state.json').read_text())['datasets']))
+        self.deliveries({dataset: {'dataset_id': dataset, 'kind': kind, 'version': 2, 'sequence': 1, 'labelled_at': '2026-01-01T00:00:00Z', 'files': []}})
+        convert_run, review_run = 'run-' + '1' * 32, 'run-' + '2' * 32
+        binding = lambda *ids: [{'id': i, 'sha256': i[-1] * 64, 'bytes': 1, 'type': 'x'} for i in ids]
+        delivery = {'dataset_id': dataset, 'kind': kind, 'version': 2}
+        convert_body = {'operation': 'standard_convert', 'delivery': delivery, 'converter_revision': 'c' * 40,
+                        'converter': {'repo': 'https://github.com/x/y.git', 'branch': 'migration/arc/x'}, 'source_charset': 'utf8mb4',
+                        'roles': {'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32, 'reconciliation': 'input-' + 'd' * 32},
+                        'input_binding': binding('input-' + 'a' * 32, 'input-' + 'b' * 32, 'input-' + 'd' * 32)}
+        review_body = {'operation': 'standard_review', 'delivery': delivery, 'from_run': {'run_id': convert_run},
+                       'roles': {'reconciliation': 'input-' + 'e' * 32}, 'input_binding': binding('input-' + 'e' * 32),
+                       'discourse_profile': 'discourse-2026.11.0-latest-3158c750', 'runtime_lock_sha256': 'f' * 64}
+        results = lambda matched: {'reconciliation_checks': 6, 'reconciliation_matched': matched}
+        standard = self.base / 'arc/.silo-migrate/named/standard'
+        state = json.loads((standard / 'state.json').read_text())
+        state['config'] = dict(state.get('config') or {}, converter_revision='c' * 40, discourse_profile='discourse-2026.11.0-latest-3158c750')
+        state['plans'] = {'plan-' + '1' * 32: {'digest': '1' * 64, 'body': convert_body}, 'plan-' + '2' * 32: {'digest': '2' * 64, 'body': review_body}}
+        state['runs'] = {convert_run: {'id': convert_run, 'plan_id': 'plan-' + '1' * 32, 'status': 'completed', 'results': results(6)},
+                         review_run: {'id': review_run, 'plan_id': 'plan-' + '2' * 32, 'status': 'completed', 'results': results(6 if review_passed else 5)}}
+        (standard / 'state.json').write_text(json.dumps(state))
+        self.control.status = {'version': 1, 'instances': [], 'plans': [],
+                               'runs': [{'run_id': run_id, 'plan_id': run['plan_id'], 'status': 'completed', 'started_at': '2026-01-0%dT00:00:00Z' % (4 + i),
+                                         'results': run['results']} for i, (run_id, run) in enumerate(state['runs'].items())]}
+        return review_run
+
+    def deliveries(self, records):
+        (self.base / 'arc/.silo-migrate/named/deliveries.json').write_text(json.dumps({'version': 1, 'deliveries': records}))
+
+    def test_site_review_accepts_exactly_the_process_shown_and_the_guide_follows(self):
+        run_id = self.site_state()
+        shown = self.op('site_process', run_id=run_id)
+        self.assertTrue(shown['can_accept'])
+        process = shown['process']
+        self.assertEqual(('c' * 40, 'migration/arc/x', 2), (process['converter']['revision'], process['converter']['branch'], process['delivery']['version']))
+        self.assertEqual({'id': 'input-' + 'b' * 32, 'sha256': 'b' * 64}, process['settings'])
+        self.assertEqual({'convert': {'checks': 6, 'matched': 6}, 'import': {'checks': 6, 'matched': 6}}, process['results'])
+        accept = dict(run_id=run_id, verdict='accepted', basis='customer', by='Alex (web UI)', note='approved on the call')
+        with self.assertRaisesRegex(self.d.Refusal, 'STANDARD_APPROVAL_MISMATCH'):
+            self.op('site_review', process_digest='0' * 64, **accept)
+        with self.assertRaisesRegex(self.d.Refusal, 'basis'):
+            self.op('site_review', process_digest=shown['process_digest'], **dict(accept, basis='me'))
+        # Not something an agent can do, even with the right arguments.
+        with self.assertRaisesRegex(self.d.Refusal, 'STANDARD_DATA_OPERATION_REFUSED'):
+            self.op('site_review', process_digest=shown['process_digest'], via='chat', **accept)
+        self.assertFalse(self.d.site_reviews_file(self.d.Workspace(self.base, 'arc', ROOT, None, {}, None)).exists())
+        done = self.op('site_review', process_digest=shown['process_digest'], **accept)
+        self.assertEqual(('accepted', 'customer', 'Alex (web UI)'), (done['review']['verdict'], done['review']['basis'], done['review']['by']))
+        guide = self.op('guide')
+        self.assertEqual('done', guide['stages'][-1]['state'])
+        self.assertEqual('nobody', guide['next']['who'])
+        self.assertIn('accepted: the customer approved it', guide['next']['action'])
+        self.assertEqual({'run_id': run_id, 'data': 'Development v2', 'converter': 'c' * 40, 'by': 'Alex (web UI)', 'note': 'approved on the call'},
+                         {key: value for key, value in guide['site_acceptance']['accepted'].items() if key not in ('at', 'id')})
+        self.assertEqual([], guide['site_acceptance']['changed_since_acceptance'])
+        # The converter moves on: the guide says so, the acceptance stands.
+        standard = self.base / 'arc/.silo-migrate/named/standard/state.json'
+        state = json.loads(standard.read_text())
+        state['config']['converter_revision'] = '9' * 40
+        standard.write_text(json.dumps(state))
+        self.assertEqual(['converter ccccccc → 9999999'], self.op('guide')['site_acceptance']['changed_since_acceptance'])
+        # Withdrawn: nothing is accepted, and the site is back to deciding.
+        with self.assertRaisesRegex(self.d.Refusal, 'review_id'):
+            self.op('site_review', verdict='withdrawn', review_id='review-nope', by='Alex (web UI)')
+        self.op('site_review', verdict='withdrawn', review_id=done['review']['id'], by='Alex (web UI)')
+        guide = self.op('guide')
+        self.assertIsNone(guide['site_acceptance']['accepted'])
+        self.assertEqual('engineer', guide['next']['who'])
+        with self.assertRaisesRegex(self.d.Refusal, 'review_id'):  # once
+            self.op('site_review', verdict='withdrawn', review_id=done['review']['id'], by='Alex (web UI)')
+        reviews = json.loads((self.base / 'arc/.silo-migrate/named/site-reviews.json').read_text())['reviews']
+        self.assertEqual(['accepted', 'withdrawn'], [entry['verdict'] for entry in reviews])  # append-only
+        audit = (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text()
+        self.assertNotIn('approved on the call', audit)  # the note's text is logged by hash only
+
+    def test_site_review_own_check_and_needs_changes(self):
+        run_id = self.site_state()
+        digest = self.op('site_process', run_id=run_id)['process_digest']
+        self.op('site_review', run_id=run_id, verdict='accepted', basis='engineer', by='Alex (web UI)', process_digest=digest)
+        guide = self.op('guide')
+        self.assertIsNone(guide['site_acceptance']['accepted'])  # launch repeats only the customer's
+        self.assertEqual(run_id, guide['site_acceptance']['own_check']['run_id'])
+        self.assertNext('engineer', 'checked the site of review run %s yourself' % run_id, guide)
+        self.assertEqual('current', guide['stages'][-1]['state'])
+        with self.assertRaisesRegex(self.d.Refusal, 'note'):
+            self.op('site_review', run_id=run_id, verdict='needs_changes', by='Alex (web UI)')
+        self.op('site_review', run_id=run_id, verdict='needs_changes', by='Alex (web UI)', note='quoted replies show raw markup')
+        guide = self.op('guide')
+        self.assertNext('agent', 'needs changes: "quoted replies show raw markup"', guide)
+        for bad in ('x' * 2001, 'a\x00b', '   '):
+            with self.subTest(bad=bad[:5]), self.assertRaisesRegex(self.d.Refusal, 'note'):
+                self.op('site_review', run_id=run_id, verdict='needs_changes', by='Alex (web UI)', note=bad)
+
+    def test_only_a_passing_development_site_can_be_accepted(self):
+        for case, kwargs in (('a check differs', {'review_passed': False}), ('launch data', {'kind': 'launch'})):
+            with self.subTest(case):
+                self.setUp()
+                run_id = self.site_state(**kwargs)
+                shown = self.op('site_process', run_id=run_id)
+                self.assertFalse(shown['can_accept'])
+                with self.assertRaisesRegex(self.d.Refusal, 'STANDARD_SITE_NOT_PASSED'):
+                    self.op('site_review', run_id=run_id, verdict='accepted', basis='customer', by='A (web UI)', process_digest=shown['process_digest'])
+                # Saying it needs changes is always possible on a finished import.
+                self.op('site_review', run_id=run_id, verdict='needs_changes', by='A (web UI)', note='check the counts')
+        with self.assertRaisesRegex(self.d.Refusal, 'STANDARD_SITE_NOT_REVIEW'):
+            self.op('site_process', run_id='run-' + '1' * 32)  # a convert run has no site
 
     def test_guide_puts_a_running_run_first_then_what_waits_on_the_engineer(self):
         self.guide_ready()
@@ -1100,7 +1210,8 @@ class DataToolsTest(unittest.TestCase):
         guide = self.op('guide')
         self.assertIsNone(guide['data']['development'])
         self.assertIn('no data is labelled yet', guide['data']['note'])
-        self.assertIn('not recorded yet', guide['site_acceptance'])
+        self.assertIsNone(guide['site_acceptance']['accepted'])
+        self.assertIn('nothing accepted yet', guide['site_acceptance']['note'])
         self.assertEqual('your node admin', guide['support_contact'])
         contact = self.base.parent / 'etc/support-contact'
         contact.parent.mkdir(exist_ok=True)

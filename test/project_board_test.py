@@ -40,8 +40,8 @@ class PassesTest(unittest.TestCase):
     def setUp(self):
         self.b = load()
 
-    def build(self, plans, runs, bodies, sites=None, pushes=(), deliveries=None):
-        return self.b.build_passes(plans, runs, bodies, sites or {}, list(pushes), deliveries or {})
+    def build(self, plans, runs, bodies, sites=None, pushes=(), deliveries=None, reviews=()):
+        return self.b.build_passes(plans, runs, bodies, sites or {}, list(pushes), deliveries or {}, list(reviews))
 
     def test_a_convert_run_and_its_imports_make_one_pass_newest_first(self):
         result = self.build([plan(1), plan(2), plan(3), plan(4)], [run(1, 1), run(2, 2), run(3, 3), run(4, 4)],
@@ -54,6 +54,26 @@ class PassesTest(unittest.TestCase):
         self.assertEqual(('Ready to check', 'now'), latest['status'])
         self.assertEqual(('All checks matched', 'ok'), result['passes'][1]['status'])
         self.assertEqual('Development v1', latest['delivery'])
+
+    def test_the_site_verdict_shows_on_its_import_and_the_pass(self):
+        plans, runs = [plan(1), plan(2)], [run(1, 1), run(2, 2)]
+        bodies = {'plan-1': convert_body(), 'plan-2': review_body('run-1')}
+        accepted = {'id': 'review-1', 'verdict': 'accepted', 'basis': 'customer', 'run_id': 'run-2', 'by': 'A', 'at': '2026-01-03T00:00:00Z', 'process': {'big': 1}}
+        cases = [((), None, ('Ready to check', 'now')),
+                 ([accepted], 'accepted', ('Accepted', 'ok')),
+                 ([dict(accepted, basis='engineer')], 'accepted', ('Checked by you', 'ok')),
+                 ([accepted, {'id': 'review-2', 'verdict': 'needs_changes', 'run_id': 'run-2', 'note': 'n'}], 'needs_changes', ('Needs changes', 'warn')),
+                 ([accepted, {'id': 'review-3', 'verdict': 'withdrawn', 'of': 'review-1', 'run_id': 'run-2'}], None, ('Ready to check', 'now'))]
+        for reviews, verdict, status in cases:
+            with self.subTest(reviews=[entry['verdict'] for entry in reviews]):
+                group = self.build(plans, runs, bodies, sites={'run-2': True}, reviews=reviews)['passes'][0]
+                step = group['imports'][0]
+                self.assertEqual(verdict, (step['review'] or {}).get('verdict'))
+                self.assertEqual(status, group['status'])
+                self.assertNotIn('process', step['review'] or {})  # the page gets the verdict, not the stored process
+        # Another run's verdict doesn't count for this one.
+        other = dict(accepted, run_id='run-9')
+        self.assertIsNone(self.build(plans, runs, bodies, reviews=[other])['passes'][0]['imports'][0]['review'])
 
     def test_statuses_tell_what_is_next(self):
         cases = [

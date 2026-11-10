@@ -82,17 +82,49 @@ export function runsView(ctx) {
     return actions.length ? el('div', { class: 'actions' }, actions) : null;
   }
 
+  const passed = (step) => step && step.run_status === 'completed' && step.checks && step.matched === step.checks;
+  // The engineer's verdict on the last import's site: accepted (on the customer's approval or their own
+  // check), needs changes, or still to decide.
+  function siteRow(last) {
+    const review = last.review;
+    const up = last.site_up ? ' · up, holds customer data until reset' : '';
+    if (review && review.verdict === 'accepted') {
+      const basis = review.basis === 'customer' ? 'customer approved' : 'your own check';
+      return el('div', { class: 'step static' }, el('span', { class: 'dot' }), el('span', {}, 'Site'), el('span', { class: 'what' }, `Accepted by ${safe(review.by)} ${ago(review.at)} · ${basis}${up}`),
+        el('span', { class: 'pill ok' }, review.basis === 'customer' ? 'accepted' : 'checked'));
+    }
+    if (review && review.verdict === 'needs_changes') {
+      return el('div', { class: 'step static' }, el('span', { class: 'dot warn' }), el('span', {}, 'Site'), el('span', { class: 'what' }, `Needs changes: ${safe(review.note || '')}${up}`),
+        el('span', { class: 'pill warn' }, 'needs changes'));
+    }
+    return el('div', { class: 'step static' }, el('span', { class: 'dot run' }), el('span', {}, 'Site'),
+      el('span', { class: 'what' }, last.site_up ? 'Up · check it through the tunnel, then decide' : 'Reset · decide from what you saw'), el('span', { class: 'pill now' }, 'for you'));
+  }
+
   function steps(group) {
     const rows = [stepRow('Convert run', group.convert, false), ...group.imports.map((step, i) => stepRow(group.imports.length > 1 ? `Import ${i + 1}` : 'Import', step, true))];
     const last = group.imports[group.imports.length - 1];
-    if (last && last.site_up) rows.push(el('div', { class: 'step static' }, el('span', { class: 'dot run' }), el('span', {}, 'Review site'), el('span', { class: 'what' }, 'Up · holds customer data until reset'), el('span', { class: 'pill now' }, 'check it')));
+    if (last && passed(last) && passed(group.convert)) rows.push(siteRow(last));
+    else if (last && last.site_up) rows.push(el('div', { class: 'step static' }, el('span', { class: 'dot run' }), el('span', {}, 'Review site'), el('span', { class: 'what' }, 'Up · holds customer data until reset'), el('span', { class: 'pill now' }, 'check it')));
     return rows;
+  }
+
+  // Is this site right? Shown on a pass whose last import passed and has no verdict yet, or only the
+  // engineer's own check (the customer's approval is what launch repeats).
+  function decideBox(group) {
+    const last = group.imports[group.imports.length - 1];
+    if (!last || !passed(last) || !passed(group.convert)) return null;
+    const review = last.review;
+    if (review && !(review.verdict === 'accepted' && review.basis === 'engineer')) return null;
+    return el('div', { class: 'decide' }, el('span', {}, review ? 'Has the customer approved it?' : 'Is this site right?'),
+      el('span', { class: 'btns' }, el('button', { type: 'button', class: 'btn', onclick: () => ctx.open('accept', last.run_id) }, 'Accept site\u2026'),
+        el('button', { type: 'button', class: 'btn q', onclick: () => ctx.open('changes', last.run_id) }, 'Needs changes\u2026')));
   }
 
   function passCard(group, open) {
     const head = el('button', { type: 'button', class: 'pass-head', onclick: () => ctx.open('pass', group.key) },
       el('div', {}, el('span', { class: 'name' }, `Pass ${group.number}`), el('small', {}, passMeta(group))), el('span', { class: `pill ${tone(group)}` }, group.status[0]));
-    return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, steps(group), passActions(group, false)) : null);
+    return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, steps(group), decideBox(group), passActions(group, false)) : null);
   }
 
   function updatesList(all) {
@@ -159,7 +191,7 @@ export function runsView(ctx) {
     const more = details(facts([['Convert run', group.convert.run_id, true], ['Convert plan', group.convert.plan_id, true],
       ...group.imports.map((step, i) => [`Import ${i + 1}`, step.run_id || step.plan_id, true]), ['Converter', group.converter, true], ['Branch', group.branch, true]]));
     ctx.mount([back('Runs', ctx.close), card(`PASS ${group.number} · ${safe(group.delivery || 'DATA NOT LABELLED').toUpperCase()}`, group.status[0], changed,
-      el('div', { class: 'steps' }, steps(group)), passActions(group, true), more)]);
+      el('div', { class: 'steps' }, steps(group)), decideBox(group), passActions(group, true), more)]);
   }
 
   function plan(data) {
@@ -331,6 +363,99 @@ export function runsView(ctx) {
       details(table(['Commit', 'Subject', 'Author', 'Date', 'GitHub'], (log.commits || []).map((c) => [el('span', { class: 'mono' }, short(c.sha, 10)), safe(c.subject), safe(c.author), (c.date || '').slice(0, 16).replace('T', ' '), c.pushed ? 'pushed' : 'not yet']))))];
   }
 
+  // Accepting a site: the server shows exactly what is frozen (the accepted process), and the
+  // acceptance names that (process_digest); anything changed in between is refused.
+  async function acceptView(runId) {
+    const mine = ++ticket;
+    ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, 'Loading…')]);
+    let shown;
+    try { shown = await api(`api/site/process?${new URLSearchParams({ workspace: ctx.project, id: runId })}`); } catch (error) {
+      if (mine === ticket) ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, explain(error))]);
+      return;
+    }
+    if (mine !== ticket) return;
+    const process = shown.process;
+    const what = facts([['Data', process.delivery.kind === 'development' ? `Development v${process.delivery.version}` : safe(process.delivery.kind)],
+      ['Converter', `${short(process.converter.revision, 7)}${process.converter.branch ? ` on ${safe(process.converter.branch)}` : ''}`],
+      ['Settings', process.settings ? 'As this pass used them' : 'None'],
+      ['Checks', `${process.results.import.checks} on the site, all matched; ${process.results.convert.checks} in the convert run, all matched`],
+      ['Discourse', safe(((process.discourse_profile || '').match(/discourse-([0-9][0-9.]*[0-9])/) || [])[1] || process.discourse_profile || '')]]);
+    if (!shown.can_accept) {
+      ctx.mount([back('Runs', ctx.close), card('CAN\u2019T BE ACCEPTED', `This site can't be accepted: ${shown.reason}.`, what,
+        el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn q', onclick: () => ctx.open('changes', runId) }, 'Needs changes\u2026')))]);
+      return;
+    }
+    let basis = 'customer';
+    const option = (value, title, hint) => {
+      const input = el('input', { type: 'radio', name: 'basis', value, checked: value === basis });
+      const label = el('label', { class: value === basis ? 'on' : '' }, input, el('span', {}, title, el('small', {}, hint)));
+      input.addEventListener('change', () => { basis = value; for (const node of document.querySelectorAll('.choice label')) node.className = node.contains(input) ? 'on' : ''; });
+      return label;
+    };
+    const note = el('textarea', { class: 'note', maxlength: '2000', placeholder: 'For example: approved on the call', 'aria-label': 'Note' });
+    const accept = el('button', { type: 'button', class: 'btn', onclick: async () => {
+      accept.disabled = true;
+      try {
+        await api('api/site/review', { workspace: ctx.project, run_id: runId, verdict: 'accepted', basis, note: note.value.trim() || undefined, process_digest: shown.process_digest });
+      } catch (error) {
+        accept.disabled = false;
+        toast(explain(error), true);
+        return;
+      }
+      board = null;
+      done(runId, basis);
+    } }, 'Accept');
+    ctx.mount([back('Runs', ctx.close), card('ACCEPT, FOR YOU', `Accept this site for ${ctx.project}?`,
+      el('div', { class: 'label' }, 'WHAT YOU ACCEPT'), what,
+      el('div', { class: 'label' }, 'ON WHAT BASIS'),
+      el('div', { class: 'choice' }, option('customer', 'The customer approved it', 'They reviewed it and are happy. This is the process launch will repeat.'),
+        option('engineer', 'I checked it myself', 'Your own review. The customer hasn\u2019t seen it yet.')),
+      el('div', { class: 'label' }, 'NOTE (OPTIONAL)'), note,
+      el('p', { class: 'hint' }, 'Recorded with your name and the time. Launch runs will use exactly this process; anything that changes later is shown before you approve them.'),
+      el('div', { class: 'actions' }, accept, el('button', { type: 'button', class: 'btn q', onclick: ctx.close }, 'Cancel')),
+      details(facts([['Import run', process.run_id, true], ['Convert run', process.convert_run_id, true], ['Converter', process.converter.revision, true],
+        ['Settings', process.settings && process.settings.id, true], ['Checks', process.checks.import && process.checks.import.id, true], ['Process code', short(shown.process_digest, 16), true]])))]);
+  }
+
+  // After accepting: the site still holds customer data, so Reset is offered straight away.
+  async function done(runId, basis) {
+    let up = false;
+    try {
+      const data = await api(`api/runs/passes?${new URLSearchParams({ workspace: ctx.project })}`);
+      board = data;
+      up = data.passes.some((group) => group.imports.some((step) => step.run_id === runId && step.site_up));
+    } catch { /* the Runs list shows it */ }
+    const reset = up ? el('button', { type: 'button', class: 'btn', onclick: async () => {
+      if (await act('reset', { run_id: runId }, `Reset this review site of ${ctx.project}? It holds customer data; evidence and plans stay.`)) { toast('Reset.'); ctx.close(); }
+    } }, 'Reset the site') : null;
+    ctx.mount([back('Runs', ctx.close), card('ACCEPTED', basis === 'customer' ? 'Accepted: this is the process launch will repeat.' : 'Recorded as your own check.',
+      el('p', { class: 'hint' }, up ? 'The review site still holds customer data. Reset it now unless you still need it.' : 'Its review site is already gone.'),
+      el('div', { class: 'actions' }, reset, el('button', { type: 'button', class: reset ? 'btn q' : 'btn', onclick: ctx.close }, 'Back to Runs')))]);
+    ctx.refreshCounts && ctx.refreshCounts();
+  }
+
+  function changesView(runId) {
+    ++ticket;
+    const note = el('textarea', { class: 'note tall', maxlength: '2000', placeholder: 'For example: quoted replies show raw markup; avatars are missing', 'aria-label': 'What needs changing' });
+    const save = el('button', { type: 'button', class: 'btn', disabled: true, onclick: async () => {
+      save.disabled = true;
+      try {
+        await api('api/site/review', { workspace: ctx.project, run_id: runId, verdict: 'needs_changes', note: note.value.trim() });
+      } catch (error) {
+        save.disabled = false;
+        toast(explain(error), true);
+        return;
+      }
+      board = null;
+      toast('Saved. Ask migration-data in a chat in this project: "What\u2019s next?"');
+      ctx.close();
+    } }, 'Save');
+    note.addEventListener('input', () => { save.disabled = !note.value.trim(); });
+    ctx.mount([back('Runs', ctx.close), card('NEEDS CHANGES', 'What needs changing on this site?', note,
+      el('p', { class: 'hint' }, 'Stays on this server. migration-data reads it in a chat in this project and works out the fix with you. The site stays up until you Reset it.'),
+      el('div', { class: 'actions' }, save, el('button', { type: 'button', class: 'btn q', onclick: ctx.close }, 'Cancel')))]);
+  }
+
   async function detail(kind, id, quiet = false) {
     const mine = ++ticket;
     board = null;  // a decision may change the passes: the list asks again
@@ -360,5 +485,7 @@ export function runsView(ctx) {
     }
   }
 
-  return { show: () => (!ctx.selected ? list() : ctx.selected.kind === 'pass' ? passView(ctx.selected.id) : detail(ctx.selected.kind, ctx.selected.id)) };
+  return { show: () => (!ctx.selected ? list() : ctx.selected.kind === 'pass' ? passView(ctx.selected.id)
+    : ctx.selected.kind === 'accept' ? acceptView(ctx.selected.id) : ctx.selected.kind === 'changes' ? changesView(ctx.selected.id)
+      : detail(ctx.selected.kind, ctx.selected.id)) };
 }

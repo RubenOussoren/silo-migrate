@@ -120,8 +120,34 @@ def passes_of(base, control, workspace):
         review_sites[run_id] = isinstance(record, dict) and record.get("state") != "removed"
     named = base / workspace / ".silo-migrate/named"
     deliveries = read_json_file(named / "deliveries.json").get("deliveries") or {}
-    result = board.build_passes(view["plans"], view["runs"], bodies, review_sites, store.pushes(workspace), deliveries if isinstance(deliveries, dict) else {})
+    reviews = read_json_file(named / "site-reviews.json").get("reviews") or []
+    result = board.build_passes(view["plans"], view["runs"], bodies, review_sites, store.pushes(workspace), deliveries if isinstance(deliveries, dict) else {},
+                                reviews if isinstance(reviews, list) else [])
     return dict(result, converter=view.get("converter"))
+
+
+def site_review(control, body):
+    """Accept a review site, say it needs changes, or withdraw an acceptance: only these fields pass,
+    with the server's reviewer name. An acceptance carries the digest of the process the page showed."""
+    verdict = body.get("verdict")
+    request = {"op": "site_review", "verdict": verdict, "by": runs.reviewer_name()}
+    if verdict == "withdrawn":
+        if not isinstance(body.get("review_id"), str) or not re.fullmatch(r"review-[0-9a-f]{16}", body["review_id"]):
+            raise Refused("STANDARD_ARGUMENTS_INVALID")
+        request["review_id"] = body["review_id"]
+    elif verdict in ("accepted", "needs_changes"):
+        if not isinstance(body.get("run_id"), str) or not RUN.fullmatch(body["run_id"]):
+            raise Refused("STANDARD_ARGUMENTS_INVALID")
+        request["run_id"] = body["run_id"]
+        if isinstance(body.get("note"), str):
+            request["note"] = body["note"]
+        if verdict == "accepted":
+            if body.get("basis") not in ("customer", "engineer") or not isinstance(body.get("process_digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", body["process_digest"]):
+                raise Refused("STANDARD_ARGUMENTS_INVALID")
+            request.update(basis=body["basis"], process_digest=body["process_digest"])
+    else:
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    return data(control, body.get("workspace"), request)
 
 
 def findings_board(base, control, workspace):
@@ -277,6 +303,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, data(control, query.get("workspace"), {"op": "guide"}))
             if url.path == "/api/counts":
                 return self.send(200, counts(base, query.get("workspace")))
+            if url.path == "/api/site/process":
+                run_id = query.get("id")
+                if not isinstance(run_id, str) or not RUN.fullmatch(run_id):
+                    raise Refused("STANDARD_ARGUMENTS_INVALID")
+                return self.send(200, data(control, query.get("workspace"), {"op": "site_process", "run_id": run_id}))
             if url.path == "/api/project/removal":
                 return self.send(200, removal_plan(control, query.get("workspace"), query.get("keep") == "1"))
             if url.path == "/api/runs/passes":
@@ -330,6 +361,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = label(self.server.control, body)
             elif path == "/api/project/remove":
                 result = remove(self.server.control, body)
+            elif path == "/api/site/review":
+                result = site_review(self.server.control, body)
             elif path in ("/api/runs/again", "/api/runs/import"):
                 result = propose_again(self.server.base, self.server.control, body, import_next=path.endswith("/import"))
             elif path == "/api/findings/done":

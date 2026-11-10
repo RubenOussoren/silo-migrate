@@ -140,3 +140,14 @@ input.search { font: inherit; font-size: 13px; background: var(--surface-2); col
 .typed b { color: var(--text); font-weight: 600; }
 input.remove-confirm { display: block; width: 100%; margin: 6px 0 4px; font-family: var(--font-mono); }
 .error { color: var(--danger); font-size: 14px; margin: 10px 0 0; }
+.decide { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0 2px; padding: 14px 16px; border-radius: 11px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); font-size: 14px; }
+.decide .btns { display: flex; gap: 8px; flex-shrink: 0; }
+.choice { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 14px; font-size: 14px; }
+.choice label { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
+.choice label.on { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--accent-soft); }
+.choice small { display: block; color: var(--text-muted); font-size: 13px; }
+.choice input { margin-top: 3px; accent-color: var(--accent); }
+textarea.note { font: 14px/1.5 var(--font-sans); height: 72px; }
+textarea.note.tall { height: 110px; }
+.card .label { font-size: 12px; font-weight: 600; letter-spacing: .06em; color: var(--text-muted); margin: 14px 0 6px; }
+.banner.warn { background: var(--launch-soft); border-color: color-mix(in srgb, var(--launch) 40%, transparent); }

@@ -1,5 +1,5 @@
 // The Project page: one project at a glance, its files, findings and runs.
-import { $, el, safe, toast, api, explain, card, details, back } from './ui.js';
+import { $, el, safe, short, toast, api, explain, card, details, back, facts } from './ui.js';
 import { runsView } from './runs.js';
 import { findingsView } from './findings.js';
 
@@ -32,7 +32,7 @@ function readHash() {
   const params = new URLSearchParams(location.hash.slice(1));
   const tab = params.get('tab');
   const kind = params.get('kind');
-  const kinds = { runs: ['plan', 'run', 'push', 'converter', 'pass'], findings: ['finding'] }[tab] || [];
+  const kinds = { runs: ['plan', 'run', 'push', 'converter', 'pass', 'accept', 'changes'], findings: ['finding'] }[tab] || [];
   return { project: params.get('project') || params.get('ws'), tab: TABS.some(([id]) => id === tab) ? tab : null,
     selected: kinds.includes(kind) && params.get('id') ? { kind, id: params.get('id') } : null };
 }
@@ -130,7 +130,36 @@ function renderOverview() {
   const more = details(el('pre', { class: 'mono' }, lines.join('\n')));
   more.open = state.details;
   more.addEventListener('toggle', () => { state.details = more.open; });
-  return [card(eyebrow, plain(next.action), el('div', { class: 'row' }, left), more), ...others, ...also, manageLine()];
+  const site = guide.site_acceptance || {};
+  const accepted = site.accepted ? acceptedCard(site) : null;
+  // Once accepted with nothing for anyone to do, the acceptance is the main card.
+  const main = accepted && next.who === 'nobody' ? null : card(eyebrow, plain(next.action), el('div', { class: 'row' }, left), more);
+  const changed = site.accepted && (site.changed_since_acceptance || []).length
+    ? el('div', { class: 'banner warn' }, el('span', {}, el('b', {}, 'Changed since acceptance: '), `${site.changed_since_acceptance.join(', ')}. Launch would use the accepted process unless you accept a newer pass.`),
+      el('button', { type: 'button', class: 'btn q', onclick: () => go('runs') }, 'See Runs'))
+    : null;
+  return [changed, main, accepted, ...others, ...also, manageLine()];
+}
+
+// The accepted process: what launch repeats. Withdrawing it is recorded too (nothing is deleted).
+function acceptedCard(site) {
+  const entry = site.accepted;
+  const withdraw = el('button', { type: 'button', class: 'btn q', onclick: async () => {
+    if (!confirm(`Withdraw the acceptance of ${state.project}'s process? Launch can't repeat it until you accept a site again. It stays in the record.`)) return;
+    withdraw.disabled = true;
+    try {
+      await api('api/site/review', { workspace: state.project, verdict: 'withdrawn', review_id: entry.id });
+      toast('Withdrawn.');
+    } catch (error) {
+      withdraw.disabled = false;
+      toast(explain(error), true);
+    }
+    refresh();
+  } }, 'Withdraw acceptance\u2026');
+  return card('ACCEPTED', 'The process is accepted: the customer approved it.',
+    facts([['Data', safe(entry.data || '')], ['Converter', short(entry.converter, 7)], ['Accepted', `by ${safe(entry.by)} ${day(entry.at)}`], ['Note', entry.note ? safe(entry.note) : '']]),
+    el('p', { class: 'hint' }, 'Next: when the launch dump arrives, label it Launch on the Files tab.'),
+    el('div', { class: 'actions' }, withdraw));
 }
 
 // Start over and Remove: rare and can't be undone, so they sit quietly at the foot of Overview, and the

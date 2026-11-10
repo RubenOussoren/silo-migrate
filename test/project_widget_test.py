@@ -162,6 +162,31 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         self.assertEqual(data, (ROOT / 'integrations/term-llm/extensions/varnish/fonts/Geist-Variable.woff2').read_bytes())
         self.assertEqual(404, self.request('GET', '/fonts/../server.py')[0])
 
+    def test_site_reviews_pass_only_known_fields_and_the_servers_reviewer_name(self):
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        run_id, digest = 'run-' + 'a' * 32, 'b' * 64
+        self.assertEqual(200, self.request('POST', '/api/site/review', {'workspace': 'arc', 'run_id': run_id, 'verdict': 'accepted', 'basis': 'customer',
+                                                                          'process_digest': digest, 'note': 'ok', 'by': 'Someone Else', 'op': 'db_reset', 'via': 'x'}, headers)[0])
+        self.assertEqual(200, self.request('POST', '/api/site/review', {'workspace': 'arc', 'run_id': run_id, 'verdict': 'needs_changes', 'note': 'fix it'}, headers)[0])
+        self.assertEqual(200, self.request('POST', '/api/site/review', {'workspace': 'arc', 'verdict': 'withdrawn', 'review_id': 'review-' + 'c' * 16}, headers)[0])
+        by = self.m.runs.reviewer_name()
+        self.assertEqual([(['data', 'arc'], {'op': 'site_review', 'verdict': 'accepted', 'by': by, 'run_id': run_id, 'note': 'ok', 'basis': 'customer', 'process_digest': digest}),
+                          (['data', 'arc'], {'op': 'site_review', 'verdict': 'needs_changes', 'by': by, 'run_id': run_id, 'note': 'fix it'}),
+                          (['data', 'arc'], {'op': 'site_review', 'verdict': 'withdrawn', 'by': by, 'review_id': 'review-' + 'c' * 16})],
+                         [tuple(call) for call in self.calls()])
+        for body in ({'workspace': 'arc', 'run_id': run_id, 'verdict': 'accepted', 'basis': 'customer'},  # no digest of what was shown
+                     {'workspace': 'arc', 'run_id': run_id, 'verdict': 'accepted', 'basis': 'boss', 'process_digest': digest},
+                     {'workspace': 'arc', 'run_id': 'run-x', 'verdict': 'needs_changes', 'note': 'n'},
+                     {'workspace': 'arc', 'verdict': 'withdrawn', 'review_id': 'review-../x'},
+                     {'workspace': 'arc', 'run_id': run_id, 'verdict': 'delete'}):
+            with self.subTest(body=body):
+                self.assertEqual(400, self.request('POST', '/api/site/review', body, headers)[0])
+        self.assertEqual(403, self.request('POST', '/api/site/review', {'workspace': 'arc', 'verdict': 'withdrawn', 'review_id': 'review-' + 'c' * 16}, {'Content-Type': 'application/json'})[0])
+        self.assertEqual(3, len(self.calls()))
+        self.assertEqual(200, self.request('GET', '/api/site/process?workspace=arc&id=' + run_id)[0])
+        self.assertEqual({'op': 'site_process', 'run_id': run_id}, self.calls()[-1][1])
+        self.assertEqual(400, self.request('GET', '/api/site/process?workspace=arc&id=plan-1')[0])
+
     def test_runs_and_findings_decisions_go_to_their_own_unchanged_logic(self):
         calls = []
         self.m.runs.decide = lambda store, control, action, body: calls.append(('runs', action, body)) or {'status': 'ok'}

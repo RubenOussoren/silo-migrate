@@ -42,9 +42,23 @@ def _step(kind, plan, run):
     return step
 
 
-def build_passes(plans, runs, bodies, review_sites, pushes, deliveries):
+def site_verdicts(reviews):
+    """The engineer's latest verdict on each review run's site (bin/data_tools.py site_summary's by_run):
+    accepted or needs changes, unless that acceptance was withdrawn."""
+    reviews = [entry for entry in reviews if isinstance(entry, dict)]
+    withdrawn = {entry.get("of") for entry in reviews if entry.get("verdict") == "withdrawn"}
+    latest = {}
+    for entry in reviews:
+        if entry.get("verdict") in ("accepted", "needs_changes"):
+            latest[entry.get("run_id")] = entry
+    return {run_id: {key: entry.get(key) for key in ("id", "verdict", "basis", "by", "at", "note")}
+            for run_id, entry in latest.items() if entry.get("id") not in withdrawn}
+
+
+def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=()):
     """plans/runs: the workbench's status views; bodies: {plan_id: body}; review_sites: {run_id: up?};
-    pushes: raw push records; deliveries: {dataset_id: record}."""
+    pushes: raw push records; deliveries: {dataset_id: record}; reviews: site-reviews.json's entries."""
+    verdicts = site_verdicts(reviews)
     run_of_plan = {run.get("plan_id"): run for run in runs}
     groups = {}
     for plan in plans:
@@ -75,6 +89,7 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries):
         if group:
             step = _step("import", plan, run)
             step["site_up"] = bool(run and review_sites.get(run.get("run_id")))
+            step["review"] = verdicts.get(run.get("run_id")) if run else None
             group["imports"].append(step)
     # Numbered in the order they were proposed, so a pass keeps its number when it runs.
     ordered = sorted(groups.values(), key=lambda group: (_t(group["created_at"]), group["key"]))
@@ -114,6 +129,11 @@ def pass_status(group):
         return ("Converted: import next", "now")
     if not _passed(latest):
         return ("Import needs a look", "warn")
+    review = latest.get("review") or {}
+    if review.get("verdict") == "needs_changes":
+        return ("Needs changes", "warn")
+    if review.get("verdict") == "accepted":
+        return ("Accepted", "ok") if review.get("basis") == "customer" else ("Checked by you", "ok")
     if latest.get("site_up"):
         return ("Ready to check", "now")
     return ("All checks matched", "ok")

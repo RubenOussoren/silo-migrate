@@ -50,7 +50,7 @@ module SiloMigrate
       # the plan body, so it's covered by the approval.
       def delivery_binding!(dataset_id)
         record = delivery_record!(dataset_id)
-        # A launch run needs an accepted development run, and acceptance isn't built yet.
+        # A launch run repeats the accepted process (site-reviews.json); running on launch data isn't built yet.
         raise StandardWorkflowError, "STANDARD_LAUNCH_NOT_READY" if record["kind"] == "launch"
 
         { "dataset_id" => dataset_id, "kind" => record["kind"], "version" => record["version"] }

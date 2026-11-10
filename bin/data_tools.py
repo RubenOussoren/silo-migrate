@@ -1060,6 +1060,208 @@ def op_finding_done(ws, request):
     return {"finding_id": finding_id, "done": finding_id in marks}
 
 
+# -- site reviews: the engineer's verdict on a review site -------------------------------------
+# Accepting a passing import's site freezes the process that made it (data, converter, settings,
+# checks, Discourse): the "accepted process" that launch repeats. Only an acceptance on the
+# customer's approval counts for that; the engineer's own check is recorded and shown. "Needs
+# changes" keeps a short note for migration-data. Kept beside the registry, written only from the
+# Project page (no agent tool maps to these), append-only: a withdrawal is a new entry.
+
+SITE_VERDICTS = ("accepted", "needs_changes", "withdrawn")
+SITE_BASES = ("customer", "engineer")
+MAX_SITE_NOTE = 2000
+MAX_SITE_REVIEWS = 2000
+
+
+def site_reviews_file(ws):
+    return ws.root / ".silo-migrate/named/site-reviews.json"
+
+
+def read_site_reviews(ws):
+    path = site_reviews_file(ws)
+    if path.is_symlink() or path.parent.is_symlink():
+        refuse("STANDARD_PATH_INVALID")
+    document = ws.read_json(path, {}) if ws.initialized() else {}
+    reviews = document.get("reviews") if isinstance(document, dict) else None
+    return [entry for entry in reviews if isinstance(entry, dict)] if isinstance(reviews, list) else []
+
+
+def standard_state(ws):
+    path = ws.root / ".silo-migrate/named/standard/state.json"
+    if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
+        refuse("STANDARD_NOT_INITIALIZED")
+    state = ws.read_json(path, {})
+    return state if isinstance(state, dict) else {}
+
+
+def run_passed(run):
+    results = (run or {}).get("results") or {}
+    checks = results.get("reconciliation_checks") or 0
+    return (run or {}).get("status") == "completed" and checks > 0 and results.get("reconciliation_matched") == checks
+
+
+def site_process(state, run_id):
+    """(process, digest, passed) of a review run: what accepting its site freezes. IDs, hashes and
+    counts only, never file names or customer values."""
+    if not isinstance(run_id, str) or not RUN.fullmatch(run_id):
+        refuse("STANDARD_ARGUMENTS_INVALID: run_id")
+    runs = state.get("runs") if isinstance(state.get("runs"), dict) else {}
+    plans = state.get("plans") if isinstance(state.get("plans"), dict) else {}
+    run = runs.get(run_id)
+    plan = plans.get((run or {}).get("plan_id")) or {}
+    body = plan.get("body") or {}
+    if not run:
+        refuse("STANDARD_REFERENCE_INVALID")
+    if body.get("operation") != "standard_review":
+        refuse("STANDARD_SITE_NOT_REVIEW: only an import into a review site can be accepted")
+    convert_run_id = (body.get("from_run") or {}).get("run_id")
+    convert_run = runs.get(convert_run_id) or {}
+    convert_plan = plans.get(convert_run.get("plan_id")) or {}
+    convert_body = convert_plan.get("body") or {}
+
+    def bound(source, role):
+        input_id = (source.get("roles") or {}).get(role)
+        found = next((item for item in source.get("input_binding") or [] if isinstance(item, dict) and item.get("id") == input_id), None)
+        return {"id": input_id, "sha256": found.get("sha256")} if input_id and found else None
+
+    def counts(record):
+        results = (record or {}).get("results") or {}
+        return {"checks": results.get("reconciliation_checks") or 0, "matched": results.get("reconciliation_matched") or 0}
+
+    delivery = body.get("delivery") if isinstance(body.get("delivery"), dict) else {}
+    converter = convert_body.get("converter") if isinstance(convert_body.get("converter"), dict) else {}
+    process = {
+        "run_id": run_id, "plan_id": run.get("plan_id"), "plan_digest": plan.get("digest"),
+        "convert_run_id": convert_run_id, "convert_plan_id": convert_run.get("plan_id"), "convert_plan_digest": convert_plan.get("digest"),
+        "delivery": {key: delivery.get(key) for key in ("dataset_id", "kind", "version")},
+        "converter": {"revision": convert_body.get("converter_revision"), "branch": converter.get("branch"), "repository": converter.get("repo") or converter.get("repository")},
+        "source": bound(convert_body, "source"), "settings": bound(convert_body, "settings"),
+        "checks": {"convert": bound(convert_body, "reconciliation"), "import": bound(body, "reconciliation")},
+        "charset": convert_body.get("source_charset"),
+        "discourse_profile": body.get("discourse_profile"), "runtime_lock_sha256": body.get("runtime_lock_sha256"),
+        "results": {"convert": counts(convert_run), "import": counts(run)},
+    }
+    digest = hashlib.sha256(json.dumps(process, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return process, digest, run_passed(run) and run_passed(convert_run)
+
+
+def site_entry_summary(entry):
+    process = entry.get("process") or {}
+    delivery = process.get("delivery") or {}
+    return {"id": entry.get("id"), "run_id": entry.get("run_id"), "verdict": entry.get("verdict"), "basis": entry.get("basis"),
+            "by": entry.get("by"), "at": entry.get("at"), "note": entry.get("note"),
+            "data": ("Development v%s" % delivery.get("version")) if delivery.get("kind") == "development" else delivery.get("kind"),
+            "converter": (process.get("converter") or {}).get("revision"), "process": process or None}
+
+
+def site_summary(ws, state=None, deliveries=None):
+    """The current acceptance (the customer's, which launch repeats), the engineer's own latest check,
+    the latest verdict per run, and what changed since the acceptance."""
+    reviews = read_site_reviews(ws)
+    withdrawn = {entry.get("of") for entry in reviews if entry.get("verdict") == "withdrawn"}
+    live = [entry for entry in reviews if entry.get("verdict") in ("accepted", "needs_changes") and entry.get("id") not in withdrawn]
+    accepted = next((entry for entry in reversed(live) if entry["verdict"] == "accepted" and entry.get("basis") == "customer"), None)
+    checked = next((entry for entry in reversed(live) if entry["verdict"] == "accepted" and entry.get("basis") == "engineer"), None)
+    by_run = {}
+    for entry in reviews:
+        if entry.get("verdict") in ("accepted", "needs_changes"):
+            by_run[entry.get("run_id")] = entry
+    by_run = {run_id: site_entry_summary(entry) for run_id, entry in by_run.items() if entry.get("id") not in withdrawn}
+    changed = []
+    if accepted:
+        process = accepted.get("process") or {}
+        state = state if state is not None else standard_state(ws)
+        current = ((state.get("config") or {}).get("converter_revision"))
+        was = (process.get("converter") or {}).get("revision")
+        if current and was and current != was:
+            changed.append("converter %s → %s" % (was[:7], current[:7]))
+        deliveries = deliveries if deliveries is not None else read_deliveries(ws)
+        newest = [record for record in sorted(deliveries.values(), key=lambda record: record.get("sequence", 0))
+                  if record.get("kind") == "development" and not record.get("replaced_by")]
+        accepted_data = (process.get("delivery") or {}).get("dataset_id")
+        if newest and accepted_data and newest[-1].get("dataset_id") != accepted_data:
+            changed.append("data Development v%s → Development v%s" % ((process.get("delivery") or {}).get("version"), newest[-1].get("version")))
+        profile = (state.get("config") or {}).get("discourse_profile")
+        if profile and process.get("discourse_profile") and profile != process.get("discourse_profile"):
+            changed.append("Discourse %s → %s" % (process.get("discourse_profile"), profile))
+    return {"accepted": site_entry_summary(accepted) if accepted else None, "checked": site_entry_summary(checked) if checked else None,
+            "by_run": by_run, "changed": changed}
+
+
+def site_note(request, required):
+    note = request.get("note")
+    if note is None or note == "":
+        if required:
+            refuse("STANDARD_ARGUMENTS_INVALID: note (say what needs changing)")
+        return None
+    if not isinstance(note, str) or len(note) > MAX_SITE_NOTE or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", note) or not note.strip():
+        refuse("STANDARD_ARGUMENTS_INVALID: note")
+    return note.strip()
+
+
+def op_site_process(ws, request):
+    """What accepting a review run's site would freeze, and whether it can be accepted. Engineer only."""
+    engineer_only(ws)
+    ws.require()
+    process, digest, passed = site_process(standard_state(ws), request.get("run_id"))
+    delivery = process["delivery"]
+    reason = None
+    if not passed:
+        reason = "only a site whose convert and import runs both matched every check can be accepted"
+    elif delivery.get("kind") != "development":
+        reason = "only a site built from development data can be accepted"
+    return {"process": process, "process_digest": digest, "can_accept": reason is None, "reason": reason,
+            "current": site_summary(ws)["by_run"].get(process["run_id"])}
+
+
+def op_site_review(ws, request):
+    """Accept a review site, say it needs changes, or withdraw an acceptance. Engineer only, from the
+    Project page; an acceptance names the exact process the engineer was shown (process_digest)."""
+    engineer_only(ws)
+    ws.require()
+    verdict, by = request.get("verdict"), request.get("by")
+    if verdict not in SITE_VERDICTS:
+        refuse("STANDARD_ARGUMENTS_INVALID: verdict")
+    if not isinstance(by, str) or not by.strip() or len(by) > MAX_LABELLED_BY or re.search(r"[\x00-\x1f]", by):
+        refuse("STANDARD_ARGUMENTS_INVALID: by")
+    with ws.lock():
+        reviews = read_site_reviews(ws)
+        if len(reviews) >= MAX_SITE_REVIEWS:
+            refuse("STANDARD_ARGUMENTS_INVALID: too many site reviews in this project")
+        entry = {"id": "review-" + secrets.token_hex(8), "verdict": verdict, "by": by.strip(), "at": now()}
+        if verdict == "withdrawn":
+            target = request.get("review_id")
+            withdrawn = {item.get("of") for item in reviews if item.get("verdict") == "withdrawn"}
+            found = next((item for item in reviews if item.get("id") == target and item.get("verdict") == "accepted"), None)
+            if not isinstance(target, str) or not found or target in withdrawn:
+                refuse("STANDARD_ARGUMENTS_INVALID: review_id (only an acceptance that stands can be withdrawn)")
+            entry.update(of=target, run_id=found.get("run_id"))
+        else:
+            state = standard_state(ws)
+            process, digest, passed = site_process(state, request.get("run_id"))
+            run = (state.get("runs") or {}).get(process["run_id"]) or {}
+            if run.get("status") != "completed":
+                refuse("STANDARD_SITE_NOT_FINISHED: the import hasn't finished")
+            entry.update(run_id=process["run_id"], note=site_note(request, verdict == "needs_changes"))
+            if verdict == "accepted":
+                if request.get("basis") not in SITE_BASES:
+                    refuse("STANDARD_ARGUMENTS_INVALID: basis")
+                if not passed:
+                    refuse("STANDARD_SITE_NOT_PASSED: only a site whose convert and import runs both matched every check can be accepted")
+                if process["delivery"].get("kind") != "development":
+                    refuse("STANDARD_SITE_NOT_PASSED: only a site built from development data can be accepted")
+                # The engineer accepts exactly what the page showed; anything changed since is refused.
+                if request.get("process_digest") != digest:
+                    refuse("STANDARD_APPROVAL_MISMATCH")
+                entry.update(basis=request["basis"], process=process, process_digest=digest)
+        reviews.append(entry)
+        path = site_reviews_file(ws)
+        if path.is_symlink():
+            refuse("STANDARD_PATH_INVALID")
+        ws.write_json(path, {"version": 1, "reviews": reviews})
+    return {"review": site_entry_summary(entry), "site": site_summary(ws)}
+
+
 def op_take(ws, request):
     """Move one file from the drop folder into inputs/, make it read-only, register it."""
     ws.require()
@@ -2268,10 +2470,10 @@ def op_decisions(ws, request):
 
 GUIDE_STAGES = (("files", "Customer files received"), ("workspace", "Workspace created"), ("source_db", "Source database loaded"),
                 ("finding", "Finding released"), ("converter", "Converter pushed"), ("convert", "Convert run passed its checks"),
-                ("review", "Review import passed its checks"), ("site", "Site reviewed"))
+                ("review", "Review import passed its checks"), ("site", "Site accepted (the customer approved it)"))
 GUIDE_RECENT = 10
 GUIDE_ACTIVE = ("claimed", "running")
-GUIDE_ACCEPTANCE = "not recorded yet: the engineer's review of a site isn't stored anywhere"
+NO_SITE = {"accepted": None, "checked": None, "by_run": {}, "changed": []}
 DEFAULT_CONTACT = "your node admin"
 MAX_CONTACT = 200
 
@@ -2373,7 +2575,36 @@ def guide_problem(run, kind):
             "a difference stops the process until it's explained." % (label, run["matched"], run["checks"], run["differ"], run["errors"]), "this chat")
 
 
-def guide_flow(ws, facts, records):
+def guide_site(review, site, records):
+    """The next step once the latest review import has passed: the engineer's verdict on its site."""
+    verdict = site["by_run"].get(review["run_id"])
+    live = any(item["run_id"] == review["run_id"] and item["live"] for item in records["sites"])
+    reset = " Its review site is still up and holds customer data until it's reset in the Runs tab." if live else ""
+    if verdict and verdict["verdict"] == "needs_changes":
+        return ("agent", "The engineer says the site of review run %s needs changes: \"%s\". Work out the cause with them; a converter change goes "
+                "through converter-developer and a push, then a new pass." % (review["run_id"], verdict["note"]), "this chat")
+    if verdict and verdict["basis"] == "customer":
+        return ("nobody", "The process of review run %s is accepted: the customer approved it (recorded by %s). Launch repeats it; when the launch dump "
+                "arrives the engineer labels it Launch. Running on launch data isn't built yet.%s" % (review["run_id"], verdict["by"], reset), "Runs tab")
+    if verdict:
+        return ("engineer", "You checked the site of review run %s yourself. Once the customer approves it, accept it again on its pass in the Runs tab "
+                "with \"the customer approved it\": that is the process launch repeats.%s" % (review["run_id"], reset), "Runs tab")
+    if live:
+        return ("engineer", "Open the review site of run %s through the SSH tunnel shown in the Runs tab and check it, then accept it or say what needs "
+                "changing on its pass. Reset it before the next review run." % review["run_id"], "Runs tab")
+    return ("engineer", "Review run %s passed and its site is gone: accept it on its pass in the Runs tab, or say what needs changing." % review["run_id"], "Runs tab")
+
+
+def guide_acceptance(site):
+    """For the agent: the accepted process (the customer's approval), the engineer's own latest check,
+    and what changed since the acceptance. No file names: IDs, versions and commits."""
+    def brief(entry):
+        return entry and {key: entry.get(key) for key in ("id", "run_id", "data", "converter", "by", "at", "note")}
+    return {"accepted": brief(site["accepted"]), "own_check": brief(site["checked"]), "changed_since_acceptance": site["changed"],
+            "note": None if site["accepted"] else "nothing accepted yet: the engineer accepts a passing import's site on its pass in the Runs tab"}
+
+
+def guide_flow(ws, facts, records, site=NO_SITE):
     """The next step along the stages, once nothing is running or waiting on the engineer."""
     copy_files = ("engineer", "Copy the customer's files to the drop folder (%s) with scp, then run `silo intake %s` as root." % (ws.intake, ws.name), "server terminal")
     if not facts["initialized"]:
@@ -2411,12 +2642,10 @@ def guide_flow(ws, facts, records):
     problem = guide_problem(review, "review")
     if problem:
         return problem
-    if any(site["run_id"] == review["run_id"] and site["live"] for site in records["sites"]):
-        return ("engineer", "Open review site of run %s through the SSH tunnel shown in the Project page's Runs tab and check it. Reset it there before the next review run." % review["run_id"], "Runs tab")
-    return ("nobody", "The last review import passed and its site is gone. New files or a converter fix start the next pass.", "this chat")
+    return guide_site(review, site, records)
 
 
-def guide_stages(facts, records):
+def guide_stages(facts, records, site=NO_SITE):
     """Which stages are done. A later stage's evidence counts for the ones before it, since not
     every migration needs each of them (an existing converter needs no finding or push)."""
     runs = records["runs"]
@@ -2428,9 +2657,10 @@ def guide_stages(facts, records):
             "source_db": facts["db_loaded"] or bool(runs), "finding": any(item["status"] == "released" for item in records["findings"]) or bool(runs),
             "converter": any(item["status"] == "pushed" for item in records["pushes"]) or bool(runs),
             "convert": guide_passed(convert), "review": guide_passed(review) and review["started_at"] >= (convert or {}).get("started_at", "")}
-    current = next((key for key, _label in GUIDE_STAGES[:-1] if not done[key]), "site")
-    stages = [{"id": key, "label": label, "state": "not_recorded" if key == "site" else "done" if done[key] else "current" if key == current else "to_do"}
-              for key, label in GUIDE_STAGES]
+    # Accepted on the customer's approval, for the latest import.
+    done["site"] = bool(done["review"] and site["accepted"] and site["accepted"]["run_id"] == review["run_id"])
+    current = next((key for key, _label in GUIDE_STAGES if not done[key]), "accepted")
+    stages = [{"id": key, "label": label, "state": "done" if done[key] else "current" if key == current else "to_do"} for key, label in GUIDE_STAGES]
     return current, stages
 
 
@@ -2463,6 +2693,10 @@ def op_guide(ws, request):
     facts = {"initialized": ws.initialized(), "drop_files": drop_files, "labelled_files": len(groups["labelled"]), "inputs": len(state.get("inputs") or {}),
              "db_loaded": bool(db and db.get("loads"))}
     records = guide_records(ws) if ws.initialized() else {"plans": [], "runs": [], "sites": [], "findings": [], "pushes": [], "warning": None}
+    try:
+        site = site_summary(ws, deliveries=deliveries) if ws.initialized() else NO_SITE
+    except Refusal:
+        site = NO_SITE
     contact = support_contact(ws)
     active = [run for run in records["runs"] if run["status"] in GUIDE_ACTIVE]
     happening = ["%s run %s is %s (stage %s)." % (run["kind"] or "workflow", run["run_id"], run["status"], run["stage"]) for run in active]
@@ -2503,12 +2737,12 @@ def op_guide(ws, request):
     elif waiting:
         step = ("engineer", waiting[0]["what"], waiting[0]["where"])
     else:
-        step = guide_flow(ws, facts, records)
-    current, stages = guide_stages(facts, records)
+        step = guide_flow(ws, facts, records, site)
+    current, stages = guide_stages(facts, records, site)
     return {"project": ws.name, "stage": current, "stages": stages, "happening": happening, "waiting_on_engineer": waiting,
             "next": {"who": step[0], "action": step[1], "where": step[2]}, "also": also,
             "plans": records["plans"][-GUIDE_RECENT:][::-1], "runs": records["runs"][-GUIDE_RECENT:][::-1],
-            "data": guide_data(deliveries), "site_acceptance": GUIDE_ACCEPTANCE, "support_contact": contact,
+            "data": guide_data(deliveries), "site_acceptance": guide_acceptance(site), "support_contact": contact,
             "decisions_recorded": len(read_decisions(ws)) if ws.initialized() else 0}
 
 
@@ -2517,9 +2751,9 @@ OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_creat
        "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding,
        "plan_propose": op_plan_propose,
        "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions, "deliveries": op_deliveries, "delivery_label": op_delivery_label,
-       "finding_done": op_finding_done}
+       "finding_done": op_finding_done, "site_process": op_site_process, "site_review": op_site_review}
 # Logged with their arguments (minus script code, finding text, count SQL and decisions, logged by hash).
-QUIET = {"status", "list", "job", "db_status", "notes", "guide", "decisions", "deliveries"}
+QUIET = {"status", "list", "job", "db_status", "notes", "guide", "decisions", "deliveries", "site_process"}
 
 
 def fit(result):
@@ -2548,7 +2782,7 @@ def fit(result):
 def audit_args(request):
     shown = {}
     for key, value in request.items():
-        if key in ("code", "text", "sql", "decision", "topic") and isinstance(value, str):
+        if key in ("code", "text", "sql", "decision", "topic", "note") and isinstance(value, str):
             shown[key + "_sha256"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
         elif isinstance(value, (str, int, bool)) or value is None:
             shown[key] = value if not isinstance(value, str) else value[:300]

@@ -40,6 +40,7 @@ so never ask which one it is. The first chat creates the workspace with `data_cr
 | Propose a review import of the passed run | migration-data | Chat |
 | Approve and start it | Engineer | Project page, Runs |
 | Open the site through the SSH tunnel and check it; Reset it before the next review | Engineer | Project page, Runs; browser |
+| Accept the site (on the customer's approval, or as their own check), or say what needs changing | Engineer | Project page, Runs (on the pass) |
 
 Nothing after that is tracked yet. Taking a backup and restoring it on hosted are the
 engineer's own steps today. Don't suggest the tool does them.
@@ -67,8 +68,8 @@ Agents can't do either.
 ## Limits to state plainly
 
 - A run can't use unlabelled data, and only the engineer labels (see `data` for what's current).
-- Launch data can be labelled, but a launch run is refused until accepting a site is built.
-- A site's review isn't recorded yet (see `site_acceptance`).
+- Launch data can be labelled, but a launch run is refused until running on launch data is built.
+- `site_acceptance` (in `data_guide`): the accepted process launch repeats. Only the engineer accepts; their "needs changes" note reaches you there.
 
 ## Keep the project's memory
 
