@@ -74,6 +74,9 @@ print(json.dumps({'version': 1, 'ok': True}))
             'dev_format': ({'path': 'converters/mybb', 'content': 'dropped'}, {'op': 'format', 'path': 'converters/mybb'}),
             'dev_commit': ({'message': 'Fix'}, {'op': 'commit', 'message': 'Fix'}),
             'dev_push_propose': ({'title': 'T', 'body': 'B', 'findings': ['finding-1']}, {'op': 'push-propose', 'title': 'T', 'body': 'B', 'findings': ['finding-1']}),
+            'dev_branches': ({'fetch': False, 'branch': 'x'}, {'op': 'branches', 'fetch': False}),
+            'dev_branch_diff': ({'branch': 'migration/arc/x', 'base': 'main', 'path': 'lib', 'content': 'dropped'}, {'op': 'branch-diff', 'branch': 'migration/arc/x', 'base': 'main', 'path': 'lib'}),
+            'dev_branch_read': ({'branch': 'main', 'path': 'README.md', 'start_line': 2}, {'op': 'branch-read', 'branch': 'main', 'path': 'README.md', 'start_line': 2}),
         }
         self.assertEqual(set(cases) | {'dev_findings', 'dev_finding_show'}, set(self.tools('converter-developer')))
         for tool, (args, request) in cases.items():
@@ -89,6 +92,13 @@ print(json.dumps({'version': 1, 'ok': True}))
                 self.assertEqual([], self.calls())
         self.call('converter-reviewer', 'dev_test', {})
         self.assertEqual([[['converter', 'dev', 'example-forum', '--role', 'reviewer'], json.dumps({'op': 'test'})]], self.calls())
+
+    def test_the_reviewer_has_no_branch_tools(self):
+        for tool in ('dev_branches', 'dev_branch_diff', 'dev_branch_read'):
+            with self.subTest(tool=tool):
+                self.assertNotIn(tool, self.tools('converter-reviewer'))
+                self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('converter-reviewer', tool, {'branch': 'main', 'path': 'README.md'})['error'])
+        self.assertEqual([], self.calls())
 
     def test_findings_use_the_released_only_surface(self):
         self.call('converter-reviewer', 'dev_findings', {})

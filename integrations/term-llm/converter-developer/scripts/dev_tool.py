@@ -33,6 +33,9 @@ TOOLS = {
     "dev_format": ("format", {"path"}),
     "dev_commit": ("commit", {"message"}),
     "dev_push_propose": ("push-propose", {"title", "body", "base", "findings"}),
+    "dev_branches": ("branches", {"fetch"}),
+    "dev_branch_diff": ("branch-diff", {"branch", "base", "path"}),
+    "dev_branch_read": ("branch-read", {"branch", "path", "start_line"}),
 }
 READ_ONLY = {"dev_list", "dev_read", "dev_search", "dev_status", "dev_diff", "dev_test", "dev_push_show", "dev_findings", "dev_finding_show"}
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
@@ -118,7 +121,7 @@ def main():
     workspace = chat_project()
     if workspace is None or not WORKSPACE.match(workspace):
         return fail("STANDARD_CHAT_NOT_IN_PROJECT")
-    timeout = 290 if tool in ("dev_test", "dev_format") else 55
+    timeout = 290 if tool in ("dev_test", "dev_format") else 85 if tool == "dev_branches" else 55
     try:
         if tool == "dev_findings":
             result = subprocess.run([control_path(), "standard", "agent", "findings", workspace], capture_output=True, timeout=timeout, env=control_env())

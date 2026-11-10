@@ -117,6 +117,14 @@ and the web UI keeps chats apart:
   Notes are model-written: like findings, read them before trusting them (a hostile export could
   try to steer what gets written).
 
+**Known limitation: migration-data is offered web search and fetch.** term-llm (0.9.93 to 0.9.99, and
+`main` on 2026-11-10) offers `web_search` and `read_url` to every web chat, even to an agent with
+`search: false`: the agent's tool list can't remove them. migration-data's prompt says never to use them
+and to send web lookups and branch or PR comparisons to converter-developer; that is a prompt, not a
+guarantee. `read_url` goes through a third-party reader (Jina) by default, and searches through a search
+provider. The only server-wide switch, `search.fetch_provider: none`, would remove `read_url` from every
+agent; the engineer chose to leave both on until term-llm is fixed (2026-11-10).
+
 ### Free SQL: DBHub
 
 When a project's source database is up (`data_db_up`, and every `data_db_status`), the tools

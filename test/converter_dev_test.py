@@ -85,6 +85,64 @@ class ConverterDevTest(unittest.TestCase):
         (self.checkout / 'lib/linked-dir').symlink_to(self.root / 'inputs')
         self.outputs = []
 
+    def push_branch(self, name, files, message='Other work'):
+        """Push a branch to origin, the way another migration's (or a PR's) branch reaches GitHub."""
+        other = Path(self.temp.name) / ('other-' + name.replace('/', '-'))
+        git(Path(self.temp.name), 'clone', '-q', str(self.origin), str(other))
+        git(other, 'checkout', '-q', '-b', name)
+        for relative, content in files.items():
+            self.write(other / relative, content) if isinstance(content, str) else (other / relative).parent.mkdir(parents=True, exist_ok=True) or (other / relative).write_bytes(content)
+        git(other, 'add', '-A')
+        git(other, '-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', message)
+        git(other, 'push', '-q', 'origin', name)
+
+    def test_other_branches_are_readable_but_never_the_working_tree(self):
+        self.push_branch('migration/arc/mybb-staged-activation', {'lib/importer.rb': 'def import_user(row)\n  row[:login].strip.downcase\nend\n',
+                                                                    'lib/mybb.rb': 'module MyBB\nend\n', 'assets/logo.png': b'\x89PNG\x00\x00binary'})
+        before = (self.checkout / 'lib/importer.rb').read_text(), git(self.checkout, 'rev-parse', 'HEAD'), git(self.checkout, 'branch', '--show-current')
+        listed = self.call('branches')
+        self.assertEqual('fetched', listed['fetch'], listed)
+        branch = next(entry for entry in listed['branches'] if entry['name'] == 'migration/arc/mybb-staged-activation')
+        self.assertEqual((1, 0), (branch['ahead_of_main'], branch['behind_main']))
+        self.assertEqual('Other work', branch['subject'])
+        self.assertIn('main', [entry['name'] for entry in listed['branches']])
+        self.assertEqual('recent', self.call('branches')['fetch'])  # at most once a minute
+        diff = self.call('branch-diff', branch='migration/arc/mybb-staged-activation')
+        self.assertEqual(['Other work'], [commit['subject'] for commit in diff['commits']])
+        self.assertIn('lib/mybb.rb', diff['stat'])
+        self.assertIn('+  row[:login].strip.downcase', diff['diff'])
+        one = self.call('branch-diff', branch='migration/arc/mybb-staged-activation', path='lib/importer.rb')
+        self.assertNotIn('lib/mybb.rb', one['diff'])
+        read = self.call('branch-read', branch='migration/arc/mybb-staged-activation', path='lib/mybb.rb')
+        self.assertEqual('module MyBB\nend\n', read['text'])
+        self.assertTrue(self.call('branch-read', branch='migration/arc/mybb-staged-activation', path='assets/logo.png')['binary'])
+        # Nothing about the checkout changed, and nothing outside committed branch content shows.
+        self.assertEqual(before, ((self.checkout / 'lib/importer.rb').read_text(), git(self.checkout, 'rev-parse', 'HEAD'), git(self.checkout, 'branch', '--show-current')))
+        for output in (listed, diff, read):
+            self.assertNotIn(MARKER, json.dumps(output))
+        refusals = [('branch-diff', {'branch': 'nope'}), ('branch-read', {'branch': 'main', 'path': 'nope.rb'}),
+                    ('branch-read', {'branch': 'main', 'path': '.git/config'}), ('branch-read', {'branch': 'main', 'path': '../x'}),
+                    ('branch-diff', {'branch': '-x'}), ('branch-diff', {'branch': 'a..b'}), ('branch-diff', {'branch': 'HEAD'}),
+                    ('branch-diff', {'branch': 'refs/heads/main'}), ('branch-read', {'branch': 'main', 'path': 'lib'})]
+        for op, request in refusals:
+            with self.subTest(op=op, request=request):
+                self.assertIn('error', self.call(op, **request))
+        # The reviewer has none of them.
+        for op in ('branches', 'branch-diff', 'branch-read'):
+            self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call(op, role='reviewer', branch='main', path='README.md')['error'])
+
+    def test_branches_still_lists_when_a_run_holds_the_workspace(self):
+        import fcntl
+        self.push_branch('migration/other/x', {'lib/x.rb': 'x\n'})
+        fd = os.open(self.root / '.silo-migrate/named/standard/op.lock', os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        listed = self.call('branches')
+        self.assertTrue(listed['fetch'].startswith('busy'), listed['fetch'])
+        self.assertNotIn('migration/other/x', [entry['name'] for entry in listed['branches']])  # not fetched: as of the clone
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        self.assertIn('migration/other/x', [entry['name'] for entry in self.call('branches')['branches']])
+
     def test_parallel_writes_all_stay_visible(self):
         # Seen on arc: the model sent six dev_write calls at once; unlocked manifest updates lost
         # entries (files became invisible) and a shared temporary name failed two writes.

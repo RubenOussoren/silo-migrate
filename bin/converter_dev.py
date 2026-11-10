@@ -10,8 +10,9 @@ other workspace content and customer data: never read, listed, searched, exporte
 tests or committed. Commits are built from exactly those verified bytes. term-llm runs custom
 tools without an approval prompt, so every limit is enforced here.
 
-The engineer's push approval (`converter push WS --sha256 DIGEST`) is the only path
-that reads the GitHub token; no agent operation does.
+The engineer's push approval (`converter push WS --sha256 DIGEST`) is the only path that
+writes to GitHub. The token is read only there and by dev_branches' fetch (download only,
+through the same credential helper; the agent never sees it).
 
 Trust boundary: the service account (and an engineer approving its writes) is inside
 it; same-account races between checking and opening a path are not defended.
@@ -55,7 +56,7 @@ PROTECTED_NAMES = {".gitignore", ".gitattributes", ".gitmodules", ".git"}
 # installs exactly what the checkout's committed Gemfile.lock pins, with network.
 PROTECTED_PATHS = {"Gemfile", "Gemfile.lock", ".bundle/config"}
 ROLES = {
-    "developer": {"list", "read", "search", "status", "diff", "test", "push-show",
+    "developer": {"list", "read", "search", "status", "diff", "test", "push-show", "branches", "branch-diff", "branch-read",
                   "write", "edit", "delete", "branch", "commit", "push-propose", "format"},
     "reviewer": {"list", "read", "search", "status", "diff", "test", "push-show"},
 }
@@ -509,6 +510,134 @@ def op_diff(checkout, request):
     diff_text, truncated = bounded(text, MAX_TEXT_BYTES - len(stat_text.encode()) - 512)
     return {"scope": scope, "stat": stat_text, "diff": diff_text, "truncated": truncated,
             "note": "Use path to see one file's diff when truncated." if truncated else ""}
+
+
+# -- other branches (developer, read-only) ---------------------------------------
+# What is on GitHub, as of the last fetch: another migration's branch, a pull request's branch
+# (PR #370's, say), main. Only committed content of origin's branches: never the working tree,
+# so the content rule above is untouched. dev_branches fetches first (at most once a minute,
+# not while a run holds the workspace) through silo-migrate's own credential path: the agent
+# never sees the token, and a fetch only downloads.
+
+BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
+FETCH_EVERY = 60
+
+
+def remote_ref(checkout, name):
+    """refs/remotes/origin/NAME for an existing branch of origin, or a refusal."""
+    if not isinstance(name, str) or not BRANCH.fullmatch(name) or ".." in name or "//" in name or name.endswith((".lock", "/")) or name == "HEAD":
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    ref = "refs/remotes/origin/" + name
+    if checkout.git("show-ref", "--verify", "--quiet", ref, ok=(0, 1)).returncode != 0:
+        refuse("STANDARD_DEV_BRANCH_UNKNOWN: no such branch on GitHub as of the last fetch; dev_branches lists them")
+    return ref
+
+
+def fetch_origin(checkout):
+    """Fetch origin's branches (no merge, no checkout change): (status, fetched_at)."""
+    fetch_head = checkout.path / ".git/FETCH_HEAD"
+    try:
+        last = os.lstat(fetch_head).st_mtime
+    except OSError:
+        last = None
+    if last is not None and time.time() - last < FETCH_EVERY:
+        return "recent", last
+    url = checkout.out("remote", "get-url", "origin").strip()
+    try:
+        with Locked(checkout):
+            credentials = checkout.host.github_credentials(checkout.path, url)
+            if credentials:
+                argv, env = credentials
+            else:
+                argv, env = checkout.host.converter_git(checkout.path, credentials=True), {}
+            try:
+                result = subprocess.run([*argv, "fetch", "--prune", "--no-tags", "origin"], capture_output=True, env=git_env(env), timeout=40,
+                                        stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired:
+                return "timed out", last
+    except ValueError as refusal:  # also the control script's own Refusal (an unusable token file, say)
+        return ("busy: a run holds the workspace" if str(refusal).startswith("STANDARD_BUSY") else "not fetched"), last
+    except OSError:
+        return "not fetched", last
+    if result.returncode:
+        return "failed", last
+    try:
+        return "fetched", os.lstat(fetch_head).st_mtime
+    except OSError:
+        return "fetched", None
+
+
+def op_branches(checkout, request):
+    status, fetched = (fetch_origin(checkout) if request.get("fetch", True) is not False else ("not asked", None))
+    has_main = checkout.git("show-ref", "--verify", "--quiet", "refs/remotes/origin/main", ok=(0, 1)).returncode == 0
+    rows = checkout.out("for-each-ref", "--sort=-committerdate", "--format=%(refname)%00%(objectname)%00%(committerdate:iso-strict)%00%(subject)",
+                        "refs/remotes/origin/").splitlines()
+    # Pull requests this workspace opened (its push records), by branch.
+    prs = {}
+    for record in load_proposals(checkout):
+        pull = record.get("pull_request") if isinstance(record.get("pull_request"), dict) else {}
+        if pull.get("number"):
+            prs[(record.get("proposal") or {}).get("branch")] = {"number": pull.get("number"), "url": pull.get("url")}
+    branches = []
+    for line in rows:
+        ref, sha, date, subject = (line.split("\0") + ["", "", "", ""])[:4]
+        name = ref[len("refs/remotes/origin/"):]
+        if name == "HEAD" or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            continue
+        entry = {"name": name, "head": sha[:12], "date": date[:25], "subject": subject[:200]}
+        if has_main and name != "main":
+            counts = checkout.out("rev-list", "--left-right", "--count", "refs/remotes/origin/main..." + ref).split()
+            if len(counts) == 2 and all(count.isdigit() for count in counts):
+                entry.update(behind_main=int(counts[0]), ahead_of_main=int(counts[1]))
+        if name in prs:
+            entry["pull_request"] = prs[name]
+        branches.append(entry)
+        if len(branches) >= 100:
+            break
+    return {"fetch": status, "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(fetched)) if fetched else None,
+            "branches": branches, "current_branch": checkout.branch(),
+            "note": "Branches on GitHub (newest first). A pull request's branch is shown on its GitHub page; ask the engineer if it isn't clear "
+                    "which one. dev_branch_diff shows a branch's commits and changes against main; dev_branch_read reads one of its files."}
+
+
+def op_branch_diff(checkout, request):
+    ref = remote_ref(checkout, request.get("branch"))
+    base = remote_ref(checkout, request.get("base") or "main")
+    path = relative_path(request.get("path"), allow_root=True)
+    spec = ["--", ":(literal)" + path] if path else []
+    no_drivers = ["--no-color", "--no-ext-diff", "--no-textconv"]
+    # As a pull request shows it: changes since the branch left the base (the merge base).
+    commits = []
+    for line in checkout.out("log", "--format=%H%x00%an%x00%aI%x00%s", "-n", str(MAX_COMMITS + 1), base + ".." + ref).splitlines():
+        sha, author, date, subject = (line.split("\0") + ["", "", "", ""])[:4]
+        commits.append({"sha": sha[:12], "author": author[:120], "date": date[:25], "subject": subject[:200]})
+    stat_text = checkout.out("diff", "--stat=120", *no_drivers, base + "..." + ref, *spec)
+    text = checkout.out("diff", *no_drivers, base + "..." + ref, *spec)
+    stat_text, _ = bounded(stat_text, 6 * 1024)
+    diff_text, truncated = bounded(text, MAX_TEXT_BYTES - len(stat_text.encode()) - 4096)
+    return {"branch": request.get("branch"), "base": request.get("base") or "main", "commits": commits[:MAX_COMMITS],
+            "more_commits": len(commits) > MAX_COMMITS, "stat": stat_text, "diff": diff_text, "truncated": truncated,
+            "note": "Use path to see one file's changes when truncated, or dev_branch_read for the whole file." if truncated else ""}
+
+
+def op_branch_read(checkout, request):
+    ref = remote_ref(checkout, request.get("branch"))
+    relative = relative_path(request.get("path"))
+    start = request.get("start_line", 1)
+    if not isinstance(start, int) or isinstance(start, bool) or start < 1:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    spec = ref + ":" + relative
+    kind = checkout.git("cat-file", "-t", spec, ok=(0, 128)).stdout.decode().strip()
+    if kind != "blob":
+        refuse("STANDARD_DEV_PATH_NOT_VISIBLE: no such file on that branch")
+    size = int(checkout.out("cat-file", "-s", spec).strip() or 0)
+    if size > MAX_FILE_BYTES:
+        refuse("STANDARD_DEV_FILE_TOO_LARGE")
+    data = checkout.git("cat-file", "blob", spec).stdout
+    if b"\0" in data[:8192]:
+        return {"branch": request.get("branch"), "path": relative, "bytes": size, "binary": True}
+    lines, next_line = text_lines(io.BytesIO(data), start)
+    return {"branch": request.get("branch"), "path": relative, "bytes": size, "start_line": start, "lines": len(lines), "next_line": next_line, "text": "".join(lines)}
 
 
 # -- writes (developer) ----------------------------------------------------------
@@ -1627,7 +1756,8 @@ def main(args, values, base, repo, host, stdin, home=None):
         op = request["op"]
         handlers = {"list": op_list, "read": op_read, "search": op_search, "status": op_status, "diff": op_diff,
                     "push-show": op_push_show, "write": op_write, "edit": op_edit, "delete": op_delete,
-                    "branch": op_branch, "push-propose": op_push_propose}
+                    "branch": op_branch, "push-propose": op_push_propose,
+                    "branches": op_branches, "branch-diff": op_branch_diff, "branch-read": op_branch_read}
         if op == "test":
             result = op_test(checkout, request, values, repo)
         elif op in MUTATING:

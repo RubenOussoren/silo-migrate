@@ -157,6 +157,42 @@ tools:
           path: {type: string}
         required: [path]
         additionalProperties: false
+    - name: dev_branches
+      description: "List the converter's branches on GitHub, newest first, with how far each is ahead of and behind main (and the pull request, when this project opened it). Fetches from GitHub first (at most once a minute). Read-only: use it to find another migration's branch or a pull request's branch, such as one the engineer names."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 90
+      input:
+        type: object
+        properties:
+          fetch: {type: boolean, description: "false to skip fetching (default true)"}
+        additionalProperties: false
+    - name: dev_branch_diff
+      description: "A branch on GitHub compared with main (or base), as its pull request shows it: its commits, the diff stat and the diff. Read-only; nothing in your checkout changes."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          branch: {type: string, description: "Branch name as dev_branches lists it, e.g. migration/arc/mybb-staged-activation"}
+          base: {type: string, description: "Branch to compare with (default main)"}
+          path: {type: string, description: "One file or directory, when the diff is truncated"}
+        required: [branch]
+        additionalProperties: false
+    - name: dev_branch_read
+      description: "Read one file as it is on a branch on GitHub (not your checkout). Read-only."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          branch: {type: string}
+          path: {type: string, description: "Relative to the repository root"}
+          start_line: {type: integer, minimum: 1}
+        required: [branch, path]
+        additionalProperties: false
     - name: dev_branch
       description: "Switch to (or, for a project's first change, create) the branch migration/<workspace>/<topic>. One branch per project: creating a second one is refused (STANDARD_DEV_ONE_BRANCH) unless new_pr is true because the engineer asked for a separate PR. Uncommitted changes come along."
       script: scripts/dev_tool.py
