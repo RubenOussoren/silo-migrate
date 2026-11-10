@@ -12,7 +12,9 @@ tools without an approval prompt, so every limit is enforced here.
 
 The engineer's push approval (`converter push WS --sha256 DIGEST`) is the only path that
 writes to GitHub. The token is read only there and by dev_branches' fetch (download only,
-through the same credential helper; the agent never sees it).
+through the same credential helper; the agent never sees it). That fetch only ever reaches a
+github.com origin; without a token file for its owner it uses the account's own Git
+credentials, as `converter update` does.
 
 Trust boundary: the service account (and an engineer approving its writes) is inside
 it; same-account races between checking and opening a path are not defended.
@@ -521,6 +523,12 @@ def op_diff(checkout, request):
 
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
 FETCH_EVERY = 60
+MAX_BRANCH_DIFF_LINES = 20000
+
+
+def fetchable(url):
+    """Agents only ever fetch from GitHub: never a local path (another checkout's unpushed work)."""
+    return bool(GITHUB_REMOTE.fullmatch(url))
 
 
 def remote_ref(checkout, name):
@@ -536,13 +544,26 @@ def remote_ref(checkout, name):
 def fetch_origin(checkout):
     """Fetch origin's branches (no merge, no checkout change): (status, fetched_at)."""
     fetch_head = checkout.path / ".git/FETCH_HEAD"
+    attempt = checkout.standard / "converter-fetch-attempt"  # failed tries count too: GitHub down mustn't cost 40 s a call
     try:
         last = os.lstat(fetch_head).st_mtime
     except OSError:
         last = None
-    if last is not None and time.time() - last < FETCH_EVERY:
+    try:
+        tried = os.lstat(attempt).st_mtime
+    except OSError:
+        tried = None
+    if max(last or 0, tried or 0) and time.time() - max(last or 0, tried or 0) < FETCH_EVERY:
         return "recent", last
     url = checkout.out("remote", "get-url", "origin").strip()
+    if not fetchable(url):
+        return "not fetched: origin isn't on GitHub", last
+    try:
+        fd = os.open(attempt, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+        os.utime(attempt)
+    except OSError:
+        pass
     try:
         with Locked(checkout):
             credentials = checkout.host.github_credentials(checkout.path, url)
@@ -582,7 +603,7 @@ def op_branches(checkout, request):
     for line in rows:
         ref, sha, date, subject = (line.split("\0") + ["", "", "", ""])[:4]
         name = ref[len("refs/remotes/origin/"):]
-        if name == "HEAD" or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        if name == "HEAD" or len(name) > 200 or not re.fullmatch(r"[0-9a-f]{40}", sha):
             continue
         entry = {"name": name, "head": sha[:12], "date": date[:25], "subject": subject[:200]}
         if has_main and name != "main":
@@ -612,6 +633,16 @@ def op_branch_diff(checkout, request):
         sha, author, date, subject = (line.split("\0") + ["", "", "", ""])[:4]
         commits.append({"sha": sha[:12], "author": author[:120], "date": date[:25], "subject": subject[:200]})
     stat_text = checkout.out("diff", "--stat=120", *no_drivers, base + "..." + ref, *spec)
+    # Measured before it's built: a branch far from main could make a diff of any size.
+    changed = 0
+    for line in checkout.out("diff", "--numstat", *no_drivers, base + "..." + ref, *spec).splitlines():
+        added, removed = (line.split("\t") + ["", ""])[:2]
+        changed += (int(added) if added.isdigit() else 0) + (int(removed) if removed.isdigit() else 0)
+    if changed > MAX_BRANCH_DIFF_LINES:
+        stat_text, _ = bounded(stat_text, MAX_TEXT_BYTES - 4096)
+        return {"branch": request.get("branch"), "base": request.get("base") or "main", "commits": commits[:MAX_COMMITS],
+                "more_commits": len(commits) > MAX_COMMITS, "stat": stat_text, "diff": "", "truncated": True,
+                "note": "%d changed lines: too large to show at once. Pass path for one file or directory." % changed}
     text = checkout.out("diff", *no_drivers, base + "..." + ref, *spec)
     stat_text, _ = bounded(stat_text, 6 * 1024)
     diff_text, truncated = bounded(text, MAX_TEXT_BYTES - len(stat_text.encode()) - 4096)

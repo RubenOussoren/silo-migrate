@@ -96,7 +96,14 @@ class ConverterDevTest(unittest.TestCase):
         git(other, '-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', message)
         git(other, 'push', '-q', 'origin', name)
 
+    def fetch_local_origin(self):
+        """The fixture's origin is a local path; agents fetch only from GitHub, so tests allow it."""
+        patcher = mock.patch.object(self.dev, 'fetchable', return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_other_branches_are_readable_but_never_the_working_tree(self):
+        self.fetch_local_origin()
         self.push_branch('migration/arc/mybb-staged-activation', {'lib/importer.rb': 'def import_user(row)\n  row[:login].strip.downcase\nend\n',
                                                                     'lib/mybb.rb': 'module MyBB\nend\n', 'assets/logo.png': b'\x89PNG\x00\x00binary'})
         before = (self.checkout / 'lib/importer.rb').read_text(), git(self.checkout, 'rev-parse', 'HEAD'), git(self.checkout, 'branch', '--show-current')
@@ -133,6 +140,7 @@ class ConverterDevTest(unittest.TestCase):
 
     def test_branches_still_lists_when_a_run_holds_the_workspace(self):
         import fcntl
+        self.fetch_local_origin()
         self.push_branch('migration/other/x', {'lib/x.rb': 'x\n'})
         fd = os.open(self.root / '.silo-migrate/named/standard/op.lock', os.O_RDONLY)
         self.addCleanup(os.close, fd)
@@ -141,7 +149,38 @@ class ConverterDevTest(unittest.TestCase):
         self.assertTrue(listed['fetch'].startswith('busy'), listed['fetch'])
         self.assertNotIn('migration/other/x', [entry['name'] for entry in listed['branches']])  # not fetched: as of the clone
         fcntl.flock(fd, fcntl.LOCK_UN)
+        os.utime(self.root / '.silo-migrate/named/standard/converter-fetch-attempt', (0, 0))  # as if a minute had passed
         self.assertIn('migration/other/x', [entry['name'] for entry in self.call('branches')['branches']])
+
+    def test_agents_fetch_only_from_github_and_a_failed_fetch_waits_like_a_good_one(self):
+        self.push_branch('migration/other/y', {'lib/y.rb': 'y\n'})
+        listed = self.call('branches')
+        self.assertEqual("not fetched: origin isn't on GitHub", listed['fetch'])  # a local path: never fetched for an agent
+        self.assertNotIn('migration/other/y', [entry['name'] for entry in listed['branches']])
+        self.fetch_local_origin()
+        calls = []
+        real_run = subprocess.run
+        def failing(argv, **kwargs):
+            if 'fetch' in argv:
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 1, b'', b'unreachable')
+            return real_run(argv, **kwargs)
+        with mock.patch.object(self.dev.subprocess, 'run', side_effect=failing):
+            self.assertEqual('failed', self.call('branches')['fetch'])
+            self.assertEqual('recent', self.call('branches')['fetch'])  # no second 40 s wait straight away
+        self.assertEqual(1, len(calls))
+
+    def test_a_huge_branch_diff_is_measured_first_and_a_base_option_is_refused(self):
+        self.fetch_local_origin()
+        self.push_branch('migration/other/big', {'lib/big.rb': ''.join('line %d\n' % n for n in range(25000))})
+        self.call('branches')
+        big = self.call('branch-diff', branch='migration/other/big')
+        self.assertEqual('', big['diff'])
+        self.assertIn('too large to show at once', big['note'])
+        self.assertIn('lib/big.rb', big['stat'])
+        for base in ('--output=/tmp/x', '-p', 'main --stat'):
+            with self.subTest(base=base):
+                self.assertIn('error', self.call('branch-diff', branch='migration/other/big', base=base))
 
     def test_parallel_writes_all_stay_visible(self):
         # Seen on arc: the model sent six dev_write calls at once; unlocked manifest updates lost
