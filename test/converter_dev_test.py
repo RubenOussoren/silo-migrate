@@ -134,9 +134,167 @@ class ConverterDevTest(unittest.TestCase):
         for op, request in refusals:
             with self.subTest(op=op, request=request):
                 self.assertIn('error', self.call(op, **request))
-        # The reviewer has none of them.
-        for op in ('branches', 'branch-diff', 'branch-read'):
-            self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call(op, role='reviewer', branch='main', path='README.md')['error'])
+        for role in ('developer', 'reader'):
+            for op in ('branches', 'branch-diff', 'branch-read'):
+                self.assertNotIn('error', self.call(op, role=role, branch='main', path='README.md'))
+
+    def test_reviewer_role_stays_at_head_least_privilege(self):
+        self.assertEqual({'list', 'read', 'search', 'status', 'diff', 'test', 'push-show'}, self.dev.ROLES['reviewer'])
+        for op in ('branches', 'branch-diff', 'branch-read', 'branch-resolve'):
+            self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call(op, role='reviewer')['error'])
+
+    def resolver_fixture(self):
+        self.fetch_local_origin()
+        patcher = mock.patch.object(self.dev, 'origin_repository', return_value=('discourse-org', 'discourse-converters'))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.push_branch('migration/arc/topic', {'lib/topic.rb': 'public code\n'})
+        sha = git(self.origin, 'rev-parse', 'refs/heads/migration/arc/topic')
+        git(self.origin, 'update-ref', 'refs/pull/370/head', sha)
+        return sha
+
+    def test_link_repository_validation_uses_configured_origin(self):
+        for origin in ('https://github.com/discourse-org/discourse-converters.git',
+                       'https://github.com/discourse-org/discourse-converters/',
+                       'https://github.com/Discourse-Org/Discourse-Converters'):
+            checkout = types.SimpleNamespace(out=lambda *args: origin)
+            self.assertEqual({'kind': 'pull', 'pr': 370}, self.dev.parse_link(checkout, 'https://github.com/discourse-org/discourse-converters/pull/370'))
+            with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_DEV_LINK_REPO_REFUSED'):
+                self.dev.parse_link(checkout, 'https://github.com/discourse-org/another/pull/370')
+        checkout = types.SimpleNamespace(out=lambda *args: 'https://github.com/other/configured-repo.git')
+        self.assertEqual({'kind': 'pull', 'pr': 370}, self.dev.parse_link(checkout, 'https://github.com/other/configured-repo/pull/370'))
+
+    def test_pr_resolution_prefers_own_push_record_and_preserves_gates(self):
+        import fcntl
+        sha = self.resolver_fixture()
+        git(self.origin, 'update-ref', 'refs/heads/a-same-head', sha)
+        records = [{'pull_request': {'number': 370}, 'proposal': {'branch': 'migration/arc/topic'}}]
+        with mock.patch.object(self.dev, 'load_proposals', return_value=records):
+            resolved = self.call('branch-resolve', role='reader', link='370')
+        self.assertEqual('migration/arc/topic', resolved['branch'])
+        attempt = self.root / '.silo-migrate/named/standard/converter-fetch-attempt'
+        os.utime(attempt, (0, 0))
+        os.utime(self.checkout / '.git/FETCH_HEAD', (0, 0))
+        fd = os.open(self.root / '.silo-migrate/named/standard/op.lock', os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertTrue(self.call('branch-resolve', link='370')['fetch'].startswith('busy'))
+        self.assertTrue(self.call('branch-resolve', link='371')['error'].startswith('STANDARD_DEV_PR_UNAVAILABLE'))
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        # Failed PR fetch attempts count against exactly the same throttle.
+        os.utime(attempt, (0, 0))
+        run = self.dev.subprocess.run
+        calls = []
+        def failing(argv, **kwargs):
+            if 'fetch' in argv:
+                calls.append(argv)
+                return types.SimpleNamespace(returncode=1, stdout=b'', stderr=b'private credential error')
+            return run(argv, **kwargs)
+        with mock.patch.object(self.dev.subprocess, 'run', side_effect=failing):
+            self.assertTrue(self.call('branch-resolve', link='371')['error'].startswith('STANDARD_DEV_PR_UNAVAILABLE'))
+            self.assertTrue(self.call('branch-resolve', link='371')['error'].startswith('STANDARD_DEV_PR_UNAVAILABLE'))
+        self.assertEqual(1, len(calls))
+        self.assertEqual(sha, git(self.checkout, 'rev-parse', 'refs/silo-migrate/pull/370/head'))
+        self.assertEqual('public code\n', self.call('branch-read', role='reader', branch=sha, path='lib/topic.rb')['text'])
+        # A successful new PR fetch retains exactly the new ref, not both.
+        git(self.origin, 'update-ref', 'refs/pull/371/head', sha)
+        os.utime(attempt, (0, 0))
+        os.utime(self.checkout / '.git/FETCH_HEAD', (0, 0))
+        self.assertNotIn('error', self.call('branch-resolve', link='371'))
+        self.assertEqual('refs/silo-migrate/pull/371/head', git(self.checkout, 'for-each-ref', '--format=%(refname)', 'refs/silo-migrate/pull/'))
+        self.assertNotIn('private credential error', json.dumps(self.outputs))
+
+    def test_resolver_parses_all_link_forms_and_longest_branch(self):
+        sha = self.resolver_fixture()
+        root = 'https://github.com/discourse-org/discourse-converters/'
+        # Resolve the PR first: its fetch brings branches and the single PR head together.
+        for link in (370, '370', root + 'pull/370', root + 'pull/370/files'):
+            resolved = self.call('branch-resolve', link=link)
+            self.assertEqual(('pull', 370, 'migration/arc/topic', sha),
+                             (resolved['kind'], resolved['pr'], resolved['branch'], resolved['sha']))
+        cases = [
+            ('tree/main', {'kind': 'tree', 'branch': 'main'}),
+            ('tree/migration/arc/topic/lib', {'kind': 'tree', 'branch': 'migration/arc/topic', 'path': 'lib'}),
+            ('blob/migration/arc/topic/lib/topic.rb#L10-L20', {'kind': 'blob', 'branch': 'migration/arc/topic', 'path': 'lib/topic.rb', 'lines': {'start': 10, 'end': 20}}),
+            ('blob/main/README.md#L1', {'kind': 'blob', 'branch': 'main', 'path': 'README.md', 'lines': {'start': 1, 'end': 1}}),
+            ('compare/main...migration/arc/topic', {'kind': 'compare', 'base': 'main', 'branch': 'migration/arc/topic'}),
+            ('commit/' + sha, {'kind': 'commit', 'sha': sha}),
+            ('commit/' + sha[:12], {'kind': 'commit', 'sha': sha}),
+        ]
+        # Simulate an ambiguous branch-prefix listing: the longest matching prefix wins.
+        original_out = self.dev.Checkout.out
+        def ambiguous_prefix(checkout, *args, **kwargs):
+            text = original_out(checkout, *args, **kwargs)
+            if args == ('for-each-ref', '--format=%(refname:strip=3)', 'refs/remotes/origin/'):
+                text += 'migration/arc\n'
+            return text
+        patcher = mock.patch.object(self.dev.Checkout, 'out', ambiguous_prefix)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for link, expected in cases:
+            with self.subTest(link=link):
+                resolved = self.call('branch-resolve', role='reader', link=root + link)
+                self.assertNotIn('error', resolved)
+                self.assertEqual(expected, {key: resolved[key] for key in expected})
+        self.assertEqual('public code\n', self.call('branch-read', role='reader', branch=sha, path='lib/topic.rb')['text'])
+        self.assertIn('topic.rb', self.call('branch-diff', role='reader', branch=sha)['diff'])
+
+    def test_resolver_refuses_invalid_links_before_fetch(self):
+        root = 'https://github.com/discourse-org/discourse-converters/'
+        urls = [None, True, 0, -1, '0', 'PR 370', '1' * 2050, root + 'tree/' + 'a' * 2048,
+                root.replace('github.com', 'example.invalid') + 'pull/370',
+                root.replace('github.com', 'github.com.evil.invalid') + 'pull/370',
+                root.replace('https:', 'http:') + 'pull/370',
+                root.replace('github.com', 'user@github.com') + 'pull/370',
+                root.replace('github.com', 'github.com:443') + 'pull/370',
+                root.replace('github.com/', 'github.com//') + 'pull/370',
+                root + 'pull/370//', root + 'pull/370?token=x', root + 'pull/370#x', root + 'pull/370/commits',
+                root + 'blob/main/../secrets', root + 'blob/main/%2e%2e/file', root + 'blob/main/a b',
+                root + 'blob/main/a\\b', root + 'blob/main/a\n', root + 'tree/main//x',
+                root + 'blob/main/a#L20-L10', root + 'blob/main/a#L0', root + 'commit/--all',
+                root + 'compare/a..b', root + 'compare/a...b...c', root + 'blob/main']
+        with mock.patch.object(self.dev, 'fetch_origin') as fetch, mock.patch.object(self.dev, 'origin_repository', return_value=('discourse-org', 'discourse-converters')):
+            for link in urls:
+                with self.subTest(link=link):
+                    self.assertIn('error', self.call('branch-resolve', link=link))
+            # blob/main needs the branch lookup before it can be rejected.
+            self.assertLessEqual(fetch.call_count, 1)
+            other = self.call('branch-resolve', link='https://github.com/other/repo/pull/370')
+            self.assertTrue(other['error'].startswith('STANDARD_DEV_LINK_REPO_REFUSED'))
+        self.assertTrue(self.call('branch-resolve', link='370')['error'].startswith('STANDARD_DEV_ORIGIN_REFUSED'))
+
+    def test_pr_ref_is_bounded_throttled_and_fork_head_can_be_read(self):
+        sha = self.resolver_fixture()
+        self.call('branches')  # shares the very same throttle with PR lookups
+        self.assertTrue(self.call('branch-resolve', link='370')['error'].startswith('STANDARD_DEV_PR_UNAVAILABLE'))
+        attempt = self.root / '.silo-migrate/named/standard/converter-fetch-attempt'
+        os.utime(attempt, (0, 0))
+        os.utime(self.checkout / '.git/FETCH_HEAD', (0, 0))
+        git(self.origin, 'update-ref', '-d', 'refs/heads/migration/arc/topic')
+        resolved = self.call('branch-resolve', link=370)
+        self.assertEqual(sha, resolved['sha'])
+        self.assertNotIn('branch', resolved)
+        self.assertIn("isn't a branch here", resolved['note'])
+        self.assertEqual('public code\n', self.call('branch-read', role='reader', branch=sha, path='lib/topic.rb')['text'])
+        git(self.origin, 'update-ref', 'refs/pull/371/head', sha)
+        self.assertTrue(self.call('branch-resolve', link=371)['error'].startswith('STANDARD_DEV_PR_UNAVAILABLE'))
+        os.utime(attempt, (0, 0))
+        os.utime(self.checkout / '.git/FETCH_HEAD', (0, 0))
+        self.assertEqual(sha, self.call('branch-resolve', link=371)['sha'])
+        self.assertEqual('refs/silo-migrate/pull/371/head', git(self.checkout, 'for-each-ref', '--format=%(refname)', 'refs/silo-migrate/pull/'))
+        # Local-only commits must not be reachable through the SHA escape hatch.
+        self.write(self.checkout / 'README.md', 'Local only\n')
+        git(self.checkout, 'add', 'README.md')
+        git(self.checkout, 'commit', '-q', '-m', 'Local only')
+        local = git(self.checkout, 'rev-parse', 'HEAD')
+        self.assertIn('error', self.call('branch-read', role='reader', branch=local, path='README.md'))
+
+    def test_reader_server_allowlist_refuses_every_other_operation(self):
+        allowed = {'branches', 'branch-diff', 'branch-read', 'branch-resolve'}
+        self.assertEqual(allowed, self.dev.ROLES['reader'])
+        for op in set.union(*self.dev.ROLES.values()) - allowed | {'push', 'deps', 'unknown'}:
+            with self.subTest(op=op):
+                self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call(op, role='reader')['error'])
 
     def test_branches_still_lists_when_a_run_holds_the_workspace(self):
         import fcntl

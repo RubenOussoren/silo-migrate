@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I
 """Fixed mapping from term-llm custom tools to `silo-migrate-control converter dev`.
 
-The same file serves converter-developer and converter-reviewer; the role comes from
+The adapter serves converter-developer; the role comes from
 the agent directory this copy lives in, and converter_dev enforces it again. There
 is no mapping to the engineer's push approval, to clone/update, or to any path
 outside the workspace's converter checkout. Arguments never reach a shell.
@@ -33,6 +33,7 @@ TOOLS = {
     "dev_format": ("format", {"path"}),
     "dev_commit": ("commit", {"message"}),
     "dev_push_propose": ("push-propose", {"title", "body", "base", "findings"}),
+    "dev_branch_resolve": ("branch-resolve", {"link"}),
     "dev_branches": ("branches", {"fetch"}),
     "dev_branch_diff": ("branch-diff", {"branch", "base", "path"}),
     "dev_branch_read": ("branch-read", {"branch", "path", "start_line"}),
@@ -121,7 +122,7 @@ def main():
     workspace = chat_project()
     if workspace is None or not WORKSPACE.match(workspace):
         return fail("STANDARD_CHAT_NOT_IN_PROJECT")
-    timeout = 290 if tool in ("dev_test", "dev_format") else 85 if tool == "dev_branches" else 55
+    timeout = 290 if tool in ("dev_test", "dev_format") else 85 if tool in ("dev_branches", "dev_branch_resolve") else 55
     try:
         if tool == "dev_findings":
             result = subprocess.run([control_path(), "standard", "agent", "findings", workspace], capture_output=True, timeout=timeout, env=control_env())

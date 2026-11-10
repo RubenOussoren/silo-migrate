@@ -1,4 +1,4 @@
-"""Host-side converter development for the converter-developer and reviewer agents.
+"""Host-side converter development and read-only repository access for migration agents.
 
 Imported by bin/silo-migrate-control. Agent operations only ever see, in
 workspaces/<ws>/converter, files whose current content Git or the agent vouches for:
@@ -11,7 +11,7 @@ tests or committed. Commits are built from exactly those verified bytes. term-ll
 tools without an approval prompt, so every limit is enforced here.
 
 The engineer's push approval (`converter push WS --sha256 DIGEST`) is the only path that
-writes to GitHub. The token is read only there and by dev_branches' fetch (download only,
+writes to GitHub. The token is read only there and by branch tools' fetch (download only,
 through the same credential helper; the agent never sees it). That fetch only ever reaches a
 github.com origin; without a token file for its owner it uses the account's own Git
 credentials, as `converter update` does.
@@ -58,9 +58,10 @@ PROTECTED_NAMES = {".gitignore", ".gitattributes", ".gitmodules", ".git"}
 # installs exactly what the checkout's committed Gemfile.lock pins, with network.
 PROTECTED_PATHS = {"Gemfile", "Gemfile.lock", ".bundle/config"}
 ROLES = {
-    "developer": {"list", "read", "search", "status", "diff", "test", "push-show", "branches", "branch-diff", "branch-read",
+    "developer": {"list", "read", "search", "status", "diff", "test", "push-show", "branches", "branch-diff", "branch-read", "branch-resolve",
                   "write", "edit", "delete", "branch", "commit", "push-propose", "format"},
     "reviewer": {"list", "read", "search", "status", "diff", "test", "push-show"},
+    "reader": {"branches", "branch-diff", "branch-read", "branch-resolve"},
 }
 TRAILER = {"developer": "Assisted-by: converter-developer (term-llm agent)"}
 
@@ -514,7 +515,7 @@ def op_diff(checkout, request):
             "note": "Use path to see one file's diff when truncated." if truncated else ""}
 
 
-# -- other branches (developer, read-only) ---------------------------------------
+# -- other branches (developer, reviewer and data reader; read-only) ---------------------------------------
 # What is on GitHub, as of the last fetch: another migration's branch, a pull request's branch
 # (PR #370's, say), main. Only committed content of origin's branches: never the working tree,
 # so the content rule above is untouched. dev_branches fetches first (at most once a minute,
@@ -532,17 +533,24 @@ def fetchable(url):
 
 
 def remote_ref(checkout, name):
-    """refs/remotes/origin/NAME for an existing branch of origin, or a refusal."""
+    """An origin branch or a SHA reachable from downloaded branches/the PR ref."""
     if not isinstance(name, str) or not BRANCH.fullmatch(name) or ".." in name or "//" in name or name.endswith((".lock", "/")) or name == "HEAD":
         refuse("STANDARD_ARGUMENTS_INVALID")
     ref = "refs/remotes/origin/" + name
+    if re.fullmatch(r"[0-9a-f]{40}", name):
+        # Never expose arbitrary local commits: only commits reachable from downloaded
+        # origin branches or the single downloaded PR head.
+        refs = checkout.out("for-each-ref", "--format=%(refname)", "--contains=" + name,
+                            "refs/remotes/origin/", "refs/silo-migrate/pull/", ok=(0, 129)).splitlines()
+        if refs:
+            return name
     if checkout.git("show-ref", "--verify", "--quiet", ref, ok=(0, 1)).returncode != 0:
         refuse("STANDARD_DEV_BRANCH_UNKNOWN: no such branch on GitHub as of the last fetch; dev_branches lists them")
     return ref
 
 
-def fetch_origin(checkout):
-    """Fetch origin's branches (no merge, no checkout change): (status, fetched_at)."""
+def fetch_origin(checkout, pr=None):
+    """Fetch origin branches and optionally one PR head: (status, fetched_at). No checkout change."""
     fetch_head = checkout.path / ".git/FETCH_HEAD"
     attempt = checkout.standard / "converter-fetch-attempt"  # failed tries count too: GitHub down mustn't cost 40 s a call
     try:
@@ -572,8 +580,18 @@ def fetch_origin(checkout):
             else:
                 argv, env = checkout.host.converter_git(checkout.path, credentials=True), {}
             try:
-                result = subprocess.run([*argv, "fetch", "--prune", "--no-tags", "origin"], capture_output=True, env=git_env(env), timeout=40,
+                # One bounded PR ref, fetched in the same operation as origin's branches.
+                # A different PR during the throttle window must wait, not bypass it.
+                specs = []
+                if pr is not None:
+                    specs = ["+refs/heads/*:refs/remotes/origin/*", "+refs/pull/%d/head:refs/silo-migrate/pull/%d/head" % (pr, pr)]
+                result = subprocess.run([*argv, "fetch", "--prune", "--no-tags", "origin", *specs], capture_output=True, env=git_env(env), timeout=40,
                                         stdin=subprocess.DEVNULL)
+                if result.returncode == 0 and pr is not None:
+                    keep = "refs/silo-migrate/pull/%d/head" % pr
+                    for ref in checkout.out("for-each-ref", "--format=%(refname)", "refs/silo-migrate/pull/").splitlines():
+                        if ref != keep:
+                            checkout.git("update-ref", "-d", ref)
             except subprocess.TimeoutExpired:
                 return "timed out", last
     except ValueError as refusal:  # also the control script's own Refusal (an unusable token file, say)
@@ -617,8 +635,109 @@ def op_branches(checkout, request):
             break
     return {"fetch": status, "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(fetched)) if fetched else None,
             "branches": branches, "current_branch": checkout.branch(),
-            "note": "Branches on GitHub (newest first). A pull request's branch is shown on its GitHub page; ask the engineer if it isn't clear "
-                    "which one. dev_branch_diff shows a branch's commits and changes against main; dev_branch_read reads one of its files."}
+            "note": "Branches on GitHub (newest first). Use branch-resolve for private links or PR numbers, "
+                    "branch-diff for changes against main, and branch-read for a file."}
+
+
+def origin_repository(checkout):
+    match = GITHUB_REMOTE.fullmatch(checkout.out("remote", "get-url", "origin").strip())
+    if not match:
+        refuse("STANDARD_DEV_ORIGIN_REFUSED: origin must be an HTTPS github.com repository")
+    return (match[1].lower(), match[2].lower())
+
+
+def parse_link(checkout, value):
+    """Validate URL syntax/repository before fetching; never pass the URL to Git or the web."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or not 1 <= len(value) <= 2048:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    if re.fullmatch(r"[1-9][0-9]{0,8}", value):
+        origin_repository(checkout)
+        return {"kind": "pull", "pr": int(value)}
+    if not re.fullmatch(r"https://github\.com/[A-Za-z0-9._/#-]+", value):
+        refuse("STANDARD_DEV_LINK_INVALID: expected a private repository GitHub URL or PR number")
+    url = urllib.parse.urlsplit(value)
+    parts = url.path[1:].removesuffix("/").split("/")
+    if len(parts) < 4 or any(part in ("", ".", "..") for part in parts):
+        refuse("STANDARD_DEV_LINK_INVALID")
+    if tuple(part.lower() for part in parts[:2]) != origin_repository(checkout):
+        refuse("STANDARD_DEV_LINK_REPO_REFUSED: link is not the workspace origin repository")
+    kind, tail = parts[2], parts[3:]
+    result = {"kind": kind}
+    if kind == "pull" and len(tail) in (1, 2) and (len(tail) == 1 or tail[1] == "files") and re.fullmatch(r"[1-9][0-9]{0,8}", tail[0]) and not url.fragment:
+        result["pr"] = int(tail[0])
+    elif kind in ("tree", "blob"):
+        if url.fragment:
+            lines = re.fullmatch(r"L([1-9][0-9]{0,6})(?:-L([1-9][0-9]{0,6}))?", url.fragment)
+            if kind != "blob" or not lines or int(lines[2] or lines[1]) < int(lines[1]):
+                refuse("STANDARD_DEV_LINK_INVALID")
+            result["lines"] = {"start": int(lines[1]), "end": int(lines[2] or lines[1])}
+        result["target"] = "/".join(tail)
+    elif kind == "compare" and not url.fragment:
+        refs = "/".join(tail).split("...")
+        if len(refs) != 2 or not all(BRANCH.fullmatch(ref) and ".." not in ref for ref in refs):
+            refuse("STANDARD_DEV_LINK_INVALID")
+        result.update(base=refs[0], branch=refs[1])
+    elif kind == "commit" and len(tail) == 1 and re.fullmatch(r"[0-9a-f]{7,40}", tail[0]) and not url.fragment:
+        result["sha"] = tail[0]
+    else:
+        refuse("STANDARD_DEV_LINK_INVALID")
+    return result
+
+
+def op_branch_resolve(checkout, request):
+    result = parse_link(checkout, request.get("link"))
+    status, _ = fetch_origin(checkout, result.get("pr"))
+    result["fetch"] = status
+    kind = result["kind"]
+    if kind == "pull":
+        pr = result["pr"]
+        ref = "refs/silo-migrate/pull/%d/head" % pr
+        sha = checkout.out("rev-parse", "--verify", ref, ok=(0, 128)).strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            refuse("STANDARD_DEV_PR_UNAVAILABLE: PR head not downloaded; wait for the fetch throttle, then retry")
+        result["sha"] = sha
+        names = checkout.out("for-each-ref", "--format=%(refname:strip=3)", "--points-at=" + sha,
+                             "refs/remotes/origin/").splitlines()
+        names = [name for name in names if name != "HEAD" and BRANCH.fullmatch(name)]
+        # Prefer the branch associated with a PR this project's own push flow opened.
+        for record in load_proposals(checkout):
+            pull = record.get("pull_request") if isinstance(record.get("pull_request"), dict) else {}
+            if pull.get("number") == pr:
+                hint = (record.get("proposal") or {}).get("branch")
+                if hint in names:
+                    names.remove(hint)
+                    names.insert(0, hint)
+        if names:
+            result["branch"] = names[0]
+        else:
+            result["note"] = "PR head isn't a branch here (fork or moved head); pass sha as branch to branch-diff/branch-read."
+    elif kind in ("tree", "blob"):
+        target = result.pop("target")
+        names = checkout.out("for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin/").splitlines()
+        matches = [name for name in names if name != "HEAD" and (target == name or target.startswith(name + "/"))]
+        if not matches:
+            refuse("STANDARD_DEV_BRANCH_UNKNOWN: no origin branch prefix matches the link")
+        branch = max(matches, key=len)
+        remote_ref(checkout, branch)
+        path = target[len(branch):].lstrip("/")
+        if kind == "blob" and not path:
+            refuse("STANDARD_DEV_LINK_INVALID: blob link needs a path")
+        result["branch"] = branch
+        if path:
+            result["path"] = relative_path(path)
+    elif kind == "compare":
+        remote_ref(checkout, result["base"])
+        remote_ref(checkout, result["branch"])
+    elif kind == "commit":
+        sha = checkout.out("rev-parse", "--verify", result["sha"] + "^{commit}", ok=(0, 128)).strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            refuse("STANDARD_DEV_BRANCH_UNKNOWN: commit is not downloaded")
+        remote_ref(checkout, sha)
+        result["sha"] = sha
+        result["note"] = "Pass sha as branch to branch-diff/branch-read; diff defaults to main."
+    return result
 
 
 def op_branch_diff(checkout, request):
@@ -1788,7 +1907,8 @@ def main(args, values, base, repo, host, stdin, home=None):
         handlers = {"list": op_list, "read": op_read, "search": op_search, "status": op_status, "diff": op_diff,
                     "push-show": op_push_show, "write": op_write, "edit": op_edit, "delete": op_delete,
                     "branch": op_branch, "push-propose": op_push_propose,
-                    "branches": op_branches, "branch-diff": op_branch_diff, "branch-read": op_branch_read}
+                    "branches": op_branches, "branch-diff": op_branch_diff, "branch-read": op_branch_read,
+                    "branch-resolve": op_branch_resolve}
         if op == "test":
             result = op_test(checkout, request, values, repo)
         elif op in MUTATING:

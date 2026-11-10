@@ -157,6 +157,17 @@ tools:
           path: {type: string}
         required: [path]
         additionalProperties: false
+    - name: dev_branch_resolve
+      description: "Resolve a private converter repository URL or PR number without web tools: pull, tree, blob, compare or commit. Returns branch/path/lines/base/sha as applicable; pass sha as branch when there is no branch head. Shares the branches fetch throttle."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 90
+      input:
+        type: object
+        properties:
+          link: {type: string, maxLength: 2048, description: "Full github.com URL for this workspace's origin, or a PR number as a string"}
+        required: [link]
+        additionalProperties: false
     - name: dev_branches
       description: "List the converter's branches on GitHub, newest first, with how far each is ahead of and behind main (and the pull request, when this project opened it). Fetches from GitHub first (at most once a minute). Read-only: use it to find another migration's branch or a pull request's branch, such as one the engineer names."
       script: scripts/dev_tool.py
@@ -175,7 +186,7 @@ tools:
       input:
         type: object
         properties:
-          branch: {type: string, description: "Branch name as dev_branches lists it, e.g. migration/arc/mybb-staged-activation"}
+          branch: {type: string, description: "Origin branch name, e.g. migration/arc/mybb-staged-activation, or a downloaded SHA returned by the resolver"}
           base: {type: string, description: "Branch to compare with (default main)"}
           path: {type: string, description: "One file or directory, when the diff is truncated"}
         required: [branch]
@@ -188,7 +199,7 @@ tools:
       input:
         type: object
         properties:
-          branch: {type: string}
+          branch: {type: string, description: "Origin branch name or a downloaded SHA returned by the resolver"}
           path: {type: string, description: "Relative to the repository root"}
           start_line: {type: integer, minimum: 1}
         required: [branch, path]

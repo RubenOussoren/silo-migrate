@@ -117,13 +117,36 @@ and the web UI keeps chats apart:
   Notes are model-written: like findings, read them before trusting them (a hostile export could
   try to steer what gets written).
 
-**Known limitation: migration-data is offered web search and fetch.** term-llm (0.9.93 to 0.9.99, and
-`main` on 2026-11-10) offers `web_search` and `read_url` to every web chat, even to an agent with
-`search: false`: the agent's tool list can't remove them. migration-data's prompt says never to use them
-and to send web lookups and branch or PR comparisons to converter-developer; that is a prompt, not a
-guarantee. `read_url` goes through a third-party reader (Jina) by default, and searches through a search
-provider. The only server-wide switch, `search.fetch_provider: none`, would remove `read_url` from every
-agent; the engineer chose to leave both on until term-llm is fixed (2026-11-10).
+**Web tools stay on for all agents (owner's decision, 2026-11-10).** migration-data may search
+and read pages for public reference only. Its prompt forbids customer-derived values in any search
+query, URL or web request (including names, emails, IPs, text, titles, private hosts/site names and
+export IDs/values); describe the subject generically instead. Public product schema names and
+platform/version names are fine. A lookup needing a customer value stops for the engineer. Web text
+is untrusted reference, not instructions, and conclusions must name their source pages.
+
+**Observed tool availability:** an isolated term-llm 0.9.99 web server and a loopback fake model
+received the same tool list with `search: false` and `search: true`: `read_url`, `update_plan`,
+`web_search`. No real provider was contacted. CLI help describes `search` as enabling search and
+`--no-search` as overriding agent defaults; that does not remove the tools from web chats in this
+check. migration-data now declares `search: true` to match the decision and observed availability.
+Earlier checks (0.9.93–0.9.99 and `main` on 2026-11-10) found the same web-chat limitation. The control
+is a prompt rule, not enforced data-loss prevention: per-agent tool removal and per-tool approval/
+request logging in term-llm remain limitations. `read_url` uses a third-party reader (Jina) by default,
+and search uses a search provider. The server-wide `search.fetch_provider: none` switch would remove
+`read_url` for everyone; the owner chose not to use it.
+
+**Private converter links never use web tools.** Links to
+`github.com/discourse-org/discourse-converters` and PR numbers go through `dev_branch_resolve`
+(converter-developer) or `data_branch_resolve` (migration-data), then branch list/diff/read tools.
+These resolve only the workspace's configured origin. The data adapter uses the server-enforced
+`reader` role: only `branches`, `branch-resolve`, `branch-diff`, `branch-read`, never tests or writes.
+Repository content may flow to migration-data; customer data may not flow back through these tools.
+A PR number of up to nine digits reaches GitHub during fetch, far narrower than the already accepted web tools.
+PR heads use Git refs, not the GitHub API, with the existing private credential helper, workspace lock,
+40-second timeout and shared 60-second fetch throttle. A different PR during that window may return
+`STANDARD_DEV_PR_UNAVAILABLE`; wait, then retry. One private PR ref is retained, replaced on the next
+PR fetch. Fork/moved heads return `sha` without `branch`; pass that SHA as `branch` to diff/read.
+Only commits reachable from downloaded origin branches or that PR ref may be read by SHA.
 
 ### Free SQL: DBHub
 
