@@ -384,7 +384,7 @@ def push_detail(store, workspace, digest):
     if not record:
         raise Refused("STANDARD_REFERENCE_INVALID", 404)
     proposal = record["proposal"]
-    keep = ("repository", "branch", "base", "head", "title", "body", "stat", "files_total")
+    keep = ("repository", "branch", "base", "head", "title", "body", "stat", "files_total", "findings")
     return dict(push_summary(record), workspace=workspace, **{key: proposal.get(key) for key in keep},
                 commits=[commit for commit in proposal.get("commits") or [] if isinstance(commit, (str, dict))][:50],
                 files=[name for name in proposal.get("files") or [] if isinstance(name, str)][:300])

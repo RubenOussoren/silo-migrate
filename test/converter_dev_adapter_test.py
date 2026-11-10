@@ -73,7 +73,7 @@ print(json.dumps({'version': 1, 'ok': True}))
             'dev_branch': ({'topic': 'fix', 'new_pr': True}, {'op': 'branch', 'topic': 'fix', 'new_pr': True}),
             'dev_format': ({'path': 'converters/mybb', 'content': 'dropped'}, {'op': 'format', 'path': 'converters/mybb'}),
             'dev_commit': ({'message': 'Fix'}, {'op': 'commit', 'message': 'Fix'}),
-            'dev_push_propose': ({'title': 'T', 'body': 'B'}, {'op': 'push-propose', 'title': 'T', 'body': 'B'}),
+            'dev_push_propose': ({'title': 'T', 'body': 'B', 'findings': ['finding-1']}, {'op': 'push-propose', 'title': 'T', 'body': 'B', 'findings': ['finding-1']}),
         }
         self.assertEqual(set(cases) | {'dev_findings', 'dev_finding_show'}, set(self.tools('converter-developer')))
         for tool, (args, request) in cases.items():

@@ -201,5 +201,6 @@ tools:
           title: {type: string}
           body: {type: string}
           base: {type: string, description: "Base branch, default main"}
+          findings: {type: array, items: {type: string}, description: "IDs of the released findings this push addresses (from dev_findings). Name every one it fixes; leave it out for pushes that aren't about a finding, such as tidying or tests"}
         required: [title]
         additionalProperties: false

@@ -1025,6 +1025,38 @@ def op_delivery_label(ws, request):
     return {"dataset_id": dataset_id, "kind": kind, "delivery": delivery_label(record), "files": len(files)}
 
 
+# -- findings the engineer marks done ---------------------------------------------------------
+# A released finding is done when a pass on its fix passes, or when the engineer says it needed no
+# converter change (or was fixed before fixes were linked to findings). Only the second is stored.
+
+def finding_marks_file(ws):
+    return ws.root / ".silo-migrate/named/finding-progress.json"
+
+
+def op_finding_done(ws, request):
+    engineer_only(ws)
+    ws.require()
+    finding_id, by = request.get("finding_id"), request.get("by")
+    if not isinstance(finding_id, str) or not re.fullmatch(r"finding-[0-9a-f]{32}", finding_id):
+        refuse("STANDARD_ARGUMENTS_INVALID: finding_id")
+    if not isinstance(by, str) or not by.strip() or len(by) > MAX_LABELLED_BY or re.search(r"[\x00-\x1f]", by):
+        refuse("STANDARD_ARGUMENTS_INVALID: by")
+    with ws.lock():
+        state = ws.read_json(ws.root / ".silo-migrate/named/standard/state.json", {}) or {}
+        if ((state.get("findings") or {}).get(finding_id) or {}).get("status") != "released":
+            refuse("STANDARD_ARGUMENTS_INVALID: finding_id (only a released finding)")
+        path = finding_marks_file(ws)
+        if path.is_symlink():
+            refuse("STANDARD_PATH_INVALID")
+        marks = (ws.read_json(path, {}) or {}).get("done") or {}
+        if request.get("undo") is True:
+            marks.pop(finding_id, None)
+        else:
+            marks[finding_id] = {"by": by.strip(), "at": now()}
+        ws.write_json(path, {"version": 1, "done": marks})
+    return {"finding_id": finding_id, "done": finding_id in marks}
+
+
 def op_take(ws, request):
     """Move one file from the drop folder into inputs/, make it read-only, register it."""
     ws.require()
@@ -2291,7 +2323,8 @@ OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_creat
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
        "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding,
        "plan_propose": op_plan_propose,
-       "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions, "deliveries": op_deliveries, "delivery_label": op_delivery_label}
+       "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions, "deliveries": op_deliveries, "delivery_label": op_delivery_label,
+       "finding_done": op_finding_done}
 # Logged with their arguments (minus script code, finding text, count SQL and decisions, logged by hash).
 QUIET = {"status", "list", "job", "db_status", "notes", "guide", "decisions", "deliveries"}
 

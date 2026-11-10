@@ -269,7 +269,7 @@ else:
 
     def test_bad_arguments_or_unknown_tool_never_invoke_control(self):
         for tool, args in (('data_status', []), ('data_release_finding', {}), ('analyst_run_evidence', {'run_id': self.run_id}),
-                           ('data_delivery_label', {'kind': 'launch'}), ('data_deliveries', {}), ('delivery_label', {})):
+                           ('data_delivery_label', {'kind': 'launch'}), ('data_deliveries', {}), ('delivery_label', {}), ('data_finding_done', {}), ('finding_done', {})):
             with self.subTest(tool=tool, args=args):
                 result, _raw = self.call(tool, args)
                 self.assertIn(result['error'], ('STANDARD_ARGUMENTS_INVALID', 'STANDARD_TOOL_UNKNOWN'))

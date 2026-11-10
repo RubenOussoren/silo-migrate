@@ -439,7 +439,7 @@ class ApprovalShowsTheDataTest(unittest.TestCase):
         self.assertIn('Start this run of ${ctx.project} on ${dataLabel(data)}', source)
         self.assertEqual(2, source.count('Approval code ${short(data.digest, 16)}'))  # the code the page shows, in both approval texts
         self.assertIn("'Not labelled'", source)
-        self.assertIn('${operationLabel(plan.operation)} on ${dataLabel(plan)}', source)
+        self.assertIn("group.delivery || 'Data not labelled'", source)  # every pass says which data it ran on
 
 if __name__ == '__main__':
     unittest.main()

@@ -30,6 +30,11 @@ def _load(name, folder):
 
 runs = _load("silo_runs_widget", "runs")
 findings = _load("silo_findings_widget", "findings")
+_board_spec = importlib.util.spec_from_file_location("silo_project_board", HERE / "board.py")
+board = importlib.util.module_from_spec(_board_spec)
+_board_spec.loader.exec_module(board)
+RUN = re.compile(r"run-[0-9a-f]{32}\Z")
+FINDING = re.compile(r"finding-[0-9a-f]{32}\Z")
 
 Refused = runs.Refused
 REFUSALS = (runs.Refused, findings.Refused)
@@ -93,6 +98,78 @@ def counts(base, workspace):
     except REFUSALS:
         to_review = 0
     return {"findings": to_review, "runs": waiting_runs}
+
+
+def read_json_file(path):
+    try:
+        value = json.loads(runs.read_file(path, runs.MAX_STATE))
+    except (OSError, ValueError, Refused):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def passes_of(base, control, workspace):
+    """The Runs tab: passes, converter updates and what's new, from the workbench's own views."""
+    store = runs.Store(base)
+    view = runs.overview(store, control, workspace)
+    bodies = {plan_id: (plan.get("body") or {}) for plan_id, plan in store.plans(workspace).items()}
+    instances = store.state(workspace).get("instances") or {}
+    review_sites = {}
+    for run_id, run in store.runs(workspace).items():
+        record = instances.get(((run.get("instances") or {}).get("review"))) if isinstance(run.get("instances"), dict) else None
+        review_sites[run_id] = isinstance(record, dict) and record.get("state") != "removed"
+    named = base / workspace / ".silo-migrate/named"
+    deliveries = read_json_file(named / "deliveries.json").get("deliveries") or {}
+    result = board.build_passes(view["plans"], view["runs"], bodies, review_sites, store.pushes(workspace), deliveries if isinstance(deliveries, dict) else {})
+    return dict(result, converter=view.get("converter"))
+
+
+def findings_board(base, control, workspace):
+    store = findings.Store(base)
+    records = [dict(record, title=store.title(record)) for record in store.records(workspace)]
+    try:
+        passes = passes_of(base, control, workspace)
+    except REFUSALS:
+        passes = {"passes": [], "updates": []}
+    marks = read_json_file(base / workspace / ".silo-migrate/named/finding-progress.json").get("done") or {}
+    return board.build_findings(records, passes["passes"], passes["updates"], marks if isinstance(marks, dict) else {})
+
+
+def propose_again(base, control, body, import_next=False):
+    """A fresh proposal with a finished run's own inputs (still for the engineer to approve), or the
+    import of a finished convert run with the checks its pass last used."""
+    workspace, run_id = body.get("workspace"), body.get("run_id")
+    if not isinstance(run_id, str) or not RUN.fullmatch(run_id):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    store = runs.Store(base)
+    run = store.runs(workspace).get(run_id)
+    plans = store.plans(workspace)
+    plan_body = ((plans.get((run or {}).get("plan_id")) or {}).get("body") or {})
+    roles = plan_body.get("roles") or {}
+    operation = plan_body.get("operation")
+    if import_next:
+        if operation != "standard_convert":
+            raise Refused("STANDARD_ARGUMENTS_INVALID")
+        # The checks of this pass's last import, else of the project's last import (they carry the site
+        # queries), else the convert run's own.
+        reviews = sorted((plan for plan in plans.values() if (plan.get("body") or {}).get("operation") == "standard_review"),
+                         key=lambda plan: plan.get("created_at") or "")
+        here = [plan for plan in reviews if ((plan.get("body") or {}).get("from_run") or {}).get("run_id") == run_id]
+        chosen = (here or reviews)[-1:]
+        checks = ((chosen[0].get("body") or {}).get("roles") or {}).get("reconciliation") if chosen else roles.get("reconciliation")
+        request = {"op": "plan_propose", "from_run": run_id}
+    elif operation == "standard_convert":
+        checks = roles.get("reconciliation")
+        request = {"op": "plan_propose", "source": roles.get("source"), "settings": roles.get("settings"), "charset": plan_body.get("source_charset")}
+    elif operation == "standard_review":
+        checks = roles.get("reconciliation")
+        request = {"op": "plan_propose", "from_run": (plan_body.get("from_run") or {}).get("run_id")}
+    else:
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    if checks:
+        request["reconciliation"] = checks
+    # Proposing may prepare the converter's gems first: data_tools allows itself up to 290 s.
+    return data(control, workspace, request, timeout=300)
 
 
 SUMMARY_SECONDS = 20
@@ -177,6 +254,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, data(control, query.get("workspace"), {"op": "guide"}))
             if url.path == "/api/counts":
                 return self.send(200, counts(base, query.get("workspace")))
+            if url.path == "/api/runs/passes":
+                return self.send(200, passes_of(base, control, query.get("workspace")))
+            if url.path == "/api/findings/board":
+                return self.send(200, findings_board(base, control, query.get("workspace")))
             if url.path == "/api/runs/overview":
                 return self.send(200, runs.overview(runs.Store(base), control, query.get("workspace")))
             if url.path == "/api/runs/converter":
@@ -222,6 +303,16 @@ class Handler(BaseHTTPRequestHandler):
             action = path.rsplit("/", 1)[-1]
             if path == "/api/label":
                 result = label(self.server.control, body)
+            elif path in ("/api/runs/again", "/api/runs/import"):
+                result = propose_again(self.server.base, self.server.control, body, import_next=path.endswith("/import"))
+            elif path == "/api/findings/done":
+                finding_id = body.get("id")
+                if not isinstance(finding_id, str) or not FINDING.fullmatch(finding_id):
+                    raise Refused("STANDARD_ARGUMENTS_INVALID")
+                request = {"op": "finding_done", "finding_id": finding_id, "by": runs.reviewer_name()}
+                if body.get("undo") is True:
+                    request["undo"] = True
+                result = data(self.server.control, body.get("workspace"), request)
             elif path in RUN_PATHS:
                 result = runs.decide(runs.Store(self.server.base), self.server.control, action, body)
             elif path in FINDING_PATHS:

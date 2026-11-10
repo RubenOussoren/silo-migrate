@@ -31,43 +31,135 @@ export function runsView(ctx) {
     }
   }
 
+  let board = null;  // the last passes view, for opening one pass
+
+  const stepText = (step, site) => {
+    if (!step.run_status) {
+      return { waiting: 'Waiting for your approval', proposed: 'Waiting for your approval', approved: 'Approved: start it', stale: 'Out of date' }[step.plan_status] || step.plan_status;
+    }
+    if (['claimed', 'running'].includes(step.run_status)) return `Running: ${step.stage || 'starting'}`;
+    if (step.run_status === 'completed') {
+      const checks = step.checks ? (step.matched === step.checks ? `All ${step.checks} checks match` : `${step.matched} of ${step.checks} checks match`) : 'No count checks';
+      return `${checks}${site ? ' on the site' : ''}`;
+    }
+    return `${step.run_status.replace('_', ' ')}${step.stage ? ` at ${step.stage}` : ''}`;
+  };
+  const stepTone = (step) => (!step.run_status ? 'now' : ['claimed', 'running'].includes(step.run_status) ? 'run'
+    : step.run_status === 'completed' && step.checks && step.matched === step.checks ? '' : 'warn');
+  const stepPill = (step) => (!step.run_status ? (step.plan_status === 'stale' ? 'out of date' : 'for you') : step.run_status === 'completed' ? 'finished' : step.run_status.replace('_', ' '));
+  const stepRow = (name, step, site) => el('button', { type: 'button', class: 'step', onclick: () => (step.run_id ? ctx.open('run', step.run_id) : ctx.open('plan', step.plan_id)) },
+    el('span', { class: `dot ${stepTone(step)}` }), el('span', {}, name), el('span', { class: 'what' }, stepText(step, site)),
+    el('span', { class: `pill ${stepTone(step) === 'warn' ? 'warn' : stepTone(step) === '' ? 'ok' : 'now'}` }, stepPill(step)));
+  const passMeta = (group) => [group.delivery || 'Data not labelled', group.converter ? `converter ${short(group.converter, 7)}` : null, ago(group.started_at)].filter(Boolean).join(' · ');
+  const tone = (group) => ({ now: 'now', ok: 'ok', warn: 'warn', wait: '' })[group.status[1]];
+
+  function passActions(group, full) {
+    const convert = group.convert;
+    const last = group.imports[group.imports.length - 1];
+    const busy = [convert, ...group.imports].some((step) => !step.run_status || ['claimed', 'running'].includes(step.run_status));
+    const actions = [];
+    if (last && last.site_up) {
+      actions.push(el('button', { type: 'button', class: 'btn', onclick: () => ctx.open('run', last.run_id) }, 'Open the site'));
+      actions.push(el('button', { type: 'button', class: 'btn q', onclick: async () => {
+        if (await act('reset', { run_id: last.run_id }, `Reset the review site of pass ${group.number} (${ctx.project})? It holds customer data; evidence and plans stay.`)) { toast('Reset.'); ctx.refresh(); }
+      } }, 'Reset the site'));
+    }
+    const convertPassed = convert.run_status === 'completed' && convert.checks && convert.matched === convert.checks;
+    if (!busy && convertPassed && (!last || (last.run_status && !last.site_up))) {
+      actions.push(el('button', { type: 'button', class: last ? 'btn q' : 'btn', onclick: async () => {
+        const outcome = await act('import', { run_id: convert.run_id }, `Propose importing pass ${group.number} of ${ctx.project} into a new review site? You approve it next.`);
+        if (outcome && outcome.plan_id) { toast('Proposed. Check it and approve.'); ctx.open('plan', outcome.plan_id); }
+      } }, last ? 'Import again' : 'Import into a review site'));
+    }
+    if (!busy && convert.run_id) {
+      const again = el('button', { type: 'button', class: full ? 'btn q' : 'link', onclick: async () => {
+        const outcome = await act('again', { run_id: convert.run_id }, `Start a new pass of ${ctx.project} with the same data, settings and checks as pass ${group.number}, and the converter as it is now? This only proposes it: you approve it next.`);
+        if (outcome && outcome.plan_id) { toast('Proposed. Check it and approve.'); ctx.open('plan', outcome.plan_id); }
+      } }, 'Run again');
+      if (!full) again.style.marginLeft = 'auto';
+      actions.push(again);
+    }
+    return actions.length ? el('div', { class: 'actions' }, actions) : null;
+  }
+
+  function steps(group) {
+    const rows = [stepRow('Convert run', group.convert, false), ...group.imports.map((step, i) => stepRow(group.imports.length > 1 ? `Import ${i + 1}` : 'Import', step, true))];
+    const last = group.imports[group.imports.length - 1];
+    if (last && last.site_up) rows.push(el('div', { class: 'step static' }, el('span', { class: 'dot run' }), el('span', {}, 'Review site'), el('span', { class: 'what' }, 'Up · holds customer data until reset'), el('span', { class: 'pill now' }, 'check it')));
+    return rows;
+  }
+
+  function passCard(group, open) {
+    const head = el('button', { type: 'button', class: 'pass-head', onclick: () => ctx.open('pass', group.key) },
+      el('div', {}, el('span', { class: 'name' }, `Pass ${group.number}`), el('small', {}, passMeta(group))), el('span', { class: `pill ${tone(group)}` }, group.status[0]));
+    return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, steps(group), passActions(group, false)) : null);
+  }
+
+  function updatesList(all) {
+    // Replaced or discarded proposals never ran: their story is in the push itself.
+    const updates = all.filter((update) => ['proposed', 'pushed'].includes(update.status));
+    if (!updates.length) return [];
+    return [el('h2', {}, 'CONVERTER UPDATES'), el('div', { class: 'updates' }, updates.slice(0, 15).map((update) => el('button', { type: 'button', class: 'upd', onclick: () => ctx.open('push', update.digest) },
+      el('span', { class: 'mono' }, update.head || ''), el('span', {}, safe(update.title || 'Converter update')),
+      el('span', { class: `pill ${update.status === 'proposed' ? 'now' : !update.used_by.length && update.status === 'pushed' ? 'now' : ''}` },
+        update.status === 'proposed' ? 'waiting for your approval' : update.status !== 'pushed' ? update.status : update.used_by.length ? `${update.used_by.length > 1 ? 'passes' : 'pass'} ${update.used_by.join(', ')}` : 'not used yet'))))];
+  }
+
   async function list() {
     const mine = ++ticket;
-    ctx.mount([el('p', { class: 'quiet' }, 'Loading…')]);
+    if (!board) ctx.mount([el('p', { class: 'quiet' }, 'Loading…')]);
     let data;
-    try { data = await api(`api/runs/overview?${new URLSearchParams({ workspace: ctx.project })}`); } catch (error) {
+    try { data = await api(`api/runs/passes?${new URLSearchParams({ workspace: ctx.project })}`); } catch (error) {
       if (mine === ticket) ctx.mount([el('p', { class: 'quiet' }, explain(error))]);
       return;
     }
     if (mine !== ticket) return;
-    const plans = data.plans.slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
-    // A run is known by its plan: what kind it is and which data it used.
-    const planOf = Object.fromEntries(data.plans.map((plan) => [plan.plan_id, plan]));
-    const runs = data.runs.map((r) => ({ ...r, operation: (planOf[r.plan_id] || {}).operation, delivery: (planOf[r.plan_id] || {}).delivery }))
-      .sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
-    const planItem = (plan) => item(`${operationLabel(plan.operation)} on ${dataLabel(plan)}`,
-      `${plan.status === 'approved' ? 'Approved, ready to start' : plan.status === 'proposed' ? 'Waiting for your approval' : plan.status.replace('_', ' ')} · ${ago(plan.created_at)}`,
-      () => ctx.open('plan', plan.plan_id));
-    const runItem = (run) => item(`${operationLabel(run.operation)}${run.delivery ? ` on ${dataLabel(run)}` : ''} · ${run.status === 'completed' ? 'finished' : run.status.replace('_', ' ')}`,
-      `${run.stage ? `${run.stage} · ` : ''}${ago(run.started_at)}`, () => ctx.open('run', run.run_id));
-    const pushItem = (push) => item(safe(push.title || 'Converter update'), `${push.status === 'proposed' ? 'Waiting for your approval' : push.status} · ${ago(push.proposed_at)}`,
-      () => ctx.open('push', push.digest));
-    const waiting = [...plans.filter((p) => ['proposed', 'approved'].includes(p.status)).map(planItem), ...data.pushes.filter((p) => p.status === 'proposed').map(pushItem)];
-    const running = runs.filter((r) => ['claimed', 'running'].includes(r.status)).map(runItem);
-    const finished = runs.filter((r) => !['claimed', 'running'].includes(r.status));
-    const nodes = [el('h2', {}, 'WAITING FOR YOU'), ...(waiting.length ? waiting : [el('p', { class: 'quiet' }, 'Nothing. Plans appear when migration-data proposes a run, pushes when converter-developer proposes one.')])];
-    if (running.length) nodes.push(el('h2', {}, 'RUNNING'), ...running);
-    if (finished.length) nodes.push(el('h2', {}, 'LATEST'), runItem(finished[0]));
+    board = data;
+    const nodes = [];
+    if (data.banner) {
+      const b = data.banner;
+      nodes.push(el('div', { class: 'banner' }, b.kind === 'converter'
+        ? el('span', {}, el('b', {}, 'Converter updated'), ` since the last pass: ${b.head} “${safe(b.title || '')}”. Nothing has run on it yet.`)
+        : el('span', {}, el('b', {}, 'New data'), `: ${b.label} hasn't been run yet. Ask migration-data to propose a convert run on it.`),
+      b.kind === 'converter' ? el('button', { type: 'button', class: 'btn', onclick: async () => {
+        const outcome = await act('again', { run_id: b.run_id }, `Start pass ${b.next} of ${ctx.project} with the newest converter (${b.head}) and the same data, settings and checks as the last pass? This only proposes it: you approve it next.`);
+        if (outcome && outcome.plan_id) { toast('Proposed. Check it and approve.'); ctx.open('plan', outcome.plan_id); }
+      } }, `Start pass ${b.next}`) : null));
+    }
+    const waitingPushes = data.updates.filter((update) => update.status === 'proposed');
+    if (waitingPushes.length) {
+      nodes.push(el('h2', {}, 'WAITING FOR YOU'), ...waitingPushes.map((update) => item(`Converter update: ${safe(update.title || '')}`, 'Push it to GitHub and open or update the draft PR', () => ctx.open('push', update.digest))));
+    }
+    if (!data.passes.length) nodes.push(el('p', { class: 'quiet' }, 'No runs yet. migration-data proposes the first convert run; it appears here as pass 1.'));
+    nodes.push(...data.passes.map((group, i) => passCard(group, i === 0)));
+    nodes.push(...updatesList(data.updates));
     const conv = data.converter || {};
-    const earlier = [
-      ...finished.slice(1, 25).map(runItem),
-      ...data.pushes.filter((p) => p.status !== 'proposed').slice(0, 10).map(pushItem),
-      ...plans.filter((p) => !['proposed', 'approved'].includes(p.status)).slice(0, 25).map(planItem),
-    ];
-    nodes.push(el('details', { class: 'history' }, el('summary', {}, `Converter and earlier items (${earlier.length})`),
-      item(conv.error ? 'Converter' : `Converter · ${safe(conv.branch || '?')}`, conv.error ? conv.error : `${conv.not_pushed ?? '?'} commit(s) not on GitHub${conv.uncommitted ? ` · ${conv.uncommitted} uncommitted` : ''}`,
-        () => ctx.open('converter', ctx.project)), ...earlier));
+    nodes.push(el('p', { class: 'hint footer' }, el('button', { type: 'button', class: 'link', onclick: () => ctx.open('converter', ctx.project) },
+      conv.error ? 'Converter checkout' : `Converter checkout: ${safe(conv.branch || '?')} · ${conv.not_pushed ?? '?'} commit(s) not on GitHub`)));
     ctx.mount(nodes);
+  }
+
+  async function passView(key) {
+    const mine = ++ticket;
+    if (!board) {
+      try { board = await api(`api/runs/passes?${new URLSearchParams({ workspace: ctx.project })}`); } catch (error) { ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, explain(error))]); return; }
+    }
+    if (mine !== ticket) return;
+    const group = board.passes.find((candidate) => candidate.key === key);
+    if (!group) { ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, 'This pass is no longer there.')]); return; }
+    const before = board.passes.find((candidate) => candidate.number === group.number - 1);
+    const changes = [];
+    if (before) {
+      if (before.delivery !== group.delivery) changes.push(`new data (${group.delivery})`);
+      if (before.converter !== group.converter) changes.push(`converter ${short(before.converter, 7)} → ${short(group.converter, 7)}`);
+      if ((before.roles || {}).settings !== (group.roles || {}).settings) changes.push('new settings');
+      if ((before.roles || {}).reconciliation !== (group.roles || {}).reconciliation) changes.push('new checks');
+    }
+    const changed = before ? el('p', { class: 'changed' }, `Changed since pass ${before.number}: `, el('b', {}, changes.length ? changes.join(', ') : 'nothing'), '.') : null;
+    const more = details(facts([['Convert run', group.convert.run_id, true], ['Convert plan', group.convert.plan_id, true],
+      ...group.imports.map((step, i) => [`Import ${i + 1}`, step.run_id || step.plan_id, true]), ['Converter', group.converter, true], ['Branch', group.branch, true]]));
+    ctx.mount([back('Runs', ctx.close), card(`PASS ${group.number} · ${(group.delivery || 'DATA NOT LABELLED').toUpperCase()}`, group.status[0], changed,
+      el('div', { class: 'steps' }, steps(group)), passActions(group, true), more)]);
   }
 
   function plan(data) {
@@ -240,6 +332,7 @@ export function runsView(ctx) {
 
   async function detail(kind, id, quiet = false) {
     const mine = ++ticket;
+    board = null;  // a decision may change the passes: the list asks again
     if (!quiet) ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, 'Loading…')]);  // a refresh keeps what's shown
     let data;
     try { data = await api(`api/runs/${kind}?${new URLSearchParams({ workspace: ctx.project, id })}`); } catch (error) {
@@ -266,5 +359,5 @@ export function runsView(ctx) {
     }
   }
 
-  return { show: () => (ctx.selected ? detail(ctx.selected.kind, ctx.selected.id) : list()) };
+  return { show: () => (!ctx.selected ? list() : ctx.selected.kind === 'pass' ? passView(ctx.selected.id) : detail(ctx.selected.kind, ctx.selected.id)) };
 }

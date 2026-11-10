@@ -817,13 +817,33 @@ def current_proposal(checkout, request_base, title, body):
             "files": files[:300], "files_total": len(files), "stat": bounded(stat_text, 4096)[0], "title": title, "body": body}
 
 
+MAX_ADDRESSED = 10
+FINDING_ID = re.compile(r"finding-[0-9a-f]{32}\Z")
+
+
+def addressed_findings(checkout, request):
+    """The released findings a push says it addresses: the link from a finding to the fix that tracks
+    it to Done. Optional; only IDs of this project's released findings are accepted."""
+    wanted = request.get("findings", [])
+    if not isinstance(wanted, list) or len(wanted) > MAX_ADDRESSED or not all(isinstance(item, str) and FINDING_ID.fullmatch(item) for item in wanted):
+        refuse("STANDARD_ARGUMENTS_INVALID: findings")
+    known = checkout.state.get("findings") if isinstance(checkout.state.get("findings"), dict) else {}
+    for finding_id in wanted:
+        if (known.get(finding_id) or {}).get("status") != "released":
+            refuse("STANDARD_ARGUMENTS_INVALID: findings (only released findings of this project)")
+    return sorted(set(wanted))
+
+
 def op_push_propose(checkout, request):
     title, body = request.get("title"), request.get("body", "")
     if not isinstance(title, str) or not title.strip() or len(title) > 120 or "\n" in title:
         refuse("STANDARD_ARGUMENTS_INVALID")
     if not isinstance(body, str) or len(body) > 20000 or "\0" in body:
         refuse("STANDARD_ARGUMENTS_INVALID")
+    findings = addressed_findings(checkout, request)
     proposal = current_proposal(checkout, request.get("base", "main"), title.strip(), body)
+    if findings:
+        proposal["findings"] = findings  # part of what the engineer approves
     digest = hashlib.sha256(canonical(proposal).encode("utf-8")).hexdigest()
     record = {"digest": digest, "status": "proposed", "proposed_at": now(), "proposal": proposal}
     path = proposal_dir(checkout) / (digest + ".json")

@@ -3,7 +3,6 @@
 import { el, safe, ago, toast, api, explain, facts, details, card, back, item } from './ui.js';
 
 const STATUS_LABEL = { proposed: 'to review', released: 'released', rejected: 'rejected', superseded: 'replaced', withdrawn: 'withdrawn' };
-const FILTERS = [['proposed', 'To review'], ['released', 'Released'], ['history', 'Everything else']];
 
 // A small Markdown subset rendered as DOM nodes (never as HTML): headings (also ALL-CAPS section
 // lines), bullet and numbered lists, pipe tables, fenced code, `code` and **bold**. Links stay text.
@@ -124,6 +123,7 @@ export function findingsView(ctx) {
       const outcome = await api(`api/findings/${action}`, { workspace: ctx.project, id: record.id, text });
       toast(action === 'amend' ? 'Released the correction.' : `Done: ${outcome.status}.`);
       editing = null;
+      board = null;
       if (outcome.finding_id && outcome.finding_id !== record.id) ctx.open('finding', outcome.finding_id); else ctx.refresh();
     } catch (error) {
       for (const button of buttons) button.disabled = false;
@@ -131,36 +131,54 @@ export function findingsView(ctx) {
     }
   }
 
-  async function list(typed = false) {
+  let board = null;  // grouped findings with their tracks
+  const find = (id) => board && Object.values(board).flat().find((entry) => entry.id === id);
+
+  // Released, fixed, run, checked: where a finding is, in four dots.
+  function track(entry) {
+    const steps = [
+      ['done', entry.status === 'proposed' ? 'Proposed' : `Released ${ago(entry.decided_at)}`],
+      entry.marked ? ['done', 'Marked done'] : entry.fix && entry.fix.head ? ['done', `Fix ${entry.fix.head}`] : entry.fix ? ['now', 'Fix proposed'] : ['now', 'Waiting for a fix'],
+      entry.marked ? null : entry.ran ? ['done', 'Run'] : entry.fix && entry.fix.head ? ['now', 'Not run yet'] : ['', 'Run'],
+      entry.marked ? null : entry.checked_in ? ['done', `Checked in pass ${entry.checked_in}`] : ['', 'Checked'],
+    ].filter(Boolean);
+    if (entry.status === 'proposed') steps.splice(1);
+    return el('div', { class: 'track' }, steps.map(([state, label]) => el('span', { class: `tstep ${state}` }, el('i'), label)));
+  }
+
+  const origin = (entry) => (entry.origin ? `Found in pass ${entry.origin.pass}'s ${entry.origin.step === 'import' ? 'import' : 'convert run'}` : entry.kind === 'schema' ? 'Schema' : entry.kind || 'Finding');
+  const nextStep = (entry) => (entry.marked ? `Marked done by ${safe(entry.marked.by)}` : entry.checked_in ? `Checked in pass ${entry.checked_in}`
+    : entry.fix && entry.fix.head ? (entry.ran ? 'A pass ran on the fix but its checks didn\'t all match' : 'Next: start a new pass to check the fix')
+      : entry.fix ? 'Next: approve the converter update in Runs' : 'Next: converter-developer works from it, or mark it done if no change is needed');
+
+  function boardCard(entry, open) {
+    const head = el('button', { type: 'button', class: 'pass-head', onclick: () => ctx.open('finding', entry.id) },
+      el('div', {}, el('span', { class: 'name' }, safe(entry.title)), el('small', {}, entry.status === 'proposed' ? `${origin(entry)} · proposed ${ago(entry.proposed_at)}` : origin(entry))),
+      entry.status === 'proposed' ? el('span', { class: 'btn' }, 'Review') : el('span', { class: `pill ${entry.checked_in || entry.marked ? 'ok' : 'now'}` },
+        entry.checked_in ? 'checks match' : entry.marked ? 'done' : entry.fix && entry.fix.head ? 'fix pushed' : entry.fix ? 'fix proposed' : 'needs a fix'));
+    return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, track(entry), el('p', { class: 'changed' }, nextStep(entry))) : null);
+  }
+
+  async function list() {
     const mine = ++ticket;
-    editing = null;
-    const filter = ctx.state.filter || 'proposed';
-    const page = ctx.state.page || 0;
-    const search = el('input', { type: 'search', class: 'search', placeholder: 'Search: ID, kind or first line', 'aria-label': 'Search findings', value: ctx.state.q || '' });
-    let timer = null;
-    search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { ctx.state.q = search.value; ctx.state.page = 0; list(true); }, 300); });
-    const chips = el('div', { class: 'chips' }, FILTERS.map(([id, label]) => el('button', { type: 'button', class: id === filter ? 'chip on' : 'chip', onclick: () => { ctx.state.filter = id; ctx.state.page = 0; list(); } }, label)), search);
-    ctx.mount([chips, el('p', { class: 'quiet' }, 'Loading…')]);
+    if (!board) ctx.mount([el('p', { class: 'quiet' }, 'Loading…')]);
     let data;
-    try { data = await api(`api/findings/list?${new URLSearchParams({ workspace: ctx.project, status: filter, q: ctx.state.q || '', page })}`); } catch (error) {
-      if (mine === ticket) ctx.mount([chips, el('p', { class: 'quiet' }, explain(error))]);
+    try { data = await api(`api/findings/board?${new URLSearchParams({ workspace: ctx.project })}`); } catch (error) {
+      if (mine === ticket) ctx.mount([el('p', { class: 'quiet' }, explain(error))]);
       return;
     }
     if (mine !== ticket) return;
-    if (!data.items.length && data.page > 0) {  // past the end, e.g. after the last item was decided
-      ctx.state.page = Math.max(0, data.pages - 1);
-      list(typed);
-      return;
+    board = data;
+    const nodes = [];
+    if (data.review.length) nodes.push(el('h2', {}, 'TO REVIEW'), ...data.review.map((entry) => boardCard(entry, false)));
+    if (data.progress.length) nodes.push(el('h2', {}, 'IN PROGRESS'), ...data.progress.map((entry) => boardCard(entry, true)));
+    if (data.done.length) nodes.push(el('h2', {}, 'DONE'), ...data.done.map((entry) => boardCard(entry, false)));
+    if (data.other.length) {
+      nodes.push(el('details', { class: 'history' }, el('summary', {}, `Rejected, withdrawn and replaced (${data.other.length})`),
+        ...data.other.map((entry) => item(safe(entry.title), `${STATUS_LABEL[entry.status]} · ${ago(entry.decided_at || entry.proposed_at)}`, () => ctx.open('finding', entry.id)))));
     }
-    const items = data.items.map((record) => item(safe(record.title || record.id), `${record.kind} · ${STATUS_LABEL[record.status]} · ${ago(record.updated_at)}${record.supersedes ? ' · correction' : ''}`,
-      () => ctx.open('finding', record.id)));
-    const empty = filter === 'proposed' ? 'Nothing to review. migration-data proposes findings when converter work needs to know something.' : 'Nothing here.';
-    const pager = data.pages > 1 ? el('div', { class: 'actions' },
-      el('button', { type: 'button', class: 'btn q', disabled: data.page === 0, onclick: () => { ctx.state.page = data.page - 1; list(); } }, 'Newer'),
-      el('span', { class: 'hint' }, `Page ${data.page + 1} of ${data.pages} · ${data.total} in all`),
-      el('button', { type: 'button', class: 'btn q', disabled: data.page + 1 >= data.pages, onclick: () => { ctx.state.page = data.page + 1; list(); } }, 'Older')) : null;
-    ctx.mount([chips, ...(items.length ? items : [el('p', { class: 'quiet' }, ctx.state.q ? 'Nothing matches.' : empty)]), pager]);
-    if (typed) { search.focus(); search.setSelectionRange(search.value.length, search.value.length); }
+    if (!nodes.length) nodes.push(el('p', { class: 'quiet' }, 'No findings yet. migration-data proposes them when converter work needs to know something about the data.'));
+    ctx.mount(nodes);
   }
 
   async function detail(id) {
@@ -173,6 +191,14 @@ export function findingsView(ctx) {
       return;
     }
     if (mine !== ticket) return;
+    if (!find(record.id)) { try { board = await api(`api/findings/board?${new URLSearchParams({ workspace: ctx.project })}`); } catch { /* no track then */ } }
+    if (mine !== ticket) return;
+    const entry = find(record.id);
+    const story = entry && record.status !== 'proposed' ? [track(entry), el('p', { class: 'changed' }, `${origin(entry)}. ${nextStep(entry)}.`)] : [];
+    const mark = (undo) => el('button', { type: 'button', class: 'btn q', onclick: async () => {
+      if (!confirm(undo ? `Reopen this finding of ${ctx.project}? It goes back to In progress.` : `Mark this finding of ${ctx.project} done? Use this when it needed no converter change, or was fixed before fixes named their findings.`)) return;
+      try { await api('api/findings/done', { workspace: ctx.project, id: record.id, undo }); toast(undo ? 'Reopened.' : 'Marked done.'); board = null; ctx.refresh(); } catch (error) { toast(explain(error), true); }
+    } }, undo ? 'Reopen' : 'Mark done');
     const more = details(facts([['Finding', record.id, true], ['Kind', record.kind + (record.run_id ? ` (run ${record.run_id})` : '')], ['Proposed', record.proposed_at],
       ['Decided', record.decided_at ? `${record.decided_at}${record.reviewer ? ` by ${record.reviewer}` : ''}` : null], ['SHA-256', record.sha256, true]]),
     record.versions.length > 1 ? el('ol', {}, record.versions.map((version) => el('li', {}, el('button', { type: 'button', class: version.id === record.id ? 'link current' : 'link', onclick: () => {
@@ -194,8 +220,9 @@ export function findingsView(ctx) {
       edit.node.hidden = true;
       editing = null;
       const amend = el('button', { type: 'button', class: 'btn', hidden: true, onclick: () => act('amend', record, edit.area.value) }, 'Release correction');
-      parts = [card('RELEASED', 'What the coding agents see', el('div', { class: 'block' }, el('h3', {}, 'Released text ', toggle), view), edit.node,
-        el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn q', onclick: (event) => {
+      parts = [card(entry && (entry.checked_in || entry.marked) ? 'FINDING · DONE' : 'FINDING · IN PROGRESS', safe((entry && entry.title) || 'Released finding'), ...story,
+        el('div', { class: 'block' }, el('h3', {}, 'Released text (what the coding agents see) ', toggle), view), edit.node,
+        el('div', { class: 'actions' }, entry && entry.marked ? mark(true) : entry && !entry.checked_in ? mark(false) : null, el('button', { type: 'button', class: 'btn q', onclick: (event) => {
           edit.node.hidden = false; amend.hidden = false; event.currentTarget.hidden = true; editing = { area: edit.area, original: edit.area.value }; edit.area.focus();
         } }, 'Amend…'), amend, el('button', { type: 'button', class: 'btn q', onclick: () => act('withdraw', record) }, 'Withdraw')), more)];
     } else {

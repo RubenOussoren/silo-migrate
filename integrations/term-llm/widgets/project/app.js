@@ -31,7 +31,7 @@ function readHash() {
   const params = new URLSearchParams(location.hash.slice(1));
   const tab = params.get('tab');
   const kind = params.get('kind');
-  const kinds = { runs: ['plan', 'run', 'push', 'converter'], findings: ['finding'] }[tab] || [];
+  const kinds = { runs: ['plan', 'run', 'push', 'converter', 'pass'], findings: ['finding'] }[tab] || [];
   return { project: params.get('project') || params.get('ws'), tab: TABS.some(([id]) => id === tab) ? tab : null,
     selected: kinds.includes(kind) && params.get('id') ? { kind, id: params.get('id') } : null };
 }

@@ -1270,6 +1270,21 @@ class DataToolsTest(unittest.TestCase):
         self.assertIn('\ufffd', view['not_ready_files'][0]['path'])
         self.assertNext('engineer', 'silo intake arc')
 
+    def test_marking_a_finding_done_is_for_the_engineer_and_released_findings_only(self):
+        self.create()
+        state_file = self.base / 'arc/.silo-migrate/named/standard/state.json'
+        state = json.loads(state_file.read_text())
+        released, proposed = 'finding-' + 'a' * 32, 'finding-' + 'b' * 32
+        state['findings'] = {released: {'status': 'released'}, proposed: {'status': 'proposed'}}
+        state_file.write_text(json.dumps(state))
+        self.refused('STANDARD_DATA_OPERATION_REFUSED', 'finding_done', finding_id=released, by='R', via='chat')
+        self.refused('STANDARD_ARGUMENTS_INVALID: finding_id', 'finding_done', finding_id=proposed, by='R')
+        self.refused('STANDARD_ARGUMENTS_INVALID: finding_id', 'finding_done', finding_id='x', by='R')
+        self.assertTrue(self.op('finding_done', finding_id=released, by='Reviewer')['done'])
+        marks = json.loads((self.base / 'arc/.silo-migrate/named/finding-progress.json').read_text())['done']
+        self.assertEqual('Reviewer', marks[released]['by'])
+        self.assertFalse(self.op('finding_done', finding_id=released, by='Reviewer', undo=True)['done'])
+
     def test_refusals_name_the_bad_field(self):
         self.create()
         self.refused('STANDARD_ARGUMENTS_INVALID: timeout_minutes', 'script', language='ruby', code='puts 1', into='x', timeout_minutes='soon')

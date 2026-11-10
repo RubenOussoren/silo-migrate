@@ -566,6 +566,22 @@ class ConverterDevTest(unittest.TestCase):
         # Agents can't reach it: it isn't a dev operation.
         self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('push-discard', digest=first)['error'])
 
+    def test_a_push_names_only_released_findings_of_this_project_and_its_approval_covers_them(self):
+        released, proposed = 'finding-' + 'a' * 32, 'finding-' + 'b' * 32
+        self.state['findings'] = {released: {'status': 'released'}, proposed: {'status': 'proposed'}}
+        (self.root / '.silo-migrate/named/standard/state.json').write_text(json.dumps(self.state))
+        self.commit_fix()
+        target, api = self.github([])
+        with target, api:
+            for bad in ([proposed], ['finding-' + 'c' * 32], ['x'], released, [released] * 11):
+                with self.subTest(bad=bad):
+                    self.assertTrue(self.call('push-propose', title='Fix', findings=bad)['error'].startswith('STANDARD_ARGUMENTS_INVALID'))
+            plain = self.call('push-propose', title='Fix')
+            self.assertNotIn('findings', plain['proposal'])
+            named = self.call('push-propose', title='Fix', findings=[released, released])
+            self.assertEqual([released], named['proposal']['findings'])
+            self.assertNotEqual(plain['digest'], named['digest'])
+
     def test_push_refuses_a_stale_proposal(self):
         self.commit_fix()
         self.token()

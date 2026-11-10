@@ -149,6 +149,32 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         self.assertEqual(403, self.request('POST', '/api/runs/approve', {'workspace': 'arc'}, {'Content-Type': 'application/json', 'X-Silo-Runs': '1'})[0])
         self.assertEqual(len(self.m.RUN_ACTIONS) + len(self.m.FINDING_ACTIONS), len(calls))
 
+    def test_run_again_and_import_reuse_the_runs_own_inputs_and_only_propose(self):
+        base = self.base / 'arc/.silo-migrate/named/standard'
+        base.mkdir(parents=True)
+        convert = {'operation': 'standard_convert', 'roles': {'source': 'input-1', 'settings': 'input-2', 'reconciliation': 'input-3'}, 'source_charset': 'latin1'}
+        review = {'operation': 'standard_review', 'from_run': {'run_id': 'run-' + 'a' * 32}, 'roles': {'reconciliation': 'input-4'}}
+        state = {'plans': {'plan-' + 'a' * 32: {'body': convert, 'created_at': '1'}, 'plan-' + 'b' * 32: {'body': review, 'created_at': '2'}},
+                 'runs': {'run-' + 'a' * 32: {'plan_id': 'plan-' + 'a' * 32}, 'run-' + 'b' * 32: {'plan_id': 'plan-' + 'b' * 32}}}
+        (base / 'state.json').write_text(json.dumps(state))
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        self.assertEqual(200, self.request('POST', '/api/runs/again', {'workspace': 'arc', 'run_id': 'run-' + 'a' * 32}, headers)[0])
+        self.assertEqual(200, self.request('POST', '/api/runs/again', {'workspace': 'arc', 'run_id': 'run-' + 'b' * 32}, headers)[0])
+        self.assertEqual(200, self.request('POST', '/api/runs/import', {'workspace': 'arc', 'run_id': 'run-' + 'a' * 32}, headers)[0])
+        self.assertEqual(400, self.request('POST', '/api/runs/import', {'workspace': 'arc', 'run_id': 'run-' + 'b' * 32}, headers)[0])  # only from a convert run
+        self.assertEqual(400, self.request('POST', '/api/runs/again', {'workspace': 'arc', 'run_id': 'x'}, headers)[0])
+        requests = [request for _argv, request in self.calls()]
+        self.assertEqual({'op': 'plan_propose', 'source': 'input-1', 'settings': 'input-2', 'charset': 'latin1', 'reconciliation': 'input-3'}, requests[0])
+        self.assertEqual({'op': 'plan_propose', 'from_run': 'run-' + 'a' * 32, 'reconciliation': 'input-4'}, requests[1])
+        self.assertEqual({'op': 'plan_propose', 'from_run': 'run-' + 'a' * 32, 'reconciliation': 'input-4'}, requests[2])
+        self.assertEqual(3, len(requests))
+
+    def test_marking_done_sends_only_the_finding_and_the_servers_reviewer(self):
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        self.assertEqual(200, self.request('POST', '/api/findings/done', {'workspace': 'arc', 'id': 'finding-' + 'a' * 32, 'by': 'Other', 'undo': 'yes'}, headers)[0])
+        self.assertEqual({'op': 'finding_done', 'finding_id': 'finding-' + 'a' * 32, 'by': self.m.runs.reviewer_name()}, self.calls()[-1][1])
+        self.assertEqual(400, self.request('POST', '/api/findings/done', {'workspace': 'arc', 'id': 'x'}, headers)[0])
+
     def test_findings_are_shown_one_project_at_a_time(self):
         for query in ('', 'workspace=', 'workspace=../x'):
             self.assertEqual(400, self.request('GET', '/api/findings/list?' + query)[0])

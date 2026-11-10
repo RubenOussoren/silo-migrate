@@ -32,7 +32,7 @@ TOOLS = {
     "dev_branch": ("branch", {"topic", "new_pr"}),
     "dev_format": ("format", {"path"}),
     "dev_commit": ("commit", {"message"}),
-    "dev_push_propose": ("push-propose", {"title", "body", "base"}),
+    "dev_push_propose": ("push-propose", {"title", "body", "base", "findings"}),
 }
 READ_ONLY = {"dev_list", "dev_read", "dev_search", "dev_status", "dev_diff", "dev_test", "dev_push_show", "dev_findings", "dev_finding_show"}
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
