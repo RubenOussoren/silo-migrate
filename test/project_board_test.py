@@ -43,6 +43,39 @@ class PassesTest(unittest.TestCase):
     def build(self, plans, runs, bodies, sites=None, pushes=(), deliveries=None, reviews=()):
         return self.b.build_passes(plans, runs, bodies, sites or {}, list(pushes), deliveries or {}, list(reviews))
 
+    def test_a_merge_run_is_a_pass_of_its_own(self):
+        base = {'delivery': {'kind': 'base_site', 'version': 1}, 'discourse_version': '2026.11.0-latest'}
+        layer = {'present': True, 'path': 'mergers/arc/merger.rb', 'revision': 'c' * 40, 'files': 2, 'bytes': 900, 'sha256': 'd' * 64}
+
+        def body(layer):
+            return {'operation': 'standard_merge', 'converter_revision': 'c' * 40, 'converter': {'branch': 'migration/arc/merge-layer'}, 'dataset_id': 'dataset-1',
+                    'delivery': {'dataset_id': 'dataset-1', 'kind': 'development', 'version': 1}, 'roles': {'source': 'input-1', 'base_site': 'input-2'},
+                    'base_site': base, 'merge': {'layer': layer, 'settings': False, 'options': {}}}
+        waiting = self.build([plan(1, 'proposed')], [], {'plan-1': body({'present': False})})['passes'][0]
+        self.assertEqual(('merge', 'merge', [], ('Waiting for your approval', 'now'), {'present': False}, 'Base site v1'),
+                         (waiting['kind'], waiting['convert']['kind'], waiting['imports'], waiting['status'], waiting['layer'], waiting['base_site']))
+        merged = run(1, 1, checks=0, matched=0)
+        merged['artifacts'] = {'backup': {'filename': 'invented.tar.gz', 'sha256': 'a' * 64, 'bytes': 42}}
+        args = ([plan(1)], [merged], {'plan-1': body(layer)})
+        group = self.build(*args, sites={'run-1': True})['passes'][0]
+        self.assertEqual((('Ready to check', 'now'), 'ready', True, 'Development v1', 1), (group['status'], group['backup_state'], group['convert']['site_up'], group['delivery'], group['number']))
+        self.assertEqual({'present': True, 'path': 'mergers/arc/merger.rb', 'revision': 'c' * 40, 'files': 2, 'sha256': 'd' * 64}, group['layer'])
+        self.assertEqual(('Merged', 'ok'), self.build(*args)['passes'][0]['status'])
+        merged['release'] = {'released_by': 'Engineer', 'outbox': '/invented/outbox'}
+        group = self.build(*args, sites={'run-1': True})['passes'][0]
+        self.assertEqual((('Backup released', 'ok'), 'released'), (group['status'], group['backup_state']))
+        for status, expected in (('failed', ('Merge needs a look', 'warn')), ('abandoned', ('Merge needs a look', 'warn')), ('running', ('Running', 'now'))):
+            self.assertEqual(expected, self.build([plan(1)], [run(1, 1, status=status)], {'plan-1': body(layer)})['passes'][0]['status'])
+        self.assertEqual(('Out of date: propose it again', 'warn'), self.build([plan(1, 'stale')], [], {'plan-1': body(layer)})['passes'][0]['status'])
+        self.assertEqual([], self.build([plan(1, 'discarded')], [], {'plan-1': body(layer)})['passes'])
+        # A layer pushed after the last merge: the banner offers the next pass, worded for a merge.
+        result = self.build([plan(1)], [merged], {'plan-1': body(layer)}, pushes=[push('p1', 'e' * 40)])
+        self.assertEqual(('converter', True, 'run-1', 2), tuple(result['banner'][key] for key in ('kind', 'merge', 'run_id', 'next')))
+        # A finding is never marked checked by a merge alone: there are no count checks to pass.
+        findings = self.b.build_findings([{'id': 'finding-1', 'status': 'released', 'run_id': 'run-1'}], result['passes'],
+                                         self.build([plan(1)], [merged], {'plan-1': body(layer)}, pushes=[push('p1', 'c' * 40, pushed='2026-01-01T00:30:00Z', findings=['finding-1'])])['updates'], {})
+        self.assertEqual(({'pass': 1, 'step': 'merge'}, None), (findings['progress'][0]['origin'], findings['progress'][0]['checked_in']))
+
     def test_base_backup_release_is_separate_from_passed_checks(self):
         body = dict(review_body('run-1'), base_site={'delivery': {'kind': 'base_site', 'version': 2}, 'discourse_version': '2026.10.0'})
         review = run(2, 2, checks=6, matched=5)

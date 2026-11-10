@@ -91,6 +91,15 @@ tools:
         type: object
         properties: {}
         additionalProperties: false
+    - name: dev_merge_guide
+      description: "Merge projects: the contract a project's merge layer (mergers/<workspace>/) must keep, its limits, the pinned Discourse revision with links to the stock merger's source, what is committed, and the outcome of the latest merge runs (where each stopped, fixed site counts). Read it before reviewing anything under mergers/."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties: {}
+        additionalProperties: false
     - name: dev_findings
       description: "List investigation findings an engineer has released for coding work."
       script: scripts/dev_tool.py

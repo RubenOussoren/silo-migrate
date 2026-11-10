@@ -149,7 +149,7 @@ module SiloMigrate
         state = @store.load
         run = state.fetch("runs")[run_id]
         raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
-        raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless review_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+        raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless review_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {})) || merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
 
         record = state.fetch("instances")[run.dig("instances", "review").to_s]
         path = @store.run_dir(run_id, "private", "admin-password")
@@ -188,13 +188,13 @@ module SiloMigrate
         when "destination"
           raise StandardWorkflowError, "STANDARD_RECONCILIATION_INVALID" unless count_sql?(sql, destination: true)
 
-          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless review_plan?(plan)
+          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless review_plan?(plan) || merge_plan?(plan)
 
           @store.with_op_lock do
             # Checked again under the lock: a reset may have removed the site meanwhile.
             current = @store.load
             record = current.fetch("instances")[current.dig("runs", run_id, "instances", "review").to_s]
-            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless record && %w[imported review dirty].include?(record["state"])
+            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless record && %w[imported review dirty setup].include?(record["state"])
 
             stack = stack_for(run_id, "review")
             raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless stack.live?
@@ -218,13 +218,15 @@ module SiloMigrate
           state = @store.load
           run = state.fetch("runs")[run_id]
           plan = run && state.fetch("plans")[run["plan_id"]]
-          unless run && plan && review_plan?(plan) && plan.dig("body", "base_site") && run["status"] == "completed" && run.dig("artifacts", "backup")
+          unless run && plan && (review_plan?(plan) || merge_plan?(plan)) && plan.dig("body", "base_site") && run["status"] == "completed" && run.dig("artifacts", "backup")
             raise StandardWorkflowError, "STANDARD_RELEASE_NOT_READY"
           end
+          raise StandardWorkflowError, "STANDARD_RELEASE_CHECKS" if merge_plan?(plan) && !acknowledge_differences
+
           artifact = run.fetch("artifacts").fetch("backup")
           source = release_artifact!(artifact)
           results = run.fetch("results")
-          checks = results.fetch("reconciliation_checks", 0)
+          checks = merge_plan?(plan) ? 0 : results.fetch("reconciliation_checks", 0)
           unless acknowledge_differences || run.dig("release", "acknowledged_differences") || run.dig("release", "differences_acknowledged") || (checks.positive? && results["reconciliation_matched"] == checks && results.fetch("reconciliation_errors", 0).zero?)
             raise StandardWorkflowError, "STANDARD_RELEASE_CHECKS"
           end
@@ -233,7 +235,7 @@ module SiloMigrate
           release_directory!(outbox)
           filename = artifact.fetch("filename")
           output = File.join(outbox, filename)
-          manifest_name = filename.delete_suffix(".sql.gz") + ".manifest.json"
+          manifest_name = filename.sub(/\.(?:sql|tar)\.gz\z/, "") + ".manifest.json"
           previous = run["release"]
           released_at = previous ? previous.fetch("released_at") : now
           released_by = previous ? previous.fetch("released_by") : reviewer
@@ -244,7 +246,7 @@ module SiloMigrate
             "workspace" => @workspace, "run_id" => run_id, "plan_id" => plan.fetch("id"), "plan_digest" => plan.fetch("digest"),
             "delivery" => body.fetch("delivery").slice("kind", "version"),
             "base_site" => base.merge("sha256" => input.fetch("sha256")),
-            "converter_revision" => body.dig("from_run", "converter_revision"), "app_revision" => body["app_revision"],
+            "converter_revision" => (body["converter_revision"] || body.dig("from_run", "converter_revision")), "app_revision" => body["app_revision"],
             "discourse_version" => results["discourse_version"], "schema_version" => results["schema_version"],
             "check_totals" => { "checks" => checks, "matched" => results.fetch("reconciliation_matched", 0),
                                 "differs" => results.fetch("reconciliation_differs", 0), "errors" => results.fetch("reconciliation_errors", 0) },
@@ -271,6 +273,7 @@ module SiloMigrate
       # The review module precedes the convert module in method lookup; all other plans
       # retain the existing stage selector.
       def stages_for(plan)
+        return StandardMergeRun::MERGE_STAGES if merge_plan?(plan)
         return BASE_SITE_STAGES if review_plan?(plan) && plan.dig("body", "base_site")
 
         super
@@ -426,6 +429,7 @@ module SiloMigrate
       end
 
       def stage_backup(run_id)
+        return merge_backup(run_id) if merge_plan?(plan_for(run_id))
         stack = stack_for(run_id, "review")
         stem = "#{@workspace}-#{run_id}"
         remote = "/shared/silo-review-backup"
@@ -455,7 +459,7 @@ module SiloMigrate
 
       def release_artifact!(artifact)
         filename = artifact.fetch("filename")
-        unless File.basename(filename) == filename && filename.match?(/\A[a-zA-Z0-9_.-]+\.sql\.gz\z/)
+        unless File.basename(filename) == filename && filename.match?(/\A[a-zA-Z0-9_.-]+\.(?:sql|tar)\.gz\z/)
           raise StandardWorkflowError, "STANDARD_ARTIFACT_CHANGED"
         end
         path = artifact.fetch("path")

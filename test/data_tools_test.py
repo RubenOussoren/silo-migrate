@@ -1588,6 +1588,137 @@ class DataToolsTest(unittest.TestCase):
         doc = json.loads(state.read_text()); doc['inputs'] = {}; state.write_text(json.dumps(doc))
         self.refused('STANDARD_BASE_SITE_NOT_TAKEN', 'plan_propose', from_run=run)
 
+    # -- merge projects (source platform discourse) ----------------------------------------
+
+    SOURCE_BACKUP = 'invented-source-v2026-11-0-latest-20261104011110.tar.gz'
+
+    def merge_project(self):
+        """A discourse project with the source site's backup and the Base site taken."""
+        self.auto_label = False
+        self.op('create', platform='discourse')
+        (self.intake / self.SOURCE_BACKUP).write_bytes(b'invented archive bytes')
+        self.label('development')
+        source = self.op('take', path=self.SOURCE_BACKUP, type='discourse-backup')['input_id']
+        self.base_backup()
+        return source, self.label('base_site')['input']['input_id']
+
+    def merge_control(self, calls, base, layer=None):
+        original = self.control
+
+        def control(argv, input=None, timeout=120):
+            if argv[:3] == ['standard', 'plan', 'propose']:
+                calls.append((argv, timeout))
+                return json.dumps({'version': 1, 'plan_id': 'plan-' + 'e' * 32, 'digest': 'f' * 64, 'status': 'proposed', 'operation': 'standard_merge',
+                                   'roles': {'source': argv[argv.index('--source') + 1], 'base_site': base}, 'converter_revision': 'a' * 40,
+                                   'base_site': {'input_id': base, 'delivery': {'kind': 'base_site', 'version': 1}, 'schema_version': 100, 'site_schema_version': 100, 'ahead': False},
+                                   'merge': {'layer': layer or {'present': False}, 'settings': '--settings' in argv, 'options': {}},
+                                   'instances': {'review': {'name': 'private', 'hostname': 'private', 'port': 4200}}, 'private': 'not passed on'})
+            if argv == ['standard', 'converter', 'refresh', 'arc', '--if-changed']:
+                calls.append((argv, timeout))
+                return json.dumps({'version': 1, 'commit': 'a' * 40, 'branch': 'migration/arc/merge-layer', 'dirty': False})
+            return original(argv, input=input, timeout=timeout)
+        self.control = control
+
+    def test_a_merge_source_is_a_full_discourse_backup_in_a_discourse_project(self):
+        self.create()  # a converter project
+        (self.intake / self.SOURCE_BACKUP).write_bytes(b'x')
+        self.refused('STANDARD_MERGE_SOURCE_INVALID', 'take', path=self.SOURCE_BACKUP, type='discourse-backup')
+        self.assertTrue((self.intake / self.SOURCE_BACKUP).exists())
+        self.refused('STANDARD_MERGE_NOT_DISCOURSE', 'merge_propose')
+
+    def test_a_merge_source_keeps_its_backup_name(self):
+        self.op('create', platform='discourse')
+        for name in ('backup.tar.gz', 'site-v2026-11-0-latest-20261104011110.sql.gz'):
+            (self.intake / name).write_bytes(b'x')
+            self.refused('STANDARD_MERGE_SOURCE_INVALID', 'take', path=name, type='discourse-backup')
+        (self.intake / self.SOURCE_BACKUP).write_bytes(b'x')
+        self.refused('STANDARD_MERGE_SOURCE_INVALID', 'take', path=self.SOURCE_BACKUP, type='discourse-backup', name='renamed.tar.gz')
+        self.assertTrue(self.op('take', path=self.SOURCE_BACKUP, type='discourse-backup')['input_id'].startswith('input-'))
+
+    def test_merge_propose_uses_the_registered_source_and_base_site(self):
+        source, base = self.merge_project()
+        calls = []
+        self.merge_control(calls, base)
+        result = self.op('merge_propose')
+        propose = ['standard', 'plan', 'propose', 'arc', '--operation', 'merge', '--source', source, '--base-site', base]
+        self.assertEqual([['standard', 'converter', 'refresh', 'arc', '--if-changed'], propose], [argv for argv, _ in calls])
+        self.assertLessEqual(sum(timeout for _, timeout in calls), 285)
+        self.assertEqual(('plan-' + 'e' * 32, 'standard_merge', 'migration/arc/merge-layer', {'review': {'port': 4200}}),
+                         (result['plan_id'], result['operation'], result['converter_branch'], result['instances']))
+        self.assertNotIn('private', json.dumps(result))
+        self.assertIn("Discourse's own merger with no project merge layer", result['next'])
+        self.assertIn('Runs tab', result['next'])
+        # Options and a settings input are passed on; a layer is named with its commit.
+        settings = self.settings_input()
+        calls.clear()
+        self.merge_control(calls, base, layer={'present': True, 'path': 'mergers/arc/merger.rb', 'revision': 'c' * 40})
+        result = self.op('merge_propose', source=source, base_site=base, settings=settings, ignore_global_pins=True,
+                         separate_same_named_groups=True)
+        self.assertEqual(propose + ['--settings', settings, '--ignore-global-pins', '--separate-same-named-groups'], calls[-1][0])
+        self.assertIn('mergers/arc/merger.rb at ' + 'c' * 12, result['next'])
+        self.assertTrue(result['merge']['settings'])
+
+    def settings_input(self):
+        """Register a merge-settings input the way migration-data would (a derived file)."""
+        state = self.base / 'arc/.silo-migrate/named/state.json'
+        doc = json.loads(state.read_text())
+        input_id = 'input-' + '9' * 32
+        doc['inputs'][input_id] = {'id': input_id, 'type': 'merge-settings', 'dataset_id': 'dataset-' + 'b' * 32}
+        state.write_text(json.dumps(doc))
+        return input_id
+
+    def test_merge_propose_refuses_what_is_not_a_source_base_site_or_settings(self):
+        source, base = self.merge_project()
+        calls = []
+        self.merge_control(calls, base)
+        for code, request in (('STANDARD_MERGE_SOURCE_INVALID', {'source': base}), ('STANDARD_MERGE_SOURCE_INVALID', {'source': 'input-1 --x'}),
+                              ('STANDARD_BASE_SITE_INVALID', {'base_site': source}), ('STANDARD_MERGE_SETTINGS_INVALID', {'settings': source}),
+                              ('STANDARD_MERGE_SETTINGS_INVALID', {'settings': '--base-site'}), ('STANDARD_ARGUMENTS_INVALID', {'separate_same_named_groups': 'no'}),
+                              ('STANDARD_ARGUMENTS_INVALID', {'ignore_global_pins': 1})):
+            with self.subTest(request=request):
+                self.refused(code, 'merge_propose', **request)
+        self.assertEqual([], calls)
+
+    def test_merge_propose_says_what_is_missing(self):
+        self.auto_label = False
+        self.op('create', platform='discourse')
+        self.refused('STANDARD_MERGE_SOURCE_NOT_TAKEN', 'merge_propose')
+        (self.intake / self.SOURCE_BACKUP).write_bytes(b'x')
+        self.label('development')
+        self.op('take', path=self.SOURCE_BACKUP, type='discourse-backup')
+        self.refused('STANDARD_MERGE_BASE_SITE_MISSING', 'merge_propose')
+
+    def test_guide_walks_a_merge_project(self):
+        self.auto_label = False
+        self.op('create', platform='discourse')
+        self.assertNext('engineer', 'full backup (with uploads')
+        (self.intake / self.SOURCE_BACKUP).write_bytes(b'x')
+        self.label('development')
+        guide = self.op('guide')
+        self.assertNext('agent', 'type=discourse-backup', guide)
+        self.assertEqual(['files', 'workspace', 'source', 'base', 'merge', 'release'], [stage['id'] for stage in guide['stages']])
+        self.op('take', path=self.SOURCE_BACKUP, type='discourse-backup')
+        guide = self.op('guide')
+        self.assertEqual('base', guide['stage'])
+        self.assertNext('engineer', 'label it Base site', guide)
+        self.base_backup()
+        self.label('base_site')
+        guide = self.op('guide')
+        self.assertEqual('merge', guide['stage'])
+        self.assertNext('agent', 'data_merge_propose', guide)
+        self.assertIn('merge layer', guide['next']['action'])
+        run = {'run_id': 'run-' + '5' * 32, 'plan_id': 'plan-' + '5' * 32, 'kind': 'merge', 'stage': 'merge'}
+        for state, who, text in ((dict(run, status='failed', failure={'code': 'STANDARD_MERGE_FAILED'}), 'agent', 'STANDARD_MERGE_FAILED'),
+                                 (dict(run, status='abandoned'), 'engineer', 'Recover it'),
+                                 (dict(run, status='completed'), 'engineer', 'release its backup')):
+            with self.subTest(status=state['status']):
+                self.guide_state(runs=[state])
+                self.assertNext(who, text)
+        self.guide_state(runs=[dict(run, status='completed')], sites=[{'role': 'review', 'run_id': run['run_id'], 'state': 'running'}])
+        guide = self.op('guide')
+        self.assertEqual(['files', 'workspace', 'source', 'base', 'merge'], self.stages(guide))
+        self.assertNotIn(self.SOURCE_BACKUP, json.dumps(guide))
+
     def test_files_must_be_labelled_before_they_can_be_taken(self):
         self.auto_label = False
         self.create()

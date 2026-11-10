@@ -226,6 +226,20 @@ tools:
           base_site: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Review only: registered Base site input ID; mutually exclusive with fresh_site. Omit both to use the current Base site automatically."}
           fresh_site: {type: boolean, description: "Review only: true proposes on a fresh site instead of the current Base site; mutually exclusive with base_site."}
         additionalProperties: false
+    - name: data_merge_propose
+      description: "Merge project only (source platform discourse): propose a merge run that restores the Base site, loads the source site's full backup (type discourse-backup) beside it and runs Discourse's merger, with the project's merge layer (mergers/<workspace>/merger.rb at the converter checkout's committed revision) when one exists. Omit source and base_site to use the registered ones. settings is an optional merge-settings input (YAML mapping the layer reads; customer values belong there, never in the repository). Returns the plan ID, digest and which layer applies; the engineer approves and starts it."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 295
+      input:
+        type: object
+        properties:
+          source: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the source site's full backup (type discourse-backup); omit to use the one in the newest Development delivery"}
+          base_site: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the site to merge into (type base_site); omit to use the current Base site"}
+          settings: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the merge settings (type merge-settings); optional"}
+          ignore_global_pins: {type: boolean, description: "true: source topics pinned globally are not pinned globally after the merge"}
+          separate_same_named_groups: {type: boolean, description: "true: a source group named like a destination group is kept as a separate group instead of merged"}
+        additionalProperties: false
     - name: data_propose_finding
       description: "Propose a finding privately for the engineer. Without run_id: a schema finding (tables, columns, counts, invented example rows) for converter work. With run_id: the cause of a failed run. Never include real customer values. The engineer decides what is released to coding agents."
       script: scripts/data_tool.py

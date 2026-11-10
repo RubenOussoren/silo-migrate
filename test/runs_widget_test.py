@@ -294,6 +294,16 @@ else:
         for text in ('Import into a review site', 'Convert run', 'Site difference', 'Show admin password',
                      'Copy password', "'Hide'", 'ssh -N -L ${port}:127.0.0.1:${port}', 'holds customer data until it is reset'):
             self.assertIn(text, script)
+        # A merge run has the same sign-in and reset as an import, and says there are no automatic checks.
+        for text in ("'Merge run'", "(data.operation === 'standard_review' || merge) && data.status === 'completed' && reviewURL",
+                     "review ? 'Reset the site' : 'Reset'", 'no automatic count checks', "acknowledge: !matched",
+                     'It runs the merge layer at commit ${short(layer.revision, 12)} next to the customer data.',
+                     'column(s) exist only on the Base site', 'A settings file: shown under Details'):
+            self.assertIn(text, script)
+        messages = (ROOT / 'integrations/term-llm/widgets/project/ui.js').read_text()
+        for code in ('STANDARD_MERGE_NOT_DISCOURSE', 'STANDARD_MERGE_SOURCE_INVALID', 'STANDARD_MERGE_SOURCE_NOT_TAKEN', 'STANDARD_MERGE_SOURCE_NEWER',
+                     'STANDARD_MERGE_BASE_SITE_MISSING', 'STANDARD_MERGE_SETTINGS_INVALID', 'STANDARD_MERGE_LAYER_INVALID', 'STANDARD_MERGE_SCHEMA', 'STANDARD_MERGE_FAILED'):
+            self.assertIn(code + ':', messages)
 
     def test_converter_view_is_read_only_and_survives_a_refusal(self):
         status, data = self.get('/api/converter?workspace=arc&id=arc')

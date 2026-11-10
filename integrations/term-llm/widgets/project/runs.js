@@ -7,7 +7,11 @@ const bytes = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n /
 const resetNote = (release) => release ? 'The released backup stays in the output folder.' : 'The unreleased backup is kept with the run.';
 
 const RUN_DONE = new Set(['completed', 'failed', 'interrupted']);
-const operationLabel = (operation) => (operation === 'standard_review' ? 'Import into a review site' : operation === 'standard_convert' ? 'Convert run' : 'Run');
+const operationLabel = (operation) => (operation === 'standard_review' ? 'Import into a review site' : operation === 'standard_convert' ? 'Convert run' : operation === 'standard_merge' ? 'Merge run' : 'Run');
+const isMerge = (group) => group.kind === 'merge';
+// A merge pass names the merge layer it ran with (the commit it was read from), or that there was none.
+const layerLabel = (layer) => (layer && layer.present ? `merge layer ${short(layer.revision, 7)}` : 'no merge layer');
+const MERGE_TOTALS = ['users', 'topics', 'posts', 'categories', 'groups', 'tags', 'uploads'];
 // Which data a plan runs on, in words: part of what an approval covers.
 export const dataLabel = (plan) => {
   const delivery = plan.delivery;
@@ -42,6 +46,7 @@ export function runsView(ctx) {
       return { waiting: 'Waiting for your approval', proposed: 'Waiting for your approval', approved: 'Approved: start it', stale: 'Out of date' }[step.plan_status] || step.plan_status;
     }
     if (['claimed', 'running'].includes(step.run_status)) return `Running: ${step.stage || 'starting'}`;
+    if (step.run_status === 'completed' && step.kind === 'merge') return 'Merged · no automatic count checks: check the site';
     if (step.run_status === 'completed') {
       const checks = step.checks ? (step.matched === step.checks ? `All ${step.checks} checks match` : `${step.matched} of ${step.checks} checks match`) : 'No count checks';
       return `${checks}${site ? ' on the site' : ''}`;
@@ -49,28 +54,29 @@ export function runsView(ctx) {
     return `${step.run_status.replace('_', ' ')}${step.stage ? ` at ${step.stage}` : ''}`;
   };
   const stepTone = (step) => (!step.run_status ? 'now' : ['claimed', 'running'].includes(step.run_status) ? 'run'
-    : step.run_status === 'completed' && step.checks && step.matched === step.checks ? '' : 'warn');
+    : step.run_status === 'completed' && (step.kind === 'merge' || (step.checks && step.matched === step.checks)) ? '' : 'warn');
   const stepPill = (step) => (!step.run_status ? (step.plan_status === 'stale' ? 'out of date' : 'for you') : step.run_status === 'completed' ? 'finished' : step.run_status.replace('_', ' '));
   const stepRow = (name, step, site) => el('button', { type: 'button', class: 'step', onclick: () => (step.run_id ? ctx.open('run', step.run_id) : ctx.open('plan', step.plan_id)) },
     el('span', { class: `dot ${stepTone(step)}` }), el('span', {}, name), el('span', { class: 'what' }, stepText(step, site)),
     el('span', { class: `pill ${stepTone(step) === 'warn' ? 'warn' : stepTone(step) === '' ? 'ok' : 'now'}` }, stepPill(step)));
-  const passMeta = (group) => [group.delivery || 'Data not labelled', group.converter ? `converter ${short(group.converter, 7)}` : null, ago(group.started_at)].filter(Boolean).join(' · ');
+  const passMeta = (group) => [group.delivery || 'Data not labelled', isMerge(group) ? layerLabel(group.layer) : group.converter ? `converter ${short(group.converter, 7)}` : null, ago(group.started_at)].filter(Boolean).join(' · ');
   const tone = (group) => ({ now: 'now', ok: 'ok', warn: 'warn', wait: '' })[group.status[1]];
 
   function passActions(group, full) {
     const convert = group.convert;
-    const last = group.imports[group.imports.length - 1];
+    // A merge pass is one run: the merged site and its backup are on that run.
+    const last = isMerge(group) ? (convert.run_id ? convert : undefined) : group.imports[group.imports.length - 1];
     const busy = [convert, ...group.imports].some((step) => !step.run_status || ['claimed', 'running'].includes(step.run_status));
     const actions = [];
     if (last) { const release = releaseButton(last); if (release) actions.push(release); }
     if (last && last.site_up) {
       actions.push(el('button', { type: 'button', class: 'btn', onclick: () => ctx.open('run', last.run_id) }, 'Open the site'));
       actions.push(el('button', { type: 'button', class: 'btn q', onclick: async () => {
-        if (await act('reset', { run_id: last.run_id }, `Reset the review site of pass ${group.number} (${ctx.project})? It holds customer data; evidence and plans stay. ${resetNote(last && last.release)}`)) { toast('Reset.'); ctx.refresh(); }
+        if (await act('reset', { run_id: last.run_id }, `Reset the ${isMerge(group) ? 'merged' : 'review'} site of pass ${group.number} (${ctx.project})? It holds customer data; evidence and plans stay. ${resetNote(last && last.release)}`)) { toast('Reset.'); ctx.refresh(); }
       } }, 'Reset the site'));
     }
     const convertPassed = convert.run_status === 'completed' && convert.checks && convert.matched === convert.checks;
-    if (!busy && convertPassed && (!last || (last.run_status && !last.site_up))) {
+    if (!isMerge(group) && !busy && convertPassed && (!last || (last.run_status && !last.site_up))) {
       actions.push(el('button', { type: 'button', class: last ? 'btn q' : 'btn', onclick: async () => {
         const outcome = await act('import', { run_id: convert.run_id }, `Propose importing pass ${group.number} of ${ctx.project} into a new review site? You approve it next.`);
         if (outcome && outcome.plan_id) { toast('Proposed. Check it and approve.'); ctx.open('plan', outcome.plan_id); }
@@ -78,7 +84,9 @@ export function runsView(ctx) {
     }
     if (!busy && convert.run_id) {
       const again = el('button', { type: 'button', class: full ? 'btn q' : 'link', onclick: async () => {
-        const outcome = await act('again', { run_id: convert.run_id }, `Start a new pass of ${ctx.project} with the same data, settings and checks as pass ${group.number}, and the converter as it is now? This only proposes it: you approve it next.`);
+        const outcome = await act('again', { run_id: convert.run_id }, isMerge(group)
+          ? `Start a new merge of ${ctx.project} with the same source backup, settings and options as pass ${group.number}, on the current Base site, with the merge layer as it is committed now? This only proposes it: you approve it next.`
+          : `Start a new pass of ${ctx.project} with the same data, settings and checks as pass ${group.number}, and the converter as it is now? This only proposes it: you approve it next.`);
         if (outcome && outcome.plan_id) { toast('Proposed. Check it and approve.'); ctx.open('plan', outcome.plan_id); }
       } }, 'Run again');
       if (!full) again.style.marginLeft = 'auto';
@@ -111,10 +119,11 @@ export function runsView(ctx) {
     const matched = step.checks > 0 && step.matched === step.checks;
     const differs = Math.max(0, step.checks - step.matched);
     const question = matched ? 'Release this backup for review? It copies the backup and a manifest to this project’s output folder. Nothing is sent anywhere.'
+      : step.kind === 'merge' ? 'A merge has no automatic count checks: the totals and your own check of the merged site are what there is. Release this backup for review? It copies the backup and a manifest to this project’s output folder. Nothing is sent anywhere.'
       : `${step.checks ? `${differs} of ${step.checks} checks ${differs === 1 ? 'differs' : 'differ'}.` : 'There are no count checks.'} Release this backup for review anyway?`;
-    return el('button', { type: 'button', class: matched ? 'btn' : 'btn q', onclick: async () => {
+    return el('button', { type: 'button', class: matched || step.kind === 'merge' ? 'btn' : 'btn q', onclick: async () => {
       if (await act('release', { run_id: step.run_id, acknowledge: !matched }, question)) { toast('Backup released.'); ctx.refresh(); }
-    } }, matched ? 'Release backup' : 'Release anyway…');
+    } }, matched ? 'Release backup' : step.kind === 'merge' ? 'Release backup…' : 'Release anyway…');
   }
 
   function backupRows(last) {
@@ -124,8 +133,9 @@ export function runsView(ctx) {
     const row = (name, text, state) => el('div', { class: 'step static' }, el('span', { class: 'dot' }), el('span', {}, name),
       el('span', { class: 'what' }, text), state ? el('span', { class: 'pill ok' }, state) : null);
     const ahead = base.ahead || (last.results || {}).base_site_ahead;
-    return [row('Base site', `${last.base_site} · Discourse ${base.discourse_version || 'unknown'}${ahead ? ' · newer schema than this server, as approved' : ''} · restored before the import`, ''),
-      row('Backup', backup ? `Sandbox + imported data, no uploads · ${bytes(backup.bytes)} · taken before the review sign-in was added` : 'Not taken yet', last.backup_state)];
+    const merge = last.kind === 'merge';
+    return [row('Base site', `${last.base_site} · Discourse ${base.discourse_version || 'unknown'}${ahead ? ' · newer schema than this server, as approved' : ''} · restored before the ${merge ? 'merge' : 'import'}`, ''),
+      row('Backup', backup ? `${merge ? 'Merged site with the source site’s uploads' : 'Sandbox + imported data, no uploads'} · ${bytes(backup.bytes)} · taken before the review sign-in was added` : 'Not taken yet', last.backup_state)];
   }
 
   function releasedDetails(last) {
@@ -141,6 +151,11 @@ export function runsView(ctx) {
   }
 
   function steps(group) {
+    if (isMerge(group)) {
+      const merge = group.convert;
+      const site = merge.site_up ? [el('div', { class: 'step static' }, el('span', { class: 'dot run' }), el('span', {}, 'Merged site'), el('span', { class: 'what' }, 'Up · holds customer data until reset'), el('span', { class: 'pill now' }, 'check it'))] : [];
+      return [stepRow('Merge run', merge, false), ...site, ...backupRows(merge)];
+    }
     const rows = [stepRow('Convert run', group.convert, false), ...group.imports.map((step, i) => stepRow(group.imports.length > 1 ? `Import ${i + 1}` : 'Import', step, true))];
     const last = group.imports[group.imports.length - 1];
     if (last && passed(last) && passed(group.convert)) rows.push(siteRow(last));
@@ -162,6 +177,12 @@ export function runsView(ctx) {
   }
 
   function passSay(group) {
+    if (isMerge(group)) {
+      const merge = group.convert;
+      if (merge.run_status !== 'completed') return group.status[0];
+      if (merge.release) return 'Released for review. Copy the backup from the server and restore it on the migration site.';
+      return `Merged into the sandbox with ${layerLabel(group.layer)}. There are no automatic count checks: ${merge.site_up ? 'check the site, then release the backup.' : 'the run shows the totals.'}`;
+    }
     const last = group.imports[group.imports.length - 1];
     if (!last || !last.base_site || last.run_status !== 'completed') return group.status[0];
     if (last.release) return 'Released for review. Copy the backup from the server and restore it on the migration site.';
@@ -172,7 +193,7 @@ export function runsView(ctx) {
   function passCard(group, open) {
     const head = el('button', { type: 'button', class: 'pass-head', onclick: () => ctx.open('pass', group.key) },
       el('div', {}, el('span', { class: 'name' }, `Pass ${group.number}`), el('small', {}, passMeta(group))), el('span', { class: `pill ${tone(group)}` }, group.status[0]));
-    return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, group.base_site ? el('p', { class: 'hint' }, passSay(group)) : null, steps(group), decideBox(group), passActions(group, false), releasedDetails(group.imports[group.imports.length - 1])) : null);
+    return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, group.base_site ? el('p', { class: 'hint' }, passSay(group)) : null, steps(group), decideBox(group), passActions(group, false), releasedDetails(isMerge(group) ? group.convert : group.imports[group.imports.length - 1])) : null);
   }
 
   function updatesList(all) {
@@ -199,10 +220,12 @@ export function runsView(ctx) {
     if (data.banner) {
       const b = data.banner;
       nodes.push(el('div', { class: 'banner' }, b.kind === 'converter'
-        ? el('span', {}, el('b', {}, 'Converter updated'), ` since the last pass: ${b.head} “${safe(b.title || '')}”. Nothing has run on it yet.`)
-        : el('span', {}, el('b', {}, 'New data'), `: ${safe(b.label)} hasn't been run yet. Ask migration-data to propose a convert run on it.`),
+        ? el('span', {}, el('b', {}, b.merge ? 'Converter checkout updated' : 'Converter updated'), ` since the last pass: ${b.head} “${safe(b.title || '')}”. Nothing has run on it yet.`)
+        : el('span', {}, el('b', {}, 'New data'), `: ${safe(b.label)} hasn't been run yet. Ask migration-data to propose a ${b.merge ? 'merge' : 'convert'} run on it.`),
       b.kind === 'converter' ? el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', onclick: async () => {
-        const outcome = await act('again', { run_id: b.run_id }, `Start pass ${b.next} of ${ctx.project} with the newest converter (${b.head}) and the same data, settings and checks as the last pass? This only proposes it: you approve it next.`);
+        const outcome = await act('again', { run_id: b.run_id }, b.merge
+          ? `Start pass ${b.next} of ${ctx.project} with the merge layer as it is committed now (${b.head}) and the same source backup, settings and options as the last pass? This only proposes it: you approve it next.`
+          : `Start pass ${b.next} of ${ctx.project} with the newest converter (${b.head}) and the same data, settings and checks as the last pass? This only proposes it: you approve it next.`);
         if (outcome && outcome.plan_id) { toast('Proposed. Check it and approve.'); ctx.open('plan', outcome.plan_id); }
       } }, `Start pass ${b.next}`)) : null));
     }
@@ -210,7 +233,7 @@ export function runsView(ctx) {
     if (waitingPushes.length) {
       nodes.push(el('h2', {}, 'WAITING FOR YOU'), ...waitingPushes.map((update) => item(`Converter update: ${safe(update.title || '')}`, 'Push it to GitHub and open or update the draft PR', () => ctx.open('push', update.digest))));
     }
-    if (!data.passes.length) nodes.push(el('p', { class: 'quiet' }, 'No runs yet. migration-data proposes the first convert run; it appears here as pass 1.'));
+    if (!data.passes.length) nodes.push(el('p', { class: 'quiet' }, 'No runs yet. migration-data proposes the first run (a convert run, or a merge run in a Discourse merge project); it appears here as pass 1.'));
     nodes.push(...data.passes.map((group, i) => passCard(group, i === 0)));
     nodes.push(...updatesList(data.updates));
     const conv = data.converter || {};
@@ -231,30 +254,47 @@ export function runsView(ctx) {
     const changes = [];
     if (before) {
       if (before.delivery !== group.delivery) changes.push(`new data (${group.delivery})`);
-      if (before.converter !== group.converter) changes.push(`converter ${short(before.converter, 7)} → ${short(group.converter, 7)}`);
+      if (isMerge(group) && isMerge(before)) {
+        if ((before.layer || {}).sha256 !== (group.layer || {}).sha256) changes.push(`merge layer (${layerLabel(before.layer).replace('merge layer ', '')} → ${layerLabel(group.layer).replace('merge layer ', '')})`);
+        if (before.base_site !== group.base_site) changes.push(`Base site (${group.base_site})`);
+      } else if (before.converter !== group.converter) changes.push(`converter ${short(before.converter, 7)} → ${short(group.converter, 7)}`);
       if ((before.roles || {}).settings !== (group.roles || {}).settings) changes.push('new settings');
       if ((before.roles || {}).reconciliation !== (group.roles || {}).reconciliation) changes.push('new checks');
     }
     const changed = before ? el('p', { class: 'changed' }, `Changed since pass ${before.number}: `, el('b', {}, changes.length ? changes.join(', ') : 'nothing'), '.') : null;
-    const more = details(facts([['Convert run', group.convert.run_id, true], ['Convert plan', group.convert.plan_id, true],
-      ...group.imports.map((step, i) => [`Import ${i + 1}`, step.run_id || step.plan_id, true]), ['Converter', group.converter, true], ['Branch', group.branch, true]]));
+    const layer = group.layer || {};
+    const more = details(facts(isMerge(group)
+      ? [['Merge run', group.convert.run_id, true], ['Merge plan', group.convert.plan_id, true], ['Merge layer', layer.present ? layer.path : 'None: Discourse’s own merger only', true],
+        ['Layer commit', layer.present ? layer.revision : null, true], ['Layer SHA-256', layer.present ? layer.sha256 : null, true], ['Branch', group.branch, true]]
+      : [['Convert run', group.convert.run_id, true], ['Convert plan', group.convert.plan_id, true],
+        ...group.imports.map((step, i) => [`Import ${i + 1}`, step.run_id || step.plan_id, true]), ['Converter', group.converter, true], ['Branch', group.branch, true]]));
     ctx.mount([back('Runs', ctx.close), card(`PASS ${group.number} · ${safe(group.delivery || 'DATA NOT LABELLED').toUpperCase()}${group.base_site ? ` ON ${group.base_site.toUpperCase()}` : ''}`, passSay(group), changed,
-      el('div', { class: 'steps' }, steps(group)), decideBox(group), passActions(group, true), group.backup_state === 'ready' ? el('p', { class: 'hint' }, 'Release copies the backup and a manifest to this project’s output folder on the server. Nothing is sent anywhere.') : null, releasedDetails(group.imports[group.imports.length - 1]), more)]);
+      el('div', { class: 'steps' }, steps(group)), decideBox(group), passActions(group, true), group.backup_state === 'ready' ? el('p', { class: 'hint' }, 'Release copies the backup and a manifest to this project’s output folder on the server. Nothing is sent anywhere.') : null, releasedDetails(isMerge(group) ? group.convert : group.imports[group.imports.length - 1]), more)]);
   }
 
   function plan(data) {
     const convert = data.operation === 'standard_convert';
     const review = data.operation === 'standard_review';
+    const merge = data.operation === 'standard_merge';
+    const merging = merge ? (data.merge || {}) : {};
+    const layer = merging.layer || {};
+    const onBase = review || merge;
     const converter = data.converter || {};
     const texts = data.texts || {};
-    const unseen = (convert && texts.settings == null) || ((convert || review) && (data.roles || {}).reconciliation && texts.reconciliation == null);
-    const say = data.status === 'proposed' ? `Approve this ${convert ? 'convert run' : review ? 'import' : 'run'} on ${dataLabel(data)}${review ? ` · ${baseLabel(data.base_site)}` : ''}?`
+    const unseen = (convert && texts.settings == null) || (merge && (data.roles || {}).settings && texts.settings == null)
+      || ((convert || review) && (data.roles || {}).reconciliation && texts.reconciliation == null);
+    const say = data.status === 'proposed' ? `Approve this ${convert ? 'convert run' : review ? 'import' : merge ? 'merge' : 'run'} on ${dataLabel(data)}${onBase ? ` · ${baseLabel(data.base_site)}` : ''}?`
       : data.status === 'approved' ? 'Approved. Start it when you are ready.' : `This plan is ${data.status === 'stale' ? 'out of date' : data.status.replace('_', ' ')}.`;
     const summary = facts([
       ['Data', el('strong', {}, dataLabel(data))],
-      ['Base site', review ? `${baseLabel(data.base_site)}${data.base_site ? ` · Discourse ${data.base_site.discourse_version}` : ''}` : null],
-      ['What', convert ? `Converts the data with converters/${data.platform} and checks the counts. Nothing is imported yet.` : review ? 'Imports the converted data into a new local review site and checks the counts there.' : operationLabel(data.operation)],
-      ['Converter', review ? null : `${converter.branch || ''} @ ${short(data.converter_revision, 12)}`, true],
+      ['Source site', merge ? `Its full backup, with uploads · Discourse ${safe((merging.source || {}).discourse_version || 'unknown')}` : null],
+      ['Base site', onBase ? `${baseLabel(data.base_site)}${data.base_site ? ` · Discourse ${data.base_site.discourse_version}` : ''}${merge ? ' · the site merged into' : ''}` : null],
+      ['What', convert ? `Converts the data with converters/${data.platform} and checks the counts. Nothing is imported yet.` : review ? 'Imports the converted data into a new local review site and checks the counts there.'
+        : merge ? 'Restores the Base site in a new local review site, merges the source site into it with Discourse’s own merger, and takes a full backup. No automatic count checks.' : operationLabel(data.operation)],
+      ['Merge layer', merge ? (layer.present ? `${safe(layer.path)} @ ${short(layer.revision, 12)} · ${layer.files} file${layer.files === 1 ? '' : 's'}` : 'None: Discourse’s own merger only') : null, true],
+      ['Merge settings', merge ? ((data.roles || {}).settings ? 'A settings file: shown under Details' : 'None') : null],
+      ['Options', merge ? ([(merging.options || {}).ignore_global_pins ? 'ignore globally pinned topics' : null, (merging.options || {}).separate_same_named_groups ? 'keep same-named groups separate' : null].filter(Boolean).join(', ') || 'Discourse’s defaults') : null],
+      ['Converter', review || merge ? null : `${converter.branch || ''} @ ${short(data.converter_revision, 12)}`, true],
       ['Proposed', ago(data.created_at)],
       ['Approved by', data.approved_by],
     ]);
@@ -269,6 +309,12 @@ export function runsView(ctx) {
       const source = data.from_run || {};
       more.push(block('Review source', facts([['Source run', source.run_id, true], ['Intermediate SHA-256', source.intermediate_sha256, true], ['Loopback port', ((data.instances || {}).review || {}).port]])));
     }
+    if (merge) {
+      more.push(block('Merge', facts([['Source site', `Discourse ${safe((merging.source || {}).discourse_version || '')} · schema ${safe((merging.source || {}).schema_version || '')}`],
+        ['Merge layer', layer.present ? layer.path : 'none', true], ['Layer commit', layer.present ? layer.revision : null, true], ['Layer size', layer.present ? `${layer.files} file(s), ${layer.bytes} bytes` : null],
+        ['Layer SHA-256', layer.present ? layer.sha256 : null, true], ['Checkout branch', converter.branch, true], ['Loopback port', ((data.instances || {}).review || {}).port]])));
+      if ((data.roles || {}).settings) more.push(block('Merge settings (customer values the merge layer reads)', texts.settings == null ? el('p', { class: 'quiet' }, '(not readable, or changed since the plan)') : el('pre', {}, safe(texts.settings))));
+    }
     if (convert) more.push(block('Converter settings (the run fills in ${SILO_DB_*})', texts.settings == null ? el('p', { class: 'quiet' }, '(not readable, or changed since the plan)') : el('pre', {}, safe(texts.settings))));
     if ((convert || review) && (data.roles || {}).reconciliation) {
       more.push(block('Count checks', texts.reconciliation == null ? el('p', { class: 'quiet' }, '(not readable, or changed since the plan)') : checksView(texts.reconciliation)));
@@ -277,8 +323,8 @@ export function runsView(ctx) {
     const actions = [];
     if (data.status === 'proposed') {
       const question = unseen
-        ? `Approve this run of ${ctx.project} on ${dataLabel(data)}${review ? ` · ${baseLabel(data.base_site)}` : ''}?\nApproval code ${short(data.digest, 16)}…\nThe settings or checks could NOT be shown here: you approve them by their checksum only.`
-        : `Approve this run of ${ctx.project} on ${dataLabel(data)}${review ? ` · ${baseLabel(data.base_site)}` : ''}?\nApproval code ${short(data.digest, 16)}…\nIt runs exactly what this page shows.`;
+        ? `Approve this run of ${ctx.project} on ${dataLabel(data)}${onBase ? ` · ${baseLabel(data.base_site)}` : ''}?\nApproval code ${short(data.digest, 16)}…\nThe settings or checks could NOT be shown here: you approve them by their checksum only.`
+        : `Approve this run of ${ctx.project} on ${dataLabel(data)}${onBase ? ` · ${baseLabel(data.base_site)}` : ''}?\nApproval code ${short(data.digest, 16)}…\n${merge && layer.present ? `It runs the merge layer at commit ${short(layer.revision, 12)} next to the customer data.` : 'It runs exactly what this page shows.'}`;
       actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
         if (await act('approve', { plan_id: data.plan_id, digest: data.digest }, question)) { toast('Approved. Start it when you are ready.'); ctx.refresh(); }
       } }, 'Approve'));
@@ -295,7 +341,9 @@ export function runsView(ctx) {
       } }, 'Discard'));
     }
     const notes = [];
-    if (review && data.base_site && data.base_site.ahead) notes.push(el('p', { class: 'note' },
+    if (merge && layer.present) notes.push(el('p', { class: 'note' },
+      `The merge layer is code converter-developer wrote. It runs inside the review site, next to the customer data, exactly as committed at ${short(layer.revision, 12)}. Have converter-reviewer check it before you approve.`));
+    if (onBase && data.base_site && data.base_site.ahead) notes.push(el('p', { class: 'note' },
       `The sandbox is on a newer schema (${data.base_site.schema_version}) than this server's Discourse (${data.base_site.site_schema_version}). Normal for hosted sandboxes. It will be restored anyway.`));
     if (data.status === 'stale') notes.push(el('p', { class: 'note' }, 'Something this plan uses changed since it was proposed, so it can\'t run. Discard it and ask migration-data to propose it again.'));
     if (unseen) notes.push(el('p', { class: 'note' }, 'The settings or checks couldn\'t be shown here: an approval would cover them by checksum only.'));
@@ -316,11 +364,14 @@ export function runsView(ctx) {
     const rows = Array.isArray(data.reconciliation) ? data.reconciliation : [];
     const destination = rows.some((row) => row.destination != null);
     const bad = rows.filter((row) => row.status !== 'matched');
+    const merge = data.operation === 'standard_merge';
+    const merged = merge && results.merge && typeof results.merge === 'object' ? results.merge : null;
     const say = ['claimed', 'running'].includes(data.status) ? `Running: ${data.stage || 'starting'}.`
+      : data.status === 'completed' && merge ? 'Merged. There are no automatic count checks: check the site and the totals.'
       : data.status === 'completed' ? (bad.length ? `${bad.map((row) => safe(row.name)).join(', ')} ${bad.length === 1 ? 'doesn\'t' : 'don\'t'} match.` : rows.length ? 'Finished. Every check matches.' : 'Finished.')
         : data.status === 'failed' ? `Stopped at ${data.stage || 'a stage'}.` : `This run is ${data.status.replace('_', ' ')}.`;
     const parts = [];
-    const backupStep = { run_id: data.run_id, run_status: data.status, checks: results.reconciliation_checks || 0,
+    const backupStep = { kind: merge ? 'merge' : undefined, run_id: data.run_id, run_status: data.status, checks: results.reconciliation_checks || 0,
       matched: results.reconciliation_matched || 0, base_site: data.base_site ? baseLabel(data.base_site) : null,
       base_site_details: data.base_site, backup: (data.artifacts || {}).backup, release: data.release, results,
       backup_state: data.release ? 'released' : (data.artifacts || {}).backup ? 'ready' : 'none' };
@@ -330,11 +381,24 @@ export function runsView(ctx) {
         rows.map((r) => [safe(r.name), r.source, r.intermediate, ...(destination ? [r.destination] : []), badge(r.status === 'matched' ? 'ok' : 'differs', r.status)]),
         destination ? [1, 2, 3] : [1, 2], (i) => (rows[i].status !== 'matched' ? 'bad' : '')));
     } else if (results.reconciliation_checks !== undefined) parts.push(el('p', { class: 'quiet' }, 'No count checks in this run.'));
+    if (merged) {
+      // Totals only: how many of each the two sites had and the merged site has. Never names or text.
+      const count = (side, key) => (merged[side] && Number.isInteger(merged[side][key]) ? merged[side][key] : '');
+      if (merged.target_before || merged.source || merged.after) {
+        parts.push(block('Totals', table(['', 'Base site before', 'Source site', 'Merged site'], MERGE_TOTALS.map((key) => [key, count('target_before', key), count('source', key), count('after', key)]), [1, 2, 3]),
+          el('p', { class: 'hint' }, 'The merged site rarely has the sum: the merger joins users with the same email, categories and tags with the same name, and identical uploads.')));
+      }
+      if (Number.isInteger(merged.target_only_columns) && merged.target_only_columns > 0) {
+        parts.push(el('p', { class: 'note' }, `${merged.target_only_columns} column(s) exist only on the Base site’s tables (a plugin there adds them). The merger stops if a table it copies has one. migration-data can name them from this run.`));
+      }
+      const own = Object.entries(merged.layer_totals || {}).filter(([name, value]) => /^[a-z][a-z0-9_]{0,40}$/.test(name) && Number.isInteger(value));
+      if (own.length) parts.push(block('Totals the merge layer reported', table(['Total', 'Count'], own.map(([name, value]) => [name, value]), [1])));
+    }
     if (data.failure && data.failure.recovery) parts.push(el('p', { class: 'note' }, data.failure.recovery));
     if (data.recovery) parts.push(el('p', { class: 'note' }, data.recovery));
     // Accept only the contracted loopback URL before constructing links or tunnel instructions.
     const reviewURL = /^http:\/\/127[.]0[.]0[.]1:([0-9]{1,5})\/?$/.exec(results.review_url || '');
-    if (data.operation === 'standard_review' && data.status === 'completed' && reviewURL && Number(reviewURL[1]) > 0 && Number(reviewURL[1]) <= 65535 && data.review_site_available) {
+    if ((data.operation === 'standard_review' || merge) && data.status === 'completed' && reviewURL && Number(reviewURL[1]) > 0 && Number(reviewURL[1]) <= 65535 && data.review_site_available) {
       const port = reviewURL[1];
       const url = `http://127.0.0.1:${port}/`;
       const credentials = el('div');
@@ -350,7 +414,7 @@ export function runsView(ctx) {
           show.hidden = true;
         } catch (error) { toast(explain(error), true); } finally { show.disabled = false; }
       } }, 'Show admin password');
-      parts.push(block('Review site', el('p', {}, 'Open an SSH tunnel with the same port on both sides, then ', el('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, url), ':'),
+      parts.push(block(merge ? 'Merged site' : 'Review site', el('p', {}, 'Open an SSH tunnel with the same port on both sides, then ', el('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, url), ':'),
         el('pre', {}, `ssh -N -L ${port}:127.0.0.1:${port} <your server login>`), show, credentials,
         el('p', { class: 'note' }, 'This site holds customer data until it is reset.')));
     }
@@ -363,16 +427,18 @@ export function runsView(ctx) {
     }
     // Only offered while there's something to remove: a review site still up, or what a run that
     // didn't finish cleanly may have left. A convert run cleans up after itself when it ends.
-    const review = data.operation === 'standard_review';
+    const review = data.operation === 'standard_review' || merge;
     const leftovers = review ? data.review_site_available : data.status !== 'completed';
     if (RUN_DONE.has(data.status) && !leftovers) parts.push(el('p', { class: 'hint' }, review ? 'Its site has been reset. Evidence and backups stay with the run; released backups stay in the output folder.' : 'Nothing to clean up: it tidied up after itself.'));
     if (RUN_DONE.has(data.status) && leftovers) {
       actions.push(el('button', { type: 'button', class: 'btn q', onclick: async () => {
         if (await act('reset', { run_id: data.run_id }, `Reset this run of ${ctx.project}? Its review site, containers and leftovers are removed. Evidence and plans stay. ${resetNote(data.release)}`)) { toast('Reset.'); ctx.refresh(); }
-      } }, data.operation === 'standard_review' ? 'Reset the site' : 'Reset'));
+      } }, review ? 'Reset the site' : 'Reset'));
     }
     const more = [facts([['Run', data.run_id, true], ['Plan', data.plan_id, true], ['Started', data.started_at], ['Finished', data.finished_at],
-      ['Problem', data.failure ? `${data.failure.code} (stage ${data.failure.stage})` : null, true], ['Import issues', results.import_issues]]),
+      ['Problem', data.failure ? `${data.failure.code} (stage ${data.failure.stage})` : null, true], ['Import issues', results.import_issues],
+      ...(merged ? [['Columns only the Base site has', merged.target_only_columns], ['Source upload files', merged.source_upload_files], ['Upload files in the backup', merged.archive_upload_files], ['Site settings changed by the merge', merged.site_settings_changed],
+        ['Restore proof', merged.restore_proof === 'skipped' ? 'Not run in this version' : merged.restore_proof]] : [])]),
     el('div', { class: 'stagelist' }, Object.entries(data.stages || {}).map(([name, status]) => el('span', {}, `${name} `, badge(status))))];
     if (rows.length) {
       more.push(block('All check columns', table(['Check', 'Source', 'Converted', 'Difference', ...(destination ? ['Site', 'Site difference'] : []), 'Status', 'Note'],

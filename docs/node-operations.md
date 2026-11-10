@@ -39,6 +39,8 @@ Then, in the web UI, open the **Project** page for the project. On the **Files**
 workspace (first time only: type the source platform, which must match the converter's folder
 `converters/PLATFORM` in discourse-converters, and press **Create workspace**) and say what the
 files are for (Development, Launch or Base site). No chat is needed for either.
+To merge another Discourse site into the customer's site instead of converting a forum, the platform
+is `discourse`: see `docs/project-merge-run.md`.
 
 Then open a chat with **migration-data** (Frontier only) in that project, for example:
 "Take the export from the drop folder, register it, load it into the

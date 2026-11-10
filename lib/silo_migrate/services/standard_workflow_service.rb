@@ -22,6 +22,7 @@ require_relative "standard_oracle"
 require_relative "discourse_archive"
 require_relative "standard_convert_run"
 require_relative "standard_review_run"
+require_relative "standard_merge_run"
 
 module SiloMigrate
   module Services
@@ -36,6 +37,7 @@ module SiloMigrate
       include DiscourseArchive
       include StandardConvertRun
       include StandardReviewRun
+      include StandardMergeRun
 
       STAGES = %w[preflight convert site_up baseline uploads import verify_site final_backup review_url restore verify_restore].freeze
 
@@ -48,7 +50,7 @@ module SiloMigrate
         "new_converter_development" => "not_implemented_in_workbench",
         "delta_import" => "not_implemented_requires_base_lineage",
         "multi_source_merge" => "not_implemented_requires_namespaces_and_order",
-        "native_discourse_merge" => "not_implemented_separate_engine"
+        "native_discourse_merge" => "supported_local_discourse_merge"
       }.freeze
 
       RECOVERY = {
@@ -81,6 +83,12 @@ module SiloMigrate
         "STANDARD_ARTIFACT_CHANGED" => "The recorded backup is missing or changed. Do not release it; investigate and re-run.",
         "STANDARD_RELEASE_NOT_READY" => "Release requires a completed base-site review and safe output directories.",
         "STANDARD_RELEASE_CHECKS" => "Review reconciliation differences or missing checks and explicitly acknowledge them before release.",
+        "STANDARD_MERGE_SOURCE_INVALID" => "Register a valid full Discourse source backup and re-plan.",
+        "STANDARD_MERGE_SOURCE_NEWER" => "Use a runtime at least as new as the source backup and re-plan.",
+        "STANDARD_MERGE_LAYER_INVALID" => "Correct and commit the merge layer, refresh the converter and re-plan.",
+        "STANDARD_MERGE_SETTINGS_INVALID" => "Register a valid merge settings mapping and re-plan.",
+        "STANDARD_MERGE_SCHEMA" => "Inspect private schema evidence, correct the layer or runtime and re-plan.",
+        "STANDARD_MERGE_FAILED" => "Inspect private merge evidence, reset the dirty run and re-plan.",
         "STANDARD_INTERNAL" => "An unexpected failure occurred. Inspect private evidence, reset this run, then re-plan."
       }.freeze
 
@@ -88,7 +96,7 @@ module SiloMigrate
       EXECUTE_LOCK_WAIT = 120
       # Longer than EXECUTE_LOCK_WAIT, so a queued executor isn't called never-started.
       CLAIM_GRACE_SECONDS = 180
-      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb review_access.rb review_state.rb].freeze
+      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb review_access.rb review_state.rb merge_run.rb merge_source_config.rb merge_state.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
       attr_reader :store
@@ -501,8 +509,11 @@ module SiloMigrate
           sweep_run_resources(run_id)
           convert_leftovers!(run_id) if convert_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
           # The review admin's sign-in is useless once its site is gone (also a setup file a crash left).
-          if review_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+          if review_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {})) || merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
             %w[admin-password review-setup.env].each { |name| FileUtils.rm_f(@store.run_dir(run_id, "private", name)) }
+          end
+          if merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+            %w[merge-source merge].each { |name| FileUtils.rm_rf(@store.run_dir(run_id, "private", name)) }
           end
           @store.update do |current|
             stacks.each { |stack| current.fetch("instances")[stack.name] = stack.record }
@@ -650,6 +661,7 @@ module SiloMigrate
       end
 
       def stale_reason(plan, state)
+        return merge_stale_reason(plan, state) if merge_plan?(plan)
         return convert_stale_reason(plan, state) if convert_plan?(plan)
         return review_stale_reason(plan, state) if review_plan?(plan)
 
@@ -725,7 +737,7 @@ module SiloMigrate
       # while this one is between containers.
       def operation_admission!(plan, state)
         return convert_admission!(plan.fetch("body")) if convert_plan?(plan)
-        return review_capacity!(plan.dig("body", "limits")) if review_plan?(plan)
+        return review_capacity!(plan.dig("body", "limits")) if review_plan?(plan) || merge_plan?(plan)
 
         admission!(state)
       end
@@ -895,6 +907,7 @@ module SiloMigrate
         # checked again by the process that will actually use it.
         stale = stale_reason(plan, @store.load)
         raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
+        return merge_preflight(run_id, plan) if merge_plan?(plan)
         return convert_preflight(run_id, plan) if convert_plan?(plan)
         return review_preflight(run_id, plan) if review_plan?(plan)
 
@@ -1174,8 +1187,8 @@ module SiloMigrate
       def stage_site_up(run_id)
         body = plan_for(run_id).fetch("body")
         # Review runs import real data: their stack is sized per host and bound by the plan.
-        stack = create_stack(run_id, "review", body.dig("instances", "review"), limits: body["operation"] == REVIEW_OPERATION ? body.fetch("limits") : nil,
-                             extra_env: body["base_site"] ? review_environment(body.dig("instances", "review", "port")) : {})
+        stack = create_stack(run_id, "review", body.dig("instances", "review"), limits: [REVIEW_OPERATION, MERGE_OPERATION].include?(body["operation"]) ? body.fetch("limits") : nil,
+                             extra_env: body["base_site"] ? review_environment(body.dig("instances", "review", "port")).merge(body["operation"] == MERGE_OPERATION ? { "DISCOURSE_AUTHORIZED_EXTENSIONS" => "*", "DISCOURSE_DISABLE_SYSTEM_EDIT_NOTIFICATIONS" => "true" } : {}) : {})
         assert_runtime_identity!(run_id, stack, "review")
       end
 
@@ -1390,6 +1403,7 @@ module SiloMigrate
       end
 
       def stage_verify(run_id)
+        return merge_verify(run_id) if merge_plan?(plan_for(run_id))
         review_verify(run_id, plan_for(run_id))
       end
 
@@ -1607,7 +1621,7 @@ module SiloMigrate
 
       # Local review convenience only, after the portable archive already exists.
       def stage_review_url(run_id)
-        return review_url_check(run_id) if review_plan?(plan_for(run_id))
+        return review_url_check(run_id) if review_plan?(plan_for(run_id)) || merge_plan?(plan_for(run_id))
 
         stack = stack_for(run_id, "review")
         result = stack.rails_runner("/tmp/set_review_port.rb", env: { "SILO_SITE_PORT" => stack.record.fetch("port").to_s })
@@ -1728,7 +1742,7 @@ module SiloMigrate
         result.merge(
           discourse_profile: body["discourse_profile"], runtime_profile_sha256: body["runtime_lock_sha256"],
           runtime_qualified: body["runtime_qualified"], allow_unqualified_runtime: body["allow_unqualified_runtime"], converter: body["converter"],
-          operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
+          merge: body["merge"], operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
           platform: body["platform"], roles: body["roles"], source_charset: body["source_charset"], converter_deps: body.dig("converter_deps", "key"),
           reconciliation_policy: body["reconciliation_policy"], base_site: body["base_site"]&.slice("input_id", "delivery", "discourse_version", "schema_version", "site_schema_version", "ahead"),
           from_run: body["from_run"]&.slice("run_id", "plan_id", "converter_revision", "intermediate_sha256", "intermediate_bytes"), limits: body["limits"],
@@ -1754,7 +1768,7 @@ module SiloMigrate
           stage: run["stage"], stages: run["stages"].transform_values { |entry| entry["status"] },
           # Never the per-check reconciliation numbers: they are derived from customer data.
           assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments",
-                                                                       "conversion_summary", "reconciliation_checks", "reconciliation_matched", "reconciliation_differs", "reconciliation_errors",
+                                                                       "merge", "conversion_summary", "reconciliation_checks", "reconciliation_matched", "reconciliation_differs", "reconciliation_errors",
                                                                        "review_url", "import_issues", "base_site", "base_site_ahead", "base_site_unknown_migrations", "site_schema_version", "base_discourse_version", "base_schema_version", "discourse_version", "schema_version", "backup_discourse_version", "backup_schema_version"),
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
@@ -1769,7 +1783,7 @@ module SiloMigrate
           filename = run.dig("artifacts", "backup", "filename")
           result[:release] = released.slice("released_at", "released_by", "sha256", "path").merge(
             "filename" => filename, "outbox" => File.dirname(released.fetch("path")),
-            "manifest" => filename.delete_suffix(".sql.gz") + ".manifest.json",
+            "manifest" => filename.sub(/\.(?:sql|tar)\.gz\z/, "") + ".manifest.json",
             "acknowledged_differences" => released.fetch("acknowledged_differences") { released.fetch("differences_acknowledged") }
           )
         end

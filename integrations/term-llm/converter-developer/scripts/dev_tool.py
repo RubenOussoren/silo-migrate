@@ -26,6 +26,7 @@ TOOLS = {
     "dev_diff": ("diff", {"scope", "path"}),
     "dev_test": ("test", {"suite", "file"}),
     "dev_push_show": ("push-show", set()),
+    "dev_merge_guide": ("merge-guide", set()),
     "dev_write": ("write", {"path", "content"}),
     "dev_edit": ("edit", {"path", "old_text", "new_text", "replace_all"}),
     "dev_delete": ("delete", {"path"}),
@@ -38,7 +39,8 @@ TOOLS = {
     "dev_branch_diff": ("branch-diff", {"branch", "base", "path"}),
     "dev_branch_read": ("branch-read", {"branch", "path", "start_line"}),
 }
-READ_ONLY = {"dev_list", "dev_read", "dev_search", "dev_status", "dev_diff", "dev_test", "dev_push_show", "dev_findings", "dev_finding_show"}
+READ_ONLY = {"dev_list", "dev_read", "dev_search", "dev_status", "dev_diff", "dev_test", "dev_push_show", "dev_merge_guide", "dev_findings",
+             "dev_finding_show"}
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
 
 

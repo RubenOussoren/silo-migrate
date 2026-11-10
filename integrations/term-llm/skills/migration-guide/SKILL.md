@@ -43,6 +43,7 @@ so never ask which one it is. The engineer creates the workspace on the Files ta
 
 With a **Base site** (the engineer's Files-tab label for the customer's sandbox: a `discourse backup --sql-only` file with its original name), the review import sits on that sandbox. Labelling takes it read-only as a `base_site` input once the workspace exists; review proposals use the current one unless `fresh_site: true`.
 After checking the site the engineer chooses **Release backup** on the pass: the SQL-only combined site and its manifest go to the workspace's **output folder**; nothing is sent anywhere. With differences it needs the engineer's explicit acknowledgement and doesn't make the pass passed. Restoring it on the hosted migration site is the engineer's step, outside this tool.
+A **merge project** (source platform `discourse`) brings another Discourse site into the Base site with Discourse's own merger: no convert run and no count checks. Development is the source site's full backup (`.tar.gz`), the Base site is the site merged into; `data_merge_propose` proposes the one **merge run**. Project rules (which category goes where) are a **merge layer** converter-developer writes (`dev_merge_guide`), with customer values in a `merge-settings` file you register. The engineer checks the merged site and the totals, then releases the full backup.
 
 To begin a project again, the engineer uses **Start over** at the foot of the Project page's
 Overview: the work, chats (this one too) and review sites go, and the received files return to

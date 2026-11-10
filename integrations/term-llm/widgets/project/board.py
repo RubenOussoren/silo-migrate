@@ -1,8 +1,8 @@
 """Passes and the findings track for the Project page, worked out from what the workbench stores.
 
 Pure functions over plain data, so they're easy to test. A pass is one convert run with the imports
-made from it; converter updates are the pushes; a finding moves from released to fixed to checked
-as the pushes that name it are pushed and a later pass passes.
+made from it, or (in a merge project) one merge run; converter updates are the pushes; a finding moves
+from released to fixed to checked as the pushes that name it are pushed and a later pass passes.
 """
 
 from datetime import datetime, timezone
@@ -89,6 +89,28 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=
             "converter": body.get("converter_revision"), "branch": (body.get("converter") or {}).get("branch"),
             "started_at": step["started_at"], "created_at": plan.get("created_at") or step["started_at"], "roles": body.get("roles") or {}}
     for plan in plans:
+        # A merge run is a pass of its own: one step (in the convert slot, so everything that walks a
+        # pass's steps still works), with the merged site and its backup on that step.
+        body = bodies.get(plan.get("plan_id")) or {}
+        if body.get("operation") != "standard_merge":
+            continue
+        run = run_of_plan.get(plan.get("plan_id"))
+        if not run and plan.get("status") not in WAITING + ("stale",):
+            continue
+        step = _step("merge", dict(plan, base_site=body.get("base_site")), run)
+        step["site_up"] = bool(run and review_sites.get(run.get("run_id")))
+        merge = body.get("merge") if isinstance(body.get("merge"), dict) else {}
+        layer = merge.get("layer") if isinstance(merge.get("layer"), dict) else {}
+        delivery = body.get("delivery") or {}
+        groups[plan.get("plan_id")] = {
+            "key": plan.get("plan_id"), "kind": "merge", "convert": step, "imports": [],
+            "delivery": ("Launch" if delivery.get("kind") == "launch" else "Development v%s" % delivery.get("version")) if delivery else None,
+            "dataset_id": delivery.get("dataset_id") or body.get("dataset_id"),
+            "converter": body.get("converter_revision"), "branch": (body.get("converter") or {}).get("branch"),
+            "layer": {"present": True, "path": layer.get("path"), "revision": layer.get("revision"), "files": layer.get("files"),
+                      "sha256": layer.get("sha256")} if layer.get("present") else {"present": False},
+            "started_at": step["started_at"], "created_at": plan.get("created_at") or step["started_at"], "roles": body.get("roles") or {}}
+    for plan in plans:
         body = bodies.get(plan.get("plan_id")) or {}
         if body.get("operation") != "standard_review":
             continue
@@ -107,8 +129,8 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=
     for number, group in enumerate(ordered, 1):
         group["number"] = number
         group["imports"].sort(key=lambda step: _t(step["started_at"]))
-        group["status"] = pass_status(group)
-        latest = group["imports"][-1] if group["imports"] else {}
+        group["status"] = merge_status(group["convert"]) if group.get("kind") == "merge" else pass_status(group)
+        latest = group["convert"] if group.get("kind") == "merge" else group["imports"][-1] if group["imports"] else {}
         for key in ("base_site", "backup_state", "release"):
             group[key] = latest.get(key, "none" if key == "backup_state" else None)
     used = {}
@@ -124,6 +146,22 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=
                         "findings": proposal.get("findings") or [], "used_by": used.get(head, [])})
     updates.sort(key=lambda update: _t(update.get("pushed_at") or update.get("proposed_at")), reverse=True)
     return {"passes": ordered[::-1], "updates": updates, "banner": banner(ordered, updates, deliveries)}
+
+
+def merge_status(step):
+    """Where a merge pass stands. A merge has no automatic count checks: finished means the merger
+    ran to the end and the site came up; whether it is right is the engineer's check of the site."""
+    if step["run_status"] in ACTIVE:
+        return ("Running", "now")
+    if step["run_status"] is None:
+        if step["plan_status"] in WAITING:
+            return ("Waiting for your approval", "now")
+        return ("Out of date: propose it again", "warn") if step["plan_status"] == "stale" else ("Not started", "wait")
+    if step["run_status"] != "completed":
+        return ("Merge needs a look", "warn")
+    if step.get("release"):
+        return ("Backup released", "ok")
+    return ("Ready to check", "now") if step.get("site_up") else ("Merged", "ok")
 
 
 def pass_status(group):
@@ -162,11 +200,12 @@ def banner(ordered, updates, deliveries):
         return None
     last = ran[-1]
     pushed = [update for update in updates if update["status"] == "pushed" and update["full_head"] and _t(update["pushed_at"]) > _t(last["started_at"])]
+    merge = {"merge": True} if last.get("kind") == "merge" else {}  # the page words it for a merge project
     if pushed and not pushed[0]["used_by"]:
-        return {"kind": "converter", "head": pushed[0]["head"], "title": pushed[0]["title"], "run_id": last["convert"]["run_id"], "next": last["number"] + 1}
+        return {"kind": "converter", "head": pushed[0]["head"], "title": pushed[0]["title"], "run_id": last["convert"]["run_id"], "next": last["number"] + 1, **merge}
     newest = [record for record in sorted(deliveries.values(), key=lambda record: record.get("sequence", 0)) if record.get("kind") == "development" and not record.get("replaced_by")]
     if newest and newest[-1].get("dataset_id") not in {group["dataset_id"] for group in ran}:
-        return {"kind": "data", "label": "Development v%s" % newest[-1].get("version"), "next": last["number"] + 1}
+        return {"kind": "data", "label": "Development v%s" % newest[-1].get("version"), "next": last["number"] + 1, **merge}
     return None
 
 

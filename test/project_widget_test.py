@@ -93,6 +93,20 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         self.assertEqual({checks_id: 'inputs/derived/checks.json'}, result['input_paths'])
         self.assertEqual(base_id, result['roles']['base_site'])
 
+    def test_merge_plan_does_not_name_either_sites_backup_file_or_the_settings_file(self):
+        source_id, base_id, settings_id = 'input-' + 'a' * 32, 'input-' + 'b' * 32, 'input-' + 'c' * 32
+        shown = {'operation': 'standard_merge', 'roles': {'source': source_id, 'base_site': base_id, 'settings': settings_id},
+                 'input_paths': {source_id: 'inputs/invented-source-v2026-11-0-latest-20261104011110.tar.gz',
+                                 base_id: 'inputs/invented-target-v2026-11-0-latest-20261109022141.sql.gz', settings_id: 'inputs/derived/merge.yml'}}
+        with mock.patch.object(self.m.runs, 'plan_detail', return_value=shown):
+            result = self.m.RUN_VIEWS['plan'](None, str(self.control), 'arc', 'plan-' + 'c' * 32)
+        self.assertNotIn('invented-', json.dumps(result))
+        self.assertEqual({}, result['input_paths'])  # the settings file's name is whoever wrote it's choice: not shown either
+        # a convert plan still names its source file
+        shown = {'operation': 'standard_convert', 'roles': {'source': source_id}, 'input_paths': {source_id: 'inputs/dump.sql'}}
+        with mock.patch.object(self.m.runs, 'plan_detail', return_value=shown):
+            self.assertEqual({source_id: 'inputs/dump.sql'}, self.m.RUN_VIEWS['plan'](None, str(self.control), 'arc', 'plan-' + 'c' * 32)['input_paths'])
+
     def test_release_is_engineer_stamped_validated_and_uses_long_timeout(self):
         run_id = 'run-' + 'a' * 32
         headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
@@ -274,6 +288,26 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         self.assertEqual({'op': 'plan_propose', 'from_run': 'run-' + 'a' * 32, 'reconciliation': 'input-4'}, requests[1])
         self.assertEqual({'op': 'plan_propose', 'from_run': 'run-' + 'a' * 32, 'reconciliation': 'input-4'}, requests[2])
         self.assertEqual(3, len(requests))
+
+    def test_run_again_for_a_merge_proposes_the_same_source_settings_and_options(self):
+        base = self.base / 'arc/.silo-migrate/named/standard'
+        base.mkdir(parents=True)
+        merge = {'operation': 'standard_merge', 'roles': {'source': 'input-1', 'base_site': 'input-2', 'settings': 'input-3'},
+                 'merge': {'options': {'ignore_global_pins': True, 'separate_same_named_groups': False, 'restore_proof': True, 'other': 'x'}}}  # only the two real options are passed on
+        plain = {'operation': 'standard_merge', 'roles': {'source': 'input-1', 'base_site': 'input-2', 'settings': None}, 'merge': {}}
+        state = {'plans': {'plan-' + 'a' * 32: {'body': merge, 'created_at': '1'}, 'plan-' + 'b' * 32: {'body': plain, 'created_at': '2'}},
+                 'runs': {'run-' + 'a' * 32: {'plan_id': 'plan-' + 'a' * 32, 'status': 'completed'}, 'run-' + 'b' * 32: {'plan_id': 'plan-' + 'b' * 32, 'status': 'failed'}}}
+        (base / 'state.json').write_text(json.dumps(state))
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        self.assertEqual(200, self.request('POST', '/api/runs/again', {'workspace': 'arc', 'run_id': 'run-' + 'a' * 32}, headers)[0])
+        self.assertEqual(200, self.request('POST', '/api/runs/again', {'workspace': 'arc', 'run_id': 'run-' + 'b' * 32}, headers)[0])
+        self.assertEqual(400, self.request('POST', '/api/runs/import', {'workspace': 'arc', 'run_id': 'run-' + 'a' * 32}, headers)[0])  # nothing to import after a merge
+        requests = [request for _argv, request in self.calls()]
+        # The Base site is not sent: the proposal takes the project's current one.
+        self.assertEqual({'op': 'merge_propose', 'source': 'input-1', 'settings': 'input-3', 'ignore_global_pins': True,
+                          'separate_same_named_groups': False}, requests[0])
+        self.assertEqual({'op': 'merge_propose', 'source': 'input-1'}, requests[1])
+        self.assertEqual(2, len(requests))
 
     def test_marking_done_sends_only_the_finding_and_the_servers_reviewer(self):
         headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}

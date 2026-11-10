@@ -171,4 +171,21 @@ class StandardCLITest < SiloMigrateTest
     end
   end
 
+  def test_merge_cli_flags_are_strict_and_forwarded
+    output = StringIO.new
+    error = StringIO.new
+    cli = SiloMigrate::StandardCLI.new(output: output, error: error)
+    received = nil
+    fake = Object.new
+    fake.define_singleton_method(:propose_merge_plan) { |**kwargs| received = kwargs; { operation: 'standard_merge' } }
+    cli.define_singleton_method(:service) { |_workspace| fake }
+    args = %w[plan propose synthetic --operation merge --source input-source --base-site input-base --settings input-settings --ignore-global-pins --separate-same-named-groups --port 18088 --allow-unqualified-runtime]
+    assert_equal 0, cli.run(args.dup), error.string
+    assert_equal({ source: 'input-source', base_site: 'input-base', settings: 'input-settings', ignore_global_pins: true,
+      separate_same_named_groups: true, port: 18088, allow_unqualified_runtime: true }, received)
+    assert_equal 1, cli.run(args + ['--ignore-global-pins'])
+    assert_equal 1, cli.run(%w[plan propose synthetic --operation merge --source source])
+    assert_equal 1, cli.run(%w[plan propose synthetic --operation merge --source source --base-site base --port invalid])
+  end
+
 end

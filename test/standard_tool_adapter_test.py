@@ -225,9 +225,9 @@ else:
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
         blocks = re.split(r'(?m)^    - name: ', definition)[1:]
         # The four branch tools use a separate reader-role adapter, tested in converter_dev_adapter_test.
-        self.assertEqual(26, len(blocks))
+        self.assertEqual(27, len(blocks))
         declared = [block.splitlines()[0] for block in blocks if 'script: scripts/data_tool.py' in block]
-        self.assertEqual(22, len(declared))
+        self.assertEqual(23, len(declared))
         for tool in declared:
             with self.subTest(tool=tool):
                 self.call(tool, {'path': 'x', 'unexpected': 'dropped'})
@@ -254,6 +254,9 @@ else:
                                {'op': 'run_count', 'run_id': self.run_id, 'side': 'destination', 'sql': 'SELECT COUNT(*) FROM posts'}),
             'data_plan_propose': ({'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32, 'reconciliation': None, 'plan_id': 'x'},
                                   {'op': 'plan_propose', 'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32}),
+            'data_merge_propose': ({'source': 'input-' + 'a' * 32, 'base_site': 'input-' + 'b' * 32, 'settings': None, 'restore_proof': False,
+                                    'ignore_global_pins': True, 'from_run': 'x', 'fresh_site': True},  # restore_proof is not an option
+                                   {'op': 'merge_propose', 'source': 'input-' + 'a' * 32, 'base_site': 'input-' + 'b' * 32, 'ignore_global_pins': True}),
         }
         for tool, (args, request) in cases.items():
             with self.subTest(tool=tool):

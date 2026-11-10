@@ -343,7 +343,7 @@ function setupCard(files, known) {
   box.addEventListener('input', () => { setup.platform = box.value.trim(); create.disabled = !PLATFORM.test(setup.platform); });
   box.addEventListener('keydown', (event) => { if (event.key === 'Enter') submitSetup(setup.platform); });
   return card('NEXT, FOR YOU', say, rows, el('label', { class: 'typed' }, 'Source platform'), el('div', { class: 'actions' }, box, create),
-    el('p', { class: 'hint' }, 'Lowercase, and the same as the converter\u2019s folder in discourse-converters (converters/PLATFORM). It can\u2019t be changed later without starting over. After this you say what the files are for.'));
+    el('p', { class: 'hint' }, 'Lowercase, and the same as the converter\u2019s folder in discourse-converters (converters/PLATFORM). To merge another Discourse site into this one, type discourse. It can\u2019t be changed later without starting over. After this you say what the files are for.'));
 }
 
 function renderFiles() {

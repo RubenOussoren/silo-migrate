@@ -69,6 +69,7 @@ print(json.dumps({'version': 1, 'ok': True}))
             'dev_diff': ({'scope': 'unpushed'}, {'op': 'diff', 'scope': 'unpushed'}),
             'dev_test': ({'suite': 'lint', 'file': 'lib/a.rb'}, {'op': 'test', 'suite': 'lint', 'file': 'lib/a.rb'}),
             'dev_push_show': ({}, {'op': 'push-show'}),
+            'dev_merge_guide': ({'path': 'dropped'}, {'op': 'merge-guide'}),
             'dev_write': ({'path': 'a.rb', 'content': 'x'}, {'op': 'write', 'path': 'a.rb', 'content': 'x'}),
             'dev_edit': ({'path': 'a.rb', 'old_text': 'a', 'new_text': 'b'}, {'op': 'edit', 'path': 'a.rb', 'old_text': 'a', 'new_text': 'b'}),
             'dev_delete': ({'path': 'a.rb'}, {'op': 'delete', 'path': 'a.rb'}),
@@ -134,6 +135,9 @@ print(json.dumps({'version': 1, 'ok': True}))
                 self.assertEqual([], self.calls())
         self.call('converter-reviewer', 'dev_test', {})
         self.assertEqual([[['converter', 'dev', 'example-forum', '--role', 'reviewer'], json.dumps({'op': 'test'})]], self.calls())
+        self.assertIn('dev_merge_guide', self.tools('converter-reviewer'))
+        self.call('converter-reviewer', 'dev_merge_guide', {})
+        self.assertEqual([['converter', 'dev', 'example-forum', '--role', 'reviewer'], json.dumps({'op': 'merge-guide'})], self.calls()[-1])
 
     def test_the_reviewer_has_no_branch_tools(self):
         for tool in ('dev_branches', 'dev_branch_diff', 'dev_branch_read'):

@@ -520,7 +520,7 @@ Email is disabled and the sites have no route out, so anything involving email w
 ## Limitations
 
 - **Synthetic only.** Customer data needs separately approved isolation that this doesn't provide.
-- **One source platform.** The Khoros converter is the only one wired in. Other converters, new-converter development, delta imports, multi-source merge and native Discourse merge aren't implemented here, and `status` reports them as such.
+- **One source platform.** The Khoros converter is the only one wired in. Other converters, new-converter development, delta imports and multi-source merge aren't implemented here, and `status` reports them as such. Merging one Discourse site into another with Discourse's own merger is a run of its own: see [Merging another Discourse site](project-merge-run.md).
 - **Same OS user.** The analyst, coding and control paths are separated by interface and storage, not by the operating system. Prompts and role labels aren't isolation, and the release boundary doesn't stop a process running as the same user from reading private files directly.
 - **Local restore only.** `restore-proven` means a fresh local instance passed the checks. It doesn't cover hosted environments, S3, or plugins beyond those in the stock image.
 - **Background rebake isn't awaited.** A restored site rebakes posts in the background, so system posts can briefly show the old hostname in protocol-relative image URLs.

@@ -15,6 +15,15 @@ You review converter changes for a migration engineer before they are pushed. Yo
 - Scope: unrelated changes, dead code, commit message accuracy (imperative subject, says why).
 - The PR text in the proposal: accurate, and claims nothing that wasn't tested.
 
+## Merge layers
+
+A change under `mergers/<workspace>/` is a merge layer: Ruby that a merge run loads inside the Discourse app, next to two sites' customer data. Read `dev_merge_guide` for the contract, then check, as must-fix when broken:
+
+- Exactly one subclass of `BulkImport::DiscourseMerger`; overrides call `super` where the stock behaviour must still happen; the stock classes are not reopened or copied. Compare each override with the stock source at the pinned revision the guide links: same arguments, same return meaning (an id or nil, a row hash or nil).
+- No customer values anywhere in the checkout (names, IDs, URLs, emails): they come from the settings file. Tests use invented values and a stub base class.
+- Nothing that moves data out or sideways: no network, no file writes, no shelling out, no reads other than the settings file, no SQL or model calls beyond what the stated rule needs, and no data put into `SILO_MERGE_TOTAL` names, exception messages or output. Totals are counts.
+- Only regular `.rb` files in the folder, within the limits the guide states.
+
 ## How to report
 
 Lead with a verdict: **ready to push**, or **changes needed**. Then findings by severity (blocker, should-fix, minor), each with file and line and a concrete fix, then what you ran and its results. Be brief where the change is fine.

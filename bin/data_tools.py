@@ -1007,6 +1007,11 @@ def op_deliveries(ws, request):
 
 
 BASE_SITE_NAME = re.compile(r"-v(?:(\d{4}-\d{1,2}-\d+(?:-latest(?:-\d+)?)?)-)?(\d{14})\.sql\.gz$")
+# A merge project: the source is another Discourse site, given as its full backup (with uploads).
+MERGE_PLATFORM = "discourse"
+MERGE_SOURCE_TYPE = "discourse-backup"
+MERGE_SETTINGS_TYPE = "merge-settings"
+DISCOURSE_BACKUP_NAME = re.compile(r"-v(?:(\d{4}-\d{1,2}-\d+(?:-latest(?:-\d+)?)?)-)?(\d{14})\.tar\.gz$")
 
 
 def validate_base_site(ws, files):
@@ -1374,6 +1379,11 @@ def op_take(ws, request):
         # created through the Ruby CLI without migration-data's default dataset.
         if not meta.get("dataset_id") and kind != "base_site":
             refuse("STANDARD_NOT_INITIALIZED")
+        if kind == MERGE_SOURCE_TYPE:
+            if meta.get("platform") != MERGE_PLATFORM:
+                refuse("STANDARD_MERGE_SOURCE_INVALID: type discourse-backup is for a project whose source platform is discourse")
+            if not DISCOURSE_BACKUP_NAME.search(name):
+                refuse("STANDARD_MERGE_SOURCE_INVALID: keep the backup's original name (it ends -v<version>.tar.gz); a merge needs the full backup with uploads")
         root, inputs = ws.open_area("intake"), None
         try:
             inputs = ws.open_area("inputs")
@@ -2507,6 +2517,69 @@ def op_plan_propose(ws, request):
                      "approve and start it. When it has finished, read it with data_run_evidence.")}
 
 
+MERGE_OPTIONS = ("ignore_global_pins", "separate_same_named_groups")
+
+
+def merge_source(ws, request, inputs, records):
+    """The source site's backup: the one named, else the only one of the newest Development delivery."""
+    explicit = request.get("source")
+    if "source" in request:
+        if not isinstance(explicit, str) or not INPUT_ID.fullmatch(explicit) or (inputs.get(explicit) or {}).get("type") != MERGE_SOURCE_TYPE:
+            refuse("STANDARD_MERGE_SOURCE_INVALID: source must name a registered input of type discourse-backup")
+        return explicit
+    development = sorted((r for r in records.values() if r.get("kind") == "development"), key=lambda r: r.get("sequence", 0))
+    found = [key for key, item in inputs.items()
+             if development and item.get("dataset_id") == development[-1]["dataset_id"] and item.get("type") == MERGE_SOURCE_TYPE]
+    if len(found) != 1:
+        refuse("STANDARD_MERGE_SOURCE_NOT_TAKEN: take the source site's full backup from the newest Development delivery with data_take "
+               "type=discourse-backup (exactly one), or name one with source")
+    return found[0]
+
+
+def op_merge_propose(ws, request):
+    """Propose merging the project's source Discourse site into its Base site. Only a proposal:
+    the engineer approves and starts it."""
+    ws.require()
+    if ws.meta().get("platform") != MERGE_PLATFORM:
+        refuse("STANDARD_MERGE_NOT_DISCOURSE: a merge needs a project whose source platform is discourse")
+    options = {key: request.get(key, False) for key in MERGE_OPTIONS}
+    if not all(isinstance(value, bool) for value in options.values()):
+        refuse("STANDARD_ARGUMENTS_INVALID: options are true or false")
+    inputs = ws.named_state().get("inputs") or {}
+    source = merge_source(ws, request, inputs, read_deliveries(ws))
+    try:
+        base = review_base_site(ws, {"base_site": request["base_site"]} if "base_site" in request else {})
+    except Refusal as refusal:
+        if not str(refusal).startswith("STANDARD_BASE_SITE_NOT_TAKEN"):
+            raise
+        refuse("STANDARD_BASE_SITE_NOT_TAKEN: take the labelled Base site file with data_take type=base_site, then propose again")
+    if not base:
+        refuse("STANDARD_MERGE_BASE_SITE_MISSING: a merge needs the site to merge into: the engineer labels its SQL-only backup Base site on the Files tab")
+    settings = request.get("settings")
+    if settings is not None and (not isinstance(settings, str) or not INPUT_ID.fullmatch(settings)
+                                 or (inputs.get(settings) or {}).get("type") != MERGE_SETTINGS_TYPE):
+        refuse("STANDARD_MERGE_SETTINGS_INVALID: settings must name a registered input of type merge-settings")
+    argv = ["standard", "plan", "propose", ws.name, "--operation", "merge", "--source", source, "--base-site", base]
+    if settings is not None:
+        argv += ["--settings", settings]
+    argv += ["--" + key.replace("_", "-") for key, value in options.items() if value]
+    # Bind the workspace to the converter checkout's committed branch head: the merge layer, if the
+    # project has one, is read from exactly that commit. A dirty checkout refuses: commit first.
+    converter = json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
+    plan = json.loads(ws.control(argv, timeout=240))  # checks the registered inputs (a backup can be GBs)
+    merge = plan.get("merge") or {}
+    layer = merge.get("layer") or {}
+    return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "roles", "inputs", "base_site", "merge",
+                                              "converter_revision", "limits", "mutations", "not_included")},
+            "converter_branch": converter.get("branch"),
+            "instances": {"review": {"port": ((plan.get("instances") or {}).get("review") or {}).get("port")}},
+            "next": ("Tell the engineer the merge is waiting in the Project page's Runs tab, where they approve and start it. " +
+                     ("It runs the project's merge layer (%s at %s) on top of Discourse's merger. " % (layer.get("path"), str(layer.get("revision") or "")[:12])
+                      if layer.get("present") else "It runs Discourse's own merger with no project merge layer. ") +
+                     (base_site_warning(plan["base_site"]) + " " if (plan.get("base_site") or {}).get("ahead") else "") +
+                     "When it has finished, read it with data_run_evidence.")}
+
+
 def op_propose_finding(ws, request):
     text = request.get("text")
     run_id = request.get("run_id")
@@ -2845,6 +2918,68 @@ def guide_stages(facts, records, site=NO_SITE):
     return current, stages
 
 
+MERGE_GUIDE_STAGES = (("files", "Customer files received"), ("workspace", "Workspace created"), ("source", "Source site backup taken"),
+                      ("base", "Site to merge into taken"), ("merge", "Merge run finished"), ("release", "Release backup"))
+
+
+def guide_merge_runs(records):
+    return [run for run in records["runs"] if run["kind"] == "merge"]
+
+
+def guide_merge_stages(facts, records):
+    """A merge project's stages: one Discourse site (the source backup) into another (the Base site)."""
+    merges = guide_merge_runs(records)
+    latest = merges[-1] if merges else None
+    finished = bool(latest) and latest["status"] == "completed"
+    done = {"files": facts["drop_files"] > 0 or facts["inputs"] > 0, "workspace": facts["initialized"],
+            "source": facts["merge_source"] > 0 or bool(merges), "base": facts["base_taken"] or bool(merges),
+            "merge": finished, "release": finished and bool(latest.get("release"))}
+    current = next((key for key, _label in MERGE_GUIDE_STAGES if not done[key]), "released")
+    return current, [{"id": key, "label": label, "state": "done" if done[key] else "current" if key == current else "to_do"}
+                     for key, label in MERGE_GUIDE_STAGES]
+
+
+def guide_merge_flow(ws, facts, records):
+    """The next step of a merge project, once nothing is running or waiting on the engineer."""
+    if not facts["initialized"]:
+        if facts["drop_files"]:
+            return ("engineer", "On the Files tab, create the workspace (it asks for the source platform), then say what the files are for.", "Project page")
+        return ("engineer", "Copy the source site's full backup (with uploads) and the SQL-only backup of the site to merge into to the drop folder (%s) "
+                "with scp, then run `silo intake %s` as root." % (ws.intake, ws.name), "server terminal")
+    if facts["labelled_files"]:
+        return ("agent", "Take the labelled files with data_take: the source site's full backup (Development) with type=discourse-backup and its "
+                "original name; the Base site file with type=base_site. Never extract or load either yourself.", "this chat")
+    merges = guide_merge_runs(records)
+    if not facts["merge_source"] and not merges:
+        return ("engineer", "Copy the source site's full backup (with uploads, original name) to the drop folder (%s), run `silo intake %s` as root, "
+                "then label it Development on the Files tab." % (ws.intake, ws.name), "server terminal")
+    if not facts["base_taken"] and not merges:
+        if facts.get("base_site"):
+            return ("agent", "Take the labelled Base site file with data_take type=base_site.", "this chat")
+        return ("engineer", "Copy the SQL-only backup of the site to merge into (discourse backup --sql-only, original name) to the drop folder, run "
+                "`silo intake %s` as root, then label it Base site on the Files tab." % ws.name, "server terminal")
+    latest = merges[-1] if merges else None
+    pushed = [item for item in records["pushes"] if item["status"] == "pushed"]
+    if not latest or latest["started_at"] < (pushed[-1]["at"] if pushed else ""):
+        return ("agent", "Propose the merge with data_merge_propose; the engineer approves and starts it on the Project page. If this merge needs rules of "
+                "its own (for example source categories into chosen categories of the other site), the engineer first asks converter-developer for a "
+                "merge layer, and you register the values it reads as type merge-settings.", "this chat")
+    if latest["status"] in ("abandoned", "not_started"):
+        return ("engineer", "The merge run %s stopped without finishing. Recover it in the Project page's Runs tab, then a new plan can be proposed." % latest["run_id"], "Runs tab")
+    if latest["status"] != "completed":
+        return ("agent", "The merge run %s failed at stage %s (%s). Read data_run_evidence and explain the cause. If the merge layer must change, propose a "
+                "finding that describes the problem with invented examples (the engineer releases it to converter-developer)."
+                % (latest["run_id"], latest["stage"], latest["failure"] or "no code"), "this chat")
+    live = any(item["run_id"] == latest["run_id"] and item["live"] for item in records["sites"])
+    if latest.get("release"):
+        return ("engineer", "Copy the released backup from the output folder and restore it on the hosted migration site. That restore is outside this tool.%s"
+                % (" Reset the merged site in the Runs tab when you're done with it: it holds customer data." if live else ""), "Runs tab")
+    if live:
+        return ("engineer", "Open the merged site of run %s through the SSH tunnel shown in the Runs tab and check it. Then release the backup for customer "
+                "review, or say what needs changing in a chat." % latest["run_id"], "Runs tab")
+    return ("engineer", "Merge run %s finished and its site is gone: release its backup in the Runs tab, or ask migration-data to propose the merge again." % latest["run_id"], "Runs tab")
+
+
 def guide_data(records):
     """Which delivery is which: labels, versions and IDs only, never file names. The newest of each
     kind is current; launch work isn't possible yet, so development is what runs use."""
@@ -2874,6 +3009,10 @@ def op_guide(ws, request):
     facts = {"initialized": ws.initialized() and (ws.root / ".silo-migrate/named/standard/state.json").is_file(), "drop_files": drop_files, "labelled_files": len(groups["labelled"]), "inputs": sum(1 for item in (state.get("inputs") or {}).values()
                            if item.get("type") != "base_site" and (deliveries.get(item.get("dataset_id")) or {}).get("kind") != "base_site"),
              "db_loaded": bool(db and db.get("loads")), "base_site": guide_data(deliveries)["base_site"]}
+    merge = ws.initialized() and ws.meta().get("platform") == MERGE_PLATFORM
+    current_base = [record["dataset_id"] for record in deliveries.values() if record.get("kind") == "base_site" and not record.get("replaced_by")]
+    facts.update(merge=merge, merge_source=sum(1 for item in (state.get("inputs") or {}).values() if item.get("type") == MERGE_SOURCE_TYPE),
+                 base_taken=any(item.get("type") == "base_site" and item.get("dataset_id") in current_base for item in (state.get("inputs") or {}).values()))
     records = guide_records(ws) if ws.initialized() else {"plans": [], "runs": [], "sites": [], "findings": [], "pushes": [], "warning": None}
     site_warning = None
     try:
@@ -2924,9 +3063,9 @@ def op_guide(ws, request):
     elif waiting:
         step = ("engineer", waiting[0]["what"], waiting[0]["where"])
     else:
-        step = guide_flow(ws, facts, records, site)
-    current, stages = guide_stages(facts, records, site)
-    if facts.get("base_site") and not active and not waiting and not records["warning"]:
+        step = guide_merge_flow(ws, facts, records) if merge else guide_flow(ws, facts, records, site)
+    current, stages = guide_merge_stages(facts, records) if merge else guide_stages(facts, records, site)
+    if facts.get("base_site") and not merge and not active and not waiting and not records["warning"]:
         if current == "review" and step[0] == "agent" and step[1].startswith("Propose a review import"):
             step = ("agent", "Propose the review import on %s with data_plan_propose; the engineer approves and starts it on the Project page." % facts["base_site"], "this chat")
         elif current == "site" and step[0] == "engineer":
@@ -2945,7 +3084,7 @@ def op_guide(ws, request):
 OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
        "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding,
-       "plan_propose": op_plan_propose,
+       "plan_propose": op_plan_propose, "merge_propose": op_merge_propose,
        "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions, "deliveries": op_deliveries, "delivery_label": op_delivery_label,
        "finding_done": op_finding_done, "site_process": op_site_process, "site_review": op_site_review}
 # Logged with their arguments (minus script code, finding text, count SQL and decisions, logged by hash).

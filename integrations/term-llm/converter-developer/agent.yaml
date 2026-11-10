@@ -100,6 +100,15 @@ tools:
         type: object
         properties: {}
         additionalProperties: false
+    - name: dev_merge_guide
+      description: "Merge projects (one Discourse site merged into another): how to write this project's merge layer, the Ruby file a merge run applies on top of Discourse's own merger. Returns the layer's path, the contract, the limits, the pinned Discourse revision with links to the stock merger's source, how to test it, what is committed so far, and the outcome of the latest merge runs (which layer commit ran, where it stopped, fixed site counts). Read it before writing or changing anything under mergers/."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties: {}
+        additionalProperties: false
     - name: dev_findings
       description: "List investigation findings an engineer has released for coding work."
       script: scripts/dev_tool.py

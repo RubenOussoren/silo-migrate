@@ -29,6 +29,8 @@ module SiloMigrate
                                                        (real data: convert and reconcile counts only; no import)
         plan propose WORKSPACE --operation review --from-run RUN_ID [--reconciliation INPUT_ID] [--base-site INPUT_ID] [--port N]
                                                        (real data: import a completed convert run into a local review site)
+        plan propose WORKSPACE --operation merge --source INPUT_ID --base-site INPUT_ID [--settings INPUT_ID]
+                     [--ignore-global-pins] [--separate-same-named-groups] [--port N] [--allow-unqualified-runtime]
         plan show WORKSPACE PLAN_ID
         plan approve WORKSPACE PLAN_ID --sha256 DIGEST --reviewer NAME
         plan discard WORKSPACE PLAN_ID --reviewer NAME          (a proposal nobody will approve)
@@ -190,6 +192,19 @@ module SiloMigrate
           return service(workspace).propose_convert_plan(source: opts.fetch("--source"), settings: opts.fetch("--settings"), reconciliation: opts["--reconciliation"],
                                                          charset: opts.fetch("--charset", "utf8mb4"), allow_unqualified_runtime: !allow.nil?)
         end
+        if args[0, 2] == %w[--operation merge]
+          args.shift(2)
+          flags = %w[--ignore-global-pins --separate-same-named-groups].to_h do |flag|
+            invalid! if args.count(flag) > 1
+            [flag, !args.delete(flag).nil?]
+          end
+          opts = options!(args, "--source", "--base-site", "--settings", "--port", optional: %w[--settings --port])
+          port = opts["--port"]
+          invalid! if port && !port.match?(/\A[1-9]\d{0,4}\z/)
+          return service(workspace).propose_merge_plan(source: opts.fetch("--source"), base_site: opts.fetch("--base-site"), settings: opts["--settings"],
+            ignore_global_pins: flags["--ignore-global-pins"], separate_same_named_groups: flags["--separate-same-named-groups"],
+            port: port&.to_i, allow_unqualified_runtime: !allow.nil?)
+        end
         if args[0, 2] == %w[--operation review]
           args.shift(2)
           opts = options!(args, "--from-run", "--reconciliation", "--base-site", "--port", optional: %w[--reconciliation --base-site --port])
@@ -294,7 +309,10 @@ module SiloMigrate
       case action
       when "evidence"
         no_more!(args)
-        findings(workspace).private_evidence(run_id)
+        result = findings(workspace).private_evidence(run_id)
+        merge = service(workspace).merge_evidence(run_id)
+        result[:merge] = merge if merge
+        result
       when "count"
         # The SQL comes on stdin: it may quote customer values and must not be in any argv.
         opts = options!(args, "--side", "--sql-file")

@@ -194,6 +194,14 @@ def propose_again(base, control, body, import_next=False):
     elif operation == "standard_review":
         checks = roles.get("reconciliation")
         request = {"op": "plan_propose", "from_run": (plan_body.get("from_run") or {}).get("run_id")}
+    elif operation == "standard_merge":
+        # The same source backup, settings and options; the current Base site and the merge layer as committed now.
+        checks = None
+        options = ((plan_body.get("merge") or {}).get("options") or {})
+        request = {"op": "merge_propose", "source": roles.get("source"),
+                   **{key: options[key] for key in ("ignore_global_pins", "separate_same_named_groups") if isinstance(options.get(key), bool)}}
+        if roles.get("settings"):
+            request["settings"] = roles["settings"]
     else:
         raise Refused("STANDARD_ARGUMENTS_INVALID")
     if checks:
@@ -271,10 +279,14 @@ def release_backup(control, body):
 
 def plan_detail(store, control, workspace, plan_id):
     result = runs.plan_detail(store, control, workspace, plan_id)
-    # Base-site plans name the delivery/version, never the original backup file.
-    base_id = (result.get("roles") or {}).get("base_site")
-    if base_id:
-        result["input_paths"] = {key: value for key, value in (result.get("input_paths") or {}).items() if key != base_id}
+    # Base-site plans name the delivery/version, never the original backup file; nor does a merge
+    # plan name its source site's backup (a Discourse backup's name starts with the site's name)
+    # or its settings file (named by whoever wrote it). The settings' content is still shown.
+    roles = result.get("roles") or {}
+    merge = result.get("operation") == "standard_merge"
+    hidden = {roles.get("base_site"), roles.get("source") if merge else None, roles.get("settings") if merge else None} - {None}
+    if hidden:
+        result["input_paths"] = {key: value for key, value in (result.get("input_paths") or {}).items() if key not in hidden}
     return result
 
 

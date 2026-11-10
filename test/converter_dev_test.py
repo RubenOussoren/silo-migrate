@@ -1,4 +1,5 @@
 """Converter development boundary tests with real Git. Run: python3 -I -B test/converter_dev_test.py."""
+import base64
 import hashlib
 import importlib.util
 import io
@@ -139,9 +140,83 @@ class ConverterDevTest(unittest.TestCase):
                 self.assertNotIn('error', self.call(op, role=role, branch='main', path='README.md'))
 
     def test_reviewer_role_stays_at_head_least_privilege(self):
-        self.assertEqual({'list', 'read', 'search', 'status', 'diff', 'test', 'push-show'}, self.dev.ROLES['reviewer'])
+        self.assertEqual({'list', 'read', 'search', 'status', 'diff', 'test', 'push-show', 'merge-guide'}, self.dev.ROLES['reviewer'])
         for op in ('branches', 'branch-diff', 'branch-read', 'branch-resolve'):
             self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call(op, role='reviewer')['error'])
+
+    def test_merge_guide_states_the_layer_contract_and_what_is_committed(self):
+        folder = 'mergers/' + self.ws
+        guide = self.call('merge-guide')
+        self.assertEqual({'path': folder + '/merger.rb', 'tests': 'test/' + folder, 'committed': False, 'committed_files': [], 'committed_bytes': 0,
+                          'not_allowed': [], 'within_limits': True, 'uncommitted_changes': []},
+                         {key: value for key, value in guide['layer'].items() if key != 'head'})
+        self.assertFalse(guide['merge_project'])  # the fixture workspace has no discourse source
+        self.assertIn('never be applied', guide['note'])
+        self.assertNotIn('discourse', guide)  # the fixture's profile isn't bound: no links rather than a wrong revision
+        for phrase in (folder + '/merger.rb', 'exactly ONE subclass of BulkImport::DiscourseMerger', 'SILO_MERGE_SETTINGS', 'SILO_MERGE_TOTAL: name=integer',
+                       'at most 32 files, 512 KiB', 'category_exists(cat_row)', 'test/' + folder, 'Customer values never go in the repository'):
+            self.assertIn(phrase, guide['guide'])
+        # A merge project with a layer: written, then committed; a file the run would refuse is named.
+        named = {'sources': {'source-1': {'platform': base64.b64encode(b'discourse').decode()}}}
+        (self.root / '.silo-migrate/named/state.json').write_text(json.dumps(named))
+        self.call('branch', topic='merge-layer')
+        self.call('write', path=folder + '/merger.rb', content='class ExampleMerger < BulkImport::DiscourseMerger\nend\n')
+        self.call('write', path=folder + '/notes.txt', content='invented\n')
+        written = self.call('merge-guide', role='reviewer')
+        self.assertTrue(written['merge_project'])
+        self.assertNotIn('note', written)
+        self.assertEqual((False, sorted([folder + '/merger.rb', folder + '/notes.txt'])), (written['layer']['committed'], sorted(written['layer']['uncommitted_changes'])))
+        self.set_identity()
+        self.assertNotIn('error', self.call('commit', message='Add the merge layer\n\nInvented example.'))
+        committed = self.call('merge-guide')
+        self.assertEqual((True, [folder + '/merger.rb', folder + '/notes.txt'], [folder + '/notes.txt'], False, []),
+                         (committed['layer']['committed'], committed['layer']['committed_files'], committed['layer']['not_allowed'],
+                          committed['layer']['within_limits'], committed['layer']['uncommitted_changes']))
+        self.assertEqual(git(self.checkout, 'rev-parse', 'HEAD'), committed['layer']['head'])
+        self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('merge-guide', role='reader')['error'])
+
+    def test_merge_guide_shows_recent_merge_runs_as_checked_totals_only(self):
+        self.assertEqual([], self.call('merge-guide')['recent_runs'])
+        counts = {key: 3 for key in ('users', 'topics', 'posts', 'categories', 'groups', 'tags', 'uploads')}
+        layer = {'present': True, 'path': 'mergers/x/merger.rb', 'revision': 'b' * 40, 'files': 1, 'bytes': 9, 'sha256': 'c' * 64}
+        self.state['plans'] = {
+            'plan-1': {'body': {'operation': 'standard_merge', 'merge': {'layer': layer, 'settings': True}, 'roles': {'source': 'input-private'}}},
+            'plan-2': {'body': {'operation': 'standard_merge', 'merge': {'layer': {'present': False}, 'settings': False}}},
+            'plan-3': {'body': {'operation': 'standard_convert'}}}
+        self.state['runs'] = {
+            'run-' + 'a' * 32: {'plan_id': 'plan-1', 'status': 'completed', 'started_at': '2026-11-10T21:57:44Z', 'failure': None,
+                                'results': {'review_url': 'http://127.0.0.1:18088', 'merge': {
+                                    'target_before': counts, 'source': dict(counts, users='Invented Person', extra=9), 'after': dict(counts, posts=24),
+                                    'layer_totals': {'categories_routed': 1, 'Invented Name': 2, 'as_text': 'Invented Person', 'negative': -1},
+                                    'log_tail': 'Invented Person wrote this'}}},
+            'run-' + 'b' * 32: {'plan_id': 'plan-2', 'status': 'failed', 'started_at': '2026-11-10T22:10:00Z', 'results': {'merge': {'restore_proof': 'skipped'}},
+                                'failure': {'stage': 'merge', 'code': 'STANDARD_MERGE_FAILED', 'recovery': 'Invented Person broke it'}},
+            'run-' + 'c' * 32: {'plan_id': 'plan-3', 'status': 'completed', 'started_at': '2026-11-10T23:00:00Z', 'results': {}},
+            'Invented Person': {'plan_id': 'plan-1', 'status': 'completed'}}
+        (self.root / '.silo-migrate/named/standard/state.json').write_text(json.dumps(self.state))
+        runs = self.call('merge-guide', role='reviewer')['recent_runs']
+        self.assertEqual(['run-' + 'b' * 32, 'run-' + 'a' * 32], [run['run_id'] for run in runs])  # newest first, merge runs only
+        self.assertEqual({'run_id': 'run-' + 'b' * 32, 'status': 'failed', 'started_at': '2026-11-10T22:10:00Z', 'layer_commit': None, 'with_settings': False,
+                          'failed_stage': 'merge', 'failure_code': 'STANDARD_MERGE_FAILED', 'site_before': {}, 'source_site': {}, 'merged_site': {}, 'layer_totals_reported': 0}, runs[0])
+        self.assertEqual(('b' * 40, True, counts, {key: 3 for key in counts if key != 'users'}, dict(counts, posts=24), 4),
+                         (runs[1]['layer_commit'], runs[1]['with_settings'], runs[1]['site_before'], runs[1]['source_site'], runs[1]['merged_site'], runs[1]['layer_totals_reported']))
+        # The layer's totals themselves go to the engineer only: code a coding agent wrote chooses their names and values.
+        self.assertNotIn('categories_routed', json.dumps(runs))
+        self.assertNotIn('Invented', json.dumps(runs))
+        self.assertNotIn('127.0.0.1', json.dumps(runs))
+        self.assertNotIn('input-private', json.dumps(runs))
+
+    def test_merge_guide_links_the_stock_merger_at_the_pinned_revision(self):
+        profiles = Path(self.temp.name) / 'profiles'
+        raw = json.dumps({'images': {}, 'app': {'revision': 'a' * 40, 'version': '2026.11.0-latest'}}).encode()
+        self.write(profiles / 'profile-a.json', raw.decode())
+        self.state['config']['discourse_profile_sha256'] = hashlib.sha256(raw).hexdigest()
+        (self.root / '.silo-migrate/named/standard/state.json').write_text(json.dumps(self.state))
+        checkout = self.dev.Checkout(self.base, self.ws, self.host)
+        guide = self.dev.op_merge_guide(checkout, {}, {'SILO_RUNTIME_PROFILES_DIR': str(profiles)}, Path(self.temp.name) / 'no-release')
+        self.assertEqual({'version': '2026.11.0-latest', 'revision': 'a' * 40,
+                          'merger_source': 'https://raw.githubusercontent.com/discourse/discourse/' + 'a' * 40 + '/script/bulk_import/discourse_merger.rb',
+                          'base_source': 'https://raw.githubusercontent.com/discourse/discourse/' + 'a' * 40 + '/script/bulk_import/base.rb'}, guide['discourse'])
 
     def resolver_fixture(self):
         self.fetch_local_origin()

@@ -19,6 +19,7 @@ credentials, as `converter update` does.
 Trust boundary: the service account (and an engineer approving its writes) is inside
 it; same-account races between checking and opening a path are not defended.
 """
+import base64
 import datetime
 import difflib
 import hashlib
@@ -59,8 +60,8 @@ PROTECTED_NAMES = {".gitignore", ".gitattributes", ".gitmodules", ".git"}
 PROTECTED_PATHS = {"Gemfile", "Gemfile.lock", ".bundle/config"}
 ROLES = {
     "developer": {"list", "read", "search", "status", "diff", "test", "push-show", "branches", "branch-diff", "branch-read", "branch-resolve",
-                  "write", "edit", "delete", "branch", "commit", "push-propose", "format"},
-    "reviewer": {"list", "read", "search", "status", "diff", "test", "push-show"},
+                  "write", "edit", "delete", "branch", "commit", "push-propose", "format", "merge-guide"},
+    "reviewer": {"list", "read", "search", "status", "diff", "test", "push-show", "merge-guide"},
     "reader": {"branches", "branch-diff", "branch-read", "branch-resolve"},
 }
 TRAILER = {"developer": "Assisted-by: converter-developer (term-llm agent)"}
@@ -446,6 +447,146 @@ def op_status(checkout, request):
     return {"branch": checkout.branch(), "head": checkout.head(), "changes": shown[:500], "other_changes_not_shown": hidden,
             "unpushed_commits": commits[:MAX_COMMITS], "unpushed_truncated": len(commits) > MAX_COMMITS,
             "migration_branch_prefix": checkout.migration_prefix()}
+
+
+MERGE_LAYER_ROOT = "mergers"
+MERGE_LAYER_MAX_FILES = 32
+MERGE_LAYER_MAX_BYTES = 512 * 1024
+MERGE_LAYER_FILE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.rb\Z")
+MERGE_STOCK = "https://raw.githubusercontent.com/discourse/discourse/%s/script/bulk_import/%s"
+MERGE_GUIDE = """A merge run restores the site to merge into (the Base site), loads the source site's backup beside it and runs
+Discourse's own merger, script/bulk_import/discourse_merger.rb, unedited. A project that needs rules of its own (source
+categories into chosen destination categories, topics re-homed, groups mapped, ...) adds a merge layer. You write the layer;
+the run applies it; the engineer approves every run.
+
+The contract
+- Entry file: {path}. Sibling .rb files in the same folder may be loaded with require_relative. The layer must not load or read anything else.
+- The folder may hold only regular .rb files: at most {files} files, {kib} KiB together. Anything else refuses the plan.
+- The entry file defines exactly ONE subclass of BulkImport::DiscourseMerger, anywhere in the folder's files. Change behaviour
+  by overriding its methods and calling super. Never copy or edit the stock script, and never reopen BulkImport::DiscourseMerger
+  or BulkImport::Base themselves.
+- The layer is loaded inside the Discourse app (Rails models such as Category, Topic, Group are available) after the stock
+  merger, with no network. Do not require the stock file yourself.
+- Customer values never go in the repository: no real category, group or user names, IDs, URLs or emails in code, tests,
+  comments or commit messages. The layer reads them at run time from the YAML mapping named by ENV["SILO_MERGE_SETTINGS"]
+  (YAML.safe_load_file). You decide the key names; migration-data fills in the values and registers the file (type
+  merge-settings). Describe the keys and value shapes to the engineer, with invented values, so migration-data can write it.
+  If the layer needs no values, don't read the variable (it is unset when the run has no settings).
+- Report what the layer did as totals: print lines `SILO_MERGE_TOTAL: name=integer` to standard output (name: lowercase
+  letters, digits, _, spelled out in the layer's code; at most 20 names). A name built from a row (a slug, a user name) is
+  dropped. The engineer and migration-data see those totals on the run; you don't. What you see back from a run, under
+  recent_runs here, is which commit ran, where it stopped, fixed site counts and how many of your totals were reported.
+  A total's value reaches you only if the engineer passes it on (a released finding). Everything else the layer prints or
+  raises stays in the run's private log. Never try to return data through messages, names, totals or the site's counts.
+- Do not write files, open sockets, start processes or read paths other than SILO_MERGE_SETTINGS.
+
+Useful extension points of the stock class (read the source at the URLs below before overriding; they are pinned to the
+Discourse revision runs use, and the file is public, so reading it on the web is fine):
+- category_exists(cat_row): called for every source category; return an existing destination category's id to merge the
+  source category into it, or nil to create it.
+- process_topic(topic), process_post(post) and the other process_<table>(row) methods: called per copied row with a hash of
+  column values; change the hash and return it, or return nil to skip the row.
+- execute: the ordered list of copy steps; override to add a step before or after super.
+- initialize: call super first, then load your settings.
+
+Testing without a Discourse app
+- Put tests in {tests}/..._test.rb. They run with dev_test in the converter sandbox, which has no Discourse: define a small
+  stub BulkImport::DiscourseMerger (and any model you call, e.g. Category) in the test before requiring the layer, write a
+  temporary settings file with invented values, and assert on what your overrides return.
+- The stub proves your logic, not the fit with the real merger. That is proven by a merge run: migration-data proposes it,
+  the engineer starts it, and you read the outcome under recent_runs here (call this tool again) and in any released finding.
+  failure_code STANDARD_MERGE_LAYER_INVALID at stage merge means the layer didn't load or didn't define exactly one subclass;
+  STANDARD_MERGE_SCHEMA means the merger met a column it doesn't know; STANDARD_MERGE_FAILED means it raised while merging.
+  What it raised is in the private log: ask the engineer to have migration-data look and release a finding.
+- Format, lint and commit as for converter code. A run uses the checkout's committed head: commit before asking for a run.
+"""
+
+
+def workspace_platforms(checkout):
+    """Source platform names of the workspace (they are base64 in the named state)."""
+    try:
+        sources = json.loads((checkout.root / ".silo-migrate/named/state.json").read_text()).get("sources") or {}
+        return sorted({base64.b64decode(item.get("platform", ""), validate=True).decode("utf-8") for item in sources.values()})
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+MERGE_COUNTS = ("users", "topics", "posts", "categories", "groups", "tags", "uploads")
+MERGE_RUN_STATUS = ("claimed", "running", "completed", "failed", "interrupted", "abandoned", "not_started")
+
+
+def merge_runs(checkout, limit=3):
+    """The project's latest merge runs as a coding agent may see them: which layer commit ran, where it
+    stopped, fixed site counts and how many totals the layer reported. Only checked integers and fixed
+    words: never names, text, paths or anything from the log. The layer's own totals are not here: their
+    names and values are chosen by code a coding agent wrote, so they go to the engineer, who may pass
+    them on."""
+    plans = checkout.state.get("plans") if isinstance(checkout.state.get("plans"), dict) else {}
+    runs = checkout.state.get("runs") if isinstance(checkout.state.get("runs"), dict) else {}
+
+    def word(value, pattern):
+        return value if isinstance(value, str) and re.fullmatch(pattern, value) else None
+
+    def counts(value):
+        return {key: value[key] for key in MERGE_COUNTS if isinstance(value, dict) and type(value.get(key)) is int and 0 <= value[key] < 10 ** 12}
+
+    shown = []
+    for run_id, run in runs.items():
+        plan = plans.get(run.get("plan_id")) if isinstance(run, dict) else None
+        body = plan.get("body") if isinstance(plan, dict) and isinstance(plan.get("body"), dict) else {}
+        if body.get("operation") != "standard_merge" or not word(run_id, r"run-[0-9a-f]{32}"):
+            continue
+        merge = body.get("merge") if isinstance(body.get("merge"), dict) else {}
+        layer = merge.get("layer") if isinstance(merge.get("layer"), dict) else {}
+        results = run.get("results") if isinstance(run.get("results"), dict) else {}
+        merged = results.get("merge") if isinstance(results.get("merge"), dict) else {}
+        failure = run.get("failure") if isinstance(run.get("failure"), dict) else {}
+        totals = merged.get("layer_totals") if isinstance(merged.get("layer_totals"), dict) else {}
+        shown.append({
+            "run_id": run_id, "status": run.get("status") if run.get("status") in MERGE_RUN_STATUS else None,
+            "started_at": word(run.get("started_at"), r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z"),
+            "layer_commit": word(layer.get("revision"), r"[0-9a-f]{40}") if layer.get("present") is True else None,
+            "with_settings": merge.get("settings") is True,
+            "failed_stage": word(failure.get("stage"), r"[a-z_]{1,40}"), "failure_code": word(failure.get("code"), r"STANDARD_[A-Z_]{1,60}"),
+            "site_before": counts(merged.get("target_before")), "source_site": counts(merged.get("source")), "merged_site": counts(merged.get("after")),
+            "layer_totals_reported": min(len(totals), 20)})
+    shown.sort(key=lambda item: item["started_at"] or "", reverse=True)
+    return shown[:limit]
+
+
+def op_merge_guide(checkout, request, values, repo):
+    """How to write this project's merge layer, with the facts that depend on the workspace."""
+    folder = "%s/%s" % (MERGE_LAYER_ROOT, checkout.workspace)
+    path = folder + "/merger.rb"
+    listed = checkout.git("ls-tree", "-r", "-z", "--long", "HEAD", "--", folder + "/").stdout.decode("utf-8", "replace")
+    committed_files, problems, total = [], [], 0
+    for entry in filter(None, listed.split("\0")):
+        meta, name = entry.split("\t", 1)
+        mode, kind, _sha, size = meta.split()
+        committed_files.append(name)
+        total += int(size) if size.isdigit() else 0
+        if mode != "100644" or kind != "blob" or not MERGE_LAYER_FILE.fullmatch(name[len(folder) + 1:]):
+            problems.append(name)
+    shown, _hidden = changes(checkout)
+    uncommitted = [item["path"] for item in shown if item["path"] == folder or item["path"].startswith(folder + "/")]
+    layer = {"path": path, "tests": "test/%s" % folder, "committed": path in committed_files, "head": checkout.head(),
+             "committed_files": committed_files[:MERGE_LAYER_MAX_FILES + 1], "committed_bytes": total,
+             "not_allowed": problems[:20], "within_limits": not problems and len(committed_files) <= MERGE_LAYER_MAX_FILES and total <= MERGE_LAYER_MAX_BYTES,
+             "uncommitted_changes": uncommitted[:50]}
+    platforms = workspace_platforms(checkout)
+    result = {"merge_project": "discourse" in platforms, "layer": layer, "recent_runs": merge_runs(checkout),
+              "guide": MERGE_GUIDE.format(path=path, tests="test/" + folder, files=MERGE_LAYER_MAX_FILES, kib=MERGE_LAYER_MAX_BYTES // 1024)}
+    if "discourse" not in platforms:
+        result["note"] = "This project's source platform is not discourse, so it has no merge runs; a merge layer here would never be applied."
+    try:
+        app = runtime_profile(checkout, values, repo).get("app") or {}
+    except Refusal:
+        app = {}
+    revision = app.get("revision")
+    if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
+        result["discourse"] = {"version": app.get("version"), "revision": revision,
+                               "merger_source": MERGE_STOCK % (revision, "discourse_merger.rb"), "base_source": MERGE_STOCK % (revision, "base.rb")}
+    return result
 
 
 def converter_log(checkout, limit=30):
@@ -1181,7 +1322,8 @@ def converter_image(checkout, values, repo):
     return converter_image_document(checkout, values, repo)["Id"]
 
 
-def converter_image_document(checkout, values, repo):
+def runtime_profile(checkout, values, repo):
+    """The workspace's pinned Discourse profile, checked against the hash the workspace recorded."""
     config = checkout.config
     name = config["discourse_profile"]
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", name):
@@ -1193,7 +1335,11 @@ def converter_image_document(checkout, values, repo):
     raw = paths[0].read_bytes()
     if hashlib.sha256(raw).hexdigest() != config["discourse_profile_sha256"]:
         refuse("STANDARD_RUNTIME_MISMATCH")
-    image = json.loads(raw)["images"]["converter"]
+    return json.loads(raw)
+
+
+def converter_image_document(checkout, values, repo):
+    image = runtime_profile(checkout, values, repo)["images"]["converter"]
     host = checkout.host
     try:
         document = host.inspect(image["ref"])
@@ -1911,6 +2057,8 @@ def main(args, values, base, repo, host, stdin, home=None):
                     "branch-resolve": op_branch_resolve}
         if op == "test":
             result = op_test(checkout, request, values, repo)
+        elif op == "merge-guide":
+            result = op_merge_guide(checkout, request, values, repo)
         elif op in MUTATING:
             with DevLock(checkout):
                 if op == "commit":
