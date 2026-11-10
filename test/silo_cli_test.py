@@ -100,23 +100,36 @@ class SiloTest(unittest.TestCase):
     def test_doctor_checks_dbhub_servers_are_limited_without_naming_projects(self):
         self.assertEqual('OK', self.statuses(self.healthy())['DBHub']['status'])
         config = self.home / '.config/term-llm/mcp.json'
+        rules = self.home / '.config/term-llm/config.yaml'
+        base = rules.read_text()
         entry = {'command': '/srv/silo-migrate/bin/silo-migrate-control', 'args': ['dbhub', 'acme-forum']}
         config.write_text(json.dumps({'servers': {'db-acme-forum': entry, 'db-other': {'command': 'x'}, 'mine': {'command': 'y'}}}))
-        responses = dict(self.healthy(), **{' version': (0, 'term-llm version 0.9.93 (commit: x)\n')})
+        responses = dict(self.healthy(), **{' version': (0, 'term-llm version 0.9.99 (commit: x)\n')})
         check = self.statuses(responses)['DBHub']
         self.assertEqual(('WARN', '1 of 1 project servers not limited to migration-data'), (check['status'], check['detail']))
-        self.assertIn('data_db_status', check['fix'])
-        entry['agents'] = ['migration-data']
-        config.write_text(json.dumps({'servers': {'db-acme-forum': entry}}))
+        self.assertIn('silo update', check['fix'])
+        # The old mcp.json key isn't a rule: term-llm reads only config.yaml's.
+        config.write_text(json.dumps({'servers': {'db-acme-forum': dict(entry, agents=['migration-data'])}}))
+        self.assertEqual('WARN', self.statuses(responses)['DBHub']['status'])
+        rules.write_text(base + 'mcp:\n  servers:\n    db-acme-forum:\n      agents:\n        - migration-data\n')
         check = self.statuses(responses)['DBHub']
+        self.assertEqual(('OK', '1 project servers, only migration-data can use them'), (check['status'], check['detail']))
+        # Older term-llm: the rule is there but not enforced.
+        old = dict(responses, **{' version': (0, 'term-llm version 0.9.93 (commit: x)\n')})
+        check = self.statuses(old)['DBHub']
         self.assertEqual('WARN', check['status'])
         self.assertIn("0.9.93 doesn't enforce", check['detail'])
-        self.assertIn('#1332', check['fix'])
-        with mock.patch.object(self.s, 'MCP_AGENTS_SINCE', (0, 9, 94)):
-            self.assertEqual('WARN', self.statuses(responses)['DBHub']['status'])
-            newer = dict(responses, **{' version': (0, 'term-llm version 0.9.94\n')})
-            self.assertEqual('OK', self.statuses(newer)['DBHub']['status'])
+        self.assertEqual('silo update', check['fix'])
+        # Agents from a search path can't be named by the rule: migration-data couldn't use its database.
+        searched = dict(responses, **{' agents': (0, self.healthy()[' agents'][1].replace('[user] /x/', '[search-path] /srv/x'))})
+        checks = self.statuses(searched)
+        self.assertEqual(('FAIL', 'WARN'), (checks['agents']['status'], checks['DBHub']['status']))
+        self.assertIn('not from ~/.config/term-llm/agents', checks['agents']['detail'])
+        self.assertIn('silo update', checks['agents']['fix'])
+        self.assertIn("can't use them", checks['DBHub']['detail'])
         self.assertNotIn('acme', json.dumps(self.statuses(responses)))
+        rules.write_text(base + 'mcp:\n  servers: [broken\n')
+        self.assertIn("can't be read", self.statuses(responses)['DBHub']['detail'])
         config.write_text('{broken')
         self.assertEqual('WARN', self.statuses(responses)['DBHub']['status'])
 

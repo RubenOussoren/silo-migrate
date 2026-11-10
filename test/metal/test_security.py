@@ -45,7 +45,9 @@ class SecurityTests(unittest.TestCase):
                     os.utime(release, (100+n, 100+n))
                 (P/'current').symlink_to(P/'releases'/commits[0])
                 self.m.record({'commit': commits[0]}, 'apply')
-                with patch.object(self.m, 'resolve', return_value=commits[1]), patch.object(self.m, 'fetch_release', return_value=P/'releases'/commits[1]), contextlib.redirect_stdout(io.StringIO()):
+                with patch.object(self.m, 'resolve', return_value=commits[1]), patch.object(self.m, 'fetch_release', return_value=P/'releases'/commits[1]), \
+                        patch.object(self.m, 'term_llm_current', return_value=False), patch.object(self.m, 'trust_agents'), patch.object(self.m, 'project_default_agent'), patch.object(self.m, 'mcp_rules'), \
+                        contextlib.redirect_stdout(io.StringIO()):
                     self.m.account_update()
                 self.assertEqual(keep, len(list((P/'releases').iterdir())))
                 for name in ('current', 'previous'):

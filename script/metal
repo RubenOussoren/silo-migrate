@@ -32,12 +32,20 @@ import urllib.request
 
 SELF = Path(sys.argv.pop(1)).resolve()
 ROOT = SELF.parent.parent
-PIN = "2d264d175d7f8a7108a3d3530338efa2b81dadcaf5ce02c3d0f701fa88ad3d4e"
+# Reviewed term-llm release: version, and the SHA-256 of term-llm_VERSION_linux_amd64.tar.gz
+# (it must also match the release's checksums.txt). 0.9.96+ enforces config.yaml's
+# mcp.servers.NAME.agents for agents in ~/.config/term-llm/agents (SamSaffron/term-llm#1341).
+TERM_LLM_PINNED = "0.9.99"
+PIN = "1c2004cf869e9470e605197f386347ff938ab88e431edb3637ee65b95c24cc8f"
+# Versions earlier releases pinned. metal.example.conf used to name one, so a config that still
+# does gets this release's version instead of a refusal.
+TERM_LLM_SUPERSEDED = ("0.9.93",)
+TERM_NOTE = ""
 PACKAGES = ("git", "curl", "ca-certificates", "python3", "util-linux", "gzip", "tar", "gnupg")
 DEFAULTS = dict(SILO_ACCOUNT="silomig", SILO_PREFIX="/srv/silo-migrate", SILO_WORKSPACES="",
     SILO_REPO="https://github.com/RubenOussoren/silo-migrate.git", SILO_BRANCH="mvp/metal-installer",
     CONVERTER_REPO="https://github.com/discourse-org/discourse-converters.git", CONVERTER_BRANCH="main",
-    VERIFY_CONVERTER_BRANCH="mvp/metal-installer", ARTIFACT_PACKAGE="", TERM_LLM_VERSION="0.9.93",
+    VERIFY_CONVERTER_BRANCH="mvp/metal-installer", ARTIFACT_PACKAGE="", TERM_LLM_VERSION=TERM_LLM_PINNED,
     TERM_LLM_PORT="18800", TERM_LLM_SERVICE="install", DOCKER_INSTALL="if-missing", PORT_RANGE="18080-18089", KEEP_RELEASES="3",
     VERIFY_MIN_AVAILABLE_MIB="8192", HUB_URL="", HUB_NODE_ID="", HUB_NODE_NAME="", HUB_SECRETS_FILE="")
 FRESH_CONFIG = """# Work-only; no imported providers, sessions, memory or jobs.
@@ -52,19 +60,21 @@ serve:
   projects:
     enabled: true
 # The web UI's agent picker then offers only the installed migration agents; built-in
-# shell-capable agents would otherwise run with this account's Docker authority.
+# shell-capable agents would otherwise run with this account's Docker authority. They come
+# from ~/.config/term-llm/agents, which the installer links to the current release.
 agents:
   use_builtin: false
-  search_paths:
-    - {agents_path}
+# New chats in a web UI project start with the lead agent (term-llm 0.9.96+ needs an available one).
+web:
+  project_default_agent: migration-data
 """
 
 def agents_path():
-    # term-llm lists agents from search paths; symlinked agent folders are skipped.
+    # The release's agents. term-llm lists a linked agents folder but skips linked agent folders inside it.
     return str(P/"current/integrations/term-llm")
 
 def fresh_config():
-    return FRESH_CONFIG.replace("{agents_path}", agents_path())
+    return FRESH_CONFIG
 
 class Refusal(Exception):
     pass
@@ -176,7 +186,12 @@ def read_config(path):
             refuse("METAL_CONFIG_INVALID", "invalid branch name")
     if not re.fullmatch(r"[0-9]{4,7}", result["VERIFY_MIN_AVAILABLE_MIB"]) or not 2048 <= int(result["VERIFY_MIN_AVAILABLE_MIB"]) <= 1048576:
         refuse("METAL_CONFIG_INVALID", "VERIFY_MIN_AVAILABLE_MIB must be 2048..1048576")
-    if result["TERM_LLM_VERSION"] != "0.9.93":
+    global TERM_NOTE
+    if result["TERM_LLM_VERSION"] in TERM_LLM_SUPERSEDED:
+        TERM_NOTE = ("note: metal.conf's TERM_LLM_VERSION=" + result["TERM_LLM_VERSION"] + " is an older pin; this release uses term-llm "
+                     + TERM_LLM_PINNED + " (the line can be removed)")
+        result["TERM_LLM_VERSION"] = TERM_LLM_PINNED
+    if result["TERM_LLM_VERSION"] != TERM_LLM_PINNED:
         refuse("METAL_VERSION_UNPINNED", "add a reviewed pinned release SHA before selecting another version")
     if result["TERM_LLM_SERVICE"] not in ("install", "install-and-start", "skip") or result["DOCKER_INSTALL"] not in ("if-missing", "never"):
         refuse("METAL_CONFIG_INVALID", "invalid service/Docker policy")
@@ -471,8 +486,8 @@ def hub_secrets_state(entry):
 MIGRATION_AGENTS = ("converter-developer", "converter-reviewer", "migration-data", "migration-operator", "server-support")
 # Earlier releases' agent names; their exact old ~/.config links are removed like the current ones.
 LEGACY_AGENTS = ("migration-analyst",)
-AGENTS_HELP = ("the service account's term-llm config.yaml needs 'agents:' with 'use_builtin: false' and "
-               "'search_paths:' containing the installed agents directory, so the web UI offers only the node's agents")
+AGENTS_HELP = ("the service account's term-llm config.yaml needs 'agents:' with 'use_builtin: false', and "
+               "~/.config/term-llm/agents linked to the installed agents directory, so the web UI offers only the node's agents")
 
 def skills_path():
     return P/"current/integrations/term-llm/skills"
@@ -494,6 +509,149 @@ def link_skills():
     if not link.parent.is_dir():
         return False
     os.symlink(target, link)
+    return True
+
+def link_agents():
+    """~/.config/term-llm/agents -> the current release's agents. term-llm applies an MCP server's
+    agents rule only to agents found there (or built in), never to search-path agents
+    (SamSaffron/term-llm#1341). It lists a linked agents folder (os.ReadDir) but skips linked agent
+    folders inside it, so link the folder. The empty folder earlier installs made is replaced, and
+    their exact per-agent links are removed first; anything else is the engineer's: left alone."""
+    link = home()/".config/term-llm/agents"
+    target = agents_path()
+    if link.is_symlink():
+        if os.readlink(link) == target:
+            return True
+        print("METAL_AGENTS_NOT_LINKED: " + str(link) + " links elsewhere; left unchanged (silo doctor shows the fix)", flush=True)
+        return False
+    if link.is_dir():
+        for name in MIGRATION_AGENTS + LEGACY_AGENTS:
+            old = link/name
+            if old.is_symlink() and os.readlink(old) == str(P/"current/integrations/term-llm"/name):
+                old.unlink()
+        try:
+            link.rmdir()
+        except OSError:
+            print("METAL_AGENTS_NOT_LINKED: " + str(link) + " is a folder with something in it; left unchanged (silo doctor shows the fix)", flush=True)
+            return False
+    elif link.exists():
+        print("METAL_AGENTS_NOT_LINKED: " + str(link) + " is not a folder; left unchanged (silo doctor shows the fix)", flush=True)
+        return False
+    if not link.parent.is_dir():
+        return False
+    os.symlink(target, link)
+    return True
+
+SEARCH_PATHS = re.compile(r"(\s+)search_paths:[ \t]*(\S.*?)?[ \t]*(#.*)?")
+
+def without_release_search_path(text):
+    """config.yaml's text without the release's agents folder in agents.search_paths, or None when it
+    isn't there. Needed once the agents are linked: when a chat continues, term-llm 0.9.96+ takes an
+    agent's trust away if a search-path folder has the same name (LoadPersistedAgent). Handles the
+    block list this installer wrote and a one-line [list]; any other shape is refused, never guessed."""
+    wanted = {agents_path(), agents_path() + "/"}
+    unquote = lambda value: value.strip().strip("'\"")
+    lines = text.split("\n")
+    top = [i for i, line in enumerate(lines) if re.fullmatch(r"agents:[ \t]*(#.*)?", line)]
+    if not top:
+        return None
+    if len(top) > 1:
+        refuse("METAL_AGENTS_CONFIG", "config.yaml has more than one 'agents:' section")
+    end = next((i for i in range(top[0] + 1, len(lines)) if lines[i] and not lines[i][0].isspace() and not lines[i].startswith("#")), len(lines))
+    keys = [i for i in range(top[0] + 1, end) if SEARCH_PATHS.fullmatch(lines[i])]
+    if not keys:
+        return None
+    if len(keys) > 1:
+        refuse("METAL_AGENTS_CONFIG", "config.yaml has more than one agents.search_paths")
+    key = keys[0]
+    indent, inline, comment = SEARCH_PATHS.fullmatch(lines[key]).groups()
+    if inline is not None:
+        if inline in ("[]", "null", "~"):
+            return None
+        if not (inline.startswith("[") and inline.endswith("]")):
+            refuse("METAL_AGENTS_CONFIG", "agents.search_paths in config.yaml has a shape the installer doesn't edit; remove " + agents_path() + " from it by hand")
+        items = [item for item in inline[1:-1].split(",") if item.strip()]
+        kept = [item.strip() for item in items if unquote(item) not in wanted]
+        if len(kept) == len(items):
+            return None
+        lines[key:key + 1] = [indent + "search_paths: [" + ", ".join(kept) + "]" + (" " + comment if comment else "")] if kept else []
+        return "\n".join(lines)
+    items, i = [], key + 1
+    while i < end:
+        line = lines[i]
+        if line.strip() and not line.strip().startswith("#"):
+            depth = len(line) - len(line.lstrip())
+            if depth < len(indent) or (depth == len(indent) and not line.lstrip().startswith("- ")):
+                break
+            match = re.fullmatch(r"\s*-[ \t]+(.*?)[ \t]*(#.*)?", line)
+            if not match:
+                refuse("METAL_AGENTS_CONFIG", "agents.search_paths in config.yaml has a shape the installer doesn't edit; remove " + agents_path() + " from it by hand")
+            items.append((i, unquote(match[1])))
+        i += 1
+    drop = {index for index, value in items if value in wanted}
+    if not drop:
+        return None
+    if len(drop) == len(items):
+        drop.add(key)
+    return "\n".join(line for index, line in enumerate(lines) if index not in drop)
+
+def agents_trusted(as_account=True, expected=MIGRATION_AGENTS):
+    """The node's agents, each listed from ~/.config/term-llm/agents ([user]) and none from a search path."""
+    listing = output([P/"bin/term-llm", "agents"], account=as_account) or ""
+    return agents_ready(as_account, expected) and "[search-path]" not in listing and "  [user] " in listing
+
+def trust_agents(as_account=True):
+    """Link the agents folder, then take the release out of agents.search_paths, in that order: an
+    agent must never be left with neither. Returns True once term-llm lists them as trusted. Any
+    problem leaves config.yaml as it was (silo doctor shows the fix)."""
+    if not link_agents():
+        return False
+    config = home()/".config/term-llm/config.yaml"
+    try:
+        info = os.lstat(config)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError
+        text = config.read_text()
+    except (OSError, UnicodeDecodeError):
+        print("METAL_AGENTS_CONFIG: " + str(config) + " can't be read; left unchanged (silo doctor shows the fix)", flush=True)
+        return False
+    try:
+        edited = without_release_search_path(text)
+    except Refusal as refusal:
+        print(str(refusal) + " (left unchanged; silo doctor shows the fix)", flush=True)
+        return False
+    if edited is not None:
+        atomic_write(config, edited, stat.S_IMODE(info.st_mode) & 0o600 or 0o600)
+        if not agents_ready(as_account=as_account, expected=shipped_agents(P/"current") or MIGRATION_AGENTS):
+            atomic_write(config, text, stat.S_IMODE(info.st_mode) & 0o600 or 0o600)
+            print("METAL_AGENTS_CONFIG: the agents weren't listed without the search path; config.yaml put back (silo doctor shows the fix)", flush=True)
+            return False
+    return agents_trusted(as_account=as_account, expected=shipped_agents(P/"current") or MIGRATION_AGENTS)
+
+LEAD_AGENT = "migration-data"
+
+def project_default_agent(as_account=True):
+    """term-llm 0.9.96+ starts a project's new chats with web.project_default_agent and won't serve
+    web UI projects unless it names an available agent. Its default, the built-in developer, is off
+    on this node, so set the lead agent; an available agent the engineer chose is kept."""
+    term = P/"bin/term-llm"
+    current = output([term, "config", "get", "web.project_default_agent"], account=as_account)
+    if current in (shipped_agents(P/"current") or MIGRATION_AGENTS):
+        return True
+    result = run([term, "config", "set", "web.project_default_agent", LEAD_AGENT], check=False, account=as_account)
+    if not result or result.returncode:
+        print("METAL_DEFAULT_AGENT_SKIPPED: web.project_default_agent isn't set; the web UI won't start until it names an agent (silo doctor shows the fix)", flush=True)
+        return False
+    return True
+
+def mcp_rules():
+    """Each project database's MCP rule (only migration-data may use it) in config.yaml, written by the
+    release's own code. Prints counts only: project names can identify customers."""
+    result = run([P/"bin/silo-migrate-control", "mcp-rules"], check=False, timeout=120)
+    if not result or result.returncode:
+        print("METAL_MCP_RULES_SKIPPED: the project databases' agent rules weren't all written (silo doctor shows the fix)", flush=True)
+        return False
+    print("METAL_MCP_RULES: " + (result.stdout.strip().splitlines() or [""])[-1][:200], flush=True)
     return True
 
 def shipped_agents(release):
@@ -540,7 +698,8 @@ def make_plan(allow=False):
     if "docker" not in groups.split():
         roots += [{"action": "group", "detail": "add account to docker group: ROOT-EQUIVALENT authority; an already running user manager must be restarted separately to acquire new supplementary groups"}]
     dirs = [P, W] + [P/p for p in ("bin", "etc", "releases", "term-llm", "control", "control/gems", "control/site-cache", "state", "state/logs", "state/tmp", "state/runtime-profiles")]
-    account_dirs = [home()/part for part in (".config", ".config/term-llm", ".config/term-llm/agents",
+    # ~/.config/term-llm/agents is a link to the release (link_agents checks it exactly), like skills.
+    account_dirs = [home()/part for part in (".config", ".config/term-llm",
         ".config/term-llm/services/web", ".config/systemd/user", ".local/share/term-llm")]
     authority = directory_authority(dirs + account_dirs + [P/"term-llm"/C["TERM_LLM_VERSION"]])
     if C["ARTIFACT_PACKAGE"]:
@@ -589,7 +748,7 @@ def make_plan(allow=False):
     needs = image_repair or any(old.get(k) != v for k,v in target.items()) or not (P/"current").exists() or not (P/"bin/term-llm").exists() or not (P/"bin/silo-migrate-control").exists() or (P/"current").resolve() != P/"releases"/commit
     if needs:
         users = [
-            {"action": "term-llm", "detail": ("verify existing version/binary receipts (download skipped); ensure bin symlink" if (versiondir/"term-llm").exists() else "download https://github.com/samsaffron/term-llm/releases/download/v0.9.93/term-llm_0.9.93_linux_amd64.tar.gz; verify pinned SHA256 " + PIN + " AND release checksums.txt; install version directory and atomic bin symlink")},
+            {"action": "term-llm", "detail": ("verify existing version/binary receipts (download skipped); ensure bin symlink" if (versiondir/"term-llm").exists() else "download https://github.com/samsaffron/term-llm/releases/download/v" + C["TERM_LLM_VERSION"] + "/term-llm_" + C["TERM_LLM_VERSION"] + "_linux_amd64.tar.gz; verify pinned SHA256 " + PIN + " AND release checksums.txt; install version directory and atomic bin symlink")},
             {"action": "release", "detail": ("verify clean detached release (clone skipped): " if (P/"releases"/commit).exists() else "clone detached commit into ") + str(P/"releases"/commit) + "; validate release profile against package"},
             {"action": "artifacts", "detail": "verify SHA256SUMS/profile; " + "; ".join(image_steps) if package else "SKIPPED: no ARTIFACT_PACKAGE; shell/service install only, NOT migration-ready"},
             {"action": "configuration", "detail": "write control env and shim; fresh term-llm config/data only if absent; preserve existing account config; agents from the release (refuse conflicting old links); link ~/.config/term-llm/skills to the release skills if absent; atomic current switch"}]
@@ -609,10 +768,13 @@ def make_plan(allow=False):
     if (home()/".config/term-llm").exists():
         notes.append("Existing term-llm config directory PRESERVED; safety/routing of existing config requires engineer review before customer use.")
     # Before the switch, term-llm lists the agents of the release `current` still points
-    # to (agents.search_paths); after it, apply requires exactly MIGRATION_AGENTS.
+    # to (by its search path or the linked agents folder); after it, apply requires exactly MIGRATION_AGENTS.
     if C["TERM_LLM_SERVICE"] != "skip" and (P/"bin/term-llm").exists() and (home()/".config/term-llm/config.yaml").exists() and entry \
             and (P/"current").exists() and not agents_ready(expected=shipped_agents(P/"current") or MIGRATION_AGENTS):
         refuse("METAL_AGENTS_CONFIG", "existing term-llm config preserved; " + AGENTS_HELP + " (" + agents_path() + "), then re-plan")
+    notes.append("term-llm " + C["TERM_LLM_VERSION"] + ": ~/.config/term-llm/agents links to the release's agents (the only ones an MCP rule can name; "
+                 "the release path leaves agents.search_paths), web.project_default_agent is set to migration-data if it isn't one of the node's agents, "
+                 "and each project database's rule (mcp.servers.db-PROJECT.agents: [migration-data]) is written to config.yaml with term-llm's config set.")
     notes.append("Everyday node commands: <prefix>/current/bin/silo (doctor, update, use-github, restart, shell, prime, claude-login, intake, set-contact, remove-project); link it once as root: ln -sfn " + str(P/"current/bin/silo") + " /usr/local/bin/silo")
     notes.append("Web UI projects are on (--projects): every chat belongs to a project. 'silo intake PROJECT' creates the folder ~/projects/PROJECT and its web UI project; migration-data's tools work only in a chat inside that project and only on that workspace. Existing chats move to the home project. 'metal update' re-installs the service once to switch this on.")
     notes.append("Root, every apply/update: /etc/tmpfiles.d/silo-migrate-term-llm.conf reserves /tmp/term-llm-widgets (term-llm's widget sockets; 0.9.93 doesn't check its owner) for the service account at boot, and it is created now; if another account owns it, apply/update stops for you to inspect it.")
@@ -820,7 +982,7 @@ def install_term():
     if old.is_symlink() and old.resolve() != dest:
         symlink(old.resolve(), P/"bin/term-llm.previous")
     symlink(dest, old)
-    if "0.9.93" not in (output([dest, "--version"]) or ""):
+    if not re.search(r"\bversion " + re.escape(version) + r"\b", output([dest, "--version"]) or ""):
         refuse("METAL_TERM_VERSION", "downloaded binary version mismatch")
     install_help = output([dest, "service", "install", "--help"]) or ""
     serve_help = output([dest, "serve", "--help"]) or ""
@@ -1031,24 +1193,29 @@ def account_apply(saved):
     if not datadir.exists():
         datadir.mkdir(parents=True, mode=0o700)
     agents = configdir/"agents"
-    agents.mkdir(exist_ok=True, mode=0o700)
-    for name in MIGRATION_AGENTS + LEGACY_AGENTS:
-        dest = agents/name
-        expected = P/"current/integrations/term-llm"/name
-        # Agents come from the search path. Earlier installs linked them here; term-llm
-        # skips symlinked folders when listing, so remove only those exact links.
-        if dest.is_symlink() and os.readlink(dest) == str(expected):
-            dest.unlink()
-        elif name in LEGACY_AGENTS:
-            continue
-        elif dest.exists() or dest.is_symlink():
-            refuse("METAL_AGENT_CONFLICT", "existing agent preserved; resolve name conflict manually")
+    # Once linked to the release (link_agents, after the switch), the folders in it are the release's own.
+    if not (agents.is_symlink() and os.readlink(agents) == agents_path()):
+        agents.mkdir(exist_ok=True, mode=0o700)
+        for name in MIGRATION_AGENTS + LEGACY_AGENTS:
+            dest = agents/name
+            expected = P/"current/integrations/term-llm"/name
+            # Earlier installs linked single agents here; term-llm skips symlinked agent
+            # folders when listing, so remove only those exact links.
+            if dest.is_symlink() and os.readlink(dest) == str(expected):
+                dest.unlink()
+            elif name in LEGACY_AGENTS:
+                continue
+            elif dest.exists() or dest.is_symlink():
+                refuse("METAL_AGENT_CONFLICT", "existing agent preserved; resolve name conflict manually")
     host_lock = W/".silo-standard-execution.lock"
     if not host_lock.exists():
         fd = os.open(host_lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         os.close(fd)
     previous = switch(release)
     link_skills()
+    trust_agents(as_account=False)
+    project_default_agent(as_account=False)
+    mcp_rules()
     if C["TERM_LLM_SERVICE"] != "skip":
         unit = home()/".config/systemd/user/term-llm-web.service"
         spec = configdir/"services/web/service.json"
@@ -1137,12 +1304,13 @@ def service_current(args):
     return ("--projects" in args and not {"--no-projects", "--disable-widgets", "--disable-extensions"} & set(args)
             and all(flag in args and args.index(flag) + 1 < len(args) and args[args.index(flag) + 1] == value for flag, value in pairs.items()))
 
-def refresh_service():
-    """Re-install the web service when its saved arguments predate web UI projects or the Project page.
-    Keeps the unit's directory, environment and secrets (term-llm reuses them); silo update restarts."""
+def refresh_service(force=False):
+    """Re-install the web service when its saved arguments predate web UI projects or the Project page,
+    or (force) when term-llm itself changed. Keeps the unit's directory, environment and secrets
+    (term-llm reuses them); silo update restarts."""
     global STAGE
     args = service_spec_args()
-    if C["TERM_LLM_SERVICE"] == "skip" or args is None or service_current(args):
+    if C["TERM_LLM_SERVICE"] == "skip" or args is None or (service_current(args) and not force):
         return False
     STAGE = "SERVICE_UPDATE"
     try:
@@ -1153,6 +1321,17 @@ def refresh_service():
         print("METAL_SERVICE_UPDATE_SKIPPED: " + str(refusal).split(":")[0] + "; web UI projects stay off, so the migration agents' tools "
               "refuse (STANDARD_CHAT_NOT_IN_PROJECT) until 'silo update' is run again", flush=True)
         return False
+    return True
+
+def term_llm_current():
+    """Install this release's pinned term-llm when bin/term-llm is another version (the old one stays
+    as bin/term-llm.previous for rollback --term-llm). True if it changed; silo update restarts."""
+    global STAGE
+    if (P/"bin/term-llm").resolve() == P/"term-llm"/C["TERM_LLM_VERSION"]/"term-llm":
+        return False
+    STAGE = "TERM_DOWNLOAD"
+    install_term()
+    print("METAL_TERM_UPDATED: term-llm " + C["TERM_LLM_VERSION"], flush=True)
     return True
 
 def account_update(rollback=False, branch=None, term=False):
@@ -1174,8 +1353,16 @@ def account_update(rollback=False, branch=None, term=False):
             selected = branch or C["SILO_BRANCH"]
             commit = resolve(C["SILO_REPO"], selected)
             if commit == old["commit"]:
-                # The service settings are still checked, so a skipped re-install is retried.
-                if refresh_service():
+                # The service settings, term-llm and the agents' trust are still checked, so an
+                # interrupted update finishes.
+                changed = term_llm_current()
+                if changed:
+                    kept = {key: value for key, value in old.items() if key not in ("installed_at", "operation", "previous_commit")}
+                    record(dict(kept, term_llm_version=C["TERM_LLM_VERSION"]), "update", old.get("previous_commit"))
+                trust_agents()
+                project_default_agent()
+                mcp_rules()
+                if refresh_service(force=changed):
                     print("METAL_SERVICE_UPDATED", flush=True)
                 print("METAL_UNCHANGED")
                 return
@@ -1193,8 +1380,16 @@ def account_update(rollback=False, branch=None, term=False):
             symlink(previous_bin.resolve(), P/"bin/term-llm")
             symlink(active, previous_bin)
             target["term_llm_version"] = (P/"bin/term-llm").resolve().parent.name
+        changed = False
+        if not rollback:
+            changed = term_llm_current()
+            target["term_llm_version"] = C["TERM_LLM_VERSION"]
         previous = switch(release)
         link_skills()
+        if not rollback:
+            trust_agents()
+            project_default_agent()
+            mcp_rules()
         for key in ("installed_at", "operation", "previous_commit"):
             target.pop(key, None)
         record(target, "rollback" if rollback else "update", previous)
@@ -1208,7 +1403,7 @@ def account_update(rollback=False, branch=None, term=False):
                 else:
                     unseal(path)
                     shutil.rmtree(path)  # Exact managed release directories only, never workspaces/images/backups.
-        if not rollback and refresh_service():
+        if not rollback and refresh_service(force=changed):
             print("METAL_SERVICE_UPDATED", flush=True)
         print("METAL_ROLLBACK_OK" if rollback else "METAL_UPDATE_OK")
 
@@ -1408,6 +1603,8 @@ def main():
     elif args.command in ("update", "rollback"):
         if os.geteuid() == 0 and C["TERM_LLM_SERVICE"] != "skip":
             ensure_widget_runtime()
+        if TERM_NOTE:
+            print(TERM_NOTE, flush=True)
         confargs = ["--config", str(Path(args.config).resolve())] if args.config else []
         opts = (["--branch", args.branch] if args.branch else []) + (["--term-llm"] if args.term_llm else [])
         result = run([SELF, "_account-" + args.command] + confargs + opts, account=True, timeout=900)

@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import shutil
+import stat
 import os
 from pathlib import Path
 import pwd
@@ -121,8 +122,9 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("  projects:\n    enabled: true\n", self.m.fresh_config())
         self.assertEqual("prompt", args[args.index("--approval") + 1])
         fresh = self.m.fresh_config()
-        self.assertIn("agents:\n  use_builtin: false\n  search_paths:\n    - " + str(self.m.P/"current/integrations/term-llm") + "\n", fresh)
-        self.assertNotIn("{agents_path}", fresh)
+        # The agents come from the linked ~/.config/term-llm/agents (term-llm#1341 trusts only that), never a search path.
+        self.assertIn("agents:\n  use_builtin: false\n", fresh)
+        self.assertNotIn("search_paths", fresh)
         P = self.m.P
         (P/"bin").mkdir(parents=True)
         (P/"bin/term-llm").write_text("")
@@ -360,6 +362,16 @@ class InstallerTests(unittest.TestCase):
         path.write_text(body)
         return self.m.read_config(path)
 
+    @contextlib.contextmanager
+    def node_steps(self, changed=False):
+        """term-llm, the agents' trust, the project default agent and the MCP rules, recorded in order (each is tested on its own)."""
+        steps = []
+        with patch.object(self.m, "term_llm_current", side_effect=lambda: steps.append("term_llm_current") or changed), \
+                patch.object(self.m, "trust_agents", side_effect=lambda *a, **k: steps.append("trust_agents") or True), \
+                patch.object(self.m, "project_default_agent", side_effect=lambda *a, **k: steps.append("project_default_agent") or True), \
+                patch.object(self.m, "mcp_rules", side_effect=lambda: steps.append("mcp_rules") or True):
+            yield steps
+
     def plan_stubs(self):
         stack = contextlib.ExitStack()
         stack.enter_context(patch.object(self.m, "resolve", return_value="a"*40))
@@ -449,7 +461,7 @@ class InstallerTests(unittest.TestCase):
         configdir = self.home/".config/term-llm"
         configdir.mkdir(parents=True)
         (configdir/"config.yaml").write_text("# sentinel: never overwrite\n")
-        binary = P/"term-llm/0.9.93/term-llm"
+        binary = P/"term-llm"/self.m.TERM_LLM_PINNED/"term-llm"
         binary.parent.mkdir()
         binary.write_text("stub")
         os.symlink(binary, P/"bin/term-llm")
@@ -473,13 +485,191 @@ class InstallerTests(unittest.TestCase):
         (self.m.P/"state/tmp").mkdir(parents=True)
         def download(argv, **kwargs):
             dest = Path(argv[-1])
-            dest.write_bytes(b"untrusted tar" if dest.name.endswith("tar.gz") else ("0"*64 + "  term-llm_0.9.93_linux_amd64.tar.gz\n").encode())
+            dest.write_bytes(b"untrusted tar" if dest.name.endswith("tar.gz") else ("0"*64 + "  term-llm_" + self.m.TERM_LLM_PINNED + "_linux_amd64.tar.gz\n").encode())
         with patch.object(self.m, "run", side_effect=download), self.assertRaisesRegex(self.m.Refusal, "METAL_TERM_CHECKSUM"):
             self.m.install_term()
         self.assertFalse((self.m.P/"bin/term-llm").exists())
         # Pinned checksum alone is insufficient if publisher checksum differs.
         with patch.object(self.m, "run", side_effect=download), patch.object(self.m, "PIN", hashlib.sha256(b"untrusted tar").hexdigest()), self.assertRaisesRegex(self.m.Refusal, "METAL_TERM_CHECKSUM"):
             self.m.install_term()
+
+    def test_the_release_decides_the_term_llm_version(self):
+        self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("SILO_ACCOUNT=x")["TERM_LLM_VERSION"])
+        self.assertEqual("", self.m.TERM_NOTE)
+        # metal.example.conf used to name 0.9.93: such a config gets this release's version, with a note.
+        self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("TERM_LLM_VERSION=0.9.93")["TERM_LLM_VERSION"])
+        self.assertIn("TERM_LLM_VERSION=0.9.93 is an older pin", self.m.TERM_NOTE)
+        self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("TERM_LLM_VERSION=" + self.m.TERM_LLM_PINNED)["TERM_LLM_VERSION"])
+        for other in ("0.9.95", "0.9.100"):
+            with self.subTest(other=other), self.assertRaisesRegex(self.m.Refusal, "METAL_VERSION_UNPINNED"):
+                self.configured("TERM_LLM_VERSION=" + other)
+
+    def fake_term_release(self, version):
+        """A release tarball shaped like term-llm's (the binary, plus licence files) and its checksums."""
+        stage = self.root/("tar-" + version)
+        (stage/"internal/x").mkdir(parents=True)
+        (stage/"internal/x/LICENSE").write_text("licence")
+        (stage/"term-llm").write_text("#!/bin/sh\necho 'term-llm version " + version + " (commit: c)'\n"
+                                      "echo '--binary --no-start --dry-run --host --port --auth --approval --agent --projects --widgets-dir --extensions-dir --extensions'\n")
+        (stage/"term-llm").chmod(0o755)
+        archive = self.root/("term-llm_" + version + "_linux_amd64.tar.gz")
+        with tarfile.open(archive, "w:gz") as tar:
+            for name in ("term-llm", "internal"):
+                tar.add(stage/name, arcname=name)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        return archive, digest
+
+    def test_update_installs_the_pinned_term_llm_and_keeps_the_old_one(self):
+        P = self.m.P
+        for path in (P/"bin", P/"state/tmp"):
+            path.mkdir(parents=True)
+        old = P/"term-llm/0.9.93/term-llm"
+        old.parent.mkdir(parents=True)
+        old.write_text("old")
+        os.symlink(old, P/"bin/term-llm")
+        archive, digest = self.fake_term_release(self.m.TERM_LLM_PINNED)
+        fetched = []
+        def download(argv, **kwargs):
+            dest = Path(argv[-1])
+            fetched.append(argv[-3])
+            dest.write_bytes(archive.read_bytes() if dest.name.endswith("tar.gz") else (digest + "  " + archive.name + "\n").encode())
+        real_run = self.m.run
+        with patch.object(self.m, "PIN", digest), patch.object(self.m, "run", side_effect=lambda argv, **kw: download(argv) if argv[0] == "curl" else real_run(argv, **kw)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(self.m.term_llm_current())
+            self.assertFalse(self.m.term_llm_current())  # now current: nothing to do
+        new = P/"term-llm"/self.m.TERM_LLM_PINNED/"term-llm"
+        self.assertEqual(new, (P/"bin/term-llm").resolve())
+        self.assertEqual(old, (P/"bin/term-llm.previous").resolve())  # for rollback --term-llm
+        self.assertEqual(["https://github.com/samsaffron/term-llm/releases/download/v" + self.m.TERM_LLM_PINNED + "/" + archive.name,
+                          "https://github.com/samsaffron/term-llm/releases/download/v" + self.m.TERM_LLM_PINNED + "/checksums.txt"], fetched)
+        self.assertEqual([], [p for p in new.parent.iterdir() if p.name == "internal"])  # only the binary is taken
+        self.assertIn("METAL_TERM_UPDATED", out.getvalue())
+
+    def test_update_order_term_llm_then_switch_then_agents_and_rules(self):
+        P = self.m.P
+        for path in (P/"releases", P/"state/logs"):
+            path.mkdir(parents=True)
+        self.m.W.mkdir(parents=True, exist_ok=True)
+        (self.m.W/".silo-standard-execution.lock").touch()
+        a, b = "a"*40, "b"*40
+        for commit in (a, b):
+            (P/"releases"/commit).mkdir()
+        os.symlink(P/"releases"/a, P/"current")
+        self.m.record({"commit": a, "term_llm_version": "0.9.93"}, "apply")
+        switched = []
+        real_switch = self.m.switch
+        with patch.object(self.m, "resolve", return_value=b), patch.object(self.m, "fetch_release", return_value=P/"releases"/b), \
+                patch.object(self.m, "switch", side_effect=lambda release: switched.append(len(steps)) or real_switch(release)), \
+                patch.object(self.m, "refresh_service", return_value=True) as refresh, self.node_steps(changed=True) as steps, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.m.account_update(False)
+        self.assertEqual(["term_llm_current", "trust_agents", "project_default_agent", "mcp_rules"], steps)
+        self.assertEqual([1], switched)  # after term-llm, before the agents and rules
+        refresh.assert_called_once_with(force=True)  # a new term-llm re-installs the service
+        manifest = json.loads((P/"state/install-manifest.json").read_text())
+        self.assertEqual(self.m.TERM_LLM_PINNED, manifest["term_llm_version"])
+        # A rollback leaves term-llm, the agents and the rules alone.
+        with patch.object(self.m, "refresh_service") as refresh, self.node_steps() as steps, contextlib.redirect_stdout(io.StringIO()):
+            self.m.account_update(True)
+        self.assertEqual([], steps)
+
+    def test_project_default_agent_is_the_lead_agent_unless_an_available_one_is_chosen(self):
+        for name in self.m.MIGRATION_AGENTS:
+            (self.m.P/"current/integrations/term-llm"/name).mkdir(parents=True, exist_ok=True)
+            (self.m.P/"current/integrations/term-llm"/name/"agent.yaml").write_text("name: " + name + "\n")
+        for current, sets in ((None, True), ("developer", True), ("migration-analyst", True), ("server-support", False), ("migration-data", False)):
+            calls = []
+            with self.subTest(current=current), patch.object(self.m, "output", return_value=current), \
+                    patch.object(self.m, "run", side_effect=lambda argv, **kw: calls.append([str(a) for a in argv]) or subprocess.CompletedProcess(argv, 0, "", "")):
+                self.assertTrue(self.m.project_default_agent(as_account=False))
+            self.assertEqual([[str(self.m.P/"bin/term-llm"), "config", "set", "web.project_default_agent", "migration-data"]] if sets else [], calls)
+        with patch.object(self.m, "output", return_value=None), patch.object(self.m, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(self.m.project_default_agent(as_account=False))
+        self.assertIn("METAL_DEFAULT_AGENT_SKIPPED", out.getvalue())
+        self.assertIn("web:\n  project_default_agent: migration-data\n", self.m.fresh_config())
+
+    def test_agents_folder_is_linked_to_the_release_and_never_replaced(self):
+        config = self.home/".config/term-llm"
+        agents = config/"agents"
+        agents.mkdir(parents=True)
+        target = str(self.m.P/"current/integrations/term-llm")
+        # Earlier installs: an empty folder, perhaps with their exact per-agent links.
+        os.symlink(self.m.P/"current/integrations/term-llm/migration-data", agents/"migration-data")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(self.m.link_agents())
+        self.assertEqual(target, os.readlink(agents))
+        self.assertTrue(self.m.link_agents())  # idempotent
+        agents.unlink()
+        for setup in ("folder with an agent of the engineer's", "link elsewhere", "file"):
+            with self.subTest(setup=setup), contextlib.redirect_stdout(io.StringIO()) as out:
+                if setup.startswith("folder"):
+                    (agents/"mine").mkdir(parents=True)
+                elif setup == "link elsewhere":
+                    agents.symlink_to("/elsewhere")
+                else:
+                    agents.write_text("x")
+                self.assertFalse(self.m.link_agents())
+                self.assertIn("METAL_AGENTS_NOT_LINKED", out.getvalue())
+                self.assertTrue(agents.is_symlink() or agents.exists())
+                if setup.startswith("folder"):
+                    self.assertTrue((agents/"mine").is_dir())
+                    shutil.rmtree(agents)
+                else:
+                    agents.unlink()
+
+    def test_search_path_is_removed_only_once_the_agents_are_linked_and_listed(self):
+        config = self.home/".config/term-llm"
+        config.mkdir(parents=True)
+        release = str(self.m.P/"current/integrations/term-llm")
+        text = "# keep me\nproviders:\n  x:\n    api_key: $(op read \"op://a/b\")\nagents:\n  use_builtin: false\n  search_paths:\n    - " + release + "\n"
+        (config/"config.yaml").write_text(text)
+        (config/"config.yaml").chmod(0o600)
+        for name in self.m.MIGRATION_AGENTS:
+            (self.m.P/"current/integrations/term-llm"/name).mkdir(parents=True)
+            (self.m.P/"current/integrations/term-llm"/name/"agent.yaml").write_text("name: " + name + "\n")
+        user = "Available agents (5):\n\n  [user] /h/.config/term-llm/agents/\n" + "".join("    " + n + " - x\n" for n in self.m.MIGRATION_AGENTS)
+        # term-llm doesn't list them without the search path: config.yaml is put back as it was.
+        with patch.object(self.m, "output", return_value="Available agents (0):\n"), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(self.m.trust_agents(as_account=False))
+        self.assertEqual(text, (config/"config.yaml").read_text())
+        self.assertIn("config.yaml put back", out.getvalue())
+        with patch.object(self.m, "output", return_value=user):
+            self.assertTrue(self.m.trust_agents(as_account=False))
+        self.assertEqual("# keep me\nproviders:\n  x:\n    api_key: $(op read \"op://a/b\")\nagents:\n  use_builtin: false\n", (config/"config.yaml").read_text())
+        self.assertEqual(0o600, stat.S_IMODE((config/"config.yaml").stat().st_mode))
+        self.assertEqual(release, os.readlink(config/"agents"))
+        # Not linked (an engineer's folder): the search path stays, so the agents keep working.
+        (config/"agents").unlink()
+        (config/"agents/mine").mkdir(parents=True)
+        (config/"config.yaml").write_text(text)
+        with patch.object(self.m, "output", return_value=user), contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(self.m.trust_agents(as_account=False))
+        self.assertEqual(text, (config/"config.yaml").read_text())
+        # A search path still listing them is not trusted.
+        shutil.rmtree(config/"agents")
+        with patch.object(self.m, "output", return_value=user.replace("[user] /h/.config/term-llm/agents/", "[search-path] /x")):
+            self.assertFalse(self.m.trust_agents(as_account=False))
+
+    def test_search_path_edit_handles_the_shapes_written_and_refuses_others(self):
+        self.m.P = Path("/srv/silo-migrate")
+        release = "/srv/silo-migrate/current/integrations/term-llm"
+        cases = [
+            ("agents:\n  use_builtin: false\n  search_paths:\n    - " + release + "\nmcp:\n  servers: {}\n", "agents:\n  use_builtin: false\nmcp:\n  servers: {}\n"),
+            ("agents:\n  search_paths:\n    - /other\n    - '" + release + "/'  # c\n  use_builtin: false\n", "agents:\n  search_paths:\n    - /other\n  use_builtin: false\n"),
+            ("agents:\n  search_paths: [" + release + ", /o]\n", "agents:\n  search_paths: [/o]\n"),
+            ("agents:\n  search_paths:\n  - " + release + "\n  use_builtin: false\n", "agents:\n  use_builtin: false\n"),
+            ("agents:\n  use_builtin: false\n", None),
+            ("agents:\n  search_paths: []\n", None),
+            ("providers: {}\n", None),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(expected, self.m.without_release_search_path(text))
+        for text in ("agents:\n  search_paths:\n    nested: x\n", "agents:\n  search_paths: " + release + "\n", "agents:\n  x: 1\nagents:\n  y: 2\n"):
+            with self.subTest(text=text), self.assertRaisesRegex(self.m.Refusal, "METAL_AGENTS_CONFIG"):
+                self.m.without_release_search_path(text)
 
     def test_update_and_rollback_refuse_held_lock(self):
         path = self.m.W/"ws/.silo-migrate/named/standard"
@@ -542,10 +732,11 @@ class InstallerTests(unittest.TestCase):
         self.m.record({"commit": a, "term_llm_version": "0.9.93"}, "apply")
         for refreshed, expected in ((True, "METAL_SERVICE_UPDATED\nMETAL_UNCHANGED\n"), (False, "METAL_UNCHANGED\n")):
             with self.subTest(refreshed=refreshed), patch.object(self.m, "resolve", return_value=a), \
-                    patch.object(self.m, "refresh_service", return_value=refreshed) as refresh, \
+                    patch.object(self.m, "refresh_service", return_value=refreshed) as refresh, self.node_steps() as steps, \
                     patch.object(self.m, "fetch_release") as fetch, contextlib.redirect_stdout(io.StringIO()) as out:
                 self.m.account_update(False)
-            refresh.assert_called_once_with()
+            refresh.assert_called_once_with(force=False)
+            self.assertEqual(["term_llm_current", "trust_agents", "project_default_agent", "mcp_rules"], steps)
             fetch.assert_not_called()
             self.assertEqual(expected, out.getvalue())
 
@@ -562,7 +753,8 @@ class InstallerTests(unittest.TestCase):
         backup = self.m.W/"ws/backups/retained.tar.gz"
         backup.write_bytes(b"do-not-touch")
         stat = backup.stat()
-        with patch.object(self.m, "resolve", return_value=b), patch.object(self.m, "fetch_release", return_value=P/"releases"/b), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(self.m, "resolve", return_value=b), patch.object(self.m, "fetch_release", return_value=P/"releases"/b), \
+                self.node_steps(), contextlib.redirect_stdout(io.StringIO()):
             self.m.account_update(False)
             self.m.account_update(True)
         self.assertEqual(a, (P/"current").resolve().name)

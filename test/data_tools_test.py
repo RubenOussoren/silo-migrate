@@ -100,6 +100,24 @@ class FakeControl:
         raise AssertionError(argv)
 
 
+FAKE_TERM_LLM = """#!/usr/bin/env python3
+import os, sys
+top = os.path.dirname(os.environ['XDG_CONFIG_HOME'])  # term-llm gets only HOME, PATH, LANG and this
+with open(os.path.join(top, 'term-calls'), 'a') as out:
+    out.write(' '.join(sys.argv[1:]) + '\\n')
+if os.path.exists(os.path.join(top, 'term-fails')) or sys.argv[1:3] != ['config', 'set']:
+    sys.exit(1)
+name = sys.argv[3].split('.')[2]
+path = os.path.join(os.environ['XDG_CONFIG_HOME'], 'term-llm', 'config.yaml')
+os.makedirs(os.path.dirname(path), exist_ok=True)
+text = open(path).read() if os.path.exists(path) else 'providers: {}\\n'
+if 'mcp:' not in text:
+    text += 'mcp:\\n  servers:\\n'
+text += '    ' + name + ':\\n      agents:\\n        - ' + sys.argv[4] + '\\n'
+open(path, 'w').write(text)
+"""
+
+
 class FakeDocker:
     def __init__(self):
         self.calls = []
@@ -206,6 +224,22 @@ class DataToolsTest(unittest.TestCase):
         environ = mock.patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.config_home)})
         environ.start()
         self.addCleanup(environ.stop)
+        # term-llm's `config set`, faked: it records the call and appends the rule the way term-llm
+        # writes it. Never the term-llm on PATH.
+        self.term = top / 'fake-term-llm'
+        self.term.write_text(FAKE_TERM_LLM)
+        self.term.chmod(0o700)
+        self.term_calls = top / 'term-calls'
+        term = mock.patch.object(self.d, 'term_llm_command', return_value=str(self.term))
+        term.start()
+        self.addCleanup(term.stop)
+
+    def rules(self):
+        path = self.config_home / 'term-llm/config.yaml'
+        return self.d.mcp_rules_of(path.read_text()) if path.exists() else {}
+
+    def term_calls_made(self):
+        return self.term_calls.read_text().splitlines() if self.term_calls.exists() else []
 
     def content_id(self, ref):
         profile = json.loads((ROOT / 'runtime/profiles/discourse-2026.11.0-latest-3158c750.json').read_text())
@@ -667,22 +701,28 @@ class DataToolsTest(unittest.TestCase):
         self.assertEqual(mine, config['servers']['mine'])
         self.assertTrue(config['top_extra'])
         entry = config['servers']['db-arc']
-        self.assertEqual(['migration-data'], entry['agents'])
+        self.assertEqual({'command', 'args'}, set(entry))  # the limit is config.yaml's rule, not a key here
         self.assertEqual(['dbhub', 'arc'], entry['args'])
         self.assertTrue(entry['command'].endswith('/bin/silo-migrate-control'))
         self.assertEqual(0o600, stat.S_IMODE((self.config_home / 'term-llm/mcp.json').stat().st_mode))
-        # term-llm 0.9.93 drops `agents` when its web UI rewrites mcp.json: status puts it back.
-        del config['servers']['db-arc']['agents']
+        self.assertEqual(['migration-data'], self.rules()['db-arc'])
+        self.assertEqual(['config set mcp.servers.db-arc.agents migration-data'], self.term_calls_made())  # once: then it's there
+        # An entry written by an earlier release (with `agents` in mcp.json) is rewritten once.
+        config['servers']['db-arc']['agents'] = ['migration-data']
         (self.config_home / 'term-llm/mcp.json').write_text(json.dumps(config))
         self.docker.image_present = False
         self.docker.calls.clear()
         repaired = self.op('db_status')['queries']
         self.assertEqual('added', repaired['registration'])
-        self.assertEqual(['migration-data'], self.mcp()['servers']['db-arc']['agents'])
+        self.assertNotIn('agents', self.mcp()['servers']['db-arc'])
         self.assertEqual([], self.docker.argvs('pull'))  # status never pulls
         self.assertIn('data_db_up', repaired['image'])
         audit = [json.loads(line) for line in (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text().splitlines()]
         self.assertEqual(2, sum(1 for entry in audit if entry['op'] == 'mcp_register'))
+        # A rule someone took out of config.yaml is put back by status.
+        (self.config_home / 'term-llm/config.yaml').write_text('providers: {}\n')
+        self.assertEqual('registered', self.op('db_status')['queries']['registration'])
+        self.assertEqual(['migration-data'], self.rules()['db-arc'])
         # Someone else's server with that name is left alone.
         config = self.mcp()
         config['servers']['db-arc'] = {'command': 'npx', 'args': ['my-db']}
@@ -691,6 +731,7 @@ class DataToolsTest(unittest.TestCase):
         self.assertEqual(['my-db'], self.mcp()['servers']['db-arc']['args'])
         self.op('db_reset', confirm=True)
         self.assertEqual(['my-db'], self.mcp()['servers']['db-arc']['args'])
+        self.assertEqual(['migration-data'], self.rules()['db-arc'])  # the rule outlives the server
         self.op('db_up', engine='mariadb')
         del config['servers']['db-arc']
         (self.config_home / 'term-llm/mcp.json').write_text(json.dumps(config))
@@ -735,6 +776,45 @@ class DataToolsTest(unittest.TestCase):
         for bad in (['dbhub'], ['dbhub', '../x'], ['dbhub', 'arc', 'extra']):
             with self.subTest(args=bad), self.assertRaises(self.d.Refusal):
                 self.d.dbhub_main(bad, self.values, self.base, ROOT, self.host)
+
+    def test_a_database_is_never_listed_without_its_rule(self):
+        self.create()
+        (self.config_home / 'term-llm').mkdir(parents=True)
+        (self.term_calls.parent / 'term-fails').touch()
+        queries = self.op('db_up', engine='mariadb')['queries']
+        self.assertIn("couldn't be limited to migration-data", queries['registration'])
+        self.assertNotIn('db-arc', (self.mcp() if (self.config_home / 'term-llm/mcp.json').exists() else {'servers': {}})['servers'])
+        (self.term_calls.parent / 'term-fails').unlink()
+        self.assertEqual('added', self.op('db_status')['queries']['registration'])
+        self.assertEqual(['migration-data'], self.rules()['db-arc'])
+
+    def test_mcp_rules_limits_every_project_database_and_names_none(self):
+        (self.config_home / 'term-llm').mkdir(parents=True)
+        servers = {'db-arc': {'command': 'c', 'args': ['dbhub', 'arc']}, 'db-other': {'command': 'c', 'args': ['dbhub', 'other']},
+                   'db-mine': {'command': 'npx', 'args': ['x']}, 'playwright': {'command': 'npx', 'args': []}}
+        (self.config_home / 'term-llm/mcp.json').write_text(json.dumps({'servers': servers}))
+        (self.config_home / 'term-llm/config.yaml').write_text('providers: {}\nmcp:\n  servers:\n    db-arc:\n      agents:\n        - migration-data\n')
+        out = io.StringIO()
+        with mock.patch('sys.stdout', out):
+            self.assertEqual(0, self.d.mcp_rules_main(['mcp-rules'], self.values, self.base, ROOT))
+        self.assertEqual({'version': 1, 'project_servers': 2, 'limited_to_migration_data': 2}, json.loads(out.getvalue()))
+        self.assertEqual({'db-arc': ['migration-data'], 'db-other': ['migration-data']}, self.rules())
+        self.assertEqual(['config set mcp.servers.db-other.agents migration-data'], self.term_calls_made())  # only the missing one
+        self.assertNotIn('arc', out.getvalue())
+        (self.config_home / 'term-llm/config.yaml').write_text('providers: {}\n')
+        (self.term_calls.parent / 'term-fails').touch()
+        with mock.patch('sys.stdout', io.StringIO()), self.assertRaisesRegex(self.d.Refusal, 'not every project database'):
+            self.d.mcp_rules_main(['mcp-rules'], self.values, self.base, ROOT)
+
+    def test_reads_the_rules_term_llm_writes_and_refuses_what_it_cant_read(self):
+        text = ('providers:\n  x:\n    api_key: $(op read "op://a/b")\nmcp:\n  servers:\n    db-arc:\n      agents:\n        - migration-data\n'
+                '    "db-q":\n      agents: [migration-data, other]  # two\n    db-none:\n      agents: []\n    plain:\n      foo: bar\nagents:\n  use_builtin: false\n')
+        self.assertEqual({'db-arc': ['migration-data'], 'db-q': ['migration-data', 'other'], 'db-none': []}, self.d.mcp_rules_of(text))
+        self.assertEqual({}, self.d.mcp_rules_of('providers: {}\n'))
+        self.assertEqual({}, self.d.mcp_rules_of('mcp:\n  servers: {}\n'))
+        for bad in ('mcp:\n  servers:\n    db-x:\n      agents:\n        - a\n       - b\n', 'mcp:\n  servers: [1\n', 'mcp:\n  servers: {}\nmcp:\n  x: 1\n'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.d.mcp_rules_of(bad)
 
     def test_db_reset_stops_dbhub_and_removes_its_entry(self):
         self.create()

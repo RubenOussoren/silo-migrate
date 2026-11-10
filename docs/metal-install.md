@@ -122,10 +122,14 @@ configuration; workspaces may be separate or exactly `P/workspaces`, never
 elsewhere overlapping the prefix. Stale installer-owned `.metal-link-*` symlinks
 are cleaned without deleting ordinary files.
 
-The pinned term-llm v0.9.93 linux_amd64 archive must match **both** the installer
-SHA256 `2d264d175d7f8a7108a3d3530338efa2b81dadcaf5ce02c3d0f701fa88ad3d4e`
+The pinned term-llm v0.9.99 linux_amd64 archive must match **both** the installer
+SHA256 `1c2004cf869e9470e605197f386347ff938ab88e431edb3637ee65b95c24cc8f`
 and release `checksums.txt`. A binary hash receipt detects later corruption.
-`bin/term-llm` points at `term-llm/0.9.93/term-llm`.
+`bin/term-llm` points at `term-llm/0.9.99/term-llm`. The release decides the version: `metal update`
+(and so `silo update`) installs it when `bin/term-llm` is another one, keeps the old one as
+`bin/term-llm.previous` (for `metal rollback --term-llm`) and re-installs the service once. A
+`metal.conf` still naming 0.9.93 (the old example) gets the release's version, with a note; any
+other unpinned version is refused (`METAL_VERSION_UNPINNED`).
 `etc/silo-control.env` provides:
 
 - `SILO_MIGRATE_BASE_PATH`: workspace root;
@@ -141,14 +145,24 @@ installation; images/cache loading is explicitly skipped and status says so.
 
 Fresh term-llm directories get config-only provider discovery, empty providers,
 `approval.default_mode: prompt`, `serve.approval_mode: prompt`, empty
-`serve.extensions`, `serve.auto_title: false`, and `serve.projects.enabled: false`.
-Existing config/data are never overwritten or imported. Agents are found through `agents.search_paths` = `<prefix>/current/integrations/term-llm`
-(term-llm skips symlinked agent folders when listing, so the web picker showed
-nothing with per-agent links; earlier installer-created links are removed). A
+`serve.extensions`, `serve.auto_title: false`, `serve.projects.enabled: true`, and
+`web.project_default_agent: migration-data` (term-llm 0.9.96+ won't serve web UI projects unless
+that names an available agent; its default, the built-in `developer`, is off here, so apply and
+update set it when it isn't one of the node's agents).
+Existing config/data are never overwritten or imported. **Agents** come from
+`~/.config/term-llm/agents`, a link to `<prefix>/current/integrations/term-llm` that apply and update
+create (term-llm lists a linked agents folder but skips linked agent folders inside it; an empty
+folder and earlier per-agent links are replaced, anything else is left and reported). term-llm
+0.9.96+ applies an MCP server's `agents:` rule only to agents found there or built in, and from
+0.9.99 a web chat with a search-path agent doesn't start; when a chat continues, a search-path
+folder with the same name also takes the trust away. So once the link is in place, the release
+path is taken out of `agents.search_paths` (only that entry; a shape it doesn't recognise is left,
+with `METAL_AGENTS_CONFIG`), and `config.yaml` is put back if term-llm then doesn't list the agents.
+Earlier installs found the agents through that search path. A
 conflicting existing agent of the same name is refused. Existing config safety requires manual review,
 especially before any customer data. Same-user agents are not OS isolation.
 
-Confirmed against the **real 0.9.93 binary's help**: `service install web`,
+Confirmed against the **real 0.9.99 binary's help** (and before it 0.9.93's): `service install web`,
 `--binary`, `--no-start`, `--dry-run`, and serve flags `--host`, `--port`,
 `--auth bearer`, `--approval prompt`, `--projects`, and only the release's own Findings
 widget and extension (`--widgets-dir <prefix>/current/integrations/term-llm/widgets
@@ -157,7 +171,7 @@ nothing from `~/.config/term-llm/{widgets,extensions}`). No startup agent is pin
 agent picker. Instead the account's config sets `agents.use_builtin: false`, so the
 picker offers only `migration-operator`, `migration-data`, `server-support`,
 `converter-developer` and `converter-reviewer` (plus term-llm's plain "Default" chat). Fresh
-configs get this and the agents search path; for an existing config, plan refuses
+configs get this and the linked agents folder; for an existing config, plan refuses
 (`METAL_AGENTS_CONFIG`) unless `term-llm agents` lists exactly the agents shipped in the
 release `current` points to, and apply requires exactly these five after switching,
 because built-in shell agents would otherwise run with the account's Docker authority
@@ -180,7 +194,7 @@ can still `chmod` it back, which takes an explicit, visible command.
 `server-support` (ChatGPT, or Frontier in a new chat) helps keep the node running. Its
 shell has the account's **root-equivalent Docker authority**; with the service's
 `--approval prompt`, each command and each `edit_file`/`write_file` write asks the engineer
-(agents have no pre-approved write directories in term-llm 0.9.93). Choose "once" in the
+(agents have no pre-approved write directories in term-llm). Choose "once" in the
 prompt: directory or command grants last for the session. Its own read tools run without a
 prompt and are hard-limited: in `~/.config/term-llm` only `config.yaml`, `agents/`, `skills/`
 and `services/*/service.json`; in `~/.config/op-cache` only `config.yaml`; and

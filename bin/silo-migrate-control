@@ -327,6 +327,9 @@ def main(args):
         return host_data(args, values, base, self)
     if args[:1] == ["remove-project"]:
         return host_remove(args, values, base)
+    if args[:1] == ["mcp-rules"]:
+        # Host-only: each project database's MCP rule in term-llm's config.yaml (run by the installer).
+        return data_tools().mcp_rules_main(args, values, base, repo)
     image = values.get("SILO_CONTROL_IMAGE_REF", CONTROL_REF) if configured else CONTROL_REF.split("@", 1)[1]
     if configured:
         control = control_image(repo, values, base, args)

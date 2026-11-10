@@ -120,10 +120,20 @@ and the web UI keeps chats apart:
 ### Free SQL: DBHub
 
 When a project's source database is up (`data_db_up`, and every `data_db_status`), the tools
-register an MCP server for it in `~/.config/term-llm/mcp.json`:
+register an MCP server for it in `~/.config/term-llm/mcp.json`, after first writing the rule that
+only migration-data may use it into `~/.config/term-llm/config.yaml` (with term-llm's own
+`config set`, which keeps the rest of the file):
 
 ```json
-"db-arc": {"command": "/srv/silo-migrate/bin/silo-migrate-control", "args": ["dbhub", "arc"], "agents": ["migration-data"]}
+"db-arc": {"command": "/srv/silo-migrate/bin/silo-migrate-control", "args": ["dbhub", "arc"]}
+```
+
+```yaml
+mcp:
+  servers:
+    db-arc:
+      agents:
+        - migration-data
 ```
 
 To use it, in a **migration-data** chat for that project open the MCP button and turn on
@@ -137,16 +147,22 @@ environment, never argv or the config file; like any container environment it sh
 stops it and removes the entry; an `mcp.json` entry named `db-<project>` that silo-migrate
 didn't write is left alone.
 
-**Until term-llm enforces `agents:`** (SamSaffron/term-llm#1332; 0.9.93 ignores the field, and
-its web UI drops it when it rewrites `mcp.json`), any chat's MCP button can turn on a `db-*`
-server. Turn them on **only in migration-data chats**; the other agents are told not to use
-them. `silo doctor` warns while this applies, and `data_db_status` puts a dropped limit back.
+term-llm 0.9.96+ enforces the rule (SamSaffron/term-llm#1341): another agent's chat, or a chat
+with no agent, is refused the server, also after a restart. It trusts only agents loaded from
+`~/.config/term-llm/agents`, which is why that folder links to the release and the release isn't
+on `agents.search_paths` (a search-path folder of the same name takes migration-data's access away).
+The rule stays when the server goes (`data_db_reset`, Remove project), so a project re-created
+under the same name is limited from the start. `silo update` writes the rule for every project
+database already registered (`silo-migrate-control mcp-rules`, counts only); `silo doctor`'s DBHub
+check is OK when every one has it, term-llm enforces it and the agents are trusted, and
+`data_db_status` puts a missing rule back. A rollback to term-llm 0.9.93 ignores the rule: then
+turn `db-*` servers on only in migration-data chats.
 
 **Skills** ship in the release (`integrations/term-llm/skills`) and reach the account through
 the link `~/.config/term-llm/skills` → `<prefix>/current/integrations/term-llm/skills` that
 `metal apply/update` creates if absent (doctor shows the fix otherwise). Each agent's
 `skills:` decides what it sees: migration-data gets all of them, the others none (term-llm
-0.9.93 can't give an agent a subset).
+0.9.93 couldn't give an agent a subset; not rechecked on 0.9.99).
 
 ## Converter review (agents)
 
@@ -184,7 +200,7 @@ term-llm accepts its POSTs only from the web UI's own origin (or with the bearer
 widget also requires its page's header. No agent has the web UI sign-in, and `read_url` refuses
 local addresses anyway. Only you see proposed text in the browser, as you already do in Frontier
 chats. The page and extensions come from the sealed release; nothing else is loaded. The Findings and
-Runs code under `widgets/` is the page's library: same checks and commands as before, no pages of its own. term-llm 0.9.93 keeps widget sockets in the fixed folder `/tmp/term-llm-widgets` without
+Runs code under `widgets/` is the page's library: same checks and commands as before, no pages of its own. term-llm (0.9.93 to 0.9.99) keeps widget sockets in the fixed folder `/tmp/term-llm-widgets` without
 checking its owner, so the installer reserves it for the service account (now and at every boot,
 `/etc/tmpfiles.d/silo-migrate-term-llm.conf`), the widget refuses to start unless the folder is the
 account's and private, and doctor's "widget folder" check fails otherwise. Without the widget (doctor's "findings widget" check), use the CLI in

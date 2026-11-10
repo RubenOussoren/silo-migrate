@@ -207,13 +207,24 @@ def private_file(path, uid):
     return stat.S_ISREG(info.st_mode) and info.st_uid == uid and not info.st_mode & 0o077
 
 
-# term-llm 0.9.93's fixed widget socket folder, and the installer's boot-time reservation of it.
+# term-llm's fixed widget socket folder (0.9.93 to 0.9.99), and the installer's boot-time reservation of it.
 WIDGET_RUNTIME = Path("/tmp/term-llm-widgets")
 WIDGET_TMPFILES = Path("/etc/tmpfiles.d/silo-migrate-term-llm.conf")
 
-# The first term-llm release that enforces `agents:` in mcp.json (SamSaffron/term-llm#1332);
-# None until one is pinned. Older releases ignore the field, so any chat can turn DBHub on.
-MCP_AGENTS_SINCE = None
+# The first term-llm release that enforces config.yaml's mcp.servers.NAME.agents
+# (SamSaffron/term-llm#1341), for agents loaded from ~/.config/term-llm/agents. Older releases
+# ignore it, so any chat could turn DBHub on.
+MCP_AGENTS_SINCE = (0, 9, 96)
+
+
+def release_module(name):
+    """A module from beside this file (bin/), never from sys.path or the working directory."""
+    import importlib.util
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("silo_" + name, SELF.parent / (name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def term_llm_version(entry, runner):
@@ -221,30 +232,40 @@ def term_llm_version(entry, runner):
     return tuple(int(part) for part in match.groups()) if match else None
 
 
-def dbhub_check(add, entry, runner):
-    """Projects' DBHub servers (db-<project>) must be limited to migration-data, and term-llm must enforce it.
-    Only counts are printed: project names can identify customers."""
+def dbhub_check(add, entry, runner, trusted):
+    """Projects' DBHub servers (db-<project>) must have config.yaml's rule limiting them to
+    migration-data, term-llm must enforce it, and migration-data must be an agent the rule can name
+    (`trusted`, from the agents check). Only counts are printed: project names can identify customers."""
+    config = Path(entry.pw_dir) / ".config/term-llm"
     try:
-        servers = json.loads((Path(entry.pw_dir) / ".config/term-llm/mcp.json").read_text()).get("servers") or {}
+        servers = json.loads((config / "mcp.json").read_text()).get("servers") or {}
+        tools = release_module("data_tools")
+        ours = tools.silo_servers(servers if isinstance(servers, dict) else {})
     except FileNotFoundError:
-        servers = {}
+        ours = {}
     except (OSError, ValueError, AttributeError):
         add("WARN", "DBHub", "~/.config/term-llm/mcp.json can't be read")
         return
-    ours = {name: server for name, server in servers.items() if name.startswith("db-") and isinstance(server, dict) and (server.get("args") or [None])[0] == "dbhub"}
     if not ours:
         add("OK", "DBHub", "no project database servers yet")
         return
-    open_ = sum(1 for server in ours.values() if server.get("agents") != ["migration-data"])
+    try:
+        rules = tools.mcp_rules_of((config / "config.yaml").read_text())
+    except (OSError, ValueError, UnicodeDecodeError):
+        add("WARN", "DBHub", "the agents rules in ~/.config/term-llm/config.yaml can't be read", "check its mcp: section, then silo update")
+        return
+    open_ = sum(1 for name in ours if rules.get(name) != ["migration-data"])
     if open_:
-        add("WARN", "DBHub", "%d of %d project servers not limited to migration-data" % (open_, len(ours)),
-            "in a migration-data chat for each project, run data_db_status (it puts the limit back)")
+        add("WARN", "DBHub", "%d of %d project servers not limited to migration-data" % (open_, len(ours)), "silo update (it writes the rules)")
         return
     version = term_llm_version(entry, runner)
-    enforced = bool(MCP_AGENTS_SINCE and version and version >= MCP_AGENTS_SINCE)
-    add("OK" if enforced else "WARN", "DBHub", "%d project servers, limited to migration-data" % len(ours) + ("" if enforced else
-        "; term-llm %s doesn't enforce the limit yet: turn db-* servers on only in migration-data chats" % (".".join(map(str, version)) if version else "?")),
-        None if enforced else "update term-llm once a release includes SamSaffron/term-llm#1332")
+    if not (version and version >= MCP_AGENTS_SINCE):
+        add("WARN", "DBHub", "%d project servers, limited to migration-data, but term-llm %s doesn't enforce it: turn db-* servers on only in "
+            "migration-data chats" % (len(ours), ".".join(map(str, version)) if version else "?"), "silo update")
+        return
+    add("OK" if trusted else "WARN", "DBHub", "%d project servers, only migration-data can use them" % len(ours) if trusted else
+        "%d project servers limited to migration-data, but the agents aren't loaded from ~/.config/term-llm/agents, so it can't use them" % len(ours),
+        None if trusted else "silo update")
 
 
 def doctor_checks(entry, runner=run):
@@ -282,10 +303,25 @@ def doctor_checks(entry, runner=run):
     add("OK" if active else "FAIL", "web service", "active" if active else "not active", None if active else "silo restart")
 
     expected = shipped_agents(current)
-    count, names, builtin = listed_agents(runner(as_account([term_llm(), "agents"], entry), timeout=30).stdout)
+    listing = runner(as_account([term_llm(), "agents"], entry), timeout=30).stdout or ""
+    count, names, builtin = listed_agents(listing)
     good = not builtin and count == len(expected) and names == expected
-    add("OK" if good else "FAIL", "agents", (str(count) + " listed: " + ", ".join(names)) if names else "none listed",
-        None if good else "check agents.use_builtin: false and agents.search_paths in ~/.config/term-llm/config.yaml, then silo restart")
+    # MCP rules name only agents from ~/.config/term-llm/agents (term-llm#1341), linked to the release.
+    trusted = good and "  [user] " in listing and "[search-path]" not in listing
+    release_agents = str(PREFIX / "current/integrations/term-llm")
+    add("OK" if trusted else "FAIL", "agents", ((str(count) + " listed: " + ", ".join(names)) if names else "none listed")
+        + ("" if trusted or not good else ", but not from ~/.config/term-llm/agents"),
+        None if trusted else ("silo update (it links ~/.config/term-llm/agents to the release and takes the release out of agents.search_paths); "
+                              "if it says METAL_AGENTS_NOT_LINKED or METAL_AGENTS_CONFIG, move ~/.config/term-llm/agents aside, take "
+                              + release_agents + " out of agents.search_paths in ~/.config/term-llm/config.yaml, then silo update") if good else
+        "check agents.use_builtin: false in ~/.config/term-llm/config.yaml and that ~/.config/term-llm/agents links to " + release_agents + ", then silo update")
+
+    # term-llm 0.9.96+ won't serve web UI projects unless their new chats' agent is an available one.
+    version = term_llm_version(entry, runner)
+    if version and version >= MCP_AGENTS_SINCE:
+        lead = (runner(as_account([term_llm(), "config", "get", "web.project_default_agent"], entry), timeout=30).stdout or "").strip()
+        add("OK" if lead in expected else "FAIL", "default agent", ("new project chats start with " + lead) if lead in expected else
+            "web.project_default_agent isn't one of the node's agents: the web UI won't start", None if lead in expected else "silo update")
 
     home = Path(entry.pw_dir)
     shipped_skills = current / "integrations/term-llm/skills"
@@ -321,7 +357,7 @@ def doctor_checks(entry, runner=run):
         add("OK" if reserved else "WARN", "widget folder", "reserved for " + entry.pw_name + " at boot" if reserved else str(WIDGET_RUNTIME) + " not reserved",
             None if reserved else "silo update")
 
-    dbhub_check(add, entry, runner)
+    dbhub_check(add, entry, runner, trusted)
 
     chatgpt = (home / ".config/term-llm/chatgpt_oauth.json").is_file()
     add("OK" if chatgpt else "FAIL", "ChatGPT sign-in", "credential present" if chatgpt else "not signed in",

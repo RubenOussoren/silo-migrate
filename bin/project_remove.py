@@ -17,7 +17,7 @@ it. Everything a project leaves belongs to this account:
   term-llm  its chats and their agents' chats (sessions.db; deleted one by one with
             `term-llm sessions delete`, children first), their attachments (uploads/, upload-refs/)
             and the folder's handover files. A full removal archives the web UI project: term-llm
-            0.9.93 can't delete one, and `silo intake` brings it back empty.
+            (0.9.93 to 0.9.99) can't delete one, and `silo intake` brings it back empty.
 
 Start over (--keep-received) first puts each file taken from the drop folder back where it was, then
 keeps the drop folder, the chats' folder (emptied) and the web UI project (with no chats). It refuses

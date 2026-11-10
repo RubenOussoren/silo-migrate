@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import tarfile
@@ -340,13 +341,14 @@ class Workspace:
 
 
 class Locked:
-    def __init__(self, path):
+    def __init__(self, path, wait=False):
         self.path = path
+        self.wait = wait
 
     def __enter__(self):
         self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(self.fd, fcntl.LOCK_EX | (0 if self.wait else fcntl.LOCK_NB))
         except BlockingIOError:
             os.close(self.fd)
             refuse("STANDARD_BUSY")
@@ -1708,12 +1710,14 @@ def op_db_reset(ws, request):
 
 # -- DBHub: free read-only queries over MCP ------------------------------------------------
 # Each project's source database gets one MCP server in term-llm's mcp.json, `db-<project>`,
-# limited to migration-data with `agents:`. term-llm starts it per chat as
+# and a rule in config.yaml (mcp.servers.db-<project>.agents: [migration-data]) that term-llm
+# 0.9.96+ enforces (SamSaffron/term-llm#1341): only migration-data, loaded from
+# ~/.config/term-llm/agents, may turn it on. The rule is written first, so the server is never
+# listed without it; it stays when the server goes, so a project re-created under the same
+# name is limited from the start. term-llm starts the server per chat as
 # `silo-migrate-control dbhub <project>` (stdio), which runs DBHub in a container on the
-# project's internal network as the read-only user. term-llm 0.9.93 ignores `agents:` (and
-# drops it when the web UI rewrites mcp.json): until the pinned term-llm enforces it, any
-# chat's MCP button can switch it on, so `silo doctor` warns and every data_db_up /
-# data_db_status puts the entry back as it should be.
+# project's internal network as the read-only user. Every data_db_up / data_db_status puts
+# the entry and the rule back if someone changed them.
 
 DBHUB_IMAGE = "bytebase/dbhub:1.5.1@sha256:86edce0447fd9d4bd9eeb7cea7dd3b83473b732a0c437c552b36004c034ff5a9"
 DBHUB_MAX_ROWS = 50
@@ -1722,8 +1726,144 @@ DBHUB_DSN = {"mariadb": "mariadb://" + RO_USER + ":${DB_PASSWORD}@source-db:3306
              "postgres": "postgres://" + RO_USER + ":${DB_PASSWORD}@source-db:5432/source?sslmode=disable"}
 
 
+def term_llm_config_dir():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")) / "term-llm"
+
+
 def mcp_config_path():
-    return Path(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")) / "term-llm" / "mcp.json"
+    return term_llm_config_dir() / "mcp.json"
+
+
+def yaml_scalar(raw):
+    value = re.sub(r"\s+#.*$", "", raw).strip()
+    if value in ("", "~", "null"):
+        return None
+    if value == "{}":
+        return {}
+    if value.startswith("["):
+        if not value.endswith("]"):
+            raise ValueError("flow list")
+        return [yaml_scalar(item) for item in value[1:-1].split(",") if item.strip()]
+    if len(value) > 1 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def yaml_tree(entries, pos, indent):
+    """The block at exactly `indent` from entries[pos]: a mapping, or a list of scalars. Enough for the
+    mcp: section term-llm writes; anything else raises ValueError (callers then say it can't be read)."""
+    if entries[pos][1].startswith("- ") or entries[pos][1] == "-":
+        items = []
+        while pos < len(entries) and entries[pos][0] == indent and (entries[pos][1].startswith("- ") or entries[pos][1] == "-"):
+            items.append(yaml_scalar(entries[pos][1][1:]))
+            pos += 1
+        return items, pos
+    mapping = {}
+    while pos < len(entries) and entries[pos][0] == indent:
+        match = re.fullmatch(r"(\"[^\"]*\"|'[^']*'|[^:\s][^:]*?)\s*:(?:\s+(.*))?", entries[pos][1])
+        if not match or entries[pos][1].startswith("- "):
+            raise ValueError("not a mapping")
+        key, rest = yaml_scalar(match[1]), match[2]
+        pos += 1
+        if rest is not None and re.sub(r"\s*#.*$", "", rest).strip():
+            mapping[key] = yaml_scalar(rest)
+        elif pos < len(entries) and (entries[pos][0] > indent or (entries[pos][0] == indent and entries[pos][1].startswith("- "))):
+            mapping[key], pos = yaml_tree(entries, pos, entries[pos][0])
+        else:
+            mapping[key] = None
+    if pos < len(entries) and entries[pos][0] > indent:
+        raise ValueError("indentation")
+    return mapping, pos
+
+
+def mcp_rules_of(text):
+    """{server: agents} from config.yaml's mcp.servers.NAME.agents, for the servers that have one."""
+    lines = text.split("\n")
+    starts = [i for i, line in enumerate(lines) if re.fullmatch(r"mcp:\s*(#.*)?", line)]
+    if not starts:
+        return {}
+    if len(starts) > 1:
+        raise ValueError("two mcp sections")
+    entries = []
+    for line in lines[starts[0] + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace():
+            break
+        if "\t" in line[:len(line) - len(line.lstrip())]:
+            raise ValueError("tab indentation")
+        entries.append((len(line) - len(line.lstrip()), line.strip()))
+    if not entries:
+        return {}
+    section, _ = yaml_tree(entries, 0, entries[0][0])
+    servers = section.get("servers") if isinstance(section, dict) else None
+    if servers is None:
+        return {}
+    if not isinstance(servers, dict):
+        raise ValueError("servers")
+    return {name: rule.get("agents") for name, rule in servers.items() if isinstance(rule, dict) and "agents" in rule}
+
+
+def mcp_rule_present(name):
+    try:
+        return mcp_rules_of((term_llm_config_dir() / "config.yaml").read_text()).get(name) == [MCP_AGENT]
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+
+
+def term_llm_command(prefix):
+    installed = Path(prefix) / "bin/term-llm"
+    return str(installed) if installed.is_file() else shutil.which("term-llm")
+
+
+def mcp_rule(name, term):
+    """Only migration-data may use MCP server NAME: config.yaml's mcp.servers.NAME.agents, written with
+    term-llm's own `config set` (it keeps the rest of the file as it is). True once the file says so."""
+    if mcp_rule_present(name):
+        return True
+    if not term or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", name):
+        return False
+    env = {"HOME": os.path.expanduser("~"), "PATH": os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+    if os.environ.get("XDG_CONFIG_HOME"):
+        env["XDG_CONFIG_HOME"] = os.environ["XDG_CONFIG_HOME"]
+    try:
+        result = subprocess.run([term, "config", "set", "mcp.servers." + name + ".agents", MCP_AGENT], env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and mcp_rule_present(name)
+
+
+def silo_servers(servers):
+    return {name: server for name, server in servers.items()
+            if isinstance(name, str) and name.startswith("db-") and isinstance(server, dict) and (server.get("args") or [None])[0] == "dbhub"}
+
+
+def mcp_lock():
+    path = mcp_config_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return Locked(path.parent / ".mcp.json.silo-lock", wait=True)
+
+
+def mcp_rules_main(args, values, base, repo):
+    """`mcp-rules`: the rule for every project database already in mcp.json (silo update runs it once
+    term-llm can enforce them). Prints counts only: project names can identify customers."""
+    if args != ["mcp-rules"]:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    with mcp_lock():
+        try:
+            servers = json.loads(mcp_config_path().read_text()).get("servers") or {}
+        except FileNotFoundError:
+            servers = {}
+        except (OSError, ValueError, AttributeError):
+            refuse("STANDARD_OPERATION_FAILED: mcp.json can't be read")
+        ours = silo_servers(servers if isinstance(servers, dict) else {})
+        term = term_llm_command(Workspace.repo_prefix(Path(repo), Path(base)))
+        limited = sum(1 for name in ours if mcp_rule(name, term))
+    print(json.dumps({"version": 1, "project_servers": len(ours), "limited_to_migration_data": limited}))
+    if limited != len(ours):
+        refuse("STANDARD_OPERATION_FAILED: not every project database could be limited to migration-data")
+    return 0
 
 
 def mcp_name(ws):
@@ -1734,7 +1874,7 @@ def mcp_entry(ws):
     # The installed shim sets the control config itself; term-llm passes it no environment.
     repo = ws.repo.resolve()
     control = repo.parent.parent / "bin/silo-migrate-control" if repo.parent.name == "releases" else repo / "bin/silo-migrate-control"
-    return {"command": str(control), "args": ["dbhub", ws.name], "agents": [MCP_AGENT]}
+    return {"command": str(control), "args": ["dbhub", ws.name]}
 
 
 def mcp_register(ws, present=True):
@@ -1761,6 +1901,9 @@ def mcp_register(ws, present=True):
         existing = servers.get(name)
         if existing is not None and not (isinstance(existing, dict) and (existing.get("args") or [None])[0] == "dbhub"):
             return "not changed: an existing " + name + " server isn't silo-migrate's; rename it"
+        # The rule first: the server is never listed for a chat that may not use it.
+        if present and not mcp_rule(name, term_llm_command(ws.prefix)):
+            return "not changed: it couldn't be limited to migration-data in term-llm's config.yaml"
         if present and existing == entry:
             return "registered"
         if not present and existing is None:
