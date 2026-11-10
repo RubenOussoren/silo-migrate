@@ -104,7 +104,7 @@ and the web UI keeps chats apart:
   it); customer data stays in the workspace. The lock doesn't reach DBHub: MCP servers start in
   the service's home folder, not the project's, so turning on only the chat's own `db-<project>`
   stays your job (migration-data is told to stop if another project's server is on).
-- **Look and feel:** the web UI uses Varnish by Keegan George (`extensions/varnish`, an unmodified copy; `script/update-varnish COMMIT` replaces it) with our changes kept in `extensions/silo-theme`. Updates are deliberate: this code runs on pages showing customer data, so run the browser tests before shipping one.
+- **Look and feel:** the web UI uses Varnish by Keegan George (`extensions/varnish`, a copy of upstream with one checked compatibility patch; `script/update-varnish COMMIT` replaces it and applies the patch) with our changes kept in `extensions/silo-theme`. Updates are deliberate: this code runs on pages showing customer data, so run the browser tests before shipping one.
 - **The Project page** (a Project tab, and under Widgets) shows one project at a time: which data is in use, where it stands, what to do next. New files are labelled there as Development or Launch, and only there: the agent can't take a file until it's labelled, a plan's approval covers which delivery it uses, and a launch run is refused until accepting a site is built.
 - **What labels guard against:** mixing up data by accident. A script reads one delivery and its outputs belong to it, but migration-data can still read every delivery, so the labels don't stop an agent deliberately copying one delivery's content into another's script.
 - **Rollback and labels:** a release from before labels ignores them. After rolling back, the agent can take unlabelled files again until you roll forward. If a take from before labels was interrupted and shows "ask the engineer", finish it by hand: as the service account, check `.silo-migrate/data/pending/` in the workspace and the file already in `inputs/`, then ask for help.
@@ -233,4 +233,13 @@ for f in test/*_test.py; do python3 -I -B "$f" || echo "FAILED: $f"; done
 python3 -I -B -m unittest discover -s test/metal -p 'test_*.py'
 ```
 
-`test/varnish_bundle_test.py` is what proves the bundled theme is still unmodified.
+`test/varnish_bundle_test.py` is what proves the bundled theme is exactly what `update-varnish` recorded.
+
+**The Varnish patch (runtime marks):** term-llm 0.9.99 wraps each Runtime popover select in
+`.control-select`, and upstream Varnish (`002f10e`) then showed ~320 px provider logos that multiplied
+while the popover was open. `update-varnish` applies the same patch as the Development node (two
+exact replacements, `main.js` and `style.css`), refuses an upstream change it doesn't recognise, and
+records it under `patches` in `varnish-upstream.json`, with the upstream hashes of the two files. It
+was submitted upstream (keegangeorge/term-llm-varnish#20). When upstream has the fix, the update
+stops; review it, keep the patch only if needed, and check the Runtime popover in a browser: one
+14 px mark inside each of the Provider and Model fields.

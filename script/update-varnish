@@ -3,10 +3,13 @@
 
   script/update-varnish COMMIT          (the full 40-character commit)
 
-The folder integrations/term-llm/extensions/varnish is an unmodified copy of upstream and is never
-edited by hand: our changes live in the silo-theme extension. This fetches the commit, replaces the
-folder as a whole (keeping local.json), records what was installed in
-silo-theme/varnish-upstream.json and shows what changed. Nothing from upstream is run.
+The folder integrations/term-llm/extensions/varnish is a copy of upstream and is never edited by hand:
+our changes live in the silo-theme extension. The one exception is a checked compatibility patch this
+script applies to the copy (PATCHES below), the same one the Development node's update helper uses: it
+recognises the exact upstream code or its already-fixed form, and refuses anything else, so an upstream
+change gets a person's review. This fetches the commit, replaces the folder as a whole (keeping
+local.json), records what was installed (with each patch and the upstream hashes of the files it
+changed) in silo-theme/varnish-upstream.json and shows what changed. Nothing from upstream is run.
 
 Updates are deliberate. This code runs on pages showing customer data, so the known forms of outside
 address stop the update, and the network calls are listed for a person to read. A search can't catch
@@ -40,6 +43,41 @@ INERT_NAMES = ("LICENSE",)
 # Comments are searched too: a line that starts like a comment can still hold code.
 ADDRESS = re.compile(r"""(?:https?|wss?|ftp):(?:\\?/){2}[^\s"'`)]*|["'`]//[^\s"'`/]|url\(\s*["']?//|@import\s+["']?//""", re.I)
 HARMLESS = re.compile(r"https?://www\.w3\.org/|https://simpleicons\.org/?\Z", re.I)
+# term-llm 0.9.99 wraps each Runtime popover <select> in <span class="control-select">. Upstream puts
+# its provider mark before the select, so inside that wrapper: its direct-child CSS stopped sizing the
+# SVG (a ~320px logo filled the popover) and its direct-child lookup added another mark every frame.
+# Find the mark anywhere in the field; size the SVG at any depth; overlay it inside .control-select.
+# The old direct-child rules for older hosts stay. Submitted upstream as keegangeorge/term-llm-varnish#20
+# (2026-11-10): once upstream has a fix, this refuses the changed code; review it, and drop this patch
+# if upstream's fix passes the Runtime popover browser check.
+OLD_MARK_LOOKUP = '      let mark = field.querySelector(":scope > .vn-field-mark");\n'
+FIXED_MARK_LOOKUP = (
+    '      // Newer hosts wrap the native select in .control-select (with its own\n'
+    '      // chevron); find the mark wherever it was placed so it is created once.\n'
+    '      let mark = field.querySelector(".vn-field-mark");\n')
+OLD_MARK_CSS = '.runtime-popover-field > .vn-field-mark svg { width: 14px; height: 14px; }\n'
+FIXED_MARK_CSS = '''.runtime-popover-field .vn-field-mark svg { width: 14px; height: 14px; }
+
+/* Hosts that wrap the select in .control-select: overlay inside the wrapper. */
+.runtime-popover-field .control-select > .vn-field-mark {
+  grid-row: 1;
+  grid-column: 1;
+  z-index: 1;
+  display: inline-flex;
+  align-self: center;
+  justify-self: start;
+  margin-left: 11px;
+  color: var(--vn-accent);
+  pointer-events: none;
+}
+
+.runtime-popover-field .control-select > .vn-field-mark + .runtime-popover-select {
+  grid-row: 1;
+  grid-column: 1;
+  padding-left: 33px;
+}
+'''
+PATCHES = {"runtime_marks": (("main.js", OLD_MARK_LOOKUP, FIXED_MARK_LOOKUP), ("style.css", OLD_MARK_CSS, FIXED_MARK_CSS))}
 NETWORK = re.compile(r"\bfetch\(|\bWebSocket\(|\bEventSource\(|\bXMLHttpRequest\b|\bsendBeacon\(|\bimport\(")
 
 
@@ -77,6 +115,28 @@ def refuse_unknown_files(folder):
                 raise SystemExit("update-varnish: extension.yaml has an entry this can't check: %s" % line.strip())
 
 
+def apply_patch(folder, name, edits):
+    """All of a patch's replacements, or none: (status, {file: upstream sha256} of the files it changed)."""
+    planned = []
+    for filename, old, fixed in edits:
+        text = (folder / filename).read_text() if (folder / filename).is_file() else ""
+        if text.count(old) == 1 and fixed not in text:
+            planned.append((filename, text, text.replace(old, fixed)))
+        elif text.count(fixed) == 1 and old not in text:
+            planned.append(None)
+        else:
+            raise SystemExit("update-varnish: upstream changed the code the %s patch fixes (%s); review it before updating" % (name, filename))
+    if all(item is None for item in planned):
+        return "already-supported", {}
+    if any(item is None for item in planned):
+        raise SystemExit("update-varnish: upstream fixed only part of what the %s patch fixes; review it before updating" % name)
+    upstream = {}
+    for filename, text, patched in planned:
+        upstream[filename] = sha256(folder / filename)
+        (folder / filename).write_text(patched)
+    return "patched", upstream
+
+
 def install(source, commit):
     listed = git(["ls-tree", "-r", "--full-tree", "HEAD"], cwd=source).splitlines()
     names = []
@@ -97,6 +157,10 @@ def install(source, commit):
             if not (fresh / required).is_file():
                 raise SystemExit("update-varnish: upstream has no %s; refusing" % required)
         refuse_unknown_files(fresh)
+        patches = {}
+        for name, edits in PATCHES.items():
+            status, upstream = apply_patch(fresh, name, edits)
+            patches[name] = {"status": status, "upstream_files": upstream}
         outside, network = scan(fresh)
         if outside:
             raise SystemExit("update-varnish: outside addresses, not installed:\n  " + "\n  ".join(outside))
@@ -108,12 +172,12 @@ def install(source, commit):
             TARGET.rename(old)
         fresh.rename(TARGET)
         written = RECORD.with_name(RECORD.name + ".new")
-        written.write_text(json.dumps({"repository": UPSTREAM, "commit": commit, "files": after}, indent=2) + "\n")
+        written.write_text(json.dumps({"repository": UPSTREAM, "commit": commit, "files": after, "patches": patches}, indent=2) + "\n")
         written.replace(RECORD)
         shutil.rmtree(old, ignore_errors=True)
     finally:
         shutil.rmtree(fresh, ignore_errors=True)
-    print("varnish is now " + commit)
+    print("varnish is now " + commit + "".join("; %s: %s" % (name, patch["status"]) for name, patch in patches.items()))
     for label, changed in (("added", sorted(set(after) - set(before))), ("removed", sorted(set(before) - set(after))),
                            ("changed", sorted(name for name in set(after) & set(before) if after[name] != before[name]))):
         if changed:

@@ -1,5 +1,5 @@
 {
-  "repository": "https://github.com/keegangeorge/term-llm-varnish.git",
+  "repository": "/home/termllm/projects/term-llm-varnish-upstream",
   "commit": "002f10eca21d766bcf0271c188ed592f6789333c",
   "files": {
     "LICENSE": "04059d015bbc91b78e628a68576c8e8f8dbc56b6d2b8925e17c087de7fcbb0f8",
@@ -13,11 +13,20 @@
     "fonts/OFL.txt": "930853ee1daa68554d9e35c8a9175affb74f699fad9a5da6ee5ebe76379d9137",
     "local.example.json": "82b9f680e41b1bec9c69f913e488e98f64ceae17d4de2396da0315f22a83d0f2",
     "logos.js": "42ddda13f6b4c3cf92d0a9c4b17adfbb1389cab91622cf3ba35daaa963a66595",
-    "main.js": "bca7bba3312ccf53a1df928120ffc995103997c20bff11bace0d4189db17143a",
+    "main.js": "3f1b2158f2fbd5b5db35aa957217391320febf5316e56a8140ff116957033163",
     "notify.js": "b22ef24159ce767cb7feb3f85d2a9dddc985c9494f36bf6bab9b520712993c49",
     "palette.js": "762e519c0373577d784779bc6b675a400b4ecc9c80f93e936ae972acb4e9e065",
-    "style.css": "c6aa3af9df1d8231d1ec9d113662bad3e771f1cea3e8038d14e10f26002b51a1",
+    "style.css": "9650c50e259b8219fd344214f3943257485b0c675a7a0aaaae626ce0ae4b85f3",
     "thread.js": "ebb108e77e7f36795a39a4231eac92c52e0c437e999a4612c479871179fe1cd4",
     "util.js": "5755a7ce8b1bc45bc0950d391c10f1e520f4c4616215e2b8e5e6682b41fa56ed"
+  },
+  "patches": {
+    "runtime_marks": {
+      "status": "patched",
+      "upstream_files": {
+        "main.js": "bca7bba3312ccf53a1df928120ffc995103997c20bff11bace0d4189db17143a",
+        "style.css": "c6aa3af9df1d8231d1ec9d113662bad3e771f1cea3e8038d14e10f26002b51a1"
+      }
+    }
   }
 }

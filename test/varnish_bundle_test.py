@@ -15,6 +15,8 @@ EXTENSIONS = ROOT / 'integrations/term-llm/extensions'
 VARNISH = EXTENSIONS / 'varnish'
 THEME = EXTENSIONS / 'silo-theme'
 SCRIPT = ROOT / 'script/update-varnish'
+# The line of upstream main.js the runtime-marks patch replaces: every fake main.js keeps it.
+MARK = '      let mark = field.querySelector(":scope > .vn-field-mark");\n'
 
 
 def load():
@@ -33,6 +35,13 @@ class ShippedVarnishTest(unittest.TestCase):
         found.pop('local.json', None)  # upstream's own customisation file, kept across updates
         self.assertEqual(record['files'], found)
         self.assertEqual([], [str(path) for path in VARNISH.rglob('*') if path.is_symlink()])
+
+    def test_the_shipped_copy_has_the_runtime_marks_fix(self):
+        # term-llm 0.9.99's Runtime popover: one icon-sized provider mark per field (the live check counts them).
+        record = json.loads((THEME / 'varnish-upstream.json').read_text())
+        self.assertIn(record['patches']['runtime_marks']['status'], ('patched', 'already-supported'))
+        self.assertNotIn(':scope > .vn-field-mark', (VARNISH / 'main.js').read_text())
+        self.assertIn('.runtime-popover-field .vn-field-mark svg { width: 14px; height: 14px; }', (VARNISH / 'style.css').read_text())
 
     def test_licenses_and_credit_ship_with_it(self):
         self.assertIn('Keegan George', (VARNISH / 'LICENSE').read_text())
@@ -72,10 +81,13 @@ class UpdateTest(unittest.TestCase):
         self.write('extension.yaml', 'title: V\n')
         self.write('LICENSE', 'MIT\n')
         self.write('fonts/OFL.txt', 'OFL\n')
-        self.write('main.js', 'export function activate() {}\n')
+        # As upstream 002f10e has them: the code the runtime-marks patch fixes.
+        self.write('main.js', 'export function activate() {}\n' + MARK)
+        self.write('style.css', '.a { color: red; }\n.runtime-popover-field > .vn-field-mark svg { width: 14px; height: 14px; }\n')
         self.write('tools/check.mjs', 'dev only\n')
         self.write('install.sh', 'dev only\n')
         self.first = self.commit()
+        self.script = load()
 
     def git(self, *args, cwd=None):
         return subprocess.run(['git', '-c', 'user.name=T', '-c', 'user.email=t@example.invalid', *args], cwd=cwd or self.upstream,
@@ -107,7 +119,7 @@ class UpdateTest(unittest.TestCase):
         self.update(self.first)
         (self.target / 'local.json').write_text('{"nodeAccents": {}}')
         (self.target / 'stray.js').write_text('hand edit')
-        self.write('main.js', 'export function activate() { return 1; }\n')
+        self.write('main.js', 'export function activate() { return 1; }\n' + MARK)
         self.write('new.js', 'export const a = 1;\n')
         result = self.update(self.commit())
         self.assertEqual(0, result.returncode, result.stderr)
@@ -120,15 +132,15 @@ class UpdateTest(unittest.TestCase):
         self.update(self.first)
         for text in ("fetch('https://example.com/a');\n", 'const a = `<img src="//evil.example/x">`;\n'):
             with self.subTest(text=text):
-                self.write('main.js', text)
+                self.write('main.js', text + MARK)
                 result = self.update(self.commit())
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn('outside addresses', result.stderr)
                 self.assertEqual(self.first, json.loads(self.record.read_text())['commit'])
-                self.assertEqual('export function activate() {}\n', (self.target / 'main.js').read_text())
+                self.assertEqual('export function activate() {}\n' + self.script.FIXED_MARK_LOOKUP, (self.target / 'main.js').read_text())  # the first, patched
 
     def test_an_svg_namespace_is_fine(self):
-        self.write('main.js', 'const n = "http://www.w3.org/2000/svg";\n')
+        self.write('main.js', 'const n = "http://www.w3.org/2000/svg";\n' + MARK)
         self.assertEqual(0, self.update(self.commit()).returncode)
 
     def test_every_way_of_reaching_outside_is_caught(self):
@@ -162,8 +174,42 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.first, json.loads(self.record.read_text())['commit'])
         self.assertFalse(self.target.with_name('.varnish.new').exists())
 
+    def test_the_runtime_marks_patch_is_applied_to_the_copy_and_recorded(self):
+        self.assertEqual(0, self.update(self.first).returncode)
+        main, style = (self.target / 'main.js').read_text(), (self.target / 'style.css').read_text()
+        self.assertIn('field.querySelector(".vn-field-mark")', main)
+        self.assertNotIn(':scope > .vn-field-mark', main)
+        self.assertIn('.runtime-popover-field .control-select > .vn-field-mark {', style)
+        self.assertIn('.a { color: red; }', style)
+        record = json.loads(self.record.read_text())
+        self.assertEqual('patched', record['patches']['runtime_marks']['status'])
+        self.assertEqual(hashlib.sha256((self.upstream / 'main.js').read_bytes()).hexdigest(), record['patches']['runtime_marks']['upstream_files']['main.js'])
+        self.assertEqual(hashlib.sha256(main.encode()).hexdigest(), record['files']['main.js'])  # the record is what ships
+        self.assertIn(':scope > .vn-field-mark', (self.upstream / 'main.js').read_text())  # upstream itself untouched
+
+    def test_an_upstream_that_has_the_fix_is_left_as_it_is(self):
+        self.write('main.js', 'export function activate() {}\n' + self.script.FIXED_MARK_LOOKUP)
+        self.write('style.css', self.script.FIXED_MARK_CSS)
+        commit = self.commit()
+        self.assertEqual(0, self.update(commit).returncode)
+        self.assertEqual((self.upstream / 'main.js').read_text(), (self.target / 'main.js').read_text())
+        self.assertEqual({'status': 'already-supported', 'upstream_files': {}}, json.loads(self.record.read_text())['patches']['runtime_marks'])
+
+    def test_a_changed_or_partly_fixed_upstream_stops_the_update_and_changes_nothing(self):
+        self.assertEqual(0, self.update(self.first).returncode)
+        before = {path.name: path.read_bytes() for path in self.target.iterdir() if path.is_file()}
+        for case, main in (('changed', 'export function activate() {}\n      let mark = field.querySelector(".other");\n'),
+                           ('partly fixed', 'export function activate() {}\n' + self.script.FIXED_MARK_LOOKUP)):
+            with self.subTest(case):
+                self.write('main.js', main)
+                result = self.update(self.commit())
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn('runtime_marks patch', result.stderr)
+                self.assertEqual(before, {path.name: path.read_bytes() for path in self.target.iterdir() if path.is_file()})
+                self.assertEqual(self.first, json.loads(self.record.read_text())['commit'])
+
     def test_a_short_hash_is_refused_even_when_a_tag_shares_it(self):
-        self.write('main.js', 'export const other = 1;\n')
+        self.write('main.js', 'export const other = 1;\n' + MARK)
         other = self.commit()
         self.git('tag', self.first[:7], other)
         self.assertNotEqual(0, self.update(self.first[:7]).returncode)

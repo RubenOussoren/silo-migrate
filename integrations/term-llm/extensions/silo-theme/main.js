@@ -1,4 +1,4 @@
-// Our changes on top of Varnish, which stays unmodified (see NOTICE.md).
+// Our changes on top of Varnish, which is never edited by hand (see NOTICE.md).
 //
 // Varnish's new-chat starters are written for developers ("Run the specs"). A migrations engineer
 // gets these instead. A starter only fills the chat box; the engineer presses send.
