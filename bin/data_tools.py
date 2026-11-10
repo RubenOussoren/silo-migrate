@@ -1154,19 +1154,29 @@ def site_entry_summary(entry):
             "converter": (process.get("converter") or {}).get("revision"), "process": process or None}
 
 
+def site_verdicts(reviews):
+    """{run_id: entry}: each run's latest verdict (accepted or needs changes), unless that acceptance was
+    withdrawn. The Project page's board.site_verdicts reads the record the same way (a test keeps them equal)."""
+    withdrawn = {entry.get("of") for entry in reviews if entry.get("verdict") == "withdrawn"}
+    latest = {}
+    for entry in reviews:
+        if entry.get("verdict") in ("accepted", "needs_changes"):
+            latest[entry.get("run_id")] = entry
+    return {run_id: entry for run_id, entry in latest.items() if entry.get("id") not in withdrawn}
+
+
 def site_summary(ws, state=None, deliveries=None):
     """The current acceptance (the customer's, which launch repeats), the engineer's own latest check,
     the latest verdict per run, and what changed since the acceptance."""
     reviews = read_site_reviews(ws)
-    withdrawn = {entry.get("of") for entry in reviews if entry.get("verdict") == "withdrawn"}
-    live = [entry for entry in reviews if entry.get("verdict") in ("accepted", "needs_changes") and entry.get("id") not in withdrawn]
-    accepted = next((entry for entry in reversed(live) if entry["verdict"] == "accepted" and entry.get("basis") == "customer"), None)
-    checked = next((entry for entry in reversed(live) if entry["verdict"] == "accepted" and entry.get("basis") == "engineer"), None)
-    by_run = {}
-    for entry in reviews:
-        if entry.get("verdict") in ("accepted", "needs_changes"):
-            by_run[entry.get("run_id")] = entry
-    by_run = {run_id: site_entry_summary(entry) for run_id, entry in by_run.items() if entry.get("id") not in withdrawn}
+    current = site_verdicts(reviews)
+    # The accepted process is the newest acceptance on the customer's approval. Once that one is
+    # withdrawn (or its run has a later verdict), nothing is accepted: an older one never comes back.
+    newest = next((entry for entry in reversed(reviews) if entry.get("verdict") == "accepted" and entry.get("basis") == "customer"), None)
+    accepted = newest if newest and current.get(newest.get("run_id")) is newest else None
+    own = next((entry for entry in reversed(reviews) if entry.get("verdict") == "accepted" and entry.get("basis") == "engineer"), None)
+    checked = own if own and current.get(own.get("run_id")) is own else None
+    by_run = {run_id: site_entry_summary(entry) for run_id, entry in current.items()}
     changed = []
     if accepted:
         process = accepted.get("process") or {}
@@ -1194,7 +1204,7 @@ def site_note(request, required):
         if required:
             refuse("STANDARD_ARGUMENTS_INVALID: note (say what needs changing)")
         return None
-    if not isinstance(note, str) or len(note) > MAX_SITE_NOTE or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", note) or not note.strip():
+    if not isinstance(note, str) or len(note) > MAX_SITE_NOTE or re.search(r"[\x00-\x08\x0b-\x1f\x7f\u202a-\u202e\u2066-\u2069]", note) or not note.strip():
         refuse("STANDARD_ARGUMENTS_INVALID: note")
     return note.strip()
 
@@ -1231,14 +1241,17 @@ def op_site_review(ws, request):
         entry = {"id": "review-" + secrets.token_hex(8), "verdict": verdict, "by": by.strip(), "at": now()}
         if verdict == "withdrawn":
             target = request.get("review_id")
-            withdrawn = {item.get("of") for item in reviews if item.get("verdict") == "withdrawn"}
             found = next((item for item in reviews if item.get("id") == target and item.get("verdict") == "accepted"), None)
-            if not isinstance(target, str) or not found or target in withdrawn:
+            # Only an acceptance that is still its run's verdict: not withdrawn, not replaced by a later one.
+            if not isinstance(target, str) or not found or site_verdicts(reviews).get(found.get("run_id")) is not found:
                 refuse("STANDARD_ARGUMENTS_INVALID: review_id (only an acceptance that stands can be withdrawn)")
             entry.update(of=target, run_id=found.get("run_id"))
         else:
             state = standard_state(ws)
             process, digest, passed = site_process(state, request.get("run_id"))
+            standing = site_verdicts(reviews).get(process["run_id"])
+            if standing and standing.get("verdict") == "accepted" and standing.get("basis") == "customer":
+                refuse("STANDARD_SITE_ACCEPTED: this site's acceptance stands; withdraw it first (on the Overview)")
             run = (state.get("runs") or {}).get(process["run_id"]) or {}
             if run.get("status") != "completed":
                 refuse("STANDARD_SITE_NOT_FINISHED: the import hasn't finished")
@@ -1259,7 +1272,11 @@ def op_site_review(ws, request):
         if path.is_symlink():
             refuse("STANDARD_PATH_INVALID")
         ws.write_json(path, {"version": 1, "reviews": reviews})
-    return {"review": site_entry_summary(entry), "site": site_summary(ws)}
+    try:
+        site = site_summary(ws)
+    except Refusal:
+        site = None  # recorded; the page reads the rest again
+    return {"review": site_entry_summary(entry), "site": site}
 
 
 def op_take(ws, request):
@@ -2581,8 +2598,9 @@ def guide_site(review, site, records):
     live = any(item["run_id"] == review["run_id"] and item["live"] for item in records["sites"])
     reset = " Its review site is still up and holds customer data until it's reset in the Runs tab." if live else ""
     if verdict and verdict["verdict"] == "needs_changes":
-        return ("agent", "The engineer says the site of review run %s needs changes: \"%s\". Work out the cause with them; a converter change goes "
-                "through converter-developer and a push, then a new pass." % (review["run_id"], verdict["note"]), "this chat")
+        return ("agent", "The engineer says the site of review run %s needs changes: \"%s\". Work out the cause with them. The note may hold customer "
+                "details: never quote it to converter-developer; if the converter must change, propose a finding that describes the problem with "
+                "invented examples (the engineer releases it), then a push and a new pass." % (review["run_id"], verdict["note"]), "this chat")
     if verdict and verdict["basis"] == "customer":
         return ("nobody", "The process of review run %s is accepted: the customer approved it (recorded by %s). Launch repeats it; when the launch dump "
                 "arrives the engineer labels it Launch. Running on launch data isn't built yet.%s" % (review["run_id"], verdict["by"], reset), "Runs tab")
@@ -2693,10 +2711,11 @@ def op_guide(ws, request):
     facts = {"initialized": ws.initialized(), "drop_files": drop_files, "labelled_files": len(groups["labelled"]), "inputs": len(state.get("inputs") or {}),
              "db_loaded": bool(db and db.get("loads"))}
     records = guide_records(ws) if ws.initialized() else {"plans": [], "runs": [], "sites": [], "findings": [], "pushes": [], "warning": None}
+    site_warning = None
     try:
         site = site_summary(ws, deliveries=deliveries) if ws.initialized() else NO_SITE
-    except Refusal:
-        site = NO_SITE
+    except Refusal as refusal:
+        site, site_warning = NO_SITE, str(refusal).split(":")[0]
     contact = support_contact(ws)
     active = [run for run in records["runs"] if run["status"] in GUIDE_ACTIVE]
     happening = ["%s run %s is %s (stage %s)." % (run["kind"] or "workflow", run["run_id"], run["status"], run["stage"]) for run in active]
@@ -2729,7 +2748,9 @@ def op_guide(ws, request):
     stale = [plan for plan in records["plans"] if plan["status"] == "stale"]
     if stale:
         also.append("Plan %s is out of date because something it depends on changed: propose it again, and discard the old one in the Project page's Runs tab." % stale[-1]["plan_id"])
-    also += ["The review site of run %s is still up and holds customer data until it's reset in the Project page's Runs tab." % site["run_id"] for site in records["sites"]]
+    also += ["The review site of run %s is still up and holds customer data until it's reset in the Project page's Runs tab." % item["run_id"] for item in records["sites"]]
+    if site_warning:
+        also.append("The site reviews couldn't be read (%s), so acceptance shows as none: tell the engineer, and ask %s." % (site_warning, contact))
     if records["warning"]:
         step = ("agent", "Plans and runs couldn't be read (%s). Tell the engineer, and ask %s if it keeps happening." % (records["warning"], contact), "this chat")
     elif active:

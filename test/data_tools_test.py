@@ -1066,6 +1066,74 @@ class DataToolsTest(unittest.TestCase):
             with self.subTest(bad=bad[:5]), self.assertRaisesRegex(self.d.Refusal, 'note'):
                 self.op('site_review', run_id=run_id, verdict='needs_changes', by='Alex (web UI)', note=bad)
 
+    def accept(self, run_id, basis='customer', note=None):
+        digest = self.op('site_process', run_id=run_id)['process_digest']
+        return self.op('site_review', run_id=run_id, verdict='accepted', basis=basis, by='A (web UI)', process_digest=digest, **({'note': note} if note else {}))['review']
+
+    def second_review_run(self):
+        """A second passed import of the same convert run (pass 1, imported twice)."""
+        standard = self.base / 'arc/.silo-migrate/named/standard/state.json'
+        state = json.loads(standard.read_text())
+        state['plans']['plan-' + '3' * 32] = dict(state['plans']['plan-' + '2' * 32], digest='3' * 64)
+        state['runs']['run-' + '3' * 32] = dict(state['runs']['run-' + '2' * 32], id='run-' + '3' * 32, plan_id='plan-' + '3' * 32)
+        standard.write_text(json.dumps(state))
+        return 'run-' + '3' * 32
+
+    def test_withdrawing_the_newest_acceptance_leaves_none_not_an_older_one(self):
+        first = self.site_state()
+        older = self.accept(first)
+        second = self.second_review_run()
+        newer = self.accept(second)
+        self.assertEqual(second, self.op('guide')['site_acceptance']['accepted']['run_id'])
+        self.op('site_review', verdict='withdrawn', review_id=newer['id'], by='A (web UI)')
+        self.assertIsNone(self.op('guide')['site_acceptance']['accepted'])  # the older acceptance doesn't come back
+        # The older one is still its own pass's verdict, so it can be withdrawn there; nothing comes back either way.
+        self.op('site_review', verdict='withdrawn', review_id=older['id'], by='A (web UI)')
+        self.assertIsNone(self.op('guide')['site_acceptance']['accepted'])
+
+    def test_a_standing_acceptance_takes_no_other_verdict_until_withdrawn(self):
+        run_id = self.site_state()
+        done = self.accept(run_id)
+        for verdict in ({'verdict': 'needs_changes', 'note': 'n'}, {'verdict': 'accepted', 'basis': 'engineer', 'process_digest': self.op('site_process', run_id=run_id)['process_digest']}):
+            with self.subTest(verdict['verdict']), self.assertRaisesRegex(self.d.Refusal, 'STANDARD_SITE_ACCEPTED'):
+                self.op('site_review', run_id=run_id, by='A (web UI)', **verdict)
+        self.op('site_review', verdict='withdrawn', review_id=done['id'], by='A (web UI)')
+        changed = self.op('site_review', run_id=run_id, verdict='needs_changes', by='A (web UI)', note='customer found missing avatars')['review']
+        guide = self.op('guide')
+        self.assertIsNone(guide['site_acceptance']['accepted'])
+        self.assertEqual('agent', guide['next']['who'])
+        self.assertNotEqual('done', guide['stages'][-1]['state'])  # the stage and the next step agree
+        self.assertIn('never quote it to converter-developer', guide['next']['action'])
+        with self.assertRaisesRegex(self.d.Refusal, 'review_id'):  # only an acceptance can be withdrawn
+            self.op('site_review', verdict='withdrawn', review_id=changed['id'], by='A (web UI)')
+        with self.assertRaisesRegex(self.d.Refusal, 'note'):
+            self.op('site_review', run_id=run_id, verdict='needs_changes', by='A (web UI)', note='abc‮def')
+
+    def test_the_page_and_the_guide_read_the_record_alike(self):
+        spec = importlib.util.spec_from_file_location('project_board', ROOT / 'integrations/term-llm/widgets/project/board.py')
+        board = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(board)
+        a = lambda i, run, basis='customer': {'id': 'review-%d' % i, 'verdict': 'accepted', 'basis': basis, 'run_id': run}
+        n = lambda i, run: {'id': 'review-%d' % i, 'verdict': 'needs_changes', 'run_id': run, 'note': 'x'}
+        w = lambda i, of, run: {'id': 'review-%d' % i, 'verdict': 'withdrawn', 'of': of, 'run_id': run}
+        sequences = [[], [a(1, 'r1')], [a(1, 'r1'), w(2, 'review-1', 'r1')], [a(1, 'r1', 'engineer'), n(2, 'r1')], [n(1, 'r1'), a(2, 'r1')],
+                     [a(1, 'r1'), a(2, 'r2'), w(3, 'review-2', 'r2')], [a(1, 'r1'), w(2, 'review-1', 'r1'), n(3, 'r1'), a(4, 'r2', 'engineer')]]
+        for reviews in sequences:
+            with self.subTest(reviews=[entry['id'] for entry in reviews]):
+                ours = {run: (entry['verdict'], entry.get('basis')) for run, entry in self.d.site_verdicts(reviews).items()}
+                page = {run: (entry['verdict'], entry.get('basis')) for run, entry in board.site_verdicts(reviews).items()}
+                self.assertEqual(ours, page)
+
+    def test_an_unreadable_record_is_said_not_read_as_nothing_accepted(self):
+        run_id = self.site_state()
+        self.accept(run_id)
+        record = self.base / 'arc/.silo-migrate/named/site-reviews.json'
+        record.rename(record.with_name('elsewhere.json'))
+        record.symlink_to(record.with_name('elsewhere.json'))
+        guide = self.op('guide')
+        self.assertIsNone(guide['site_acceptance']['accepted'])
+        self.assertTrue(any("site reviews couldn't be read (STANDARD_PATH_INVALID)" in line for line in guide['also']), guide['also'])
+
     def test_only_a_passing_development_site_can_be_accepted(self):
         for case, kwargs in (('a check differs', {'review_passed': False}), ('launch data', {'kind': 'launch'})):
             with self.subTest(case):

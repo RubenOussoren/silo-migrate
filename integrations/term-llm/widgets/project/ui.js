@@ -73,6 +73,7 @@ const ERRORS = {
   STANDARD_SITE_NOT_PASSED: 'Only a site whose convert and import runs both matched every check, on development data, can be accepted.',
   STANDARD_SITE_NOT_REVIEW: 'Only an import into a review site can be accepted.',
   STANDARD_SITE_NOT_FINISHED: 'The import hasn\u2019t finished yet.',
+  STANDARD_SITE_ACCEPTED: 'This site\u2019s acceptance stands. Withdraw it first, on the Overview.',
   STANDARD_CONFIRMATION_REQUIRED: "Type the project's name exactly to confirm.",
   STANDARD_BUSY_RUN: 'A run is still running. Wait for it to finish, or stop it from the Runs tab.',
   STANDARD_BUSY_JOB: 'A data job is still running. Wait for it, or ask migration-data to stop it.',

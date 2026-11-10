@@ -113,7 +113,7 @@ export function runsView(ctx) {
   // engineer's own check (the customer's approval is what launch repeats).
   function decideBox(group) {
     const last = group.imports[group.imports.length - 1];
-    if (!last || !passed(last) || !passed(group.convert)) return null;
+    if (!last || !passed(last) || !passed(group.convert) || !/^Development/.test(group.delivery || '')) return null;
     const review = last.review;
     if (review && !(review.verdict === 'accepted' && review.basis === 'engineer')) return null;
     return el('div', { class: 'decide' }, el('span', {}, review ? 'Has the customer approved it?' : 'Is this site right?'),
