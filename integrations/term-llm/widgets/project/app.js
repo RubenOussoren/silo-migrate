@@ -85,7 +85,10 @@ function renderData() {
   const development = newest('development');
   const launch = newest('launch');
   const parts = [];
-  if (development) parts.push(el('span', { class: 'badge' }, deliveryLabel(development).toUpperCase()), `${fileText(development)}labelled ${day(development.labelled_at)}`);
+  // A merge project's source file is a Discourse backup: its name starts with the customer's site name.
+  // This strip is on every tab (and in every screenshot), so it says what the file is. The Files tab has the names.
+  const siteBackup = ((state.files && state.files.setup) || {}).platform === 'discourse';
+  if (development) parts.push(el('span', { class: 'badge' }, deliveryLabel(development).toUpperCase()), `${siteBackup ? 'source site backup · ' : fileText(development)}labelled ${day(development.labelled_at)}`);
   if (launch) parts.push(el('span', { class: 'badge launch' }, 'LAUNCH RECEIVED'));
   if (!parts.length) parts.push(el('span', { class: 'badge none' }, 'NO DATA LABELLED'));
   const base = newest('base_site');

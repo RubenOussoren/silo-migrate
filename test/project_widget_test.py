@@ -325,6 +325,12 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         self.assertEqual({'findings': 0, 'runs': 0}, json.loads(self.request('GET', '/api/counts?workspace=new-forum')[1]))
         self.assertEqual(400, self.request('GET', '/api/counts?workspace=../x')[0])
 
+    def test_the_top_strip_does_not_name_a_merge_projects_source_backup(self):
+        # That file name starts with the customer's site name, and the strip is in every screenshot.
+        source = (WIDGET / 'app.js').read_text()
+        self.assertIn("platform === 'discourse'", source)
+        self.assertIn("siteBackup ? 'source site backup · ' : fileText(development)", source)
+
     def test_the_page_builds_with_dom_calls_only(self):
         for name in ('app.js', 'ui.js', 'runs.js', 'findings.js'):
             source = (WIDGET / name).read_text()
