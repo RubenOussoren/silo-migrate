@@ -39,6 +39,7 @@ class ShippedVarnishTest(unittest.TestCase):
     def test_the_shipped_copy_has_the_runtime_marks_fix(self):
         # term-llm 0.9.99's Runtime popover: one icon-sized provider mark per field (the live check counts them).
         record = json.loads((THEME / 'varnish-upstream.json').read_text())
+        self.assertEqual('https://github.com/keegangeorge/term-llm-varnish.git', record['repository'])  # never a local path
         self.assertIn(record['patches']['runtime_marks']['status'], ('patched', 'already-supported'))
         self.assertNotIn(':scope > .vn-field-mark', (VARNISH / 'main.js').read_text())
         self.assertIn('.runtime-popover-field .vn-field-mark svg { width: 14px; height: 14px; }', (VARNISH / 'style.css').read_text())
@@ -183,6 +184,8 @@ class UpdateTest(unittest.TestCase):
         self.assertIn('.a { color: red; }', style)
         record = json.loads(self.record.read_text())
         self.assertEqual('patched', record['patches']['runtime_marks']['status'])
+        self.assertEqual('https://github.com/keegangeorge/term-llm-varnish.git', record['repository'])  # the clone's path isn't recorded
+        self.assertTrue(record['fetched_from_a_clone'])
         self.assertEqual(hashlib.sha256((self.upstream / 'main.js').read_bytes()).hexdigest(), record['patches']['runtime_marks']['upstream_files']['main.js'])
         self.assertEqual(hashlib.sha256(main.encode()).hexdigest(), record['files']['main.js'])  # the record is what ships
         self.assertIn(':scope > .vn-field-mark', (self.upstream / 'main.js').read_text())  # upstream itself untouched
@@ -198,10 +201,13 @@ class UpdateTest(unittest.TestCase):
     def test_a_changed_or_partly_fixed_upstream_stops_the_update_and_changes_nothing(self):
         self.assertEqual(0, self.update(self.first).returncode)
         before = {path.name: path.read_bytes() for path in self.target.iterdir() if path.is_file()}
-        for case, main in (('changed', 'export function activate() {}\n      let mark = field.querySelector(".other");\n'),
-                           ('partly fixed', 'export function activate() {}\n' + self.script.FIXED_MARK_LOOKUP)):
+        for case, main, style in (('changed', 'export function activate() {}\n      let mark = field.querySelector(".other");\n', None),
+                                  ('partly fixed', 'export function activate() {}\n' + self.script.FIXED_MARK_LOOKUP, None),
+                                  ('style changed', 'export function activate() {}\n' + MARK, '.runtime-popover-field > .vn-field-mark svg { width: 16px; }\n')):
             with self.subTest(case):
                 self.write('main.js', main)
+                if style:
+                    self.write('style.css', style)
                 result = self.update(self.commit())
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn('runtime_marks patch', result.stderr)

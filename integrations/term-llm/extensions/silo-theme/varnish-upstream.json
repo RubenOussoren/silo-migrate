@@ -1,5 +1,5 @@
 {
-  "repository": "/home/termllm/projects/term-llm-varnish-upstream",
+  "repository": "https://github.com/keegangeorge/term-llm-varnish.git",
   "commit": "002f10eca21d766bcf0271c188ed592f6789333c",
   "files": {
     "LICENSE": "04059d015bbc91b78e628a68576c8e8f8dbc56b6d2b8925e17c087de7fcbb0f8",
@@ -28,5 +28,6 @@
         "style.css": "c6aa3af9df1d8231d1ec9d113662bad3e771f1cea3e8038d14e10f26002b51a1"
       }
     }
-  }
+  },
+  "fetched_from_a_clone": true
 }

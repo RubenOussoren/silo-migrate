@@ -3,11 +3,11 @@
 
   script/update-varnish COMMIT          (the full 40-character commit)
 
-The folder integrations/term-llm/extensions/varnish is a copy of upstream and is never edited by hand:
-our changes live in the silo-theme extension. The one exception is a checked compatibility patch this
-script applies to the copy (PATCHES below), the same one the Development node's update helper uses: it
-recognises the exact upstream code or its already-fixed form, and refuses anything else, so an upstream
-change gets a person's review. This fetches the commit, replaces the folder as a whole (keeping
+The folder integrations/term-llm/extensions/varnish is a copy of upstream, unmodified except for one
+checked compatibility patch this script applies (PATCHES below; the same one the Development node's
+update helper uses). Nobody edits the folder by hand: our changes live in the silo-theme extension. The
+patch recognises the exact upstream code or its already-fixed form and refuses anything else, so an
+upstream change gets a person's review. This fetches the commit, replaces the folder as a whole (keeping
 local.json), records what was installed (with each patch and the upstream hashes of the files it
 changed) in silo-theme/varnish-upstream.json and shows what changed. Nothing from upstream is run.
 
@@ -25,7 +25,10 @@ import subprocess
 import sys
 import tempfile
 
-UPSTREAM = os.environ.get("VARNISH_UPSTREAM", "https://github.com/keegangeorge/term-llm-varnish.git")
+REPOSITORY = "https://github.com/keegangeorge/term-llm-varnish.git"
+# A clone to fetch from instead (tests; a local checkout of the same repository). The record always names
+# REPOSITORY, never a local path.
+UPSTREAM = os.environ.get("VARNISH_UPSTREAM", REPOSITORY)
 ROOT = Path(os.environ.get("VARNISH_REPO_ROOT", Path(__file__).resolve().parents[1]))
 EXTENSIONS = ROOT / "integrations/term-llm/extensions"
 TARGET = EXTENSIONS / "varnish"
@@ -172,7 +175,10 @@ def install(source, commit):
             TARGET.rename(old)
         fresh.rename(TARGET)
         written = RECORD.with_name(RECORD.name + ".new")
-        written.write_text(json.dumps({"repository": UPSTREAM, "commit": commit, "files": after, "patches": patches}, indent=2) + "\n")
+        record = {"repository": REPOSITORY, "commit": commit, "files": after, "patches": patches}
+        if UPSTREAM != REPOSITORY:
+            record["fetched_from_a_clone"] = True
+        written.write_text(json.dumps(record, indent=2) + "\n")
         written.replace(RECORD)
         shutil.rmtree(old, ignore_errors=True)
     finally:
