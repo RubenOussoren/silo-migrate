@@ -632,6 +632,26 @@ class RemoveTest(unittest.TestCase):
         self.assertEqual(1, len(result['returned']))
         self.assertEqual(["The record of this removal couldn't be written to " + str(self.top / 'state/removed-projects.jsonl') + '.'], result['notes'])
 
+    def test_a_stop_after_some_files_went_back_says_so(self):
+        pending = self.base / 'arc/.silo-migrate/data/pending/abc.json'
+        stray = self.base / 'arc/inputs/second.sql'
+        stray.write_text('moved, not registered')
+        info = stray.stat()
+        pending.write_text(json.dumps({'dev': info.st_dev, 'ino': info.st_ino, 'provenance': {'event': 'take', 'from': 'intake/second.sql'}}))
+        real, calls = self.dt.place, []
+        def second_fails(*args):
+            calls.append(args[3])
+            if len(calls) == 2:
+                raise OSError('disk full')
+            return real(*args)
+        with mock.patch.object(self.dt, 'place', side_effect=second_fails):
+            with self.assertRaisesRegex(ValueError, r'^STANDARD_OPERATION_FAILED: stopped part-way \(the received files are already back in the drop folder\)$'):
+                self.removal(keep=True).run('arc', None)
+        self.assertTrue((self.top / 'intake/arc/sub/dump.sql.gz').exists())
+        self.assertTrue((self.base / 'arc/inputs/second.sql').exists())  # nothing else went
+        self.removal(keep=True).run('arc', None)
+        self.assertTrue((self.top / 'intake/arc/second.sql').exists())
+
     def test_a_full_removal_stopped_before_its_last_step_is_found_and_finished(self):
         removal = self.removal()
         with mock.patch.object(self.pr.Removal, 'archive_web_project', side_effect=OSError('stopped')):

@@ -664,15 +664,15 @@ class Removal:
             return manual
         return "archived"
 
-    def return_received(self, files):
-        """Put each received file back in the drop folder: a rename, or a checked copy across disks."""
+    def return_received(self, files, returned):
+        """Put each received file back in the drop folder: a rename, or a checked copy across disks. Each
+        one goes into `returned` as soon as it is back, so a stop part-way still says so."""
         if not files:
-            return []
+            return returned
         dt, ws = self.dt, self.ws
         if not plain_dir(ws.intake, "the drop folder"):
             ws.intake.parent.mkdir(mode=0o700, exist_ok=True)
             ws.intake.mkdir(mode=0o700)
-        returned = []
         inputs, drop = dt.open_root(str(ws.root / "inputs")), dt.open_root(str(ws.intake))
         try:
             for entry in files:
@@ -762,7 +762,7 @@ class Removal:
                     received = self.received()
                     if any(not entry["to"] for entry in received):
                         refuse("STANDARD_REMOVE_DROP_TAKEN: the drop folder already has files of those names")
-                    returned = self.return_received(received)
+                    self.return_received(received, returned)
                     done["returned"] = len(returned)
                 done["mcp_entry"] = self.remove_mcp()
                 done["docker_objects"] = self.remove_docker(state)
@@ -781,7 +781,8 @@ class Removal:
             code = str(error).split(":")[0] if isinstance(error, ValueError) and str(error).startswith("STANDARD_") else "STANDARD_OPERATION_FAILED"
             self.record({"event": "stopped", "by": by or "unknown", "code": code, **{k: v for k, v in done.items() if k != "web_project"}})
             if returned:  # say so: the workspace no longer holds them
-                said = str(error) if isinstance(error, ValueError) and str(error).startswith("STANDARD_") else code
+                text = str(error) if isinstance(error, ValueError) else ""
+                said = text if text.startswith("STANDARD_") and ":" in text else code + ": stopped part-way"  # CODE: detail, always
                 raise Refusal(said + " (the received files are already back in the drop folder)") from error
             raise
         recorded = self.record({"event": "finished", "by": by or "unknown", **done})
