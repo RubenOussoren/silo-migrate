@@ -458,6 +458,75 @@ class SiloTest(unittest.TestCase):
         self.assertIn(['auth', 'login', '--claudeai'], [c[-3:] for c in calls])
         self.assertFalse(any('/usr/local/bin' in ' '.join(c[-4:]) for c in calls))
 
+    def remove_calls(self, replies, typed=None, tty=True):
+        """Run `silo remove-project` with silo-migrate-control's answers faked; (status, output, argvs)."""
+        calls = []
+
+        def fake(argv, timeout=60, input=None):
+            calls.append(argv)
+            code, payload = replies.pop(0)
+            return subprocess.CompletedProcess(argv, code, json.dumps(payload) + '\n' if code == 0 else '', payload if code else '')
+        out = io.StringIO()
+        stdin = mock.Mock(isatty=lambda: tty)
+        with mock.patch.object(self.s, 'run', side_effect=fake), mock.patch('sys.stdout', out), mock.patch('sys.stdin', stdin), \
+                mock.patch('builtins.input', side_effect=[typed] if typed is not None else EOFError), mock.patch.dict(os.environ, {'SUDO_USER': 'ruben'}):
+            try:
+                status = self.s.remove_project(self.entry, self.args)
+            except self.s.Stop as stop:
+                status = 'stop: ' + str(stop)
+        return status, out.getvalue(), [argv[argv.index(str(self.prefix / 'bin/silo-migrate-control')) + 1:] for argv in calls]
+
+    def test_remove_project_lists_projects_and_checks_its_arguments(self):
+        self.args = []
+        status, out, argvs = self.remove_calls([(0, {'projects': ['arc', 'demo']})])
+        self.assertEqual((0, [['remove-project', '--list']]), (status, argvs))
+        self.assertIn('projects on this server: arc, demo', out)
+        for args in (['../x'], ['arc', '--force'], ['arc', '--keep-received', 'x']):
+            self.args = args
+            self.assertIn('usage: silo remove-project', self.remove_calls([])[0])
+
+    PLAN = {'exists': True, 'mode': 'start_over', 'blocked': [],
+            'removed': [{'text': 'Work: 2 plans, 1 run, 0 findings, labels, notes and decisions', 'bytes': 2_100_000_000},
+                        {'text': 'Converter checkout on this server, with 1 commit that aren\'t on GitHub', 'bytes': 38_000_000, 'warn': True}],
+            'kept': [{'text': 'Received files: export.sql.gz, back in the drop folder to label again', 'bytes': 790_000_000}]}
+
+    def test_remove_project_shows_the_plan_and_needs_the_typed_name(self):
+        self.args = ['arc', '--keep-received']
+        status, out, argvs = self.remove_calls([(0, self.PLAN)], typed='arcc')
+        self.assertEqual(1, status)
+        self.assertEqual([['remove-project', 'arc', '--plan', '--keep-received']], argvs)  # never --confirm
+        self.assertIn('Start arc over', out)
+        self.assertIn('  ! Converter checkout on this server, with 1 commit', out)
+        self.assertIn('Received files: export.sql.gz, back in the drop folder to label again   790 MB', out)
+        self.assertIn('Cancelled. Nothing was changed.', out)
+        self.assertIn('run this in a terminal', self.remove_calls([(0, self.PLAN)], tty=False)[0])
+
+    def test_remove_project_refuses_while_busy(self):
+        self.args = ['arc']
+        plan = dict(self.PLAN, mode='remove', blocked=[{'code': 'STANDARD_BUSY_RUN', 'text': 'A run is still running. Wait for it to finish.'}])
+        status, out, argvs = self.remove_calls([(0, plan)])
+        self.assertEqual(2, status)
+        self.assertIn('Not now:\n  A run is still running', out)
+        self.assertEqual(1, len(argvs))
+
+    def test_remove_project_confirmed(self):
+        self.args = ['arc', '--keep-received']
+        done = {'status': 'done', 'removed': {'docker_objects': 9, 'chats': 5, 'attachments': 2}, 'returned': [{'name': 'export.sql.gz', 'to': 'export.sql.gz', 'bytes': 790_000_000}],
+                'notes': [], 'next': 'Next: on the Project page, Files tab, label the returned files.'}
+        status, out, argvs = self.remove_calls([(0, self.PLAN), (0, done)], typed='arc')
+        self.assertEqual(0, status)
+        self.assertEqual(['remove-project', 'arc', '--confirm', 'arc', '--keep-received', '--by', 'ruben'], argvs[1])
+        self.assertIn('chats removed: 5 (attachments: 2)', out)
+        self.assertIn('back in the drop folder: export.sql.gz   790 MB', out)
+        status, out, argvs = self.remove_calls([(0, self.PLAN), (1, 'Error: STANDARD_BUSY_CHAT: a chat in this project is still answering\n')], typed='arc')
+        self.assertEqual('stop: STANDARD_BUSY_CHAT: a chat in this project is still answering', status)
+
+    def test_remove_project_with_nothing_there(self):
+        self.args = ['ghost']
+        status, out, _ = self.remove_calls([(0, {'exists': False, 'blocked': [], 'removed': [], 'kept': []})])
+        self.assertEqual(0, status)
+        self.assertIn('There is nothing of ghost on this server.', out)
+
     def test_cli_entry_points(self):
         result = subprocess.run(['python3', '-I', '-B', str(ROOT / 'bin/silo'), 'nonsense'], capture_output=True, text=True)
         self.assertEqual(2, result.returncode)

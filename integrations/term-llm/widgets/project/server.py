@@ -220,6 +220,26 @@ def label(control, body):
     return data(control, body.get("workspace"), request)
 
 
+def removal_plan(control, workspace, keep):
+    """What Start over or Remove would do; changes nothing (bin/project_remove.py)."""
+    if not isinstance(workspace, str) or not WORKSPACE.fullmatch(workspace):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    return runs.control_call(control, ["remove-project", workspace, "--plan", *(["--keep-received"] if keep else [])], timeout=600)
+
+
+def remove(control, body):
+    """Start over or Remove, once the engineer has typed the project's name; the same command as
+    `silo remove-project`, which checks the name again and refuses while anything is busy."""
+    workspace, typed, keep = body.get("workspace"), body.get("confirm"), body.get("keep_received")
+    if not isinstance(workspace, str) or not WORKSPACE.fullmatch(workspace) or not isinstance(keep, bool):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    if typed != workspace:
+        raise Refused("STANDARD_CONFIRMATION_REQUIRED")
+    _summary["value"] = None
+    return runs.control_call(control, ["remove-project", workspace, "--confirm", typed, *(["--keep-received"] if keep else []),
+                                       "--by", runs.reviewer_name()], timeout=3600)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "silo-project"
     protocol_version = "HTTP/1.1"
@@ -257,6 +277,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, data(control, query.get("workspace"), {"op": "guide"}))
             if url.path == "/api/counts":
                 return self.send(200, counts(base, query.get("workspace")))
+            if url.path == "/api/project/removal":
+                return self.send(200, removal_plan(control, query.get("workspace"), query.get("keep") == "1"))
             if url.path == "/api/runs/passes":
                 return self.send(200, passes_of(base, control, query.get("workspace")))
             if url.path == "/api/findings/board":
@@ -306,6 +328,8 @@ class Handler(BaseHTTPRequestHandler):
             action = path.rsplit("/", 1)[-1]
             if path == "/api/label":
                 result = label(self.server.control, body)
+            elif path == "/api/project/remove":
+                result = remove(self.server.control, body)
             elif path in ("/api/runs/again", "/api/runs/import"):
                 result = propose_again(self.server.base, self.server.control, body, import_next=path.endswith("/import"))
             elif path == "/api/findings/done":

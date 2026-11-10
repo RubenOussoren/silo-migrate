@@ -124,3 +124,19 @@ input.search { font: inherit; font-size: 13px; background: var(--surface-2); col
 .tstep:not(:last-child)::after { content: ""; width: 14px; height: 1px; background: var(--border-strong); margin-left: 4px; }
 .hint.footer { margin-top: 14px; }
 .banner .actions { margin: 0; }
+/* Start over and Remove: quiet at the foot of Overview, red only once chosen. */
+.manage { margin-top: 28px; padding-top: 14px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: var(--text-muted); }
+.manage .acts { display: flex; gap: 16px; }
+.link.danger { color: var(--danger); }
+.card.danger { border-color: color-mix(in srgb, var(--danger) 35%, transparent); }
+.card.danger .eyebrow { color: var(--danger); }
+.eyebrow.ok { color: var(--ok); }
+.btn.red { background: var(--danger); color: var(--danger-ink); }
+.list { list-style: none; margin: 0 0 16px; padding: 0; font-size: 14px; }
+.list li { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.list li span:last-child { color: var(--text-muted); font-size: 13px; white-space: nowrap; }
+.list li.warn span:first-child { color: var(--launch); }
+.typed { display: block; font-size: 13px; color: var(--text-muted); margin: 4px 0 0; }
+.typed b { color: var(--text); font-weight: 600; }
+input.remove-confirm { display: block; width: 100%; margin: 6px 0 4px; font-family: var(--font-mono); }
+.error { color: var(--danger); font-size: 14px; margin: 10px 0 0; }

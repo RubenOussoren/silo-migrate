@@ -10,6 +10,10 @@
   silo claude-login [--sso|--console]   sign the service account in to Claude Code
   silo intake PROJECT              prepare the drop folder and the web UI project for a project
   silo set-contact NAME            (root) who the agents tell engineers to ask for help
+  silo remove-project [PROJECT [--keep-received]]
+                                   list projects; or remove one, after you type its name.
+                                   --keep-received starts it over: the received files go back
+                                   to the drop folder; the work, chats and review sites go
 
 Run as root or as the service account; account steps always run as the service account.
 """
@@ -674,6 +678,81 @@ def web_project(entry, project):
     return "web UI project: " + project + (" (already there)" if reply.get("duplicate") else " (created)") + ", folder " + str(folder)
 
 
+def human(size):
+    if size is None:
+        return ""
+    return "%.1f GB" % (size / 1e9) if size >= 1e9 else "%d MB" % round(size / 1e6) if size >= 1e6 else "%d KB" % round(size / 1e3)
+
+
+def control_json(argv, entry, timeout):
+    """silo-migrate-control as the service account: its JSON, or Stop with its refusal line."""
+    result = run(as_account([str(PREFIX / "bin/silo-migrate-control"), *argv], entry), timeout=timeout)
+    if result.returncode:
+        line = next((text for text in result.stderr.splitlines() if text.startswith("Error: ")), "Error: STANDARD_OPERATION_FAILED")
+        raise Stop(line[len("Error: "):])
+    try:
+        return json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise Stop("STANDARD_OPERATION_FAILED: no answer from silo-migrate-control")
+
+
+def remove_project(entry, args):
+    """Everything of one project goes (or, with --keep-received, everything but the received files),
+    after the engineer types its name. The same removal as the Project page's (bin/project_remove.py)."""
+    if not args:
+        names = control_json(["remove-project", "--list"], entry, 60).get("projects") or []
+        print("projects on this server: " + (", ".join(names) if names else "none"))
+        print("remove one with: silo remove-project PROJECT   (or start it over: add --keep-received)")
+        return 0
+    project, flags = args[0], args[1:]
+    if not PROJECT.fullmatch(project) or flags not in ([], ["--keep-received"]):
+        raise Stop("usage: silo remove-project [PROJECT [--keep-received]]")
+    plan = control_json(["remove-project", project, "--plan", *flags], entry, 600)
+    if not plan.get("exists"):
+        print("There is nothing of " + project + " on this server.")
+        return 0
+    start_over = plan.get("mode") == "start_over"
+    print(("Start " + project + " over: " if start_over else "Remove " + project + ": ") + "this is what goes, and what stays.\n")
+    for title, items in (("Removed", plan.get("removed") or []), ("Kept", plan.get("kept") or [])):
+        if items:
+            print(title + ":")
+            for item in items:
+                print("  " + ("! " if item.get("warn") else "") + item["text"] + ("   " + human(item.get("bytes")) if item.get("bytes") is not None else ""))
+            print()
+    if plan.get("blocked"):
+        print("Not now:")
+        for blocker in plan["blocked"]:
+            print("  " + blocker["text"])
+        print("Nothing was changed.")
+        return 2
+    if not sys.stdin.isatty():
+        raise Stop("run this in a terminal: it asks you to type the project's name")
+    print("This can't be undone.")
+    try:
+        typed = input("Type " + project + " to confirm (anything else cancels): ").strip()
+    except EOFError:
+        typed = ""
+    if typed != project:
+        print("Cancelled. Nothing was changed.")
+        return 1
+    by = os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
+    by = by if CONTACT.fullmatch(by) else "unknown"
+    print("Working; this can take a few minutes...")
+    result = control_json(["remove-project", project, "--confirm", project, *flags, "--by", by], entry, 3600)
+    done = result.get("removed") or {}
+    print("Done.")
+    if done.get("docker_objects"):
+        print("  containers, networks and volumes removed: %d" % done["docker_objects"])
+    if done.get("chats"):
+        print("  chats removed: %d (attachments: %d)" % (done["chats"], done.get("attachments") or 0))
+    for item in result.get("returned") or []:
+        print("  back in the drop folder: " + item["to"] + "   " + human(item.get("bytes")))
+    for note in result.get("notes") or []:
+        print("  " + note)
+    print(result.get("next") or "")
+    return 0
+
+
 # -- main ------------------------------------------------------------------------------
 
 def main(args):
@@ -681,7 +760,7 @@ def main(args):
         print(__doc__.strip())
         return 0
     command, rest = args[0], args[1:]
-    known = {"doctor", "update", "use-github", "restart", "shell", "prime", "claude-login", "intake", "set-contact"}
+    known = {"doctor", "update", "use-github", "restart", "shell", "prime", "claude-login", "intake", "set-contact", "remove-project"}
     if command not in known:
         raise Stop("unknown command; see silo --help")
     entry = account()
@@ -705,6 +784,8 @@ def main(args):
         return intake(entry, rest[0])
     if command == "set-contact" and len(rest) == 1:
         return set_contact(rest[0])
+    if command == "remove-project" and len(rest) <= 2:
+        return remove_project(entry, rest)
     raise Stop("wrong arguments; see silo --help")
 
 

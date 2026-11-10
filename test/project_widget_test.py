@@ -44,12 +44,15 @@ class ProjectWidgetTest(unittest.TestCase):
         self.control = top / 'control'
         self.control.write_text('''#!/usr/bin/env python3
 import json, os, sys
-request = json.loads(sys.stdin.read())
+request = json.loads(sys.stdin.read()) if sys.argv[1] != 'remove-project' else None
 with open(os.environ['CALLS'], 'a') as out:
     out.write(json.dumps([sys.argv[1:], request]) + '\\n')
 if os.environ.get('REFUSE'):
     print('Error: ' + os.environ['REFUSE'], file=sys.stderr)
     sys.exit(1)
+if sys.argv[1] == 'remove-project':
+    print(json.dumps({'version': 1, 'exists': True, 'blocked': [], 'removed': [], 'kept': []}))
+    sys.exit(0)
 print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.argv[2] == 'new-forum' else [], 'unlabelled_data': [], 'delivery': 'Development v1'}))
 ''')
         self.control.chmod(0o700)
@@ -120,6 +123,33 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         status, data, _ = self.post({'workspace': 'arc', 'kind': 'development', 'files': [{'path': 'a'}]})
         self.assertEqual(409, status)
         self.assertIn('STANDARD_DELIVERY_FILES_CHANGED', json.loads(data)['error'])
+
+    def test_start_over_and_remove_go_to_the_same_command_as_silo(self):
+        status, data, _ = self.request('GET', '/api/project/removal?workspace=arc&keep=1')
+        self.assertEqual((200, True), (status, json.loads(data)['exists']))
+        self.request('GET', '/api/project/removal?workspace=arc')
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        status, _data, _ = self.request('POST', '/api/project/remove', {'workspace': 'arc', 'confirm': 'arc', 'keep_received': True, 'by': 'Mallory'}, headers)
+        self.assertEqual(200, status)
+        self.request('POST', '/api/project/remove', {'workspace': 'arc', 'confirm': 'arc', 'keep_received': False}, headers)
+        self.assertEqual([['remove-project', 'arc', '--plan', '--keep-received'], ['remove-project', 'arc', '--plan'],
+                          ['remove-project', 'arc', '--confirm', 'arc', '--keep-received', '--by', self.m.runs.reviewer_name()],
+                          ['remove-project', 'arc', '--confirm', 'arc', '--by', self.m.runs.reviewer_name()]], [argv for argv, _ in self.calls()])
+
+    def test_removing_needs_the_pages_header_the_typed_name_and_exact_shapes(self):
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        self.assertEqual(403, self.request('POST', '/api/project/remove', {'workspace': 'arc', 'confirm': 'arc', 'keep_received': True},
+                                           {'Content-Type': 'application/json'})[0])
+        self.assertEqual(404, self.request('GET', '/api/project/remove?workspace=arc&confirm=arc')[0])
+        for body in ({'workspace': 'arc', 'confirm': 'Arc', 'keep_received': True}, {'workspace': 'arc', 'keep_received': True},
+                     {'workspace': 'arc', 'confirm': 'arc', 'keep_received': 'yes'}, {'workspace': 'arc', 'confirm': 'arc'},
+                     {'workspace': '../arc', 'confirm': '../arc', 'keep_received': False}, {'workspace': 'link/..', 'confirm': 'link/..', 'keep_received': False}):
+            with self.subTest(body=body):
+                status, data, _ = self.request('POST', '/api/project/remove', body, headers)
+                self.assertEqual(400, status)
+                self.assertIn(json.loads(data)['error'], ('STANDARD_ARGUMENTS_INVALID', 'STANDARD_CONFIRMATION_REQUIRED'))
+        self.assertEqual(400, self.request('GET', '/api/project/removal?workspace=../x')[0])
+        self.assertEqual([], self.calls())
 
     def test_serves_the_page_and_varnish_fonts_with_a_strict_policy(self):
         status, _data, response = self.request('GET', '/')

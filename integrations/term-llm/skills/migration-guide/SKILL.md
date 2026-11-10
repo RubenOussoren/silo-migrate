@@ -44,6 +44,12 @@ so never ask which one it is. The first chat creates the workspace with `data_cr
 Nothing after that is tracked yet. Taking a backup and restoring it on hosted are the
 engineer's own steps today. Don't suggest the tool does them.
 
+To begin a project again, the engineer uses **Start over** at the foot of the Project page's
+Overview: the work, chats (this one too) and review sites go, and the received files return to
+the drop folder. **Remove project** there deletes everything of it. Both list what goes first and
+can't be undone. In a terminal, `silo remove-project PROJECT [--keep-received]` does the same.
+Agents can't do either.
+
 ## What the words mean
 
 - **Finding:** what converter work needs to know about the data, with invented example

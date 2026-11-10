@@ -1,13 +1,14 @@
 // The Project page: one project at a glance, its files, findings and runs.
-import { $, el, safe, toast, api, explain, card, details } from './ui.js';
+import { $, el, safe, toast, api, explain, card, details, back } from './ui.js';
 import { runsView } from './runs.js';
 import { findingsView } from './findings.js';
 
 const POLL_MS = 15000;
 const TABS = [['overview', 'Overview'], ['files', 'Files'], ['findings', 'Findings'], ['runs', 'Runs']];
 const STAGE_NAMES = { files: 'Files', workspace: 'Workspace', source_db: 'Source DB', finding: 'Finding', converter: 'Converter', convert: 'Convert', review: 'Import', site: 'Check site' };
-const state = { projects: [], project: null, tab: 'overview', selected: null, files: null, guide: null, counts: {}, details: false, typing: false, generation: 0, findings: { filter: 'proposed', q: '' } };
+const state = { projects: [], project: null, tab: 'overview', selected: null, files: null, guide: null, counts: {}, details: false, typing: false, generation: 0, findings: { filter: 'proposed', q: '' }, removal: null };
 
+const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 const size = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.round(bytes / 1e3)} KB`);
 const day = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '');
 // IDs and hashes belong in Details, not in the sentence.
@@ -52,6 +53,7 @@ function leaving() {
 
 function go(tab, selected = null) {
   if (!leaving()) return;
+  if (state.removal && !state.removal.working) state.removal = null;
   state.tab = tab;
   state.selected = selected;
   writeHash();
@@ -123,7 +125,103 @@ function renderOverview() {
   const more = details(el('pre', { class: 'mono' }, lines.join('\n')));
   more.open = state.details;
   more.addEventListener('toggle', () => { state.details = more.open; });
-  return [card(eyebrow, plain(next.action), el('div', { class: 'row' }, left), more), ...others, ...also];
+  return [card(eyebrow, plain(next.action), el('div', { class: 'row' }, left), more), ...others, ...also, manageLine()];
+}
+
+// Start over and Remove: rare and can't be undone, so they sit quietly at the foot of Overview, and the
+// server lists what goes and what stays before anything happens (bin/project_remove.py).
+function manageLine() {
+  return el('div', { class: 'manage' }, el('span', {}, 'Project'), el('span', { class: 'acts' },
+    el('button', { type: 'button', class: 'link', onclick: () => openRemoval(true) }, 'Start over\u2026'),
+    el('button', { type: 'button', class: 'link danger', onclick: () => openRemoval(false) }, 'Remove project\u2026')));
+}
+
+async function openRemoval(keep) {
+  const project = state.project;
+  const removal = { keep, project, plan: null, typed: '', working: false, result: null, error: null };
+  state.removal = removal;
+  render();
+  try {
+    removal.plan = await api(`api/project/removal?${new URLSearchParams({ workspace: project, keep: keep ? '1' : '0' })}`);
+  } catch (error) {
+    removal.error = explain(error);
+  }
+  if (state.removal === removal) render();
+}
+
+async function closeRemoval() {
+  const removal = state.removal;
+  state.removal = null;
+  if (removal && removal.result && !removal.keep) {
+    await loadProjects();  // the project is gone: show another, or none
+    const next = state.projects[0] || null;
+    if (next) { choose(next); return; }
+    state.project = null;
+    state.files = state.guide = null;
+  }
+  render();
+  refresh(false);
+}
+
+async function submitRemoval() {
+  const removal = state.removal;
+  removal.working = true;
+  removal.error = null;
+  render();
+  try {
+    removal.result = await api('api/project/remove', { workspace: removal.project, confirm: removal.typed, keep_received: removal.keep });
+    // What the header showed (its label, its stages) is gone with the work.
+    state.files = state.guide = null;
+    state.counts = {};
+  } catch (error) {
+    removal.error = explain(error);
+  }
+  removal.working = false;
+  if (state.removal === removal) render();
+}
+
+const itemList = (items) => el('ul', { class: 'list' }, items.map((entry) => el('li', { class: entry.warn ? 'warn' : '' },
+  el('span', {}, safe(entry.text)), el('span', {}, entry.bytes === null || entry.bytes === undefined ? '' : size(entry.bytes)))));
+const dangerCard = (eyebrow, say, ...content) => el('div', { class: 'card danger' }, el('div', { class: 'eyebrow' }, eyebrow), say ? el('p', { class: 'say' }, say) : null, ...content);
+
+function renderRemoval() {
+  const removal = state.removal;
+  const { project, keep } = removal;
+  const title = keep ? 'START OVER' : 'REMOVE PROJECT';
+  const backButton = back('Overview', () => { if (!removal.working) closeRemoval(); });
+  const button = (label, onclick, cls = 'btn q') => el('button', { type: 'button', class: cls, onclick }, label);
+  if (removal.result) {
+    const result = removal.result;
+    const done = result.removed || {};
+    const lines = (result.returned || []).map((entry) => ({ text: `${entry.to} is back in the drop folder`, bytes: entry.bytes }));
+    lines.push({ text: keep ? 'Work, review sites and the source database removed' : 'Work, files, review sites and the source database removed' });
+    if (done.chats) lines.push({ text: `${count(done.chats, 'chat')}${done.attachments ? ` and ${count(done.attachments, 'attachment')}` : ''} removed` });
+    return [card(null, null, el('div', { class: 'eyebrow ok' }, keep ? 'STARTED OVER' : 'REMOVED'),
+      el('p', { class: 'say' }, keep ? `${project} is ready to start again.` : `${project} has been removed from this server.`),
+      itemList(lines), ...(result.notes || []).map((note) => el('p', { class: 'note' }, safe(note))),
+      el('p', { class: 'hint' }, safe(result.next || '')), el('div', { class: 'actions' }, button('Done', closeRemoval, 'btn')))];
+  }
+  if (!removal.plan) {
+    return [backButton, dangerCard(title, removal.error || 'Checking what this would remove\u2026', removal.error ? el('div', { class: 'actions' }, button('Back', closeRemoval)) : null)];
+  }
+  const plan = removal.plan;
+  if (!plan.exists) return [backButton, dangerCard(title, `There is nothing of ${project} on this server.`, el('div', { class: 'actions' }, button('Back', closeRemoval)))];
+  if (plan.blocked.length) {
+    return [backButton, dangerCard(title, 'Not now.', ...plan.blocked.map((entry) => el('p', { class: 'hint' }, safe(entry.text))),
+      el('p', { class: 'hint' }, 'Nothing was changed.'), el('div', { class: 'actions' }, button('Back', closeRemoval)))];
+  }
+  const box = el('input', { class: 'confirm remove-confirm', autocomplete: 'off', spellcheck: 'false', value: removal.typed, 'aria-label': `Type ${project} to confirm`, disabled: removal.working });
+  const confirmButton = el('button', { type: 'button', class: 'btn red', disabled: removal.working || removal.typed !== project, onclick: submitRemoval },
+    removal.working ? 'Working\u2026' : keep ? 'Start over' : 'Remove project');
+  box.addEventListener('input', () => { removal.typed = box.value; confirmButton.disabled = box.value !== project; });
+  return [backButton, dangerCard(title, keep ? `Start ${project} again from the beginning?` : `Remove ${project} from this server?`,
+    plan.removed.length ? [el('h2', {}, 'REMOVED'), itemList(plan.removed)] : null,
+    plan.kept.length ? [el('h2', {}, 'KEPT'), itemList(plan.kept)] : null,
+    el('p', { class: 'hint' }, 'This can\u2019t be undone. A short record of who did it and when is kept.'),
+    el('label', { class: 'typed' }, 'Type ', el('b', {}, project), ' to confirm', box),
+    el('div', { class: 'actions' }, confirmButton, removal.working ? null : button('Cancel', closeRemoval)),
+    removal.working ? el('p', { class: 'hint' }, 'This can take a few minutes. Keep this page open.') : null,
+    removal.error ? el('p', { class: 'error' }, removal.error) : null)];
 }
 
 async function submitLabel(kind, extra) {
@@ -192,13 +290,14 @@ function renderFiles() {
 }
 
 function render() {
-  if (state.typing && document.activeElement && document.activeElement.classList.contains('confirm')) return;  // don't wipe what's being typed
+  const typing = document.activeElement && document.activeElement.classList.contains('confirm');
+  if ((state.typing || state.removal) && typing) return;  // don't wipe what's being typed
   $('project-name').textContent = state.project || 'No projects yet';
   renderData();
   renderStages();
   renderTabs();
   if (state.tab === 'runs' || state.tab === 'findings') { views[state.tab].show(); return; }
-  mount(state.tab === 'files' ? renderFiles() : renderOverview());
+  mount(state.tab === 'files' ? renderFiles() : state.removal ? renderRemoval() : renderOverview());
 }
 
 async function refreshCounts() {
@@ -206,6 +305,7 @@ async function refreshCounts() {
 }
 
 async function refresh(full = true) {
+  if (state.removal) return;  // its screen shows what the server said; the project may be gone
   if (!state.project) { render(); return; }
   const generation = ++state.generation;
   const project = state.project;
@@ -240,6 +340,7 @@ function choose(project) {
   state.counts = {};
   state.selected = null;
   state.typing = false;
+  state.removal = null;
   state.findings.page = 0;  // another project's page or search would show an empty list
   state.findings.q = '';
   $('project').value = project;
@@ -249,18 +350,22 @@ function choose(project) {
   refresh(false);
 }
 
+async function loadProjects() {
+  state.projects = (await api('api/projects')).projects;
+  $('project').replaceChildren(...state.projects.map((name) => el('option', { value: name }, name)));
+}
+
 async function start() {
   applyScheme();
   const wanted = readHash();
   if (wanted.tab) state.tab = wanted.tab;
   state.selected = wanted.selected;
   try {
-    state.projects = (await api('api/projects')).projects;
+    await loadProjects();
   } catch (error) {
     toast(explain(error), true);
     return;
   }
-  $('project').replaceChildren(...state.projects.map((name) => el('option', { value: name }, name)));
   $('project').addEventListener('change', (event) => choose(event.target.value));
   let last = null;
   try { last = localStorage.getItem('silo-project'); } catch { /* the default */ }

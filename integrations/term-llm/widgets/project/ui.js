@@ -70,6 +70,16 @@ const ERRORS = {
   STANDARD_DELIVERY_LAUNCH_EXISTS: 'Launch data already exists. Confirm that this replaces it.',
   STANDARD_DELIVERY_LABEL_EXISTING_FIRST: 'Label the data already in this project first.',
   STANDARD_NOT_INITIALIZED: 'This project has no workspace yet. Ask migration-data to create it.',
+  STANDARD_CONFIRMATION_REQUIRED: "Type the project's name exactly to confirm.",
+  STANDARD_BUSY_RUN: 'A run is still running. Wait for it to finish, or stop it from the Runs tab.',
+  STANDARD_BUSY_JOB: 'A data job is still running. Wait for it, or ask migration-data to stop it.',
+  STANDARD_BUSY_CHAT: 'A chat in this project is still answering. Stop it or let it finish, then try again.',
+  STANDARD_REMOVE_DROP_TAKEN: 'The drop folder already has files with the received files\' names. Move them away, then try again.',
+  STANDARD_REMOVE_INCOMPLETE: 'Not everything could be removed yet. Nothing else was lost: try again to finish.',
+  STANDARD_DOCKER_UNAVAILABLE: "Docker didn't answer. Try again, or ask for help (silo doctor).",
+  STANDARD_CHATS_UNREADABLE: "term-llm's chat list couldn't be read. Try again in a moment.",
+  STANDARD_STATE_INVALID: "This project's workbench state can't be read, so its review sites can't be found. Ask for help.",
+  STANDARD_REFERENCE_INVALID: "That isn't on the server any more. The page has been refreshed.",
 };
 export const explain = (error) => ERRORS[String(error.message).split(':')[0]] || `That didn't work: ${error.message}`;
 

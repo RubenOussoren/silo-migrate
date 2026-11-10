@@ -180,6 +180,17 @@ def data_tools():
     return module
 
 
+def host_remove(args, values, base):
+    """`remove-project`: removing a project, or starting it over (bin/project_remove.py). Only the
+    engineer reaches it, from `silo remove-project` or the Project page; no agent tool maps to it."""
+    import importlib.util
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("project_remove", Path(__file__).resolve().parent / "project_remove.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], data_tools())
+
+
 def host_data(args, values, base, self):
     """`data WS`: the migration-data agent's operations (bin/data_tools.py), JSON on stdin.
     `dbhub WS`: the project's DBHub MCP server over stdio (term-llm starts it; never prints here)."""
@@ -314,6 +325,8 @@ def main(args):
         return host_converter(args, values, base, self)
     if args[:1] in (["data"], ["dbhub"]):
         return host_data(args, values, base, self)
+    if args[:1] == ["remove-project"]:
+        return host_remove(args, values, base)
     image = values.get("SILO_CONTROL_IMAGE_REF", CONTROL_REF) if configured else CONTROL_REF.split("@", 1)[1]
     if configured:
         control = control_image(repo, values, base, args)
