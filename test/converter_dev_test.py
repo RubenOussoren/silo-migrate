@@ -870,6 +870,81 @@ class ConverterDevTest(unittest.TestCase):
             shown = self.dev.main(['converter', 'push-show', self.ws], {}, self.base, ROOT, self.host, io.StringIO(''), home=str(self.home))
             self.assertEqual('pushed', shown['proposals'][0]['status'])
 
+    def test_rebase_role_and_target_are_fixed_before_any_git_mutation(self):
+        before = git(self.checkout, 'rev-parse', 'HEAD')
+        for role in ('reviewer', 'reader'):
+            self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('rebase-main', role=role)['error'])
+        self.assertEqual('STANDARD_ARGUMENTS_INVALID', self.call('rebase-main', target='other', force=True)['error'])
+        self.assertEqual(before, git(self.checkout, 'rev-parse', 'HEAD'))
+
+    def rebase_published_fix(self):
+        self.commit_fix()
+        branch = git(self.checkout, 'branch', '--show-current')
+        before = git(self.checkout, 'rev-parse', 'HEAD')
+        git(self.checkout, 'push', '-q', 'origin', branch)
+        upstream = Path(self.temp.name) / 'upstream-main'
+        git(Path(self.temp.name), 'clone', '-q', str(self.origin), str(upstream))
+        self.write(upstream / 'lib/shared_feature.rb', '# Shared upstream feature\n')
+        git(upstream, 'add', 'lib/shared_feature.rb')
+        git(upstream, 'commit', '-q', '-m', 'Shared upstream feature')
+        git(upstream, 'push', '-q', 'origin', 'main')
+        with mock.patch.object(self.dev, 'fetchable', return_value=True), \
+                mock.patch.object(self.host, 'github_credentials', return_value=None):
+            result = self.call('rebase-main')
+        self.assertEqual('rebased', result.get('status'), result)
+        self.assertNotEqual(before, result['head'])
+        self.assertEqual(MARKER, (self.checkout / 'customer.sqlite').read_text())
+        return branch, before, result['head']
+
+    def test_rebased_push_requires_explicit_approval_and_an_exact_remote_lease(self):
+        branch, before, after = self.rebase_published_fix()
+        calls = []
+        target, api = self.github(calls)
+        with target, api:
+            proposed = self.call('push-propose', title='Use shared upstream feature')
+            digest = proposed['digest']
+            self.assertEqual('force-with-lease', proposed['proposal']['rewrite']['mode'])
+            self.assertEqual(before, proposed['proposal']['rewrite']['expected_remote_head'])
+            self.assertTrue(proposed['approve'].endswith(' --allow-rewrite'))
+            push = lambda *extra: self.dev.main(['converter', 'push', self.ws, '--sha256', digest, *extra],
+                {}, self.base, ROOT, self.host, io.StringIO(''), home=str(self.home))
+            with mock.patch.object(self.dev, 'token_for', side_effect=AssertionError('credential read before approval')):
+                with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_PUSH_REWRITE_APPROVAL_REQUIRED'):
+                    push()
+            self.assertEqual(before, git(self.origin, 'rev-parse', 'refs/heads/' + branch))
+            self.token()
+            self.assertEqual('pushed', push('--allow-rewrite')['status'])
+            self.assertEqual(after, git(self.origin, 'rev-parse', 'refs/heads/' + branch))
+            self.assertEqual(1, len(calls))
+            self.assertEqual('pushed', push('--allow-rewrite')['status'])  # no second write/PR
+            self.assertEqual(1, len(calls))
+
+    def test_rebased_push_cannot_overwrite_a_teammates_new_remote_commit(self):
+        branch, before, after = self.rebase_published_fix()
+        calls = []
+        target, api = self.github(calls)
+        with target, api:
+            digest = self.call('push-propose', title='Use shared upstream feature')['digest']
+            other = Path(self.temp.name) / 'teammate'
+            git(Path(self.temp.name), 'clone', '-q', str(self.origin), str(other))
+            git(other, 'switch', '-q', '--track', 'origin/' + branch)
+            self.write(other / 'lib/teammate.rb', '# Teammate work\n')
+            git(other, 'add', 'lib/teammate.rb')
+            git(other, 'commit', '-q', '-m', 'Teammate work')
+            git(other, 'push', '-q', 'origin', branch)
+            teammate_head = git(other, 'rev-parse', 'HEAD')
+            self.token()
+            with self.assertRaisesRegex(self.dev.Refusal, 'STANDARD_PUSH_REJECTED'):
+                self.dev.main(['converter', 'push', self.ws, '--sha256', digest, '--allow-rewrite'],
+                    {}, self.base, ROOT, self.host, io.StringIO(''), home=str(self.home))
+            self.assertEqual(teammate_head, git(self.origin, 'rev-parse', 'refs/heads/' + branch))
+            self.assertEqual(after, git(self.checkout, 'rev-parse', 'HEAD'))
+            self.assertEqual([], calls)
+            record = json.loads((self.root / '.silo-migrate/named/standard/converter-pushes' / (digest + '.json')).read_text())
+            self.assertEqual('proposed', record['status'])
+            git(self.checkout, 'fetch', '-q', 'origin')
+            self.assertEqual('STANDARD_REBASE_REMOTE_DIVERGED', self.call('push-propose', title='Do not advance the lease')['error'])
+
     def test_a_new_proposal_supersedes_the_waiting_one_and_proposals_can_be_discarded(self):
         self.commit_fix()
         self.token()

@@ -477,8 +477,11 @@ export function runsView(ctx) {
   function push(data) {
     const pull = data.pull_request;
     const commits = data.commits || [];
-    const say = data.status === 'proposed' ? `Push ${commits.length} commit(s) and open or update the draft PR?` : data.status === 'superseded' ? 'A newer proposal replaced this one.' : `This push is ${data.status}.`;
+    const rewrite = data.rewrite && data.rewrite.mode === 'force-with-lease';
+    const say = data.status === 'proposed' ? (rewrite ? 'Push the rebased branch and update its draft PR?' : `Push ${commits.length} commit(s) and open or update the draft PR?`) : data.status === 'superseded' ? 'A newer proposal replaced this one.' : `This push is ${data.status}.`;
+    const warning = rewrite ? el('p', { class: 'note' }, 'This replaces this migration branch’s history on GitHub, never main. The push is refused if someone else has moved the branch from the exact remote commit shown below.') : null;
     const summary = facts([['Title', safe(data.title)], ['Branch', `${safe(data.branch)} → ${safe(data.base)}`, true], ['Repository', data.repository],
+      ...(rewrite ? [['Upstream main', short(data.rewrite.main_head, 12), true], ['Remote before', short(data.rewrite.expected_remote_head, 12), true], ['New head', short(data.head, 12), true]] : []),
       ['Addresses', (data.findings || []).length ? `${data.findings.length} finding(s): ${data.findings.join(', ')}` : 'no finding named'],
       ['Pull request', pull && pull.url ? el('a', { href: pull.url, target: '_blank', rel: 'noopener noreferrer' }, `#${pull.number} (draft)`) : null]]);
     const commitLine = (c) => (typeof c === 'string' ? safe(c) : `${short(c.sha, 10)}  ${safe(c.subject || '')}${c.author ? ` (${safe(String(c.author).replace(/\s*<[^>]*>$/, ''))})` : ''}`);
@@ -490,16 +493,19 @@ export function runsView(ctx) {
     if (data.status === 'proposed' || (data.status === 'pushed' && !(pull && pull.url))) {
       actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
         const owner = String(data.repository || '').split('/')[0];
-        const outcome = await act('push', { digest: data.digest }, `Push ${data.branch} (${short(data.head, 12)}) to ${data.repository} and open a draft PR, with the server's GitHub token for ${owner}?`);
+        const question = rewrite
+          ? `Replace the history of ${data.branch} in ${data.repository}, only if GitHub still has ${data.rewrite.expected_remote_head}, with rebased head ${data.head}, and update its draft PR? Main is never pushed. If the branch moved, nothing is pushed.`
+          : `Push ${data.branch} (${short(data.head, 12)}) to ${data.repository} and open a draft PR, with the server's GitHub token for ${owner}?`;
+        const outcome = await act('push', { digest: data.digest, ...(rewrite ? { rewrite: true } : {}) }, question);
         if (outcome) { toast(outcome.pull_request && outcome.pull_request.url ? `Pushed; draft PR #${outcome.pull_request.number}.` : 'Pushed.'); ctx.refresh(); }
-      } }, data.status === 'proposed' ? 'Push and open draft PR' : 'Open draft PR'));
+      } }, data.status === 'proposed' ? (rewrite ? 'Push rebased branch…' : 'Push and open draft PR') : 'Open draft PR'));
       if (data.status === 'proposed') actions.push(discard);
     } else if (data.status === 'superseded') actions.push(discard);
     const more = [facts([['Head', data.head, true], ['Proposed', data.proposed_at], ['Pushed', data.pushed_at], ['Approval code', data.digest, true]]),
       block('PR description', el('pre', {}, safe(data.body || '(empty)'))),
       block(`Files (${data.files_total ?? (data.files || []).length})`, el('pre', {}, (data.files || []).map(safe).join('\n')))];
     if (data.stat) more.push(block('Diff stat', el('pre', {}, safe(data.stat))));
-    return [card(data.status === 'proposed' ? 'FOR YOU' : 'CONVERTER PUSH', say, summary, block(`Commits (${commits.length})`, commitList), actions.length ? el('div', { class: 'actions' }, actions) : null, details(...more))];
+    return [card(data.status === 'proposed' ? 'FOR YOU' : 'CONVERTER PUSH', say, warning, summary, block(`Commits (${commits.length})`, commitList), actions.length ? el('div', { class: 'actions' }, actions) : null, details(...more))];
   }
 
   function converter(log) {

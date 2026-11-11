@@ -224,6 +224,47 @@ layer reported. The layer's own totals go to you (the run on the Project page) a
 not to them. A layer runs next to customer data exactly as committed, so have it reviewed before
 you approve the plan that names its commit.
 
+## Bringing upstream main into the converter branch
+
+Ask **converter-developer** in the project's chat to bring in upstream work. It now has
+`dev_rebase_main`: fixed `origin/main`, local only, no terminal or push permission.
+
+1. It checkpoints its own uncommitted work with `dev_commit` first. This preserves unfinished
+   edits without stashing anything, and leaves other people's hidden changes alone. Dirty
+   tracked/index changes must be resolved before the rebase; unrelated private/untracked files
+   are left untouched, but an incoming path may not replace one.
+2. The tool fetches main and replays committed code in a disposable checkout. On a replay
+   conflict, the live branch, index and files are unchanged and there is no live rebase to abort.
+   Stop and agree a conflict-resolution approach rather than guessing, retrying blindly, or
+   publishing an apparently synchronized branch. This version has no conflict-continue tool.
+3. On success it keeps a pre-rebase backup ref, reports the main/head IDs, and the agent reruns
+   tests/lint and obtains converter-reviewer review before proposing a new push. Old approvals
+   do not cover rewritten commits. The branch name and draft PR are kept.
+4. If the branch was already on GitHub, the existing Runs push card says **Push rebased branch…**.
+   It shows the exact old remote commit and the new head, and explicitly asks to replace this
+   migration branch's history—not main. Approval uses `--force-with-lease` pinned to that old
+   commit; a teammate moving the remote branch makes it fail. A normal **Push** approval cannot
+   authorize a rewrite, and neither agent can approve/push it itself.
+
+The CLI equivalent of that explicit engineer approval is
+`converter push WORKSPACE --sha256 DIGEST --allow-rewrite` through `silo-migrate-control`;
+without `--allow-rewrite`, a rewrite proposal is refused before reading GitHub credentials.
+Do not turn that into an agent tool or use an unqualified `--force`.
+
+The rebase is serialized with developer writes and refused during an active migration/Git
+operation. It is bounded to 50 local commits, 10,000 paths, 64 MiB of committed file bytes and
+16 MiB per file. Ordinary directory-based Git checkouts and byte-identical checkouts are required
+(no automatic line-ending/filter conversion). Unchanged tracked symlinks are checked without
+following their targets; link changes, gitlinks/submodules, local merge commits and file/directory
+transitions are safely refused rather than flattened or cleaned.
+
+Backup refs (`refs/silo-migrate/rebase-backups/...`) are deliberately retained, including after a
+rolled-back install, so the pre-rebase commits remain reachable. There is no automatic pruning.
+Normal failures roll back tracked changes; process/power loss and same-account filesystem races
+are not a transaction guarantee. If interrupted, preserve the checkout, backup refs and any
+`.converter-rebase-*` temporary files, and have the engineer inspect them privately before any
+recovery or cleanup. Do not auto-reset/clean/stash or expose hidden files to coding agents.
+
 ## Releasing findings (web UI)
 
 migration-data proposes findings (schemas, a run's cause); nothing reaches the coding agents
@@ -326,6 +367,7 @@ export CHROMIUM=/path/to/chromium
 export TERM_LLM_SOURCE=/path/to/term-llm-checkout  # contains local tag v0.9.99
 node test/launcher_extension_test.mjs
 node test/project_navigation_browser.mjs
+node test/converter_rebase_browser.mjs
 ```
 
 The launcher test covers stock/Varnish headers, narrow screens, keyboard focus and Hub-relative

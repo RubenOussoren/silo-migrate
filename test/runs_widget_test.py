@@ -343,6 +343,21 @@ else:
             ['standard', 'run', 'reset', 'arc', rid(1), '--yes'],
             ['converter', 'push', 'arc', '--sha256', 'c' * 64]], self.calls())
 
+    def test_rewrite_push_needs_a_boolean_acknowledgement_and_exposes_the_pinned_lease(self):
+        path = self.base / 'arc/.silo-migrate/named/standard/converter-pushes' / ('c' * 64 + '.json')
+        record = json.loads(path.read_text())
+        rewrite = {'mode': 'force-with-lease', 'expected_remote_head': 'a' * 40, 'main_head': 'b' * 40}
+        record['proposal']['rewrite'] = rewrite
+        path.write_text(json.dumps(record))
+        self.assertEqual(rewrite, self.get('/api/push?workspace=arc&id=' + 'c' * 64)[1]['rewrite'])
+        self.assertEqual(200, self.post('push', digest='c' * 64, rewrite=True)[0])
+        self.assertEqual([['converter', 'push', 'arc', '--sha256', 'c' * 64, '--allow-rewrite']], self.calls())
+        self.assertEqual(200, self.post('push', digest='c' * 64, rewrite=False)[0])
+        self.assertEqual(['converter', 'push', 'arc', '--sha256', 'c' * 64], self.calls()[-1])
+        for value in ('true', 1, {}, None):
+            self.assertEqual(400, self.post('push', digest='c' * 64, rewrite=value)[0])
+        self.assertEqual(2, len(self.calls()))
+
     def test_bad_requests_never_reach_control(self):
         cases = [('approve', {'plan_id': pid(1)}), ('approve', {'plan_id': 'plan-1', 'digest': 'a' * 64}), ('approve', {'plan_id': pid(1), 'digest': 'a' * 63 + '--x'}),
                  ('start', {'plan_id': pid(1) + ' --yes'}), ('reset', {'run_id': '--yes'}), ('push', {'digest': 'C' * 64}), ('release', {'plan_id': pid(1)}),

@@ -29,6 +29,15 @@ Some projects merge one Discourse site into another instead of converting a sour
 - You never see a merge run's log. `dev_merge_guide` gives back, under `recent_runs`, which commit of the layer ran, where a run stopped, fixed site counts and how many totals your layer reported. The totals themselves (`SILO_MERGE_TOTAL: name=integer`, the name spelled out in your code) go to the engineer and migration-data. Anything more reaches you as a released finding. Don't use totals, counts or error text to carry data out.
 - A run applies the layer at the checkout's committed head, and its plan shows the engineer the path and commit. Commit before telling the engineer it is ready for a run.
 
+## Keeping the branch up to date with main
+
+When the engineer asks to bring in upstream work, use `dev_rebase_main` on this project's existing migration branch. It fetches `origin/main` itself and only changes local committed code; it never pushes. Do not invent a shell, stash, merge or force-push command.
+
+1. Inspect `dev_status` and `dev_diff`. Preserve your own uncommitted work with a checkpoint `dev_commit` first, even if it is not finished. Never commit or stash someone else's invisible files. If hidden changes prevent a rebase, report the fixed refusal and ask the engineer; do not try to expose them.
+2. Call `dev_rebase_main` with no arguments. It replays commits in a disposable Git checkout, leaving the live branch unchanged on conflicts. If it reports conflicts, report the committed-code paths and ask the engineer how to resolve them; do not claim synchronization or blindly add a fix commit and retry (Git can stop at the same earlier commit again). There is no live rebase to abort. If it refuses because the remote migration branch moved, stop rather than discarding teammates' work.
+3. On success, use the returned main/head IDs as evidence, inspect the diff, rerun tests and lint, and obtain converter-reviewer review as usual. Upstream Gemfile/lockfile changes are allowed through the fetched main; you still cannot edit dependency files yourself.
+4. Propose a **new** push with the appropriate released finding IDs. Old approvals never cover the rebased head. A published branch may need **Push rebased branch…**: its digest includes an exact original remote commit, and the engineer explicitly approves replacing that branch's history with a force-with-lease push. Never main. If GitHub moved, the push is refused; do not refresh the lease or try to force it through.
+
 ## Limits
 
 - `Gemfile`, `Gemfile.lock` and `.bundle/` come from upstream; you can't change dependencies. If a fix needs a new gem, say so and stop.

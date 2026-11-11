@@ -9,7 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / 'integrations/term-llm'
-WRITE_TOOLS = {'dev_write', 'dev_edit', 'dev_delete', 'dev_branch', 'dev_commit', 'dev_push_propose', 'dev_format'}
+WRITE_TOOLS = {'dev_write', 'dev_edit', 'dev_delete', 'dev_branch', 'dev_commit', 'dev_push_propose', 'dev_format', 'dev_rebase_main'}
 
 
 class ConverterDevAdapterTest(unittest.TestCase):
@@ -66,6 +66,7 @@ print(json.dumps({'version': 1, 'ok': True}))
             'dev_read': ({'path': 'lib/a.rb', 'start_line': 3}, {'op': 'read', 'path': 'lib/a.rb', 'start_line': 3}),
             'dev_search': ({'pattern': 'x', 'fixed': False}, {'op': 'search', 'pattern': 'x', 'fixed': False}),
             'dev_status': ({}, {'op': 'status'}),
+            'dev_rebase_main': ({'target': 'other', 'force': True}, {'op': 'rebase-main'}),
             'dev_diff': ({'scope': 'unpushed'}, {'op': 'diff', 'scope': 'unpushed'}),
             'dev_test': ({'suite': 'lint', 'file': 'lib/a.rb'}, {'op': 'test', 'suite': 'lint', 'file': 'lib/a.rb'}),
             'dev_push_show': ({}, {'op': 'push-show'}),
@@ -131,7 +132,8 @@ print(json.dumps({'version': 1, 'ok': True}))
         self.assertEqual(set(), WRITE_TOOLS & set(self.tools('converter-reviewer')))
         for tool in WRITE_TOOLS:
             with self.subTest(tool=tool):
-                self.assertEqual('STANDARD_DEV_OPERATION_REFUSED', self.call('converter-reviewer', tool, {'path': 'a', 'content': 'x'})['error'])
+                self.assertEqual('STANDARD_TOOL_UNKNOWN' if tool == 'dev_rebase_main' else 'STANDARD_DEV_OPERATION_REFUSED',
+                                 self.call('converter-reviewer', tool, {'path': 'a', 'content': 'x'})['error'])
                 self.assertEqual([], self.calls())
         self.call('converter-reviewer', 'dev_test', {})
         self.assertEqual([[['converter', 'dev', 'example-forum', '--role', 'reviewer'], json.dumps({'op': 'test'})]], self.calls())

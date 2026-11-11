@@ -33,6 +33,7 @@ TOOLS = {
     "dev_branch": ("branch", {"topic", "new_pr"}),
     "dev_format": ("format", {"path"}),
     "dev_commit": ("commit", {"message"}),
+    "dev_rebase_main": ("rebase-main", set()),
     "dev_push_propose": ("push-propose", {"title", "body", "base", "findings"}),
     "dev_branch_resolve": ("branch-resolve", {"link"}),
     "dev_branches": ("branches", {"fetch"}),
@@ -124,7 +125,7 @@ def main():
     workspace = chat_project()
     if workspace is None or not WORKSPACE.match(workspace):
         return fail("STANDARD_CHAT_NOT_IN_PROJECT")
-    timeout = 290 if tool in ("dev_test", "dev_format") else 85 if tool in ("dev_branches", "dev_branch_resolve") else 55
+    timeout = 285 if tool == "dev_rebase_main" else 290 if tool in ("dev_test", "dev_format") else 85 if tool in ("dev_branches", "dev_branch_resolve") else 55
     try:
         if tool == "dev_findings":
             result = subprocess.run([control_path(), "standard", "agent", "findings", workspace], capture_output=True, timeout=timeout, env=control_env())

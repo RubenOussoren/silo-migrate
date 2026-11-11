@@ -384,7 +384,7 @@ def push_detail(store, workspace, digest):
     if not record:
         raise Refused("STANDARD_REFERENCE_INVALID", 404)
     proposal = record["proposal"]
-    keep = ("repository", "branch", "base", "head", "title", "body", "stat", "files_total", "findings")
+    keep = ("repository", "branch", "base", "head", "title", "body", "stat", "files_total", "findings", "rewrite")
     return dict(push_summary(record), workspace=workspace, **{key: proposal.get(key) for key in keep},
                 commits=[commit for commit in proposal.get("commits") or [] if isinstance(commit, (str, dict))][:50],
                 files=[name for name in proposal.get("files") or [] if isinstance(name, str)][:300])
@@ -414,7 +414,11 @@ def decide(store, control, action, body):
     elif action == "reset" and run_ok:
         argv = ["standard", "run", "reset", workspace, run_id, "--yes"]
     elif action == "push" and digest_ok:
+        if "rewrite" in body and not isinstance(body["rewrite"], bool):
+            raise Refused("STANDARD_ARGUMENTS_INVALID")
         argv = ["converter", "push", workspace, "--sha256", digest]
+        if body.get("rewrite") is True:
+            argv.append("--allow-rewrite")
     elif action == "discard-push" and digest_ok:
         argv = ["converter", "push-discard", workspace, "--sha256", digest]
     else:

@@ -33,6 +33,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import types
 import time
 import urllib.error
 import urllib.parse
@@ -60,7 +61,7 @@ PROTECTED_NAMES = {".gitignore", ".gitattributes", ".gitmodules", ".git"}
 PROTECTED_PATHS = {"Gemfile", "Gemfile.lock", ".bundle/config"}
 ROLES = {
     "developer": {"list", "read", "search", "status", "diff", "test", "push-show", "branches", "branch-diff", "branch-read", "branch-resolve",
-                  "write", "edit", "delete", "branch", "commit", "push-propose", "format", "merge-guide"},
+                  "write", "edit", "delete", "branch", "commit", "push-propose", "format", "merge-guide", "rebase-main"},
     "reviewer": {"list", "read", "search", "status", "diff", "test", "push-show", "merge-guide"},
     "reader": {"branches", "branch-diff", "branch-read", "branch-resolve"},
 }
@@ -1038,7 +1039,7 @@ def op_delete(checkout, request):
 
 # Operations that change the checkout or the manifest of what the agent wrote. Models often send
 # several tool calls at once; these run one at a time per workspace (reads don't wait).
-MUTATING = {"write", "edit", "delete", "branch", "commit", "push-propose", "format"}
+MUTATING = {"write", "edit", "delete", "branch", "commit", "push-propose", "format", "rebase-main"}
 DEV_LOCK_WAIT = 25  # the adapter gives a call 55 s; leave the operation itself ~30 s
 
 
@@ -1213,6 +1214,22 @@ def proposal_dir(checkout):
     return path
 
 
+def rebase_tools():
+    """Load the bundled Git-only helper without importing anything from the converter checkout."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("converter_rebase", Path(__file__).with_name("converter_rebase.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rebase_context():
+    """Only the host primitives the rebase helper needs, not the agent's tool dispatch."""
+    return types.SimpleNamespace(refuse=refuse, git_env=git_env, fetchable=fetchable, identity=identity,
+                                 Locked=Locked, write_record=write_record, MAX_FILE_BYTES=MAX_FILE_BYTES,
+                                 MAX_COMMITS=MAX_COMMITS)
+
+
 def current_proposal(checkout, request_base, title, body):
     branch = checkout.branch()
     if not branch.startswith(checkout.migration_prefix()):
@@ -1232,9 +1249,13 @@ def current_proposal(checkout, request_base, title, body):
         refuse("STANDARD_PUSH_BASE_UNKNOWN")
     files = checkout.out("diff", "--name-status", "--no-color", "--no-ext-diff", "--no-renames", "refs/remotes/origin/" + base + "...HEAD").splitlines()
     stat_text = checkout.out("diff", "--stat=100", "--no-color", "--no-ext-diff", "refs/remotes/origin/" + base + "...HEAD")
-    return {"version": 1, "workspace": checkout.workspace, "repository": target["owner"] + "/" + target["repo"],
-            "branch": branch, "base": base, "head": checkout.head(), "commits": commits,
-            "files": files[:300], "files_total": len(files), "stat": bounded(stat_text, 4096)[0], "title": title, "body": body}
+    proposal = {"version": 1, "workspace": checkout.workspace, "repository": target["owner"] + "/" + target["repo"],
+                "branch": branch, "base": base, "head": checkout.head(), "commits": commits,
+                "files": files[:300], "files_total": len(files), "stat": bounded(stat_text, 4096)[0], "title": title, "body": body}
+    rewrite = rebase_tools().rewrite_metadata(checkout, rebase_context())
+    if rewrite:
+        proposal["rewrite"] = rewrite
+    return proposal
 
 
 MAX_ADDRESSED = 10
@@ -1279,7 +1300,7 @@ def op_push_propose(checkout, request):
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
     return {"digest": digest, "status": "proposed", "proposal": proposal,
-            "approve": "silo-migrate-control converter push " + checkout.workspace + " --sha256 " + digest,
+            "approve": "silo-migrate-control converter push " + checkout.workspace + " --sha256 " + digest + (" --allow-rewrite" if proposal.get("rewrite") else ""),
             "note": "Nothing is pushed until the engineer approves it on the web UI's Project page, Runs tab (or runs the approve command). A draft PR is then opened with the server's GitHub token."}
 
 
@@ -1943,7 +1964,7 @@ def open_draft_pr(target, proposal, digest, token):
     refuse("STANDARD_PR_FAILED")
 
 
-def push(checkout, digest, home, open_pr=True):
+def push(checkout, digest, home, open_pr=True, allow_rewrite=False):
     if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
         refuse("STANDARD_ARGUMENTS_INVALID")
     path = checkout.standard / "converter-pushes" / (digest + ".json")
@@ -1964,12 +1985,16 @@ def push(checkout, digest, home, open_pr=True):
                 refuse("STANDARD_PUSH_FINDING_CHANGED")
         if current is not None and (current != proposal or hashlib.sha256(canonical(current).encode("utf-8")).hexdigest() != digest):
             refuse("STANDARD_PUSH_STALE")
+        rewrite = proposal.get("rewrite")
+        if record["status"] == "proposed" and rewrite and not allow_rewrite:
+            refuse("STANDARD_PUSH_REWRITE_APPROVAL_REQUIRED")
         target = github_target(checkout)
         token_path, token = token_for(target["owner"], home)
         if record["status"] == "proposed":
             options, env = credential_config(token_path)
-            # Non-force; updates refs/remotes/origin/<branch> so the commits stop counting as unpushed.
-            result = checkout.git("push", "--porcelain", "origin", proposal["head"] + ":refs/heads/" + proposal["branch"],
+            # Rewriting is opt-in for this exact digest and original remote tip, never an implicit lease.
+            lease = ["--force-with-lease=refs/heads/" + proposal["branch"] + ":" + rewrite["expected_remote_head"]] if rewrite else []
+            result = checkout.git("push", "--porcelain", *lease, "origin", proposal["head"] + ":refs/heads/" + proposal["branch"],
                                   ok=(0, 1, 128), env=env, extra=options, timeout=300)
             if result.returncode:
                 text = (result.stdout + result.stderr).decode("utf-8", "replace")
@@ -2063,6 +2088,10 @@ def main(args, values, base, repo, host, stdin, home=None):
             with DevLock(checkout):
                 if op == "commit":
                     result = op_commit(checkout, request, home)
+                elif op == "rebase-main":
+                    if set(request) != {"op"}:
+                        refuse("STANDARD_ARGUMENTS_INVALID")
+                    result = rebase_tools().rebase_main(checkout, rebase_context(), home)
                 elif op == "format":
                     result = op_format(checkout, request, values, repo)
                 else:
@@ -2073,10 +2102,13 @@ def main(args, values, base, repo, host, stdin, home=None):
     if len(args) >= 3 and args[1] == "push":
         workspace, rest = args[2], args[3:]
         open_pr = "--no-pr" not in rest
-        rest = [arg for arg in rest if arg != "--no-pr"]
+        if rest.count("--allow-rewrite") > 1:
+            refuse("STANDARD_ARGUMENTS_INVALID")
+        allow_rewrite = "--allow-rewrite" in rest
+        rest = [arg for arg in rest if arg not in ("--no-pr", "--allow-rewrite")]
         if len(rest) != 2 or rest[0] != "--sha256":
             refuse("STANDARD_ARGUMENTS_INVALID")
-        return dict(version=1, **push(Checkout(base, workspace, host), rest[1], home, open_pr))
+        return dict(version=1, **push(Checkout(base, workspace, host), rest[1], home, open_pr, allow_rewrite))
     if len(args) in (3, 5) and args[1] == "deps":
         # Engineer or migration-data: prepare the locked gems for the checkout's HEAD (the
         # step dev_test runs first), e.g. before proposing a convert plan. `--budget S`

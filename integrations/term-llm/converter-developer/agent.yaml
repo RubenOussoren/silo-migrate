@@ -246,6 +246,15 @@ tools:
           message: {type: string, description: "Subject line (max 100 chars), blank line, body"}
         required: [message]
         additionalProperties: false
+    - name: dev_rebase_main
+      description: "Rebase this project's migration branch onto a freshly fetched origin/main, locally only. Checkpoint your own uncommitted changes with dev_commit first; never stash customer files. A disposable Git replay leaves the live branch unchanged on conflicts. Nothing is pushed. Re-run tests and review, then dev_push_propose: a rewritten published branch requires the engineer's explicit lease-protected push approval."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 300
+      input:
+        type: object
+        properties: {}
+        additionalProperties: false
     - name: dev_push_propose
       description: "Propose pushing the current migration branch and opening a draft pull request. Nothing is pushed: the engineer approves the returned digest with a command."
       script: scripts/dev_tool.py
