@@ -17,6 +17,7 @@ rescue LoadError
 end
 require_relative "../standard_store"
 require_relative "../runtime_profiles"
+require_relative "../review_runtime"
 require_relative "prebuilt_stack"
 require_relative "standard_oracle"
 require_relative "discourse_archive"
@@ -79,12 +80,14 @@ module SiloMigrate
         "STANDARD_RECONCILIATION_INVALID" => "The reconciliation input is invalid. Register a corrected one, then propose a new plan.",
         "STANDARD_REVIEW_SOURCE_INVALID" => "The convert run this review imports is missing, not completed, or its intermediate database changed. Propose a review of a completed convert run.",
         "STANDARD_BASE_SITE_INVALID" => "Register a SQL-only base-site backup with its original Discourse/schema version suffix, then re-plan.",
-        "STANDARD_BASE_SITE_NEWER" => "The sandbox backup is newer than the local Discourse runtime. Use a compatible runtime or older backup.",
+        "STANDARD_BASE_SITE_NEWER" => "The backup requires a newer Discourse application than the selected runtime. Check the Base and public-image availability; resetting an unchanged plan alone cannot fix this.",
+        "STANDARD_REVIEW_RUNTIME_CHANGED" => "The running review runtime differs from the approved plan. Reset this run and propose again to resolve the current Base site's runtime.",
+        "STANDARD_REVIEW_RUNTIME_UNRESOLVED" => "No compatible review runtime could be resolved. Keep the original versioned backup; check public-image availability rather than switching tracks or using an older image.",
         "STANDARD_ARTIFACT_CHANGED" => "The recorded backup is missing or changed. Do not release it; investigate and re-run.",
         "STANDARD_RELEASE_NOT_READY" => "Release requires a completed base-site review and safe output directories.",
         "STANDARD_RELEASE_CHECKS" => "Review reconciliation differences or missing checks and explicitly acknowledge them before release.",
         "STANDARD_MERGE_SOURCE_INVALID" => "Register a valid full Discourse source backup and re-plan.",
-        "STANDARD_MERGE_SOURCE_NEWER" => "Use a runtime at least as new as the source backup and re-plan.",
+        "STANDARD_MERGE_SOURCE_NEWER" => "The source backup needs a newer application than the Base-selected runtime. Supply a compatible current Base backup or align the hosted target's version/track; resetting alone will not fix it.",
         "STANDARD_MERGE_LAYER_INVALID" => "Correct and commit the merge layer, refresh the converter and re-plan.",
         "STANDARD_MERGE_SETTINGS_INVALID" => "Register a valid merge settings mapping and re-plan.",
         "STANDARD_MERGE_SCHEMA" => "Inspect private schema evidence, correct the layer or runtime and re-plan.",
@@ -257,8 +260,32 @@ module SiloMigrate
       end
 
       def lock
+        return @review_runtime_lock if @review_runtime_lock
+
         config = @store.load.fetch("config")
         profiles.read(config.fetch("discourse_profile"), expected_sha256: config.fetch("discourse_profile_sha256"))
+      end
+
+      # Review/merge choose an immutable application runtime per plan. Conversion
+      # and the workspace's original profile are deliberately not upgraded.
+      def with_review_runtime(profile)
+        previous = @review_runtime_lock
+        @review_runtime_lock = profile
+        yield
+      ensure
+        @review_runtime_lock = previous
+      end
+
+      def review_runtime_for(body)
+        profiles.read(body.fetch("discourse_profile"), expected_sha256: body.fetch("runtime_lock_sha256"))
+      end
+
+      def review_runtime_current?(body, config)
+        original = body.fetch("workspace_runtime_profile_sha256", body["runtime_lock_sha256"])
+        profile_current?(config) && config["discourse_profile_sha256"] == original &&
+          profiles.sha256(body.fetch("discourse_profile")) == body.fetch("runtime_lock_sha256")
+      rescue StandardWorkflowError, SystemCallError
+        false
       end
 
       def profile_current?(config)
@@ -279,7 +306,7 @@ module SiloMigrate
 
       # Identity of the code that will execute. Any source edit invalidates approval.
       def code_identity
-        files = Dir.glob(%w[lib/**/*.rb bin/silo-migrate bin/silo-migrate-control Gemfile.lock silo-migrate.gemspec runtime/prebuilt-discourse/*], base: @code_root).select { |rel| File.file?(File.join(@code_root, rel)) }.sort
+        files = Dir.glob(%w[lib/**/*.rb bin/silo-migrate bin/silo-migrate-control bin/discourse_version.py bin/review_runtime.py bin/review_runtime_job.py Gemfile.lock silo-migrate.gemspec runtime/prebuilt-discourse/*], base: @code_root).select { |rel| File.file?(File.join(@code_root, rel)) }.sort
         digest = Digest::SHA256.new
         files.each do |rel|
           digest.update(rel)
@@ -780,6 +807,22 @@ module SiloMigrate
       end
 
       def execute_stages(run_id)
+        plan = plan_for(run_id)
+        if review_plan?(plan) || merge_plan?(plan)
+          begin
+            selected = review_runtime_for(plan.fetch("body"))
+          rescue StandardWorkflowError, SystemCallError
+            begin_stage(run_id, STAGES.first)
+            fail_run(run_id, STAGES.first, "STANDARD_RUNTIME_MISMATCH", "selected review runtime changed or disappeared")
+            return
+          end
+          with_review_runtime(selected) { execute_stages_on_runtime(run_id) }
+        else
+          execute_stages_on_runtime(run_id)
+        end
+      end
+
+      def execute_stages_on_runtime(run_id)
         @store.update { |state| state.fetch("runs").fetch(run_id)["status"] = "running" }
         stages_for(plan_for(run_id)).each do |stage|
           stage_method = "stage_#{stage}"
@@ -1249,6 +1292,10 @@ module SiloMigrate
         failures.concat(StandardOracle.runtime_failures(site, lock))
         evidence(run_id, "runtime-#{label}.json", site.slice("versions", "runtime"))
         assert_clean!(run_id, "runtime_#{label}", failures, "STANDARD_RUNTIME_MISMATCH")
+        if (review_plan?(plan_for(run_id)) || merge_plan?(plan_for(run_id))) && label == "review"
+          record_review_runtime(run_id, running_version: site.dig("versions", "discourse"),
+                                running_revision: site.dig("versions", "git"), schema_before_restore: site.dig("versions", "schema"))
+        end
       end
 
       def stage_baseline(run_id)
@@ -1742,7 +1789,7 @@ module SiloMigrate
         result.merge(
           discourse_profile: body["discourse_profile"], runtime_profile_sha256: body["runtime_lock_sha256"],
           runtime_qualified: body["runtime_qualified"], allow_unqualified_runtime: body["allow_unqualified_runtime"], converter: body["converter"],
-          merge: body["merge"], operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
+          merge: body["merge"], review_runtime: body["review_runtime"], operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
           platform: body["platform"], roles: body["roles"], source_charset: body["source_charset"], converter_deps: body.dig("converter_deps", "key"),
           reconciliation_policy: body["reconciliation_policy"], base_site: body["base_site"]&.slice("input_id", "delivery", "discourse_version", "schema_version", "site_schema_version", "ahead"),
           from_run: body["from_run"]&.slice("run_id", "plan_id", "converter_revision", "intermediate_sha256", "intermediate_bytes"), limits: body["limits"],
@@ -1769,7 +1816,7 @@ module SiloMigrate
           # Never the per-check reconciliation numbers: they are derived from customer data.
           assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments",
                                                                        "merge", "conversion_summary", "reconciliation_checks", "reconciliation_matched", "reconciliation_differs", "reconciliation_errors",
-                                                                       "review_url", "import_issues", "base_site", "base_site_ahead", "base_site_unknown_migrations", "site_schema_version", "base_discourse_version", "base_schema_version", "discourse_version", "schema_version", "backup_discourse_version", "backup_schema_version"),
+                                                                       "review_url", "import_issues", "base_site", "base_site_ahead", "base_site_unknown_migrations", "site_schema_version", "base_discourse_version", "base_schema_version", "discourse_version", "schema_version", "backup_discourse_version", "backup_schema_version", "review_runtime"),
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
         if status == "not_started"

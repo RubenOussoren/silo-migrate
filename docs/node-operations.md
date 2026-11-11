@@ -223,6 +223,12 @@ Both agents see only converter code and released findings. The developer remains
 (term-llm checks a sub-agent against its parent's model rule too). Frontier-only migration-data
 is unchanged. Pushing stays yours.
 
+### Discourse version for a review or merge
+
+Normal review runs choose their own Discourse runtime automatically. With no Base site, use the current supported public latest build. With a Base site, prefer its version/track and use a compatible newer build on the same track when its known core migrations require it. Label/take replacement Base backups normally: every subsequent proposal resolves again, including same-version backups whose schema has changed. Pending earlier plans become stale; existing sites/evidence are not upgraded in place. Reset an old site explicitly before replacing it when needed for capacity.
+
+First-time public-image preparation may take several minutes. The Project page waits automatically; migration-data polls a `runtime_preparing` proposal. Preparation has no customer build context and does not start an import or merge. The engineer still approves and starts the finished plan. The plan/run show version, track, immutable image identity and core revision; run evidence includes actual schema observations. No normal per-project image/configuration terminal work is needed. See [Base-site review](project-base-site-review.md#automatic-discourse-version-selection) for supported-image limits, cache behavior and exceptions. The receiving hosted site must be on the same or a compatible newer version than the output backup.
+
 ### Applying the reviewer model update
 
 As root, run `silo update`, then `silo doctor`. Reload the UI and start a **new

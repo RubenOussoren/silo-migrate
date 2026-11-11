@@ -1588,6 +1588,20 @@ class DataToolsTest(unittest.TestCase):
         doc = json.loads(state.read_text()); doc['inputs'] = {}; state.write_text(json.dumps(doc))
         self.refused('STANDARD_BASE_SITE_NOT_TAKEN', 'plan_propose', from_run=run)
 
+    def test_review_runtime_preparation_is_pending_not_a_plan_or_started_import(self):
+        self.create()
+        original = self.control
+        def control(argv, input=None, timeout=120):
+            if argv[:3] == ['standard', 'plan', 'propose']:
+                return json.dumps({'status': 'runtime_preparing'})
+            return original(argv, input=input, timeout=timeout)
+        self.control = control
+        result = self.op('plan_propose', from_run='run-' + 'a' * 32)
+        self.assertEqual('runtime_preparing', result['status'])
+        self.assertNotIn('plan_id', result)
+        self.assertIn('No customer data', result['next'])
+        self.assertIn('Poll this same proposal', result['next'])
+
     # -- merge projects (source platform discourse) ----------------------------------------
 
     SOURCE_BACKUP = 'invented-source-v2026-11-0-latest-20261104011110.tar.gz'

@@ -304,10 +304,189 @@ def control_image(repo, values, base, args):
     return json.loads(raw)["images"]["control"]
 
 
+def review_base_migrations(root, encoded_path):
+    """Stream only schema_migrations IDs; no dump rows, filenames or SQL leave
+    the trusted host. The execution path still verifies the full bound input."""
+    import base64
+    import gzip
+    import time
+    import zlib
+    module = data_tools()
+    relative = os.fsdecode(base64.b64decode(encoded_path, validate=True))
+    parts = module.parts_of(relative)
+    if not parts or parts[0] != "inputs":
+        refuse("STANDARD_BASE_SITE_INVALID")
+    directory = module.open_root(str(root))
+    try:
+        fd, info = module.open_regular(directory, parts)
+    finally:
+        os.close(directory)
+    # Repeated UI/tool polls must not decompress the same immutable backup.
+    # The private cache binds inode/size/mtime/ctime; execution still checks SHA.
+    stamp = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+    owner = module.Workspace(root.parent, root.name, Path(__file__).resolve().parent.parent, None, {}, None)
+    cache = owner.data_dir("review-runtime-inputs") / (hashlib.sha256(encoded_path.encode()).hexdigest() + ".json")
+    try:
+        cached_fd = os.open(cache, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        cached_fd = None
+    try:
+        if cached_fd is not None:
+            with os.fdopen(cached_fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode) or os.fstat(stream.fileno()).st_size > 1024 * 1024:
+                    refuse("STANDARD_BASE_SITE_INVALID")
+                cached = json.load(stream)
+            ids = cached.get("migrations")
+            if (cached.get("stat") == stamp and isinstance(ids, list) and 0 < len(ids) <= 20000 and
+                    all(isinstance(value, str) and re.fullmatch(r"[0-9]{14}", value) for value in ids) and ids == sorted(set(ids))):
+                os.close(fd)
+                return ids
+    except Exception:
+        os.close(fd)
+        raise
+    versions, copying, seen, oversized = set(), False, False, False
+    started = time.monotonic()
+    try:
+        with os.fdopen(fd, "rb") as stream, gzip.GzipFile(fileobj=stream) as sql:
+            while True:
+                line = sql.readline(65536)
+                if not line:
+                    break
+                if time.monotonic() - started > 90:
+                    refuse("STANDARD_REVIEW_RUNTIME_TIMEOUT")
+                complete = line.endswith(b"\n")
+                if oversized or not complete:
+                    oversized = not complete
+                    if copying:
+                        refuse("STANDARD_BASE_SITE_INVALID")
+                    continue
+                line = line.rstrip(b"\r\n")
+                if copying:
+                    if line == b"\\.":
+                        copying = False
+                        break  # Execution validates the full archive; selection needs only this block.
+                    elif re.fullmatch(rb"[0-9]{14}", line):
+                        versions.add(line.decode("ascii"))
+                        if len(versions) > 20000:
+                            refuse("STANDARD_BASE_SITE_INVALID")
+                    else:
+                        refuse("STANDARD_BASE_SITE_INVALID")
+                elif re.fullmatch(rb"COPY (?:public\.)?schema_migrations \(version\) FROM stdin;", line):
+                    if seen:
+                        refuse("STANDARD_BASE_SITE_INVALID")
+                    copying, seen = True, True
+        if not seen or copying or not versions:
+            refuse("STANDARD_BASE_SITE_INVALID")
+        result = sorted(versions)
+        owner.write_json(cache, {"stat": stamp, "migrations": result})
+        return result
+    except (OSError, EOFError, zlib.error):
+        refuse("STANDARD_BASE_SITE_INVALID")
+
+
+def prepare_review_runtime(args, values, base, repo):
+    """Fixed public-image preparation for review proposals only. No data is mounted
+    into preparation, and neither tools nor backups choose a repository or recipe."""
+    if args[:3] != ["standard", "plan", "propose"] or len(args) < 7:
+        return
+    tail = args[4:]
+    if tail[:2] not in (["--operation", "review"], ["--operation", "merge"]):
+        return
+    workspace = args[3]
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}", workspace):
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    pairs = {"--operation", "--from-run", "--reconciliation", "--base-site", "--port", "--source", "--settings"}
+    flags = {"--allow-unqualified-runtime", "--ignore-global-pins", "--separate-same-named-groups"}
+    opts = {}
+    while tail:
+        key = tail[0]
+        tail = tail[1:]
+        if key in opts or key not in pairs | flags or (key in pairs and (not tail or tail[0].startswith("--"))):
+            refuse("STANDARD_ARGUMENTS_INVALID")
+        opts[key] = tail.pop(0) if key in pairs else True
+    required = {"--from-run"} if opts["--operation"] == "review" else {"--source", "--base-site"}
+    allowed = ({"--operation", "--from-run", "--reconciliation", "--base-site", "--port", "--allow-unqualified-runtime"}
+               if opts["--operation"] == "review" else pairs - {"--from-run", "--reconciliation"} | flags)
+    if not required <= opts.keys() or not opts.keys() <= allowed:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    if "--port" in opts and not re.fullmatch(r"[1-9][0-9]{0,4}", opts["--port"]):
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    for key in ("--from-run", "--source", "--base-site", "--reconciliation", "--settings"):
+        if key in opts:
+            prefix = "run" if key == "--from-run" else "input"
+            if not re.fullmatch(prefix + r"-[0-9a-f]{32}", opts[key]):
+                refuse("STANDARD_ARGUMENTS_INVALID")
+
+    root = base / workspace
+    def document(path):
+        # Bind every workspace component by descriptor, not a raced lstat walk.
+        module = data_tools()
+        root_fd = module.open_root(str(root))
+        try:
+            fd, info = module.open_regular(root_fd, list(path.relative_to(root).parts))
+        finally:
+            os.close(root_fd)
+        with os.fdopen(fd, "r") as stream:
+            if info.st_size > 16 * 1024 * 1024:
+                refuse("STANDARD_PATH_INVALID")
+            return json.load(stream)
+
+    state = document(root / ".silo-migrate/named/standard/state.json")
+    config = state["config"]
+    name = config["discourse_profile"]
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", name):
+        refuse("STANDARD_RUNTIME_MISMATCH")
+    directories = {repo / "runtime/profiles", Path(values.get("SILO_RUNTIME_PROFILES_DIR", str(repo / "runtime/profiles")))}
+    paths = [directory / (name + ".json") for directory in directories if (directory / (name + ".json")).is_file()]
+    if len(paths) != 1 or paths[0].is_symlink():
+        refuse("STANDARD_RUNTIME_MISMATCH")
+    raw = paths[0].read_bytes()
+    if hashlib.sha256(raw).hexdigest() != config["discourse_profile_sha256"]:
+        refuse("STANDARD_RUNTIME_MISMATCH")
+    baseline = json.loads(raw)
+    version, schema, required_migrations = None, None, None
+    if "--base-site" in opts:
+        named = document(root / ".silo-migrate/named/state.json")
+        entry = named.get("inputs", {}).get(opts["--base-site"])
+        if not entry or entry.get("type") != "base_site":
+            refuse("STANDARD_BASE_SITE_INVALID")
+        import base64
+        filename = Path(os.fsdecode(base64.b64decode(entry["path"], validate=True))).name
+        versions = data_tools().discourse_version.backup(filename)
+        if not versions or not versions["discourse_version"]:
+            refuse("STANDARD_REVIEW_RUNTIME_UNRESOLVED")
+        version, schema = versions["discourse_version"], versions["schema_version"]
+        required_migrations = review_base_migrations(root, entry["path"])
+        if required_migrations[-1] != schema:
+            refuse("STANDARD_BASE_SITE_INVALID")
+    import importlib.util
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("review_runtime_job", repo / "bin/review_runtime_job.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    prepared = module.request(repo=repo, cache=base.parent / "state/review-runtimes",
+                              private_dir=root / ".silo-migrate/data/review-runtime-jobs",
+                              baseline=baseline, version=version, schema=schema, required_migrations=required_migrations)
+    if prepared["status"] == "runtime_preparing":
+        return prepared
+    values["SILO_REVIEW_RUNTIME_PROFILE"] = prepared["name"]
+    comparison = prepared.get("comparison") or {}
+    summary = {key: comparison[key] for key in ("core_comparison_complete", "missing_known_core_migrations") if key in comparison}
+    if ("core_comparison_complete" in summary and type(summary["core_comparison_complete"]) is not bool or
+            "missing_known_core_migrations" in summary and (type(summary["missing_known_core_migrations"]) is not int or not 0 <= summary["missing_known_core_migrations"] <= 20000)):
+        refuse("STANDARD_RUNTIME_MISMATCH")
+    values["SILO_REVIEW_RUNTIME_COMPARISON"] = json.dumps(summary, separators=(",", ":"))
+    values["SILO_REVIEW_RUNTIME_PROFILES_DIR"] = str(base.parent / "state/review-runtimes/profiles")
+
+
 def main(args):
     self = Path(__file__).resolve()
     repo = self.parent.parent
     values, configured = settings()
+    if configured:
+        # These are invocation bindings, never persistent service defaults.
+        values.pop("SILO_REVIEW_RUNTIME_PROFILE", None)
+        values.pop("SILO_REVIEW_RUNTIME_COMPARISON", None)
     # As root, the control container (all capabilities dropped) can't read the account's
     # private gems, and anything created would belong to root. image-identity is host-only.
     if configured and os.geteuid() == 0 and args[:1] != ["image-identity"]:
@@ -343,6 +522,15 @@ def main(args):
         if identity(document) != control["content_id"] or not re.fullmatch(r"sha256:[0-9a-f]{64}", document.get("Id", "")):
             refuse("STANDARD_RUNTIME_MISMATCH")
         image = document["Id"]
+        # Administrative preparation happens on the trusted host, before a plan
+        # exists. Ordinary status/start/reset calls never refresh a moving tag.
+        pending = prepare_review_runtime(args, values, base, repo)
+        if pending:
+            print(json.dumps(pending))
+            return 0
+    review_profiles = base.parent / "state/review-runtimes/profiles"
+    if review_profiles.is_dir():
+        values["SILO_REVIEW_RUNTIME_PROFILES_DIR"] = str(review_profiles)
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
     mode = ["--rm", "-i"]
     if args[:1] == ["--detach"]:
@@ -382,10 +570,14 @@ def main(args):
     mount(gems, "/gems")
     mount("/var/run/docker.sock", "/var/run/docker.sock", False)
     mount("/usr/bin/docker", "/usr/local/bin/docker")
-    for key in ("SILO_CONTROL_SITE_CACHE", "SILO_RUNTIME_PROFILES_DIR"):
+    for key in ("SILO_CONTROL_SITE_CACHE", "SILO_RUNTIME_PROFILES_DIR", "SILO_REVIEW_RUNTIME_PROFILES_DIR"):
         if values.get(key):
             mount(values[key], values[key])
             command.extend(["-e", key + "=" + values[key]])
+    if values.get("SILO_REVIEW_RUNTIME_PROFILE"):
+        command.extend(["-e", "SILO_REVIEW_RUNTIME_PROFILE=" + values["SILO_REVIEW_RUNTIME_PROFILE"]])
+    if values.get("SILO_REVIEW_RUNTIME_COMPARISON"):
+        command.extend(["-e", "SILO_REVIEW_RUNTIME_COMPARISON=" + values["SILO_REVIEW_RUNTIME_COMPARISON"]])
     environment = {"HOME": "/tmp", "USER": "silo", "TMPDIR": "/tmp", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
                    "GEM_HOME": "/gems", "GEM_PATH": "/gems:/gems/ruby/3.3.0", "BUNDLE_PATH": "/gems",
                    "BUNDLE_FROZEN": "true", "BUNDLE_APP_CONFIG": "/tmp/bundle-config", "BUNDLE_AUTO_INSTALL": "false",

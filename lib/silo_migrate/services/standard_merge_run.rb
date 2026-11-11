@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "yaml"
+require_relative "../discourse_version"
 
 module SiloMigrate
   module Services
@@ -13,13 +14,25 @@ module SiloMigrate
       MERGE_LAYER_BYTES = 512 * 1024
       MERGE_SETTINGS_BYTES = 256 * 1024
 
-      def propose_merge_plan(source:, base_site:, settings: nil, ignore_global_pins: false, separate_same_named_groups: false, port: nil, allow_unqualified_runtime: false)
+      def propose_merge_plan(**options)
+        ids = options.values_at(:source, :base_site, :settings).compact
+        unless options[:source].is_a?(String) && options[:base_site].is_a?(String) && ids.uniq.size == ids.size
+          raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID"
+        end
+        selection = select_review_runtime(options[:base_site], allow_unqualified: options.fetch(:allow_unqualified_runtime, false))
+        with_review_runtime(selection.fetch("profile")) do
+          build_merge_plan(**options, runtime_selection: selection)
+        end
+      end
+
+      def build_merge_plan(source:, base_site:, settings: nil, ignore_global_pins: false, separate_same_named_groups: false, port: nil, allow_unqualified_runtime: false, runtime_selection:)
         state = @store.load
         config = state.fetch("config")
         raise StandardWorkflowError, "STANDARD_SIZE_LIMIT" if state.fetch("plans").size >= self.class::MAX_PLANS
         raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless profile_current?(config) && check_converter!(config)
         qualified = lock.dig("qualification", "status") == "qualified"
-        raise StandardWorkflowError, "STANDARD_RUNTIME_UNQUALIFIED" unless qualified || allow_unqualified_runtime
+        review_ready = lock.dig("qualification", "status") == "review_ready"
+        raise StandardWorkflowError, "STANDARD_RUNTIME_UNQUALIFIED" unless qualified || review_ready || allow_unqualified_runtime
         named = @store.named_state
         raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless source.is_a?(String) && base_site.is_a?(String) && (settings.nil? || settings.is_a?(String))
         roles = { "source" => source, "base_site" => base_site, "settings" => settings }.compact
@@ -37,7 +50,8 @@ module SiloMigrate
         source_versions = merge_source_versions!(inputs.fetch("source").fetch("path").unpack1("m0"))
         begin
           base_site_compatible!(source_versions, { "discourse_version" => lock.fetch("app").fetch("version") })
-        rescue StandardWorkflowError
+        rescue StandardWorkflowError => error
+          raise unless error.code == "STANDARD_BASE_SITE_NEWER"
           raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_NEWER"
         end
         base_versions = base_site_versions!(inputs.fetch("base_site").fetch("path").unpack1("m0"))
@@ -62,7 +76,10 @@ module SiloMigrate
                        "options" => { "ignore_global_pins" => !!ignore_global_pins, "separate_same_named_groups" => !!separate_same_named_groups } },
           "input_binding" => ids.map { |id| inputs.values.find { |i| i["id"] == id }.slice("id", "sha256", "bytes", "type") },
           "input_stat_binding" => @store.named.input_binding(named, ids), "code_identity" => code_identity,
-          "runtime_lock_sha256" => config["discourse_profile_sha256"], "discourse_profile" => config["discourse_profile"],
+          "runtime_lock_sha256" => runtime_selection.fetch("sha256"), "discourse_profile" => runtime_selection.fetch("name"),
+          "workspace_runtime_profile_sha256" => config["discourse_profile_sha256"],
+          "review_runtime" => runtime_selection.fetch("selection"), "base_site_generation" => review_base_generation,
+          "image_content_ids" => lock.fetch("images").transform_values { |image| image.fetch("content_id") },
           "runtime_qualified" => qualified, "allow_unqualified_runtime" => allow_unqualified_runtime,
           "converter" => config["converter"], "converter_binding" => config["converter_binding"], "converter_revision" => config["converter_revision"],
           "app_revision" => lock.dig("app", "revision"), "limits" => limits,
@@ -103,9 +120,7 @@ module SiloMigrate
       end
 
       def merge_source_versions!(name)
-        match = File.basename(name).match(/-v(\d{4}-\d{1,2}-\d+(?:-latest(?:-\d+)?)?)-(\d{14})\.tar\.gz\z/)
-        raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID" unless match
-        { "discourse_version" => match[1].sub(/\A(\d+)-(\d+)-(\d+)/, '\1.\2.\3'), "schema_version" => match[2] }
+        DiscourseVersion.backup(name, extension: "tar.gz") || raise(StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID")
       end
 
       def merge_settings_input!(input)
@@ -155,6 +170,8 @@ module SiloMigrate
 
       def merge_stale_reason(plan, state)
         body = plan.fetch("body")
+        return "delivery" if body["base_site_generation"] && body["base_site_generation"] != review_base_generation
+
         named = @store.named_state
         ids = body.fetch("roles").values
         return "inputs" unless ids.all? { |id| named.fetch("inputs").key?(id) }
@@ -164,7 +181,7 @@ module SiloMigrate
         base_record = delivery_record!(named.fetch("inputs").fetch(body.dig("roles", "base_site")).fetch("dataset_id"))
         return "delivery" unless base_record.slice("kind", "version") == body.dig("base_site", "delivery")
         return "code" unless body["code_identity"] == code_identity
-        return "runtime" unless profile_current?(state.fetch("config")) && state.dig("config", "discourse_profile_sha256") == body["runtime_lock_sha256"]
+        return "runtime" unless review_runtime_current?(body, state.fetch("config"))
         return "converter" unless check_converter!(state.fetch("config")) && state.dig("config", "converter_revision") == body["converter_revision"] && state.dig("config", "converter_binding") == body["converter_binding"]
         nil
       rescue StandardWorkflowError, NamedError, Errno::ENOENT
@@ -175,6 +192,8 @@ module SiloMigrate
         body = plan.fetch("body")
         resolved = lock.fetch("images").transform_values { |image| ImageIdentity.resolve(@runtime, image) }
         @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["resolved_image_ids"] = resolved }
+        evidence(run_id, "runtime-images.json", JSON.pretty_generate(resolved) + "\n")
+        record_review_runtime(run_id, resolved_image_id: resolved.fetch("web"))
         manifest = materialize_inputs(run_id, body, @store.named_state, layout: false)
         manifest.each { |input| input["role"] = body.fetch("roles").key(input.fetch("id")) }
         @store.write_private(@store.run_dir(run_id, "work", "inputs.json"), JSON.pretty_generate(manifest) + "\n")

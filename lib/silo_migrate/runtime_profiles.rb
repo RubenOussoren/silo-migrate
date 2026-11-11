@@ -9,7 +9,7 @@ module SiloMigrate
     DEFAULT = "discourse-2026.11.0-latest-3158c750"
 
     def initialize(code_root:, env:, runtime:)
-      @dirs = [File.join(code_root, "runtime", "profiles"), env["SILO_RUNTIME_PROFILES_DIR"]].compact.reject(&:empty?).uniq
+      @dirs = [File.join(code_root, "runtime", "profiles"), env["SILO_RUNTIME_PROFILES_DIR"], env["SILO_REVIEW_RUNTIME_PROFILES_DIR"]].compact.reject(&:empty?).uniq
       @dirs = @dirs.map { |dir| File.directory?(dir) ? File.realpath(dir) : dir }.uniq
       @runtime = runtime
     end

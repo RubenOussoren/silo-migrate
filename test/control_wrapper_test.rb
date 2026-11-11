@@ -82,13 +82,16 @@ class ControlWrapperTest < SiloMigrateTest
               raise RuntimeError(args)
           class Stat:
               st_gid = 99
+          real_stat = pathlib.Path.stat
+          def socket_stat(path, *args, **kwargs):
+              return Stat() if str(path) == '/var/run/docker.sock' else real_stat(path, *args, **kwargs)
           with patch.dict(os.environ, {'SILO_CONTROL_CONFIG': str(config)}, clear=True), patch.dict(globals_, inspect=lambda ref: fixture), patch('os.execvp', side_effect=stop_exec):
               try:
                   wrapper['main'](['standard', 'runtime', 'list'])
                   raise AssertionError('accepted wrong payload')
               except ValueError as error:
                   assert str(error) == 'STANDARD_RUNTIME_MISMATCH'
-              with patch.dict(globals_, control_image=lambda *args: {'content_id': expected, 'ref': 'local:control'}), patch('pathlib.Path.stat', return_value=Stat()):
+              with patch.dict(globals_, control_image=lambda *args: {'content_id': expected, 'ref': 'local:control'}), patch('pathlib.Path.stat', socket_stat):
                   try:
                       wrapper['main'](['standard', 'runtime', 'list'])
                   except RuntimeError as error:

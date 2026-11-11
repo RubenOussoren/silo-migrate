@@ -218,6 +218,19 @@ class ConverterDevTest(unittest.TestCase):
                           'merger_source': 'https://raw.githubusercontent.com/discourse/discourse/' + 'a' * 40 + '/script/bulk_import/discourse_merger.rb',
                           'base_source': 'https://raw.githubusercontent.com/discourse/discourse/' + 'a' * 40 + '/script/bulk_import/base.rb'}, guide['discourse'])
 
+    def test_merge_guide_uses_per_plan_core_without_releasing_private_runtime_metadata(self):
+        self.state['plans'] = {'plan-' + 'b'*32: {'status': 'proposed', 'created_at': '2026-11-11T00:00:00Z',
+            'body': {'operation': 'standard_merge', 'review_runtime': {'actual_version': '2026.7.5', 'app_revision': 'c'*40,
+                     'private_customer_note': MARKER}, 'roles': {'base_site': 'private-base'}}}}
+        (self.root / '.silo-migrate/named/standard/state.json').write_text(json.dumps(self.state))
+        checkout = self.dev.Checkout(self.base, self.ws, self.host)
+        guide = self.dev.op_merge_guide(checkout, {}, {}, ROOT)
+        self.assertEqual('c'*40, guide['discourse']['revision'])
+        self.assertEqual('2026.7.5', guide['discourse']['version'])
+        self.assertIn('latest_merge_plan', guide['discourse_basis'])
+        self.assertNotIn(MARKER, json.dumps(guide))
+        self.assertNotIn('private-base', json.dumps(guide))
+
     def resolver_fixture(self):
         self.fetch_local_origin()
         patcher = mock.patch.object(self.dev, 'origin_repository', return_value=('discourse-org', 'discourse-converters'))

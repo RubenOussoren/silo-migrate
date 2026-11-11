@@ -1006,20 +1006,25 @@ def op_deliveries(ws, request):
             "counts": {key: len(value) for key, value in groups.items()}, "unlabelled_data": unlabelled_data(ws, records)}
 
 
-BASE_SITE_NAME = re.compile(r"-v(?:(\d{4}-\d{1,2}-\d+(?:-latest(?:-\d+)?)?)-)?(\d{14})\.sql\.gz$")
+# Path-based import also works under Python -I (bin is not on sys.path).
+import importlib.util
+_version_spec = importlib.util.spec_from_file_location("discourse_version", Path(__file__).with_name("discourse_version.py"))
+discourse_version = importlib.util.module_from_spec(_version_spec)
+_version_spec.loader.exec_module(discourse_version)
+BASE_SITE_NAME = discourse_version.backup_pattern()
 # A merge project: the source is another Discourse site, given as its full backup (with uploads).
 MERGE_PLATFORM = "discourse"
 MERGE_SOURCE_TYPE = "discourse-backup"
 MERGE_SETTINGS_TYPE = "merge-settings"
-DISCOURSE_BACKUP_NAME = re.compile(r"-v(?:(\d{4}-\d{1,2}-\d+(?:-latest(?:-\d+)?)?)-)?(\d{14})\.tar\.gz$")
+DISCOURSE_BACKUP_NAME = discourse_version.backup_pattern("tar.gz")
 
 
 def validate_base_site(ws, files):
     if len(files) != 1:
         refuse("STANDARD_BASE_SITE_INVALID: select exactly one SQL-only Discourse backup")
     parts = parts_of(files[0]["path"])
-    match = BASE_SITE_NAME.search(parts[-1])
-    if not match:
+    versions = discourse_version.backup(parts[-1])
+    if not versions:
         refuse("STANDARD_BASE_SITE_INVALID: keep the original backup name and take it without uploads (discourse backup --sql-only)")
     root = ws.open_area("intake")
     try:
@@ -1034,7 +1039,7 @@ def validate_base_site(ws, files):
             os.close(fd)
     finally:
         os.close(root)
-    return {"filename": True, "gzip": True, "sql_only_name": True, "discourse_version": match[1].replace("-", ".", 2) if match[1] else None}
+    return {"filename": True, "gzip": True, "sql_only_name": True, "discourse_version": versions["discourse_version"]}
 
 
 def op_delivery_label(ws, request):
@@ -2388,6 +2393,8 @@ def op_run_evidence(ws, request):
     run = (standard_state(ws).get("runs") or {}).get(run_id) or {}
     # Private analyst evidence, never the engineer/public run projection.
     results = run.get("results") or {}
+    if results.get("review_runtime"):
+        evidence["review_runtime"] = results["review_runtime"]
     if results.get("base_site"):
         evidence["base_site"] = {key: results.get(key) for key in
                                  ("base_site_newer_migrations", "prior_import_id_rows")}
@@ -2454,6 +2461,12 @@ def review_base_site(ws, request):
     return found
 
 
+def runtime_preparing(plan):
+    if plan.get("status") != "runtime_preparing":
+        return None
+    return {"status": "runtime_preparing", "next": "Preparing the matching public Discourse runtime. No customer data is used and no import has started. Poll this same proposal after a short wait; it will return a plan for the engineer to approve when ready."}
+
+
 def op_plan_propose(ws, request):
     """Propose conversion from inputs or review from a completed convert run.
     Only a proposal: the engineer approves and starts it."""
@@ -2475,7 +2488,9 @@ def op_plan_propose(ws, request):
             argv += ["--reconciliation", reconciliation]
         # The proposal hashes the convert run's intermediate database (can be GBs).
         plan = json.loads(ws.control(argv, timeout=120))
-        return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "platform", "from_run",
+        if pending := runtime_preparing(plan):
+            return pending
+        return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "platform", "from_run", "review_runtime",
                                                   "roles", "inputs", "limits", "mutations", "not_included", "base_site")},
                 "instances": {"review": {"port": ((plan.get("instances") or {}).get("review") or {}).get("port")}},
                 "next": ("Tell the engineer the review %s is waiting in the Project page's Runs tab, where they approve and start it. " %
@@ -2567,9 +2582,11 @@ def op_merge_propose(ws, request):
     # project has one, is read from exactly that commit. A dirty checkout refuses: commit first.
     converter = json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
     plan = json.loads(ws.control(argv, timeout=240))  # checks the registered inputs (a backup can be GBs)
+    if pending := runtime_preparing(plan):
+        return pending
     merge = plan.get("merge") or {}
     layer = merge.get("layer") or {}
-    return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "roles", "inputs", "base_site", "merge",
+    return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "roles", "inputs", "base_site", "merge", "review_runtime",
                                               "converter_revision", "limits", "mutations", "not_included")},
             "converter_branch": converter.get("branch"),
             "instances": {"review": {"port": ((plan.get("instances") or {}).get("review") or {}).get("port")}},

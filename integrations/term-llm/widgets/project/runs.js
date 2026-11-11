@@ -4,6 +4,7 @@ import { el, safe, short, badge, ago, toast, api, lists, explain, facts, block, 
 
 const baseLabel = (base) => base ? `Base site v${(base.delivery || {}).version}` : 'None: fresh site';
 const bytes = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`;
+const runtimeLabel = (runtime) => runtime ? `${runtime.actual_version} · ${runtime.track} · ${runtime.mode === 'latest' ? 'latest supported build' : runtime.mode === 'newer' ? 'compatible newer version' : 'matches the Base site version'}` : null;
 const resetNote = (release) => release ? 'The released backup stays in the output folder.' : 'The unreleased backup is kept with the run.';
 
 const RUN_DONE = new Set(['completed', 'failed', 'interrupted']);
@@ -31,8 +32,21 @@ export function runsView(ctx) {
     const buttons = [...document.querySelectorAll('#content .actions button')];
     for (const button of buttons) button.disabled = true;
     toast(action === 'release' ? 'Releasing… this can take a few minutes.' : action === 'push' ? 'Pushing… this can take a few minutes.' : 'Working…');
+    let preparing = null;
     try {
-      const outcome = await api(`api/runs/${action}`, { workspace: project, ...body });
+      let outcome = await api(`api/runs/${action}`, { workspace: project, ...body });
+      const deadline = Date.now() + 21 * 60 * 1000;
+      while (['import', 'again'].includes(action) && outcome.status === 'runtime_preparing') {
+        if (project !== ctx.project || mine !== ticket) return null;
+        if (!preparing) {
+          preparing = el('p', { class: 'note', role: 'status' }, 'Preparing the matching Discourse runtime… This can take several minutes the first time. No customer data is used. The plan will appear when ready.');
+          document.querySelector('#content')?.append(preparing);
+        }
+        if (Date.now() > deadline) throw new Error('STANDARD_REVIEW_RUNTIME_TIMEOUT');
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        if (project !== ctx.project || mine !== ticket) return null;
+        outcome = await api(`api/runs/${action}`, { workspace: project, ...body });
+      }
       return project === ctx.project && mine === ticket ? outcome : null;
     } catch (error) {
       if (project !== ctx.project || mine !== ticket) return null;
@@ -40,6 +54,8 @@ export function runsView(ctx) {
       toast(explain(error), true);
       ctx.refresh();
       return null;
+    } finally {
+      preparing?.remove();
     }
   }
 
@@ -313,6 +329,7 @@ export function runsView(ctx) {
       ['Data', el('strong', {}, dataLabel(data))],
       ['Source site', merge ? `Its full backup, with uploads · Discourse ${safe((merging.source || {}).discourse_version || 'unknown')}` : null],
       ['Base site', onBase ? `${baseLabel(data.base_site)}${data.base_site ? ` · Discourse ${data.base_site.discourse_version}` : ''}${merge ? ' · the site merged into' : ''}` : null],
+      ['Review Discourse', onBase ? runtimeLabel(data.review_runtime) : null],
       ['What', convert ? `Converts the data with converters/${data.platform} and checks the counts. Nothing is imported yet.` : review ? 'Imports the converted data into a new local review site and checks the counts there.'
         : merge ? 'Restores the Base site in a new local review site, merges the source site into it with Discourse’s own merger, and takes a full backup. No automatic count checks.' : operationLabel(data.operation)],
       ['Merge layer', merge ? (layer.present ? `${safe(layer.path)} @ ${short(layer.revision, 12)} · ${layer.files} file${layer.files === 1 ? '' : 's'}` : 'None: Discourse’s own merger only') : null, true],
@@ -329,6 +346,11 @@ export function runsView(ctx) {
     const more = [facts([['Plan', data.plan_id, true], ['Approval code', data.digest, true], ['Run', data.run_id, true], ['Discourse', data.discourse_profile], ['Charset', data.source_charset],
       ['Discarded', data.discarded ? `${data.discarded.discarded_at} by ${data.discarded.reviewer}` : null]]),
     block('Inputs (by content hash)', table(['Role', 'File', 'Type', 'Bytes', 'SHA-256'], inputs, [3]))];
+    if (data.review_runtime) {
+      const runtime = data.review_runtime;
+      more.push(block('Review runtime', facts([['Image', runtime.image_ref, true], ['Image content', runtime.content_id, true],
+        ['Stock digest', runtime.stock_digest, true], ['Core revision', runtime.app_revision, true], ['Core schema', runtime.schema_version, true]])));
+    }
     if (review) {
       const source = data.from_run || {};
       more.push(block('Review source', facts([['Source run', source.run_id, true], ['Intermediate SHA-256', source.intermediate_sha256, true], ['Loopback port', ((data.instances || {}).review || {}).port]])));
@@ -365,6 +387,9 @@ export function runsView(ctx) {
       } }, 'Discard'));
     }
     const notes = [];
+    if (data.review_runtime) notes.push(el('p', { class: 'hint' }, 'Chosen automatically for this plan. A replacement Base backup is resolved again for the next plan; existing runs keep their original version. Restore the output on the same or a compatible newer Discourse version.'));
+    if (data.review_runtime && data.review_runtime.core_comparison_complete === false && data.base_site) notes.push(el('p', { class: 'note' }, 'The selected version is compatible, but comparison with the current build was unavailable. Core/schema coverage is not fully confirmed; the run still verifies its identity and required runtime migrations.'));
+    if (data.review_runtime && data.review_runtime.missing_known_core_migrations > 0) notes.push(el('p', { class: 'note' }, `${data.review_runtime.missing_known_core_migrations} known Base-site core migrations are not in this image. This is a compatibility warning, not a claim of an exact match.`));
     if (merge && layer.present) notes.push(el('p', { class: 'note' },
       `The merge layer is code converter-developer wrote. It runs inside the review site, next to the customer data, exactly as committed at ${short(layer.revision, 12)}. Have converter-reviewer check it before you approve.`));
     if (onBase && data.base_site && data.base_site.ahead) notes.push(el('p', { class: 'note' },
@@ -395,6 +420,13 @@ export function runsView(ctx) {
       : data.status === 'completed' ? (bad.length ? `${bad.map((row) => safe(row.name)).join(', ')} ${bad.length === 1 ? 'doesn\'t' : 'don\'t'} match.` : rows.length ? 'Finished. Every check matches.' : 'Finished.')
         : data.status === 'failed' ? `Stopped at ${data.stage || 'a stage'}.` : `This run is ${data.status.replace('_', ' ')}.`;
     const parts = [];
+    if (results.review_runtime) {
+      const runtime = results.review_runtime;
+      parts.push(block('Review Discourse', el('p', {}, safe(runtimeLabel(runtime))), details(facts([
+        ['Image', runtime.image_ref, true], ['Resolved image', runtime.resolved_image_id, true], ['Image content', runtime.content_id, true],
+        ['Core revision', runtime.running_revision || runtime.app_revision, true], ['Schema before restore', runtime.schema_before_restore, true],
+        ['Schema after restore', runtime.schema_after_restore, true]]))));
+    }
     const backupStep = { kind: merge ? 'merge' : undefined, run_id: data.run_id, run_status: data.status, checks: results.reconciliation_checks || 0,
       matched: results.reconciliation_matched || 0, base_site: data.base_site ? baseLabel(data.base_site) : null,
       base_site_details: data.base_site, backup: (data.artifacts || {}).backup, release: data.release, results,

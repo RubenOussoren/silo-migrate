@@ -583,6 +583,25 @@ def op_merge_guide(checkout, request, values, repo):
         app = runtime_profile(checkout, values, repo).get("app") or {}
     except Refusal:
         app = {}
+    # A review runtime is now pinned per merge plan, not in the converter's
+    # workspace profile. Quote the latest planned core without exposing inputs,
+    # settings, plugin metadata or any data-bearing evidence.
+    plans = checkout.state.get("plans") if isinstance(checkout.state.get("plans"), dict) else {}
+    planned = [plan for plan in plans.values() if isinstance(plan, dict) and plan.get("status") != "discarded"
+               and isinstance(plan.get("body"), dict) and plan["body"].get("operation") == "standard_merge"
+               and isinstance(plan["body"].get("review_runtime"), dict)]
+    planned.sort(key=lambda plan: str(plan.get("created_at", "")))
+    if planned:
+        runtime = planned[-1]["body"]["review_runtime"]
+        version, revision = runtime.get("actual_version"), runtime.get("app_revision")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("merge_guide_discourse_version", Path(__file__).with_name("discourse_version.py"))
+        versions = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(versions)
+        parsed = versions.parse(version)
+        if parsed and isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
+            app = {"version": parsed["canonical"], "revision": revision}
+            result["discourse_basis"] = "latest_merge_plan; recheck after proposing against a replacement Base site"
     revision = app.get("revision")
     if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
         result["discourse"] = {"version": app.get("version"), "revision": revision,

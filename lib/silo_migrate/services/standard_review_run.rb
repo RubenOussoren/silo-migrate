@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require "zlib"
-require "rubygems/version"
+require_relative "../discourse_version"
 require "set"
 
 module SiloMigrate
@@ -44,7 +44,57 @@ module SiloMigrate
 
       # -- planning -------------------------------------------------------------
 
-      def propose_review_plan(from_run:, reconciliation: nil, base_site: nil, port: nil, allow_unqualified_runtime: false)
+      def propose_review_plan(**options)
+        selection = select_review_runtime(options[:base_site], allow_unqualified: options.fetch(:allow_unqualified_runtime, false))
+        with_review_runtime(selection.fetch("profile")) do
+          build_review_plan(**options, runtime_selection: selection)
+        end
+      end
+
+      def select_review_runtime(base_site, allow_unqualified: false)
+        versions = nil
+        if base_site
+          input = @store.named_state.fetch("inputs")[base_site] || raise(StandardWorkflowError, "STANDARD_REFERENCE_INVALID")
+          raise StandardWorkflowError, "STANDARD_INPUTS_INCOMPLETE" unless input["type"] == "base_site"
+
+          versions = base_site_versions!(input.fetch("path").unpack1("m0"))
+        end
+        selection = ReviewRuntime.new(profiles: profiles, runtime: @runtime).select(base: versions, preferred: @env["SILO_REVIEW_RUNTIME_PROFILE"], allow_unqualified: allow_unqualified)
+        # Request-derived comparison stays in this workspace's plan, not in the
+        # shared public image profile. The host forwards only bounded fixed facts.
+        comparison = JSON.parse(@env.fetch("SILO_REVIEW_RUNTIME_COMPARISON", "{}"))
+        unless comparison.is_a?(Hash) && (comparison.keys - %w[core_comparison_complete missing_known_core_migrations]).empty? &&
+               (!comparison.key?("core_comparison_complete") || [true, false].include?(comparison["core_comparison_complete"])) &&
+               (!comparison.key?("missing_known_core_migrations") || (comparison["missing_known_core_migrations"].is_a?(Integer) && comparison["missing_known_core_migrations"].between?(0, 20_000)))
+          raise StandardWorkflowError, "STANDARD_RUNTIME_MISMATCH"
+        end
+        selection.fetch("selection").merge!(comparison)
+        selection
+      rescue JSON::ParserError
+        raise StandardWorkflowError, "STANDARD_RUNTIME_MISMATCH"
+      end
+
+      # Only Base delivery identity, never customer filenames. Replacing a Base
+      # invalidates pending proposals, including an earlier automatic fresh-site one.
+      def review_base_generation
+        path = File.join(@store.workspace_root, ".silo-migrate", "named", "deliveries.json")
+        document = if File.exist?(path) || File.symlink?(path)
+                     File.open(path, File::RDONLY | File::NOFOLLOW | File::NONBLOCK) do |file|
+                       raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED" unless file.stat.file? && file.stat.size <= 1024 * 1024
+                       bytes = file.read(1024 * 1024 + 1)
+                       raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED" if bytes.bytesize > 1024 * 1024
+                       JSON.parse(bytes)
+                     end
+                   else {}
+                   end
+        records = document.fetch("deliveries", {}).select { |_id, record| record["kind"] == "base_site" }
+        identity = records.sort.map { |id, record| [id, record["version"], record["replaced_by"]] }
+        Digest::SHA256.hexdigest(canonical_json(identity))
+      rescue JSON::ParserError, SystemCallError, TypeError, NoMethodError, NamedError
+        raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED"
+      end
+
+      def build_review_plan(from_run:, reconciliation: nil, base_site: nil, port: nil, allow_unqualified_runtime: false, runtime_selection:)
         state = @store.load
         raise StandardWorkflowError, "STANDARD_SIZE_LIMIT" if state.fetch("plans").size >= self.class::MAX_PLANS
         raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless profile_current?(state.fetch("config"))
@@ -52,7 +102,8 @@ module SiloMigrate
         raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless reconciliation.nil? || reconciliation.is_a?(String)
 
         qualified = lock.dig("qualification", "status") == "qualified"
-        raise StandardWorkflowError, "STANDARD_RUNTIME_UNQUALIFIED" unless qualified || allow_unqualified_runtime
+        review_ready = lock.dig("qualification", "status") == "review_ready"
+        raise StandardWorkflowError, "STANDARD_RUNTIME_UNQUALIFIED" unless qualified || review_ready || allow_unqualified_runtime
 
         source_run, source_plan = review_source!(state, from_run)
         artifact = review_artifact_binding!(from_run, source_run, hash: true)
@@ -106,8 +157,11 @@ module SiloMigrate
           "input_binding" => ids.map { |id| named.fetch("inputs").fetch(id).slice("id", "sha256", "bytes", "type") },
           "input_stat_binding" => @store.named.input_binding(named, ids),
           "code_identity" => code_identity,
-          "runtime_lock_sha256" => state.dig("config", "discourse_profile_sha256"),
-          "discourse_profile" => state.dig("config", "discourse_profile"),
+          "runtime_lock_sha256" => runtime_selection.fetch("sha256"),
+          "discourse_profile" => runtime_selection.fetch("name"),
+          "workspace_runtime_profile_sha256" => state.dig("config", "discourse_profile_sha256"),
+          "review_runtime" => runtime_selection.fetch("selection"),
+          "base_site_generation" => review_base_generation,
           "runtime_qualified" => qualified, "allow_unqualified_runtime" => allow_unqualified_runtime,
           "image_content_ids" => lock.fetch("images").transform_values { |image| image.fetch("content_id") },
           "app_revision" => lock.dig("app", "revision"),
@@ -248,6 +302,7 @@ module SiloMigrate
             "base_site" => base.merge("sha256" => input.fetch("sha256")),
             "converter_revision" => (body["converter_revision"] || body.dig("from_run", "converter_revision")), "app_revision" => body["app_revision"],
             "discourse_version" => results["discourse_version"], "schema_version" => results["schema_version"],
+            "review_runtime" => results["review_runtime"],
             "check_totals" => { "checks" => checks, "matched" => results.fetch("reconciliation_matched", 0),
                                 "differs" => results.fetch("reconciliation_differs", 0), "errors" => results.fetch("reconciliation_errors", 0) },
             "differences_acknowledged" => acknowledged,
@@ -288,18 +343,18 @@ module SiloMigrate
       end
 
       def base_site_versions!(filename)
-        match = File.basename(filename).match(/-v(?:(?<discourse_version>\d{4}-\d{1,2}-\d+(?:-latest(?:-\d+)?)?)-)?(?<schema_version>\d{14})\.sql\.gz\z/)
-        raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID" unless match
-
-        { "discourse_version" => match[:discourse_version]&.sub(/\A(\d+)-(\d+)-(\d+)/, '\1.\2.\3'), "schema_version" => match[:schema_version] }
+        DiscourseVersion.backup(filename) || raise(StandardWorkflowError, "STANDARD_BASE_SITE_INVALID")
       end
 
       def base_site_compatible!(backup, site)
-        if backup["discourse_version"] && Gem::Version.new(backup.fetch("discourse_version")) > Gem::Version.new(site.fetch("discourse_version"))
+        return unless backup["discourse_version"]
+
+        requested = DiscourseVersion.parse(backup.fetch("discourse_version"))
+        actual = DiscourseVersion.parse(site.fetch("discourse_version"))
+        raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID" unless requested && actual
+        if requested[:version] > actual[:version]
           raise StandardWorkflowError, "STANDARD_BASE_SITE_NEWER"
         end
-      rescue ArgumentError
-        raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID"
       end
 
       # Image files, not a mutable tag or a pinned profile edit. The resolved image
@@ -373,10 +428,15 @@ module SiloMigrate
         binding = plan_for(run_id).fetch("body").fetch("base_site")
         stack = stack_for(run_id, "review")
         site = stack.rails_runner("/tmp/review_state.rb")
-        base_site_compatible!(binding, site)
+        begin
+          base_site_compatible!(binding, site)
+        rescue StandardWorkflowError => error
+          raise unless %w[STANDARD_BASE_SITE_NEWER STANDARD_BASE_SITE_INVALID].include?(error.code)
+          raise StandardWorkflowError, "STANDARD_REVIEW_RUNTIME_CHANGED"
+        end
         ahead = binding.fetch("schema_version") > site.fetch("schema_version").to_s
         unless ahead == binding.fetch("ahead") && site.fetch("schema_version").to_s == binding.fetch("site_schema_version")
-          raise StandardWorkflowError, "STANDARD_BASE_SITE_NEWER"
+          raise StandardWorkflowError, "STANDARD_REVIEW_RUNTIME_CHANGED"
         end
         input = role_input(run_inputs(run_id), "base_site")
         archive = input_path(run_id, input)
@@ -394,6 +454,8 @@ module SiloMigrate
         unless restored.dig("settings", "allow_restore") == false && (review_image_migrations - restored.fetch("migration_versions")).empty?
           raise StandardWorkflowError, "STANDARD_RESTORE_FAILED"
         end
+        record_review_runtime(run_id, schema_after_restore: restored.fetch("schema_version"),
+                              known_migrations_complete: true)
         record_results(run_id, base_site: true, base_site_ahead: ahead, base_discourse_version: binding["discourse_version"], base_schema_version: binding["schema_version"],
                        discourse_version: site.fetch("discourse_version"), site_schema_version: site.fetch("schema_version"),
                        schema_version: restored.fetch("schema_version"), prior_import_id_rows: restored.fetch("prior_import_id_rows"))
@@ -572,6 +634,8 @@ module SiloMigrate
 
       def review_stale_reason(plan, state)
         body = plan.fetch("body")
+        return "delivery" if body["base_site_generation"] && body["base_site_generation"] != review_base_generation
+
         named = @store.named_state
         ids = body.fetch("input_binding").map { |input| input["id"] }
         return "inputs" unless ids.all? { |id| named.fetch("inputs").key?(id) }
@@ -584,7 +648,7 @@ module SiloMigrate
           return "delivery" unless record.slice("kind", "version") == body.dig("base_site", "delivery")
         end
         return "code" unless code_identity == body.fetch("code_identity")
-        return "runtime" unless profile_current?(state.fetch("config")) && state.dig("config", "discourse_profile_sha256") == body.fetch("runtime_lock_sha256")
+        return "runtime" unless review_runtime_current?(body, state.fetch("config"))
 
         source = body.fetch("from_run")
         run = state.fetch("runs")[source.fetch("run_id")]
@@ -634,11 +698,22 @@ module SiloMigrate
 
       # -- stages -------------------------------------------------------------------
 
+      def record_review_runtime(run_id, **observed)
+        selection = plan_for(run_id).dig("body", "review_runtime")
+        return unless selection
+
+        previous = @store.load.dig("runs", run_id, "results", "review_runtime") || selection
+        result = previous.merge(observed.transform_keys(&:to_s))
+        record_results(run_id, review_runtime: result)
+        evidence(run_id, "review-runtime.json", result)
+      end
+
       def review_preflight(run_id, plan)
         body = plan.fetch("body")
         resolved = lock.fetch("images").transform_values { |image| ImageIdentity.resolve(@runtime, image) }
         @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["resolved_image_ids"] = resolved }
         evidence(run_id, "runtime-images.json", JSON.pretty_generate(resolved) + "\n")
+        record_review_runtime(run_id, resolved_image_id: resolved.fetch("web"))
         source = body.fetch("from_run")
         run = @store.load.fetch("runs").fetch(source.fetch("run_id"))
         unless review_artifact_binding!(source.fetch("run_id"), run, hash: true) == source.slice("intermediate_sha256", "intermediate_bytes", "intermediate_stat")

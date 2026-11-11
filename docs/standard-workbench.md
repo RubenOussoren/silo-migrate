@@ -416,6 +416,16 @@ any fetched refs intact and asks the engineer to resolve the checkout deliberate
 
 ## Runtime profiles
 
+### Review and merge: automatic per-plan application runtime
+
+Review imports and native merges now resolve their own immutable application runtime without rebinding the workspace's conversion profile: latest supported public build without a Base, otherwise a matching or compatible newer build on the Base's release track. Replacing the Base invalidates pending plans and re-resolves the next proposal, including same-version backups with different migration inventories. Existing runs remain bound to their original runtime. See [Automatic Discourse version selection](project-base-site-review.md#automatic-discourse-version-selection).
+
+The installed host launcher starts one bounded preparation worker on demand, outside the no-egress review site. A cold proposal returns `runtime_preparing` until ready; the Project page polls automatically and agents poll the same proposal. No scheduled service, automatic run approval, runtime-profile edit or server-wide upgrade is added. The shared public-image cache is account-private at `<workspace-base-parent>/state/review-runtimes/`; its generated image-only profiles are content-addressed and mounted read-only into control. Customer-derived inventories/comparisons instead remain in `<workspace>/.silo-migrate/data/review-runtime-jobs/`, never the shared profiles. `SILO_REVIEW_RUNTIME_PROFILES_DIR`, invocation-scoped `SILO_REVIEW_RUNTIME_PROFILE` and the two-field `SILO_REVIEW_RUNTIME_COMPARISON` are internal host-to-control bindings, not agent request arguments or new `control.conf` keys. See [runtime preparation operations](review-runtime-operations.md) for the trusted-broker boundary, total budget, exact sandbox cleanup, cache-wide unknown-outcome fence and separately approved retention/recovery.
+
+Preparation refreshes only fixed public product selectors, pins the resolved stock digest, builds a frozen importer overlay from a Dockerfile-only context, verifies image/core/dependency metadata and marks it `review_ready` for review/merge (not full-workflow `qualified`). Other image roles and database majors remain bound to the original profile. Version metadata alone is not an exact core-commit identity; the private migration inventory is compared with candidate core inventories, not sent to a public API. Unknown/plugin-only IDs do not force an upgrade. If current comparison is unavailable, that limitation is recorded. Public image reference/content/digest, actual core revision/version and schema observations appear in fixed-field run evidence and release lineage; no broader evidence-directory or coding-agent data access is granted.
+
+### Conversion and full synthetic workflow: initialization-time profile
+
 ```text
 standard runtime list
 standard runtime show NAME

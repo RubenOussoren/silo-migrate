@@ -12,12 +12,14 @@ What is specific to one customer (which categories go where, what to skip) lives
 2. As root: `silo intake PROJECT`.
 3. On the Project page's Files tab, create the workspace with source platform **`discourse`**. Label the source backup **Development** (or Launch) and the target backup **Base site**. Either can come first.
 4. In a chat in the project, ask migration-data to propose the merge. It takes the source backup (type `discourse-backup`) and proposes a merge run on the current Base site.
-5. On the Runs tab: read the plan, **Approve**, **Start**.
+5. The tool automatically selects/prepares the review Discourse runtime from the current Base backup, preferring a match or a compatible newer build on the same track. A replacement Base backup is resolved again; pending earlier plans become stale and existing runs keep their original version. First preparation may take several minutes; the page waits, or migration-data polls a `runtime_preparing` proposal. No merge has started yet. On the Runs tab: read the plan (including the selected runtime), **Approve**, **Start**.
 6. When it finishes, open the merged site through the SSH tunnel and check it. The run shows totals for the Base site before, the source site and the merged site.
 7. **Release backup…** copies the merged site's full backup and a manifest to the project's output folder. Nothing is sent anywhere. Restoring it on the hosted migration site is the engineer's step, outside this tool.
 8. **Reset the site** when done: it holds customer data until then.
 
 Neither backup is ever extracted, loaded or opened by an agent: only the run reads them. Their file names start with the sites' names, so the page shows the delivery (Development v1, Base site v1) instead.
+
+The same automatic runtime selection and its limits as [Base-site review](project-base-site-review.md#automatic-discourse-version-selection) apply. The selected runtime must also be new enough for the **source** site's backup; it will not silently switch the target's track to accommodate a newer source. Review-ready preparation is not a claim of full synthetic-workflow qualification. The plan/run expose fixed runtime provenance; customer backup contents remain private.
 
 ## The merge layer
 

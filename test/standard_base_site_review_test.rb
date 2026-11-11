@@ -4,11 +4,17 @@ require_relative 'standard_review_run_test'
 class BaseSiteScriptedRuntime < ReviewScriptedRuntime
   attr_accessor :site_version, :site_schema, :backup_content, :prior_ids, :admin_before_backup, :stored_allow_restore
 
+  attr_accessor :runtime_image_documents
+
   def run(cmd, **options)
+    if cmd[0, 3] == %w[docker image inspect] && runtime_image_documents&.key?(cmd.last)
+      @calls << cmd
+      return review_ok(JSON.generate([runtime_image_documents.fetch(cmd.last)]))
+    end
     line = cmd.join(' ')
     if cmd[0, 2] == %w[docker run] && cmd.include?('--entrypoint') && cmd.include?('ruby')
       @calls << cmd
-      return review_ok(JSON.generate(['20261104011110']))
+      return review_ok(JSON.generate(service.lock.dig('review_runtime', 'core_migrations') || ['20261104011110']))
     elsif line.include?('-review') && line.include?('review_state.rb') && cmd[1] == 'exec' && !cmd.include?('chown')
       @calls << cmd
       settings = service.send(:review_environment, 18080).to_h do |key, value|
@@ -16,9 +22,10 @@ class BaseSiteScriptedRuntime < ReviewScriptedRuntime
       end
       port = service.store.load.fetch('instances').values.last.fetch('port')
       settings['port'] = port
-      schema = @restored ? service.store.load.fetch('plans').values.last.dig('body', 'base_site', 'schema_version') : (site_schema || '20261104011110')
-      return site_json('discourse_version' => site_version || '2026.11.0-latest', 'schema_version' => schema,
-                       'migration_versions' => ['20261104011110'], 'prior_import_id_rows' => prior_ids || 7, 'settings' => settings.merge('disable_emails' => 'yes', 'allow_restore' => (@restored ? stored_allow_restore : false)))
+      image_schema = site_schema || service.lock.dig('review_runtime', 'schema_version') || '20261104011110'
+      schema = @restored ? [service.store.load.fetch('plans').values.last.dig('body', 'base_site', 'schema_version'), image_schema].max : image_schema
+      return site_json('discourse_version' => site_version || service.lock.dig('app', 'version'), 'schema_version' => schema,
+                       'migration_versions' => service.lock.dig('review_runtime', 'core_migrations') || ['20261104011110'], 'prior_import_id_rows' => prior_ids || 7, 'settings' => settings.merge('disable_emails' => 'yes', 'allow_restore' => (@restored ? stored_allow_restore : false)))
     elsif line.include?('-review') && line.include?('review_access.rb') && cmd[1] == 'exec' && !cmd.include?('chown')
       @calls << cmd
       run = service.store.load.fetch('runs').values.last
@@ -151,7 +158,7 @@ class StandardBaseSiteReviewTest < StandardReviewRunTest
       assert_nil @service.send(:base_site_compatible!, older, newer)
       @runtime.site_version = '2026.10.0'
       run = base_run
-      assert_equal 'STANDARD_BASE_SITE_NEWER', run.dig(:failure, 'code'), Dir.glob(@service.store.run_dir(run[:run_id], '**/*')).select { |p| File.file?(p) && p.include?('failure') }.map { |p| File.read(p) }.join
+      assert_equal 'STANDARD_REVIEW_RUNTIME_CHANGED', run.dig(:failure, 'code'), Dir.glob(@service.store.run_dir(run[:run_id], '**/*')).select { |p| File.file?(p) && p.include?('failure') }.map { |p| File.read(p) }.join
       refute @runtime.calls.any? { |cmd| cmd.join(' ').include?('script/discourse restore') }
     end
   end
@@ -209,7 +216,7 @@ class StandardBaseSiteReviewTest < StandardReviewRunTest
       plan = base_plan
       @runtime.site_schema = '20261109000000'
       run = run_review(plan)
-      assert_equal 'STANDARD_BASE_SITE_NEWER', run.dig(:failure, 'code')
+      assert_equal 'STANDARD_REVIEW_RUNTIME_CHANGED', run.dig(:failure, 'code')
     end
   end
 
@@ -219,7 +226,7 @@ class StandardBaseSiteReviewTest < StandardReviewRunTest
       @dataset = @base_dataset
       newer = add_input('private-v2099-1-0-20261109000000.sql.gz', 'invented', 'base_site')
       @dataset = previous
-      standard_error('STANDARD_BASE_SITE_NEWER') { propose_review(base_site: newer) }
+      standard_error('STANDARD_REVIEW_RUNTIME_UNRESOLVED') { propose_review(base_site: newer) }
     end
   end
 
