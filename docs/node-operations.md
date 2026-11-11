@@ -68,7 +68,10 @@ each is a fixed operation of `silo-migrate-control data WS`) can:
   with a read-only user `silo_ro`; load dumps as jobs, show tables and sizes, reset;
 - read a failed run's evidence, and propose findings: a **schema finding** (no run: tables,
   columns, counts, invented examples) or a run's cause. You review and release them
-  (`standard finding review/release`); only released text reaches converter-developer.
+  (`standard finding review/release`); only released text reaches converter-developer;
+- for a merge project (platform `discourse`): take the source site's full backup, write and
+  register a merge settings file, propose the merge run, and read a merge run's totals and the
+  end of its private log. See `docs/project-merge-run.md`.
 
 Every operation is logged in `workspaces/WS/.silo-migrate/data/audit.jsonl` (script code and
 finding text by hash); moved and derived files in `provenance.jsonl`. Database passwords stay
@@ -211,6 +214,14 @@ whatever is asked (the reviewer's model rule always applies), in the same projec
 refuses to work outside a project chat. Both see only converter code and released findings.
 Keep converter-developer on ChatGPT: Claude is in its allowed models only so it can start the
 reviewer (term-llm checks a sub-agent against its parent's model rule too). Pushing stays yours.
+
+On a merge project the same two agents write and review the **merge layer**
+(`mergers/<project>/merger.rb`), the code that changes what Discourse's merger does for this
+customer. Their `dev_merge_guide` tool gives the contract and, for the last three merge runs, the
+status, the layer's commit, where a run stopped, the fixed site counts and how many totals the
+layer reported. The layer's own totals go to you (the run on the Project page) and migration-data,
+not to them. A layer runs next to customer data exactly as committed, so have it reviewed before
+you approve the plan that names its commit.
 
 ## Releasing findings (web UI)
 
