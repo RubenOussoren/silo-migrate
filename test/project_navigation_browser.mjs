@@ -13,13 +13,13 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 try {
   const page = await browser.newPage({ viewport: { width: 1100, height: 800 } });
   const errors = [], requests = [], held = [];
-  let hold = true, fail = false, revision = 1, released = false, releasedText = '', accepting = false;
+  let hold = true, fail = false, revision = 1, released = false, releasedText = '', accepting = false, finishReset = null, refused = false;
   page.on('pageerror', error => errors.push(error.message));
   const fixture = project => {
     const entry = { id: findingId, title: `${project} finding ${revision}`, status: released ? 'released' : 'proposed', kind: 'schema', proposed_at: '2026-11-10T12:00:00Z' };
     const step = { run_id: runId, run_status: 'completed', checks: 1, matched: 1, site_up: true };
     const passes = accepting ? [{ key: 'fixture-pass', number: 1, status: ['Finished', 'ok'], delivery: 'Development v1', convert: step, imports: [step] }] : [];
-    return { runs: { passes, updates: [], converter: { branch: project, not_pushed: 0 } },
+    return { runs: { passes, ...(refused ? { error: 'STANDARD_BUSY' } : {}), updates: [], converter: { branch: project, not_pushed: 0 } },
       findings: { review: released ? [] : [entry], progress: released ? [entry] : [], done: [], other: [] } };
   };
   await page.route('**/*', async route => {
@@ -38,6 +38,10 @@ try {
       if (hold) await new Promise(resolve => held.push({ project, resolve })); else await sleep(80);
       if (fail) return route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"offline"}' });
       return json(data);
+    }
+    if (path === 'api/runs/reset') {
+      await new Promise(resolve => finishReset = resolve);
+      return json({ status: 'reset' });
     }
     if (path === 'api/runs/passes') return json(fixture(project).runs);
     if (path === 'api/site/process') return json({ can_accept: true, process_digest: 'a'.repeat(64), process: {
@@ -127,14 +131,37 @@ try {
   await page.getByText(/Couldn't refresh:/).waitFor();
   assert.match(await page.locator('#content').innerText(), /Converter checkout: beta/);
   assert.match(await page.locator('#content').innerText(), /Showing the last loaded list/);
-  // Acceptance must still read fresh process details and show Reset for a recorded live site.
+  // A list refresh cannot replace disabled controls while an action is still in flight.
   accepting = true; fail = false; hold = false;
+  await page.goto('about:blank');
+  await page.goto('http://widget.test/widgets/project/#project=alpha&tab=runs');
+  await page.getByRole('button', { name: 'Reset the site', exact: true }).waitFor();
+  await sleep(1100); hold = true;
+  await tab('Runs').click(); await waitHeld('alpha');
+  page.once('dialog', dialog => dialog.accept());
+  const reset = page.getByRole('button', { name: 'Reset the site', exact: true });
+  await reset.click();
+  for (let i = 0; i < 100 && !finishReset; i++) await sleep(20);
+  assert(finishReset);
+  const oldRead = page.waitForResponse(response => response.url().includes('/api/boards?workspace=alpha'));
+  flush('alpha');
+  await (await oldRead).finished();
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  assert(await reset.isDisabled(), 'late revalidation must not replace in-flight action controls');
+  hold = false; finishReset();
+  await page.getByText('Reset.', { exact: true }).waitFor();
+  // Acceptance must still read fresh process details and show Reset for a recorded live site.
   await page.goto('about:blank');
   await page.goto(`http://widget.test/widgets/project/#project=alpha&tab=runs&kind=accept&id=${runId}`);
   await page.getByRole('button', { name: 'Accept', exact: true }).click();
   await page.getByRole('button', { name: 'Reset the site', exact: true }).waitFor();
   assert(requests.some(r => r.path.endsWith('/api/site/process')));
   assert(requests.some(r => r.path.endsWith('/api/runs/passes')), 'post-accept site state is freshly read');
+  refused = true;
+  await page.goto('about:blank');
+  await page.goto('http://widget.test/widgets/project/#project=alpha&tab=runs&kind=pass&id=fixture-pass');
+  await page.getByText('The project is busy (a run or another decision). Try again in a moment.', { exact: true }).waitFor();
+  assert(!/This pass is no longer there/.test(await page.locator('#content').innerText()), 'a read refusal must not look like a removed pass');
   assert.equal(errors.length, 0, errors.join('\n'));
   console.log(JSON.stringify({ result: 'PROJECT_NAVIGATION_OK', warmClickMs: warmMs, boardRequests: boardCalls(), freshDetailReads: detailCalls, errors: errors.length }));
 } finally { await browser.close(); }

@@ -117,7 +117,7 @@ export function findingsView(ctx) {
     };
     if (!confirm(words[action])) return;
     const project = ctx.project;
-    const mine = ticket;
+    const mine = ++ticket;  // an older list refresh must not replace the disabled action controls
     // One decision at a time.
     const buttons = [...document.querySelectorAll('#content .actions button')];
     for (const button of buttons) button.disabled = true;

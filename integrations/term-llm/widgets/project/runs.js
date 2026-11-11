@@ -26,7 +26,7 @@ export function runsView(ctx) {
   async function act(action, body, question) {
     if (!confirm(question)) return null;
     const project = ctx.project;
-    const mine = ticket;
+    const mine = ++ticket;  // an older list refresh must not replace the disabled action controls
     // One decision at a time: no second click while this one runs (a push can take minutes).
     const buttons = [...document.querySelectorAll('#content .actions button')];
     for (const button of buttons) button.disabled = true;
@@ -265,6 +265,7 @@ export function runsView(ctx) {
     try {
       const data = (await lists.load(listPath())).runs;
       if (mine !== ticket) return;
+      if (data.error) throw new Error(data.error);
       board = data;
     } catch (error) {
       if (mine === ticket) ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, explain(error))]);

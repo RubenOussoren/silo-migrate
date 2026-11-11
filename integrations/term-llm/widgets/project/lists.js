@@ -1,7 +1,7 @@
 // Page-memory snapshots for navigation only. Detail/approval reads never use this cache.
 // Paths include the project, so a late read cannot populate another project's list.
 export function createListCache(read, limit = 8, freshMs = 1000) {
-  const entries = new Map();
+  const entries = new Map(); // bounded FIFO; project changes clear these snapshots anyway
   const entry = (path) => {
     if (!entries.has(path)) {
       while (entries.size >= limit) entries.delete(entries.keys().next().value);

@@ -52,7 +52,7 @@ try {
       window.summaryFixture = fixture;
       window.fetch = (url, options) => {
         window.calls.push({ url, credentials: options.credentials });
-        return new Promise((resolve) => window.pending.push(() => resolve({ ok: !window.fail, json: async () => window.summaryFixture })));
+        return new Promise((resolve) => window.pending.push(() => resolve({ ok: !window.fail, status: window.fail ? (window.failStatus || 503) : 200, json: async () => window.summaryFixture })));
       };
       window.flush = () => window.pending.splice(0).forEach((finish) => finish());
       window.prefix = '/hub/nodes/invented';
@@ -129,7 +129,14 @@ try {
     await button.waitFor({ state: 'visible' });
     assert.equal(await page.locator('.silo-project-button').count(), 1, 'one button after remount');
     await page.evaluate(() => { window.fail = true; flush(); sessionChanged(); flush(); });
+    await button.waitFor({ state: 'visible' });
+    await button.click();
+    await page.getByText('Project status unavailable', { exact: true }).waitFor();
+    assert.equal(await panel.locator('li').count(), 0, 'transient error clears stale project names/counts');
+    assert.equal(await panel.getByRole('link').count(), 1, 'Project page navigation survives a transient error');
+    await page.evaluate(() => { window.failStatus = 403; flush(); sessionChanged(); flush(); });
     await button.waitFor({ state: 'hidden' });
+    assert.notEqual(await page.locator(':focus').getAttribute('class'), 'silo-project-button', 'auth failure does not leave focus on a hidden button');
     await page.evaluate(() => { window.fail = false; window.summaryFixture = { waiting: 0, latest: [] }; sessionChanged(); flush(); });
     await button.waitFor({ state: 'visible' });
     assert.equal(await button.innerText(), 'Project');

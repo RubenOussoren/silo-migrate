@@ -28,9 +28,12 @@ export function activate(ui) {
   closeButton.className = 'silo-project-close';
   closeButton.textContent = '×';
   closeButton.setAttribute('aria-label', 'Close migration projects');
+  const note = document.createElement('p');
+  note.setAttribute('role', 'status');
+  note.hidden = true;
   const list = document.createElement('ul');
   const footer = document.createElement('p');
-  panel.append(closeButton, heading, list, footer);
+  panel.append(closeButton, heading, note, list, footer);
   ui.mount.append(panel);
 
   let disposed = false;
@@ -38,6 +41,7 @@ export function activate(ui) {
   let controller = null;
   let frame = 0;
   let summary = null;
+  let unavailable = false;
   let summaryURL = '';
   let attachedRow = null;
   const listeners = [];
@@ -111,9 +115,11 @@ export function activate(ui) {
       button.append(badge);
     }
     button.classList.toggle('has-pending', waiting > 0);
-    button.title = waiting ? `${waiting} project(s) with something waiting for you` : 'Open the Project page';
+    button.title = unavailable ? 'Project status unavailable; open the Project page to check' : waiting ? `${waiting} project(s) with something waiting for you` : 'Open the Project page';
     button.setAttribute('aria-label', `Migration projects${waiting ? `, ${waiting} waiting` : ''}`);
-    heading.textContent = waiting ? 'Waiting for you' : 'Nothing waiting';
+    heading.textContent = unavailable ? 'Project status unavailable' : waiting ? 'Waiting for you' : 'Nothing waiting';
+    note.hidden = !unavailable;
+    note.textContent = unavailable ? 'Couldn’t refresh. Open the Project page to check.' : '';
     // Reconcile links so an in-flight refresh cannot discard keyboard focus.
     const entries = Array.isArray(summary?.latest) ? summary.latest : [];
     const old = new Map([...list.children].map((entry) => [entry.dataset.workspace, entry]));
@@ -154,16 +160,26 @@ export function activate(ui) {
     inFlight = (async () => {
       try {
         const response = await fetch(url, { credentials: 'same-origin', headers: { Accept: 'application/json' }, signal: request.signal });
-        if (!response.ok) throw new Error(String(response.status));
+        if (!response.ok) throw Object.assign(new Error(String(response.status)), { status: response.status });
         const data = await response.json();
         if (disposed || request.signal.aborted || url !== `${widget()}api/summary`) return;
         summary = data;
+        unavailable = false;
         render();
-      } catch {
+      } catch (error) {
         if (disposed || request.signal.aborted) return;
-        close(panel.contains(document.activeElement));
-        button.hidden = true; // unavailable or signed out: do not show stale summary
-        summary = null;
+        summary = null; // never retain stale names or counts, even for a transient failure
+        if ([401, 403, 404].includes(error.status)) {
+          const focused = panel.contains(document.activeElement) || document.activeElement === button;
+          close();
+          button.hidden = true; // signed out or no widget: stay out of the way
+          if (focused) [...root.querySelectorAll('.main-header button')]
+            .find((node) => node !== button && !node.disabled && node.getClientRects().length)?.focus({ preventScroll: true });
+        } else {
+          // A transient status failure must not remove the engineer's navigation entry point.
+          unavailable = true;
+          render();
+        }
       } finally {
         if (controller === request) inFlight = null;
       }

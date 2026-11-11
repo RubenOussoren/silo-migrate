@@ -50,7 +50,8 @@ RUN_VIEWS = {"plan": runs.plan_detail, "run": runs.run_detail, "push": runs.push
 MAX_FILES = 400
 PLATFORM = re.compile(r"[a-z][a-z0-9_.-]{0,31}\Z")  # as bin/data_tools.py
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-          "/ui.js": ("ui.js", "text/javascript; charset=utf-8"), "/lists.js": ("lists.js", "text/javascript; charset=utf-8"), "/runs.js": ("runs.js", "text/javascript; charset=utf-8"),
+          "/ui.js": ("ui.js", "text/javascript; charset=utf-8"), "/lists.js": ("lists.js", "text/javascript; charset=utf-8"),
+          "/runs.js": ("runs.js", "text/javascript; charset=utf-8"),
           "/findings.js": ("findings.js", "text/javascript; charset=utf-8"),
           "/app.css": ("app.css", "text/css; charset=utf-8"), "/tokens.css": ("tokens.css", "text/css; charset=utf-8")}
 # Varnish's own font files, so that the page matches without a second copy of them.
