@@ -358,9 +358,13 @@ def main(args):
         if result.returncode:
             print("Error: STANDARD_RUN_NOT_STARTED. Recover with: standard run recover " + args[1] + " " + run_id, file=sys.stderr)
         return result.returncode
+    # Short UI reads need not throttle Ruby startup to a quarter CPU. Mutation/executor ceilings
+    # stay unchanged, as do memory, mounts, identity checks and every other isolation setting.
+    read_only = args[:2] == ["standard", "status"] or args[:3] in (["standard", "plan", "show"], ["standard", "run", "show"])
+    cpus = "1" if read_only else "0.25"
     command = ["docker", "run", *mode, "--pull=never", "--restart", "no", "--network", "host", "--read-only",
                "--user", f"{os.getuid()}:{os.getgid()}", "--group-add", str(Path("/var/run/docker.sock").stat().st_gid),
-               "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "0.25", "--memory", "512m",
+               "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", cpus, "--memory", "512m",
                "--memory-swap", "512m", "--pids-limit", "256", "--log-opt", "max-size=1m", "--tmpfs", "/tmp:rw,exec,size=256m,mode=1777"]
 
     def mount(source, destination, readonly=True):

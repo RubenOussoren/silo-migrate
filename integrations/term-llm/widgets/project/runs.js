@@ -1,6 +1,6 @@
 // The Runs tab: plans to approve and start, runs to follow and reset, converter pushes.
 // The decisions are those of widgets/runs/server.py, unchanged: same checks, same exact-digest approval.
-import { el, safe, short, badge, ago, toast, api, explain, facts, block, table, details, card, back, item } from './ui.js';
+import { el, safe, short, badge, ago, toast, api, lists, explain, facts, block, table, details, card, back, item } from './ui.js';
 
 const baseLabel = (base) => base ? `Base site v${(base.delivery || {}).version}` : 'None: fresh site';
 const bytes = (n) => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`;
@@ -25,13 +25,17 @@ export function runsView(ctx) {
 
   async function act(action, body, question) {
     if (!confirm(question)) return null;
+    const project = ctx.project;
+    const mine = ticket;
     // One decision at a time: no second click while this one runs (a push can take minutes).
     const buttons = [...document.querySelectorAll('#content .actions button')];
     for (const button of buttons) button.disabled = true;
     toast(action === 'release' ? 'Releasing… this can take a few minutes.' : action === 'push' ? 'Pushing… this can take a few minutes.' : 'Working…');
     try {
-      return await api(`api/runs/${action}`, { workspace: ctx.project, ...body });
+      const outcome = await api(`api/runs/${action}`, { workspace: project, ...body });
+      return project === ctx.project && mine === ticket ? outcome : null;
     } catch (error) {
+      if (project !== ctx.project || mine !== ticket) return null;
       for (const button of buttons) button.disabled = false;
       toast(explain(error), true);
       ctx.refresh();
@@ -206,16 +210,28 @@ export function runsView(ctx) {
         update.status === 'proposed' ? 'waiting for your approval' : update.status !== 'pushed' ? update.status : update.used_by.length ? `${update.used_by.length > 1 ? 'passes' : 'pass'} ${update.used_by.join(', ')}` : 'not used yet'))))];
   }
 
+  const listPath = () => `api/boards?${new URLSearchParams({ workspace: ctx.project })}`;
+
   async function list() {
     const mine = ++ticket;
-    if (!board) ctx.mount([el('p', { class: 'quiet' }, 'Loading…')]);
-    let data;
-    try { data = await api(`api/runs/passes?${new URLSearchParams({ workspace: ctx.project })}`); } catch (error) {
-      if (mine === ticket) ctx.mount([el('p', { class: 'quiet' }, explain(error))]);
-      return;
+    const path = listPath();
+    board = lists.peek(path)?.runs || null;
+    if (board) paintList(board, 'Refreshing…');
+    else ctx.mount([el('p', { class: 'quiet', role: 'status' }, 'Loading runs…')]);
+    try {
+      const data = (await lists.load(path)).runs;
+      if (mine !== ticket) return;
+      board = data;
+      paintList(data);
+    } catch (error) {
+      if (mine !== ticket) return;
+      if (board) paintList(board, `Couldn't refresh: ${explain(error)} Showing the last loaded list.`);
+      else ctx.mount([el('p', { class: 'quiet' }, explain(error))]);
     }
-    if (mine !== ticket) return;
-    board = data;
+  }
+
+  function paintList(data, status = '') {
+    if (data.error) { ctx.mount([el('p', { class: 'quiet' }, explain(new Error(data.error)))]); return; }
     const nodes = [];
     if (data.banner) {
       const b = data.banner;
@@ -239,13 +255,20 @@ export function runsView(ctx) {
     const conv = data.converter || {};
     nodes.push(el('p', { class: 'hint footer' }, el('button', { type: 'button', class: 'link', onclick: () => ctx.open('converter', ctx.project) },
       conv.error ? 'Converter checkout' : `Converter checkout: ${safe(conv.branch || '?')} · ${conv.not_pushed ?? '?'} commit(s) not on GitHub`)));
+    if (status) nodes.push(el('p', { class: 'hint footer', role: 'status' }, status));
     ctx.mount(nodes);
   }
 
   async function passView(key) {
     const mine = ++ticket;
-    if (!board) {
-      try { board = await api(`api/runs/passes?${new URLSearchParams({ workspace: ctx.project })}`); } catch (error) { ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, explain(error))]); return; }
+    ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, 'Loading pass…')]);
+    try {
+      const data = (await lists.load(listPath())).runs;
+      if (mine !== ticket) return;
+      board = data;
+    } catch (error) {
+      if (mine === ticket) ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, explain(error))]);
+      return;
     }
     if (mine !== ticket) return;
     const group = board.passes.find((candidate) => candidate.key === key);
@@ -521,10 +544,12 @@ export function runsView(ctx) {
       try {
         await api('api/site/review', { workspace: ctx.project, run_id: runId, verdict: 'accepted', basis, note: note.value.trim() || undefined, process_digest: shown.process_digest });
       } catch (error) {
+        if (mine !== ticket) return;
         accept.disabled = false;
         toast(explain(error), true);
         return;
       }
+      if (mine !== ticket) return;
       board = null;
       done(runId, basis);
     } }, 'Accept');
@@ -542,14 +567,17 @@ export function runsView(ctx) {
 
   // After accepting: the site still holds customer data, so Reset is offered straight away.
   async function done(runId, basis) {
+    const mine = ++ticket;
     let up = false;
     let last = null;
     try {
       const data = await api(`api/runs/passes?${new URLSearchParams({ workspace: ctx.project })}`);
+      if (mine !== ticket) return;
       board = data;
       last = data.passes.flatMap((group) => group.imports).find((step) => step.run_id === runId);
       up = Boolean(last && last.site_up);
     } catch { /* the Runs list shows it */ }
+    if (mine !== ticket) return;
     const reset = up ? el('button', { type: 'button', class: 'btn', onclick: async () => {
       if (await act('reset', { run_id: runId }, `Reset this review site of ${ctx.project}? It holds customer data; evidence and plans stay. ${resetNote(last && last.release)}`)) { toast('Reset.'); ctx.close(); }
     } }, 'Reset the site') : null;
@@ -560,17 +588,19 @@ export function runsView(ctx) {
   }
 
   function changesView(runId) {
-    ++ticket;
+    const mine = ++ticket;
     const note = el('textarea', { class: 'note tall', maxlength: '2000', placeholder: 'For example: quoted replies show raw markup; avatars are missing', 'aria-label': 'What needs changing' });
     const save = el('button', { type: 'button', class: 'btn', disabled: true, onclick: async () => {
       save.disabled = true;
       try {
         await api('api/site/review', { workspace: ctx.project, run_id: runId, verdict: 'needs_changes', note: note.value.trim() });
       } catch (error) {
+        if (mine !== ticket) return;
         save.disabled = false;
         toast(explain(error), true);
         return;
       }
+      if (mine !== ticket) return;
       board = null;
       toast('Saved. Ask migration-data in a chat in this project: "What\u2019s next?"');
       ctx.close();
@@ -583,7 +613,6 @@ export function runsView(ctx) {
 
   async function detail(kind, id, quiet = false) {
     const mine = ++ticket;
-    board = null;  // a decision may change the passes: the list asks again
     if (!quiet) ctx.mount([back('Runs', ctx.close), el('p', { class: 'quiet' }, 'Loading…')]);  // a refresh keeps what's shown
     let data;
     try { data = await api(`api/runs/${kind}?${new URLSearchParams({ workspace: ctx.project, id })}`); } catch (error) {
@@ -610,7 +639,8 @@ export function runsView(ctx) {
     }
   }
 
-  return { show: () => (!ctx.selected ? list() : ctx.selected.kind === 'pass' ? passView(ctx.selected.id)
+  return { cancel: () => { ++ticket; }, reset: () => { ++ticket; board = null; },
+    show: () => (!ctx.selected ? list() : ctx.selected.kind === 'pass' ? passView(ctx.selected.id)
     : ctx.selected.kind === 'accept' ? acceptView(ctx.selected.id) : ctx.selected.kind === 'changes' ? changesView(ctx.selected.id)
       : detail(ctx.selected.kind, ctx.selected.id)) };
 }

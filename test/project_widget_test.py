@@ -331,8 +331,37 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         self.assertIn("platform === 'discourse'", source)
         self.assertIn("siteBackup ? 'source site backup · ' : fileText(development)", source)
 
+    def test_boards_share_one_public_pass_projection(self):
+        passes = {'passes': [], 'updates': [], 'converter': {'branch': 'migration/synthetic'}}
+        with mock.patch.object(self.m, 'passes_of', return_value=passes) as read:
+            status, raw, response = self.request('GET', '/api/boards?workspace=arc')
+        self.assertEqual(200, status)
+        self.assertEqual('no-store', response.getheader('Cache-Control'))
+        self.assertEqual(passes, json.loads(raw)['runs'])
+        self.assertEqual({'review': [], 'progress': [], 'done': [], 'other': []}, json.loads(raw)['findings'])
+        read.assert_called_once_with(self.base, str(self.control), 'arc')
+
+    def test_boards_keep_findings_available_and_report_run_refusals_without_decisions(self):
+        records = [{'id': 'finding-' + 'a' * 32, 'status': 'proposed', 'title': 'Invented finding'}]
+        with mock.patch.object(self.m, 'passes_of', side_effect=self.m.Refused('STANDARD_NOT_INITIALIZED', 404)), \
+                mock.patch.object(self.m.findings.Store, 'records', return_value=records), \
+                mock.patch.object(self.m.findings.Store, 'title', return_value='Invented finding'):
+            status, raw, _ = self.request('GET', '/api/boards?workspace=arc')
+        self.assertEqual(200, status)
+        self.assertEqual('STANDARD_NOT_INITIALIZED', json.loads(raw)['runs']['error'])
+        self.assertEqual('Invented finding', json.loads(raw)['findings']['review'][0]['title'])
+        self.assertEqual([], self.calls())
+        for workspace in ('', '../x'):
+            self.assertEqual(400, self.request('GET', '/api/boards?workspace=' + workspace)[0])
+
+    def test_navigation_module_is_served_with_the_same_private_headers(self):
+        status, raw, response = self.request('GET', '/lists.js')
+        self.assertEqual(200, status)
+        self.assertIn(b'createListCache', raw)
+        self.assertEqual('no-store', response.getheader('Cache-Control'))
+
     def test_the_page_builds_with_dom_calls_only(self):
-        for name in ('app.js', 'ui.js', 'runs.js', 'findings.js'):
+        for name in ('app.js', 'ui.js', 'lists.js', 'runs.js', 'findings.js'):
             source = (WIDGET / name).read_text()
             for word in ('innerHTML', 'insertAdjacentHTML', 'document.write', 'https://', 'eval('):
                 self.assertNotIn(word, source, name)

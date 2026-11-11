@@ -50,7 +50,7 @@ RUN_VIEWS = {"plan": runs.plan_detail, "run": runs.run_detail, "push": runs.push
 MAX_FILES = 400
 PLATFORM = re.compile(r"[a-z][a-z0-9_.-]{0,31}\Z")  # as bin/data_tools.py
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-          "/ui.js": ("ui.js", "text/javascript; charset=utf-8"), "/runs.js": ("runs.js", "text/javascript; charset=utf-8"),
+          "/ui.js": ("ui.js", "text/javascript; charset=utf-8"), "/lists.js": ("lists.js", "text/javascript; charset=utf-8"), "/runs.js": ("runs.js", "text/javascript; charset=utf-8"),
           "/findings.js": ("findings.js", "text/javascript; charset=utf-8"),
           "/app.css": ("app.css", "text/css; charset=utf-8"), "/tokens.css": ("tokens.css", "text/css; charset=utf-8")}
 # Varnish's own font files, so that the page matches without a second copy of them.
@@ -151,13 +151,14 @@ def site_review(control, body):
     return data(control, body.get("workspace"), request)
 
 
-def findings_board(base, control, workspace):
+def findings_board(base, control, workspace, passes=None):
     store = findings.Store(base)
     records = [dict(record, title=store.title(record)) for record in store.records(workspace)]
-    try:
-        passes = passes_of(base, control, workspace)
-    except REFUSALS:
-        passes = {"passes": [], "updates": []}
+    if passes is None:
+        try:
+            passes = passes_of(base, control, workspace)
+        except REFUSALS:
+            passes = {"passes": [], "updates": []}
     marks = read_json_file(base / workspace / ".silo-migrate/named/finding-progress.json").get("done") or {}
     return board.build_findings(records, passes["passes"], passes["updates"], marks if isinstance(marks, dict) else {})
 
@@ -364,6 +365,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, data(control, query.get("workspace"), {"op": "site_process", "run_id": run_id}))
             if url.path == "/api/project/removal":
                 return self.send(200, removal_plan(control, query.get("workspace"), query.get("keep") == "1"))
+            if url.path == "/api/boards":
+                workspace = query.get("workspace")
+                if not isinstance(workspace, str) or not WORKSPACE.fullmatch(workspace):
+                    raise Refused("STANDARD_ARGUMENTS_INVALID")
+                try:
+                    passes = passes_of(base, control, workspace)
+                except REFUSALS as refused:
+                    # Findings remain reviewable when run status is unavailable, as on their own route.
+                    passes = {"passes": [], "updates": [], "error": refused.code}
+                return self.send(200, {"runs": passes, "findings": findings_board(base, control, workspace, passes)})
             if url.path == "/api/runs/passes":
                 return self.send(200, passes_of(base, control, query.get("workspace")))
             if url.path == "/api/findings/board":

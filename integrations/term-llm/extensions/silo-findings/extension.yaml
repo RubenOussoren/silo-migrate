@@ -1,5 +1,5 @@
-title: Project tab
-description: Shows which projects have something waiting for you, with links to the Project page where it is decided.
+title: Project launcher
+description: Header launcher showing project names and waiting counts, with links to the Project page where decisions happen.
 format_version: 1
 css: style.css
 js: main.js

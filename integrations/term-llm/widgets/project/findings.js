@@ -1,6 +1,6 @@
 // The Findings tab: what migration-data proposes, and the only way text reaches the coding agents.
 // The decisions are those of widgets/findings/server.py, unchanged: the exact text and its checksum are sent.
-import { el, safe, ago, toast, api, explain, facts, details, card, back, item } from './ui.js';
+import { el, safe, ago, toast, api, lists, explain, facts, details, card, back, item } from './ui.js';
 
 const STATUS_LABEL = { proposed: 'to review', released: 'released', rejected: 'rejected', superseded: 'replaced', withdrawn: 'withdrawn' };
 
@@ -116,16 +116,20 @@ export function findingsView(ctx) {
       withdraw: `Withdraw this finding of ${ctx.project}? The coding agents won't be able to read it any more. It doesn't erase what they already read.`,
     };
     if (!confirm(words[action])) return;
+    const project = ctx.project;
+    const mine = ticket;
     // One decision at a time.
     const buttons = [...document.querySelectorAll('#content .actions button')];
     for (const button of buttons) button.disabled = true;
     try {
-      const outcome = await api(`api/findings/${action}`, { workspace: ctx.project, id: record.id, text });
+      const outcome = await api(`api/findings/${action}`, { workspace: project, id: record.id, text });
+      if (project !== ctx.project || mine !== ticket) return;
       toast(action === 'amend' ? 'Released the correction.' : `Done: ${outcome.status}.`);
       editing = null;
       board = null;
       if (outcome.finding_id && outcome.finding_id !== record.id) ctx.open('finding', outcome.finding_id); else ctx.refresh();
     } catch (error) {
+      if (project !== ctx.project || mine !== ticket) return;
       for (const button of buttons) button.disabled = false;
       toast(explain(error), true);  // nothing changed: the page, edits included, stays as it is
     }
@@ -159,16 +163,27 @@ export function findingsView(ctx) {
     return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, track(entry), el('p', { class: 'changed' }, nextStep(entry))) : null);
   }
 
+  const listPath = () => `api/boards?${new URLSearchParams({ workspace: ctx.project })}`;
+
   async function list() {
     const mine = ++ticket;
-    if (!board) ctx.mount([el('p', { class: 'quiet' }, 'Loading…')]);
-    let data;
-    try { data = await api(`api/findings/board?${new URLSearchParams({ workspace: ctx.project })}`); } catch (error) {
-      if (mine === ticket) ctx.mount([el('p', { class: 'quiet' }, explain(error))]);
-      return;
+    const path = listPath();
+    board = lists.peek(path)?.findings || null;
+    if (board) paintList(board, 'Refreshing…');
+    else ctx.mount([el('p', { class: 'quiet', role: 'status' }, 'Loading findings…')]);
+    try {
+      const data = (await lists.load(path)).findings;
+      if (mine !== ticket) return;
+      board = data;
+      paintList(data);
+    } catch (error) {
+      if (mine !== ticket) return;
+      if (board) paintList(board, `Couldn't refresh: ${explain(error)} Showing the last loaded list.`);
+      else ctx.mount([el('p', { class: 'quiet' }, explain(error))]);
     }
-    if (mine !== ticket) return;
-    board = data;
+  }
+
+  function paintList(data, status = '') {
     const nodes = [];
     if (data.review.length) nodes.push(el('h2', {}, 'TO REVIEW'), ...data.review.map((entry) => boardCard(entry, false)));
     if (data.progress.length) nodes.push(el('h2', {}, 'IN PROGRESS'), ...data.progress.map((entry) => boardCard(entry, true)));
@@ -178,6 +193,7 @@ export function findingsView(ctx) {
         ...data.other.map((entry) => item(safe(entry.title), `${STATUS_LABEL[entry.status]} · ${ago(entry.decided_at || entry.proposed_at)}`, () => ctx.open('finding', entry.id)))));
     }
     if (!nodes.length) nodes.push(el('p', { class: 'quiet' }, 'No findings yet. migration-data proposes them when converter work needs to know something about the data.'));
+    if (status) nodes.push(el('p', { class: 'hint footer', role: 'status' }, status));
     ctx.mount(nodes);
   }
 
@@ -191,13 +207,20 @@ export function findingsView(ctx) {
       return;
     }
     if (mine !== ticket) return;
-    if (!find(record.id)) { try { board = await api(`api/findings/board?${new URLSearchParams({ workspace: ctx.project })}`); } catch { /* no track then */ } }
+    board = lists.peek(listPath())?.findings || null;
+    if (!find(record.id)) {
+      try {
+        const data = (await lists.load(listPath())).findings;
+        if (mine !== ticket) return;
+        board = data;
+      } catch { /* no track then */ }
+    }
     if (mine !== ticket) return;
     const entry = find(record.id);
     const story = entry && record.status !== 'proposed' ? [track(entry), el('p', { class: 'changed' }, `${origin(entry)}. ${nextStep(entry)}.`)] : [];
     const mark = (undo) => el('button', { type: 'button', class: 'btn q', onclick: async () => {
       if (!confirm(undo ? `Reopen this finding of ${ctx.project}? It goes back to In progress.` : `Mark this finding of ${ctx.project} done? Use this when it needed no converter change, or was fixed before fixes named their findings.`)) return;
-      try { await api('api/findings/done', { workspace: ctx.project, id: undo && entry.marked_id ? entry.marked_id : record.id, undo }); toast(undo ? 'Reopened.' : 'Marked done.'); board = null; ctx.refresh(); } catch (error) { toast(explain(error), true); }
+      try { await api('api/findings/done', { workspace: ctx.project, id: undo && entry.marked_id ? entry.marked_id : record.id, undo }); if (mine !== ticket) return; toast(undo ? 'Reopened.' : 'Marked done.'); board = null; ctx.refresh(); } catch (error) { toast(explain(error), true); }
     } }, undo ? 'Reopen' : 'Mark done');
     const more = details(facts([['Finding', record.id, true], ['Kind', record.kind + (record.run_id ? ` (run ${record.run_id})` : '')], ['Proposed', record.proposed_at],
       ['Decided', record.decided_at ? `${record.decided_at}${record.reviewer ? ` by ${record.reviewer}` : ''}` : null], ['SHA-256', record.sha256, true]]),
@@ -232,5 +255,6 @@ export function findingsView(ctx) {
     ctx.mount([back('Findings', leave), ...parts]);
   }
 
-  return { show: () => (ctx.selected ? detail(ctx.selected.id) : list()), unsaved, discard: () => { editing = null; } };
+  return { show: () => (ctx.selected ? detail(ctx.selected.id) : list()), cancel: () => { ++ticket; },
+    reset: () => { ++ticket; board = null; editing = null; }, unsaved, discard: () => { editing = null; } };
 }

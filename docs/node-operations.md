@@ -115,7 +115,8 @@ and the web UI keeps chats apart:
   the service's home folder, not the project's, so turning on only the chat's own `db-<project>`
   stays your job (migration-data is told to stop if another project's server is on).
 - **Look and feel:** the web UI uses Varnish by Keegan George (`extensions/varnish`, a copy of upstream with two checked compatibility patches; `script/update-varnish COMMIT` replaces it and applies them) with our changes kept in `extensions/silo-theme`. Updates are deliberate: this code runs on pages showing customer data, so run the browser tests before shipping one.
-- **The Project page** (a Project tab, and under Widgets) shows one project at a time: which data is in use, where it stands, what to do next. New files are labelled there as Development or Launch, and only there: the agent can't take a file until it's labelled, a plan's approval covers which delivery it uses, and a launch run is refused until running on launch data is built (the accepted process it will repeat is already recorded: see Accepting a site).
+- **The Project page** (the horizontal **Project** button in the chat header, and under Widgets) shows one project at a time: which data is in use, where it stands, what to do next. New files are labelled there as Development or Launch, and only there: the agent can't take a file until it's labelled, a plan's approval covers which delivery it uses, and a launch run is refused until running on launch data is built (the accepted process it will repeat is already recorded: see Accepting a site).
+- **Faster navigation:** Findings and Runs share one read and keep a project-scoped snapshot in page memory. Previously loaded lists appear immediately and refresh in the background; no finding text is stored in persistent browser storage. Switching projects or making a decision clears the snapshots. Approval, release and site-acceptance details still read fresh state and retain their exact-text/digest checks. A failed refresh is shown rather than silently presenting the list as current.
 - **What labels guard against:** mixing up data by accident. A script reads one delivery and its outputs belong to it, but migration-data can still read every delivery, so the labels don't stop an agent deliberately copying one delivery's content into another's script.
 - **Rollback and labels:** a release from before labels ignores them. After rolling back, the agent can take unlabelled files again until you roll forward. If a take from before labels was interrupted and shows "ask the engineer", finish it by hand: as the service account, check `.silo-migrate/data/pending/` in the workspace and the file already in `inputs/`, then ask for help.
 - **The guide:** every migration-data chat starts with `data_guide`, which works out from the project's state where it stands and what's next, so a new chat knows as much as an old one. Agents take the project from the chat, so they never need to be told which one it is.
@@ -315,6 +316,25 @@ python3 -I -B -m unittest discover -s test/metal -p 'test_*.py'
 ```
 
 `test/varnish_bundle_test.py` is what proves the bundled theme is exactly what `update-varnish` recorded.
+
+For the Project launcher and navigation, also run the invented-data browser checks (Node,
+Playwright Core and Chromium must already be available; this does not install anything):
+
+```sh
+export PLAYWRIGHT_CORE=/path/to/playwright-core/index.mjs
+export CHROMIUM=/path/to/chromium
+export TERM_LLM_SOURCE=/path/to/term-llm-checkout  # contains local tag v0.9.99
+node test/launcher_extension_test.mjs
+node test/project_navigation_browser.mjs
+```
+
+The launcher test covers stock/Varnish headers, narrow screens, keyboard focus and Hub-relative
+links. Navigation checks cover immediate snapshots, deduplicated reads, stale response isolation,
+unsaved edits, decision invalidation and fresh site-acceptance state. These fixture checks are not
+proof of work-server latency: also check the real pinned host locally with invented data. Short
+engineer reads (`standard status`, `standard plan show`, `standard run show`) have a one-CPU control
+ceiling to avoid throttling CLI startup; mutation/executor control commands retain 0.25 CPU, and
+migration containers' own profile limits and all other isolation settings are unchanged.
 
 **The Varnish patch (runtime marks):** term-llm 0.9.99 wraps each Runtime popover select in
 `.control-select`, and upstream Varnish (`002f10e`) then showed ~320 px provider logos that multiplied

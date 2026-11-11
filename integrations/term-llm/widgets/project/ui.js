@@ -1,4 +1,7 @@
 // Shared pieces of the Project page. Everything from the server goes in as text, never as markup.
+import { createListCache } from './lists.js';
+
+export const lists = createListCache((path) => api(path));
 export const $ = (id) => document.getElementById(id);
 
 export function el(tag, attrs = {}, ...children) {
@@ -41,7 +44,10 @@ export async function api(path, body) {
   const options = body
     ? { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Silo-Project': '1' }, body: JSON.stringify(body) }
     : { credentials: 'same-origin', headers: { Accept: 'application/json' } };
-  const response = await fetch(path, options);
+  // Invalidate both before and after a decision: a read started during it must not survive it.
+  if (body) lists.clear();
+  let response;
+  try { response = await fetch(path, options); } finally { if (body) lists.clear(); }
   let data = {};
   try { data = await response.json(); } catch { /* not JSON */ }
   if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);

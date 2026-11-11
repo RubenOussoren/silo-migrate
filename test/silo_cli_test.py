@@ -448,6 +448,30 @@ class SiloTest(unittest.TestCase):
             self.assertEqual('FAIL', checks['widget folder']['status'])
             self.assertIn('remove it', checks['widget folder']['fix'])
 
+    def test_status_gets_a_short_read_cpu_budget_without_changing_executor_limits(self):
+        import runpy
+        control = runpy.run_path(str(ROOT / 'bin/silo-migrate-control'))
+        values = {'SILO_MIGRATE_BASE_PATH': str(self.root / 'workspaces'), 'SILO_CONTROL_GEMS': str(self.root / 'gems')}
+        real_stat = Path.stat
+        def fake_stat(path, *args, **kwargs):
+            return types.SimpleNamespace(st_gid=99) if str(path) == '/var/run/docker.sock' else real_stat(path, *args, **kwargs)
+        cases = [(['standard', 'status', 'synthetic'], '1'),
+                 (['standard', 'plan', 'show', 'synthetic', 'plan-' + 'a' * 32], '1'),
+                 (['standard', 'run', 'show', 'synthetic', 'run-' + 'a' * 32], '1'),
+                 (['standard', 'run', 'execute', 'synthetic', 'run-' + 'a' * 32], '0.25'),
+                 (['standard', 'plan', 'approve', 'synthetic', 'plan-' + 'b' * 32], '0.25'),
+                 (['standard', 'agent', 'status', 'synthetic'], '0.25')]
+        with mock.patch.dict(control['main'].__globals__, {'settings': lambda: (values, False)}), \
+                mock.patch.object(Path, 'stat', fake_stat), mock.patch('os.execvp') as execute:
+            for args, budget in cases:
+                control['main'](args)
+                command = execute.call_args.args[1]
+                self.assertEqual(budget, command[command.index('--cpus') + 1])
+                self.assertEqual('512m', command[command.index('--memory') + 1])
+                self.assertIn('--read-only', command)
+                self.assertIn('no-new-privileges', command)
+                self.assertEqual('ALL', command[command.index('--cap-drop') + 1])
+
     def test_control_refuses_root_except_image_identity(self):
         import runpy
         config = self.root / 'control.env'

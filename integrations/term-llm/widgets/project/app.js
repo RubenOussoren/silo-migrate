@@ -1,5 +1,5 @@
 // The Project page: one project at a glance, its files, findings and runs.
-import { $, el, safe, short, toast, api, explain, card, details, back, facts } from './ui.js';
+import { $, el, safe, short, toast, api, lists, explain, card, details, back, facts } from './ui.js';
 import { runsView } from './runs.js';
 import { findingsView } from './findings.js';
 
@@ -59,6 +59,7 @@ function go(tab, selected = null) {
     if (state.removal.result) { closeRemoval().then(() => go(tab, selected)).catch((error) => toast(explain(error), true)); return; }
     state.removal = null;
   }
+  cancelViews();
   state.tab = tab;
   state.selected = selected;
   writeHash();
@@ -70,12 +71,18 @@ const context = (tab) => ({
   get project() { return state.project; },
   get selected() { return state.selected; },
   state: state.findings,
-  mount,
-  open: (kind, id) => { state.selected = { kind, id }; writeHash(); views[tab].show(); },
-  close: () => { state.selected = null; writeHash(); views[tab].show(); refreshCounts(); },
-  refresh: () => { views[tab].show(); refreshCounts(); },
+  mount: (nodes) => { if (state.tab === tab) mount(nodes); },
+  open: (kind, id) => { cancelViews(); state.selected = { kind, id }; writeHash(); views[tab].show(); },
+  close: () => { cancelViews(); state.selected = null; writeHash(); views[tab].show(); refreshCounts(); },
+  refresh: () => { cancelViews(); views[tab].show(); refreshCounts(); },
 });
 const views = { runs: runsView(context('runs')), findings: findingsView(context('findings')) };
+const cancelViews = () => { for (const view of Object.values(views)) view.cancel(); };
+
+function warmLists(project) {
+  // Read-only lists, in page memory only. Never prefetch approval details or private input texts.
+  return lists.load(`api/boards?${new URLSearchParams({ workspace: project })}`).catch(() => {});
+}
 
 function newest(kind) {
   return ((state.files && state.files.deliveries) || []).find((record) => record.kind === kind && !record.replaced_by) || null;
@@ -399,36 +406,45 @@ function render() {
 }
 
 async function refreshCounts() {
-  try { state.counts = await api(`api/counts?${new URLSearchParams({ workspace: state.project })}`); renderTabs(); } catch { /* the tabs keep their last counts */ }
+  const project = state.project;
+  try {
+    const counts = await api(`api/counts?workspace=${encodeURIComponent(project)}`);
+    if (project === state.project) { state.counts = counts; renderTabs(); }
+  } catch { /* the tabs keep their last counts */ }
 }
 
 async function refresh(full = true) {
-  if (state.removal) return;  // its screen shows what the server said; the project may be gone
+  if (state.removal) return;
   if (!state.project) { render(); return; }
   const generation = ++state.generation;
   const project = state.project;
   const stale = () => generation !== state.generation || project !== state.project;
   const repaint = () => { if (state.tab === 'overview' || state.tab === 'files') render(); else { renderData(); renderStages(); renderTabs(); } };
-  // The quick answers first, so the page has something to show while the slower one runs.
-  try {
-    const files = await api(`api/files?workspace=${encodeURIComponent(project)}`);
-    if (stale()) return;
-    state.files = files;
-    repaint();
-  } catch (error) { if (!stale()) toast(explain(error), true); }
-  try {
-    const counts = await api(`api/counts?workspace=${encodeURIComponent(project)}`);
-    if (stale()) return;
-    state.counts = counts;
-    renderTabs();
-  } catch { /* the tabs keep their last counts */ }
-  if (full && (state.tab === 'runs' || state.tab === 'findings') && !state.selected) views[state.tab].show();
-  try {
-    const guide = await api(`api/guide?workspace=${encodeURIComponent(project)}`);
-    if (stale()) return;
-    state.guide = guide;
-    repaint();
-  } catch (error) { if (!stale()) toast(explain(error), true); }
+  // Independent reads: a slow guide must not hold up files, counts, or navigation.
+  await Promise.all([
+    (async () => {
+      try {
+        const files = await api(`api/files?workspace=${encodeURIComponent(project)}`);
+        if (!stale()) { state.files = files; repaint(); }
+      } catch (error) { if (!stale()) toast(explain(error), true); }
+    })(),
+    (async () => {
+      try {
+        const counts = await api(`api/counts?workspace=${encodeURIComponent(project)}`);
+        if (!stale()) { state.counts = counts; renderTabs(); }
+      } catch { /* the tabs keep their last counts */ }
+    })(),
+    (async () => {
+      try {
+        const guide = await api(`api/guide?workspace=${encodeURIComponent(project)}`);
+        if (!stale()) { state.guide = guide; repaint(); }
+      } catch (error) { if (!stale()) toast(explain(error), true); }
+    })(),
+  ]);
+  if (!stale()) {
+    if (full && (state.tab === 'runs' || state.tab === 'findings') && !state.selected) views[state.tab].show();
+    warmLists(project);
+  }
 }
 
 function choose(project) {
@@ -438,6 +454,10 @@ function choose(project) {
       .catch((error) => toast(explain(error), true));
     return;
   }
+  cancelViews();
+  for (const view of Object.values(views)) view.reset();
+  lists.clear();
+  ++state.generation;
   state.project = project;
   state.selectedFiles = null; state.labelResult = null; state.setup = null;
   state.files = state.guide = null;
@@ -451,6 +471,7 @@ function choose(project) {
   try { localStorage.setItem('silo-project', project); } catch { /* the default */ }
   writeHash();
   render();
+  warmLists(project);
   refresh(false);
 }
 
