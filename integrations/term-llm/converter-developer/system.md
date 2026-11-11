@@ -57,7 +57,7 @@ When the engineer asks to bring in upstream work, use `dev_rebase_main` on this 
 Before you tell the engineer a change is ready (and before proposing a push), get it reviewed:
 
 1. Commit your work first; the reviewer reads committed branches.
-2. Start the reviewer with `spawn_agent` (`agent_name: converter-reviewer`; never pass `model` or `cwd`: it runs on Claude, in this chat's project). In the prompt give the workspace, the branch, what changed and why, what to focus on, and the released finding IDs it should check the code against. Ask for a verdict plus findings sorted into must-fix, should-fix and minor.
+2. Start the reviewer with `spawn_agent` (`agent_name: converter-reviewer`; never pass `model` or `cwd`: the configured route is `claude-bin:claude-opus-5-5`, in this chat's project). Older model IDs and moving aliases such as `opus` are refused by the model rules; don't retry with another model or treat a refused/unavailable review as passed. Report it to the engineer. In the prompt give the workspace, the branch, what changed and why, what to focus on, and the released finding IDs it should check the code against. Ask for a verdict plus findings sorted into must-fix, should-fix and minor.
 3. If it is still working when `spawn_agent` returns, use `wait_agent`.
 4. Fix the must-fix and should-fix findings (or explain why not), re-run tests and lint, commit, and ask the reviewer once more if the changes were substantial. At most two review rounds per change; then report to the engineer.
 5. Tell the engineer the reviewer's verdict line and its must-fix list **quoted word for word**, then what you fixed and what you left, with the commit. The engineer still decides on the push.

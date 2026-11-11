@@ -191,16 +191,33 @@ print(json.dumps({'version': 1, 'ok': True}))
                     spawn = re.search(r'(?ms)^spawn:\n((?:  .*\n)+)', text).group(1)
                     self.assertIn('allowed_agents: [converter-reviewer]', spawn)
                     self.assertIn('max_depth: 1', spawn)
-                    # A spawned agent must pass its parent's model rule too: the developer lists
-                    # claude-bin so the reviewer (claude-bin only) can run, and nothing more.
+                    # Only the approved Claude version passes the inherited parent rule.
                     allowed = text.split('allowed_models:')[1].split('workspace:')[0]
-                    self.assertEqual(['chatgpt:*', 'claude-bin:*'], re.findall(r'(?m)^  - "([^"]+)"', allowed))
+                    self.assertEqual(['chatgpt:*', 'claude-bin:claude-opus-5-5'], re.findall(r'(?m)^  - "([^"]+)"', allowed))
                 else:
                     self.assertEqual([], [tool for tool in tools if tool in delegation])
                     self.assertNotRegex(text, r'(?m)^spawn:')
         reviewer = (AGENTS / 'converter-reviewer/agent.yaml').read_text()
         self.assertRegex(reviewer, r'(?m)^provider: claude-bin$')
-        self.assertEqual(['claude-bin:*'], re.findall(r'(?m)^  - "([^"]+)"', reviewer.split('allowed_models:')[1].split('workspace:')[0]))
+        self.assertRegex(reviewer, r'(?m)^model: claude-opus-5-5$')
+        self.assertEqual(['claude-bin:claude-opus-5-5'], re.findall(r'(?m)^  - "([^"]+)"', reviewer.split('allowed_models:')[1].split('workspace:')[0]))
+
+    def test_review_route_defaults_and_unavailable_review_instructions(self):
+        import re
+        developer = (AGENTS / 'converter-developer/agent.yaml').read_text()
+        self.assertRegex(developer, r'(?m)^provider: chatgpt$')
+        self.assertRegex(developer, r'(?m)^model: gpt-6\.1-sol$')
+        self.assertRegex(developer, r'(?m)^  agent_models:\n    converter-reviewer: claude-bin:claude-opus-5-5$')
+        prompt = (AGENTS / 'converter-developer/system.md').read_text()
+        self.assertIn('never pass `model` or `cwd`', prompt)
+        self.assertIn('configured route is `claude-bin:claude-opus-5-5`', prompt)
+        self.assertIn("don't retry with another model or treat a refused/unavailable review as passed", prompt)
+        # No expansion of the trusted customer's data route alongside coding-model changes.
+        data = (AGENTS / 'migration-data/agent.yaml').read_text()
+        self.assertRegex(data, r'(?m)^provider: cdck_frontier$')
+        self.assertRegex(data, r'(?m)^model: CDCK/MoM$')
+        allowed = data.split('allowed_models:')[1].split('workspace:')[0]
+        self.assertEqual(['cdck_frontier:CDCK/MoM'], re.findall(r'(?m)^  - (.*)$', allowed))
 
 if __name__ == '__main__':
     unittest.main()

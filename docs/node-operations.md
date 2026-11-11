@@ -210,11 +210,60 @@ the link `~/.config/term-llm/skills` → `<prefix>/current/integrations/term-llm
 
 converter-developer starts converter-reviewer itself (`spawn_agent`, only that agent, one at a
 time, which can't start agents in turn) after committing, fixes what it finds, and tells you the
-verdict and must-fix list word for word; at most two rounds per change. The review runs on Claude
-whatever is asked (the reviewer's model rule always applies), in the same project; the reviewer
-refuses to work outside a project chat. Both see only converter code and released findings.
-Keep converter-developer on ChatGPT: Claude is in its allowed models only so it can start the
-reviewer (term-llm checks a sub-agent against its parent's model rule too). Pushing stays yours.
+verdict and must-fix list word for word; at most two rounds per change. The review is pinned to
+**Opus 5.5** (`claude-bin:claude-opus-5-5`), in the same project; the reviewer refuses to work
+outside a project chat. Both the parent and reviewer allow only that Claude model, and the
+parent's `spawn.agent_models` supplies that exact route when the model argument is omitted.
+Explicit older IDs (including Opus 4.6/4.8), the moving `opus` alias, and other reviewer
+providers are refused by the model policy rather than used as alternatives. If the approved
+model is unavailable, the developer must report the failed review, not call it passed or
+retry on another model. This is a reviewed version pin, not an automatic latest-model updater.
+Both agents see only converter code and released findings. The developer remains on
+`chatgpt:gpt-6.1-sol`; Claude is in its allowed models only so it can start the reviewer
+(term-llm checks a sub-agent against its parent's model rule too). Frontier-only migration-data
+is unchanged. Pushing stays yours.
+
+### Applying the reviewer model update
+
+As root, run `silo update`, then `silo doctor`. Reload the UI and start a **new
+converter-developer chat in the existing project**; existing sessions/running children are
+not retargeted by this update. There is no need to create another migration branch or project.
+Doctor's Claude sign-in check is not proof that Opus 5.5 is available to the account.
+
+Saved per-agent preferences in `config.yaml` take precedence over shipped model defaults
+and can **replace** shipped allowlists. If preferences were previously customized, inspect
+`term-llm agents get converter-developer` and `term-llm agents get converter-reviewer` inside
+`silo shell` (the service account), not root's own term-llm configuration. No preferences is
+normal: the release's definitions apply. To deliberately align customized routing with this
+release, run these commands **inside that service-account shell**:
+
+```sh
+term-llm agents set converter-developer provider=chatgpt model=gpt-6.1-sol 'allowed_models=chatgpt:*,claude-bin:claude-opus-5-5'
+term-llm agents set converter-reviewer provider=claude-bin model=claude-opus-5-5 'allowed_models=claude-bin:claude-opus-5-5'
+claude --version
+```
+
+These change only the two coding agents' routing preferences, not tools, approvals, credentials,
+Frontier, or global provider models. They persist across future releases, so deliberately
+update them again when approving a newer model. Exit the shell, run `silo restart` as root to
+reload changed preferences, then start a new developer chat. Do not run `agents clear`, which
+would discard unrelated preferences. If the installed Claude Code/account rejects the explicit
+model, keep the failure and ask the engineer to check version/availability; a Claude Code
+upgrade is a separate operator action, not something this release performs automatically.
+Confirm the requested reviewer route and any available runtime model metadata during a
+clean/invented-code review; assistant self-identification or a catalog label alone is not
+proof of which model executed. Do not paste customer transcripts or configuration secrets.
+
+For local admission regression tests (no actual model calls), use the pinned term-llm binary:
+
+```sh
+TERM_LLM_BINARY=/path/to/term-llm python3 -I -B test/agent_model_policy_test.py
+```
+
+This uses temporary configuration and loopback fake providers to exercise direct and spawned
+admission, old-model/alias refusals, inherited rules, stale preferences, and model-unavailable
+errors. It does not validate real Claude authentication, backend fallback behavior, or the
+server's effective model.
 
 On a merge project the same two agents write and review the **merge layer**
 (`mergers/<project>/merger.rb`), the code that changes what Discourse's merger does for this

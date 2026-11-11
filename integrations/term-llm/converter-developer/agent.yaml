@@ -2,11 +2,11 @@ name: converter-developer
 description: Writes and tests converter code for a migration workspace (Codex). Sees only the converter checkout and released findings, never customer data. Pushes only after engineer approval.
 provider: chatgpt
 model: gpt-6.1-sol
-# claude-bin is listed only so it can start converter-reviewer: a spawned agent must pass its
-# parent's model rule too. The reviewer's own rule keeps it on Claude whatever is requested.
+# Claude is listed only for converter-reviewer: children must pass the parent's model rule
+# too. Keep the exact reviewed version in sync with the reviewer's own model and rule.
 allowed_models:
   - "chatgpt:*"
-  - "claude-bin:*"
+  - "claude-bin:claude-opus-5-5"
 workspace: none
 agents_md: "false"
 # Web search and read_url, for public documentation.
@@ -18,6 +18,9 @@ skills: none
 # findings, never customer data. The reviewer can't start agents itself.
 spawn:
   allowed_agents: [converter-reviewer]
+  # Used when model is omitted; explicit arguments still have to pass both model rules.
+  agent_models:
+    converter-reviewer: claude-bin:claude-opus-5-5
   max_parallel: 1
   max_depth: 1
   timeout: 1200

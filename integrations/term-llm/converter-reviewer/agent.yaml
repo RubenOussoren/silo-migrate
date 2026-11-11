@@ -1,9 +1,10 @@
 name: converter-reviewer
 description: Reviews converter changes before they are pushed (Claude). Read-only; runs tests and lint in the sandbox. Never sees customer data.
 provider: claude-bin
-model: opus
+# Reviewed version pin: the moving opus alias and older explicit spawn models are refused.
+model: claude-opus-5-5
 allowed_models:
-  - "claude-bin:*"
+  - "claude-bin:claude-opus-5-5"
 workspace: none
 agents_md: "false"
 # Web search and read_url, for public documentation.
