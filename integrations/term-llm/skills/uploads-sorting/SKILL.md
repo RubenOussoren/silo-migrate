@@ -5,6 +5,17 @@ description: Make sense of a source's uploads (attachments, avatars, images) - a
 
 # Uploads
 
+On Files, classify loose uploads as **Uploads/assets** and select the source
+snapshot they belong to. Adding another archive must not create a new Development
+version or replace its source backup. Keep multiple asset archives associated
+with that snapshot and do not silently cross Development/Launch.
+
+**Storage is not import:** current normal forum review excludes loose uploads and
+avatars. Tell the engineer **Stored—not included by this workflow** until a
+specific approved workflow binds and processes them. Native Discourse merge uses
+uploads already inside its full source backup, not separately attached archives.
+Do not claim media are included just because an inventory or mapping exists.
+
 1. **Inventory**: `data_list` the extracted tree (area `work` after `data_extract`).
    Count files per folder and extension with a sandbox script (`data_script`) that prints
    a summary: count, total bytes, extensions, largest files, zero-byte files, duplicate

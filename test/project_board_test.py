@@ -157,6 +157,20 @@ class PassesTest(unittest.TestCase):
         banner = self.build([plan(1)], [run(1, 1)], {'plan-1': convert_body()}, deliveries=deliveries)['banner']
         self.assertEqual({'kind': 'data', 'label': 'Development v2', 'next': 2}, banner)
 
+    def test_effective_active_source_controls_banner_without_rewriting_passes(self):
+        deliveries = {'dataset-1': {'dataset_id': 'dataset-1', 'kind': 'development', 'version': 1, 'sequence': 1},
+                      'dataset-2': {'dataset_id': 'dataset-2', 'kind': 'development', 'version': 2, 'sequence': 2}}
+        args = ([plan(1)], [run(1, 1)], {'plan-1': convert_body()}, {}, [], deliveries)
+        for active in ({'development': 'dataset-1'}, {'development': None}, {}):
+            with self.subTest(active=active):
+                result = self.b.build_passes(*args, active=active)
+                self.assertIsNone(result['banner'])
+                self.assertEqual('dataset-1', result['passes'][0]['dataset_id'])
+                self.assertEqual('Development v1', result['passes'][0]['delivery'])
+        result = self.b.build_passes(*args, active={'development': 'dataset-2'})
+        self.assertEqual({'kind': 'data', 'label': 'Development v2', 'next': 2}, result['banner'])
+        self.assertEqual('Development v1', result['passes'][0]['delivery'])
+
     def test_no_banner_while_a_pass_waits_or_runs(self):
         result = self.build([plan(1), plan(2, 'proposed')], [run(1, 1)], {'plan-1': convert_body('a' * 40), 'plan-2': convert_body('b' * 40)},
                             pushes=[push('d2', 'b' * 40, pushed='2026-01-09T00:00:00Z')])

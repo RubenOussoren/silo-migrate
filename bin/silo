@@ -303,6 +303,17 @@ def doctor_checks(entry, runner=run):
     active = "ActiveState=active" in status.stdout
     add("OK" if active else "FAIL", "web service", "active" if active else "not active", None if active else "silo restart")
 
+    native = runner(as_account([term_llm(), "capabilities", "--json"], entry), timeout=15)
+    try:
+        capabilities = json.loads(native.stdout) if native.returncode == 0 else {}
+    except (ValueError, TypeError):
+        capabilities = {}
+    private_uploads = (isinstance(capabilities, dict) and capabilities.get("private_upload_context") == 1
+                       and capabilities.get("session_scope_lock") == 1)
+    add("OK" if private_uploads else "WARN", "private chat attachments",
+        "native upload context and locked sessions supported" if private_uploads else "unavailable: use normal intake, not private chat uploads",
+        None if private_uploads else "install the reviewed paired TERM_LLM_PACKAGE, then update; see docs/chat-attachments.md")
+
     expected = shipped_agents(current)
     listing = runner(as_account([term_llm(), "agents"], entry), timeout=30).stdout or ""
     count, names, builtin = listed_agents(listing)

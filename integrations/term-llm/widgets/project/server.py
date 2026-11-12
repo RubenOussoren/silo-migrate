@@ -49,9 +49,13 @@ FINDING_PATHS = {"/api/findings/" + action for action in FINDING_ACTIONS}
 RUN_VIEWS = {"plan": runs.plan_detail, "run": runs.run_detail, "push": runs.push_detail}
 MAX_FILES = 400
 PLATFORM = re.compile(r"[a-z][a-z0-9_.-]{0,31}\Z")  # as bin/data_tools.py
+FILE_ID = re.compile(r"file-[0-9a-f]{16,64}\Z")
+DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+FILE_CHANGE_KEYS = {"action", "role", "kind", "dataset_id", "restore_dataset_id", "reason", "confirm", "files", "file_ids"}
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/ui.js": ("ui.js", "text/javascript; charset=utf-8"), "/lists.js": ("lists.js", "text/javascript; charset=utf-8"),
           "/runs.js": ("runs.js", "text/javascript; charset=utf-8"),
+          "/files.js": ("files.js", "text/javascript; charset=utf-8"),
           "/findings.js": ("findings.js", "text/javascript; charset=utf-8"),
           "/app.css": ("app.css", "text/css; charset=utf-8"), "/tokens.css": ("tokens.css", "text/css; charset=utf-8")}
 # Varnish's own font files, so that the page matches without a second copy of them.
@@ -123,8 +127,17 @@ def passes_of(base, control, workspace):
     named = base / workspace / ".silo-migrate/named"
     deliveries = read_json_file(named / "deliveries.json").get("deliveries") or {}
     reviews = read_json_file(named / "site-reviews.json").get("reviews") or []
+    active = None
+    role_path = named.parent / "data/file-roles.json"
+    if role_path.exists() or role_path.is_symlink():
+        # Use the host's checked projection, not an unchecked metadata read or a
+        # fallback to the newest label if effective assignments are unreadable.
+        file_view = data(control, workspace, {"op": "deliveries"}, timeout=30)
+        active = (file_view.get("roles") or {}).get("active")
+        if not isinstance(active, dict):
+            raise Refused("STANDARD_FILE_ROLES_INVALID", 409)
     result = board.build_passes(view["plans"], view["runs"], bodies, review_sites, store.pushes(workspace), deliveries if isinstance(deliveries, dict) else {},
-                                reviews if isinstance(reviews, list) else [])
+                                reviews if isinstance(reviews, list) else [], active=active)
     return dict(result, converter=view.get("converter"))
 
 
@@ -255,6 +268,77 @@ def label(control, body):
     if body.get("replaces_launch") is True:
         request["replaces_launch"] = True
     return data(control, body.get("workspace"), request, timeout=3600 if request["kind"] == "base_site" else 90)
+
+
+def file_change(body):
+    """Allowlist the engineer's intent, not arbitrary data-tool operations or paths.
+
+    Identity, role compatibility, project membership and dependency checks are
+    repeated by the host operation under its locks. Preview is never approval.
+    """
+    raw = body.get("change")
+    if not isinstance(raw, dict):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    change = {key: value for key, value in raw.items() if key in FILE_CHANGE_KEYS}
+    action = change.get("action")
+    if action not in ("classify", "correct", "activate"):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    if action != "activate" and change.get("role") not in ("source", "uploads", "reference", "base_site", "unassigned"):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    if "kind" in change and change["kind"] not in ("development", "launch"):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    for key in ("dataset_id", "restore_dataset_id"):
+        if key in change and (not isinstance(change[key], str) or not DATASET.fullmatch(change[key])):
+            raise Refused("STANDARD_ARGUMENTS_INVALID")
+    if (action == "activate" or change.get("role") == "uploads") and not change.get("dataset_id"):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    if "confirm" in change and change["confirm"] != "LAUNCH":
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    reason = change.get("reason", "")
+    if (not isinstance(reason, str) or len(reason) > 2000
+            or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", reason)
+            or (action in ("correct", "activate") and not reason.strip())):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    if action == "classify":
+        files = change.get("files")
+        if (not isinstance(files, list) or not 0 < len(files) <= MAX_FILES
+                or "file_ids" in change or not all(isinstance(item, dict) for item in files)):
+            raise Refused("STANDARD_ARGUMENTS_INVALID")
+        clean, paths = [], set()
+        for item in files:
+            path = item.get("path")
+            if (not isinstance(path, str) or not path or len(path.encode("utf-8")) > 1024
+                    or path.startswith("/") or any(part in ("", ".", "..") for part in path.split("/"))
+                    or re.search(r"[\x00-\x1f\x7f]", path) or path in paths
+                    or type(item.get("bytes")) is not int or not 0 <= item["bytes"] < 2**63
+                    or any(not isinstance(item.get(key), str) or not re.fullmatch(r"[0-9]{1,24}", item[key])
+                           for key in ("mtime_ns", "ctime_ns", "ino"))):
+                raise Refused("STANDARD_ARGUMENTS_INVALID")
+            paths.add(path)
+            clean.append({key: item[key] for key in ("path", "bytes", "mtime_ns", "ctime_ns", "ino")})
+        change["files"] = clean
+    elif action == "correct":
+        ids = change.get("file_ids")
+        if (not isinstance(ids, list) or not 0 < len(ids) <= MAX_FILES or "files" in change
+                or not all(isinstance(identity, str) and FILE_ID.fullmatch(identity) for identity in ids)
+                or len(set(ids)) != len(ids)):
+            raise Refused("STANDARD_ARGUMENTS_INVALID")
+    elif "files" in change or "file_ids" in change:
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    return change
+
+
+def change_files(control, body, commit=False):
+    request = {"op": "file_roles_commit" if commit else "file_roles_preview",
+               "change": file_change(body), "by": runs.reviewer_name()}
+    if commit:
+        digest = body.get("digest")
+        if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+            raise Refused("STANDARD_ARGUMENTS_INVALID")
+        request["digest"] = digest
+    # Both stages may checksum a large original; the ordinary chat-tool timeout
+    # does not apply to these engineer-only, explicitly requested decisions.
+    return data(control, body.get("workspace"), request, timeout=3600)
 
 
 def create_workspace(control, body):
@@ -425,6 +509,8 @@ class Handler(BaseHTTPRequestHandler):
             action = path.rsplit("/", 1)[-1]
             if path == "/api/label":
                 result = label(self.server.control, body)
+            elif path in ("/api/files/preview", "/api/files/commit"):
+                result = change_files(self.server.control, body, commit=path.endswith("/commit"))
             elif path == "/api/workspace/create":
                 result = create_workspace(self.server.control, body)
             elif path == "/api/project/remove":

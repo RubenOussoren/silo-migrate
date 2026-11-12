@@ -16,6 +16,7 @@ rescue LoadError
   # Reported when an operation that needs it runs.
 end
 require_relative "../standard_store"
+require_relative "../file_role_store"
 require_relative "../runtime_profiles"
 require_relative "../review_runtime"
 require_relative "prebuilt_stack"
@@ -687,7 +688,54 @@ module SiloMigrate
         false
       end
 
+      def file_roles
+        FileRoleStore.new(@store.workspace_root)
+      end
+
+      def file_role_binding(named, roles)
+        file_roles.binding(file_roles.load, named, roles)
+      end
+
+      # Called under state.lock at proposal commit. Never take op.lock here.
+      def verify_file_role_proposal!(body, named, source_plan: nil)
+        document = file_roles.load
+        unless file_roles.binding(document, named, body.fetch("roles")) == body["file_role_binding"]
+          raise StandardWorkflowError, "STANDARD_STALE_PLAN"
+        end
+        verify_review_lineage!(source_plan, document, named) if source_plan
+      end
+
+      def verify_review_lineage!(source_plan, document, named)
+        unless file_role_lineage_current?(source_plan, document: document, named: named)
+          raise StandardWorkflowError, "STANDARD_STALE_PLAN"
+        end
+      end
+
+      # Role-only progression gate, including consumed/legacy source plans. Keep
+      # this identical to the review guard, not ordinary code/runtime staleness.
+      def file_role_lineage_current?(plan, document: file_roles.load, named: nil)
+        file_role_stale_reason(plan, document: document, named: named).nil? &&
+          !file_roles.lineage_invalidated?(document, plan.fetch("id"))
+      rescue StandardWorkflowError
+        false
+      end
+
+      def file_role_stale_reason(plan, document: file_roles.load, named: nil)
+        return "file_roles" if file_roles.invalidated?(document, plan.fetch("id"))
+        body = plan.fetch("body")
+        bindings = [body["file_role_binding"], body["source_file_role_binding"]].compact
+        return "file_roles" if bindings.any? { |bound| !file_roles.current?(document, named || @store.named_state, bound) }
+        if body["from_run"] && file_roles.lineage_invalidated?(document, body.dig("from_run", "plan_id"))
+          return "file_roles"
+        end
+        nil
+      rescue StandardWorkflowError
+        "file_roles"
+      end
+
       def stale_reason(plan, state)
+        role_reason = file_role_stale_reason(plan)
+        return role_reason if role_reason
         return merge_stale_reason(plan, state) if merge_plan?(plan)
         return convert_stale_reason(plan, state) if convert_plan?(plan)
         return review_stale_reason(plan, state) if review_plan?(plan)
@@ -1783,12 +1831,15 @@ module SiloMigrate
 
       def public_plan(plan, state, summary: false)
         body = plan.fetch("body")
-        result = { plan_id: plan["id"], digest: plan["digest"], status: plan_status(plan, state), run_id: plan["run_id"], created_at: plan["created_at"], approved_by: plan.dig("approval", "reviewer"), delivery: body["delivery"] }
+        result = { plan_id: plan["id"], digest: plan["digest"], status: plan_status(plan, state), run_id: plan["run_id"], created_at: plan["created_at"], approved_by: plan.dig("approval", "reviewer"), delivery: body["delivery"],
+                   file_role_lineage_current: file_role_lineage_current?(plan) }
         return result if summary
 
         result.merge(
           discourse_profile: body["discourse_profile"], runtime_profile_sha256: body["runtime_lock_sha256"],
           runtime_qualified: body["runtime_qualified"], allow_unqualified_runtime: body["allow_unqualified_runtime"], converter: body["converter"],
+          file_role_binding: body["file_role_binding"], source_file_role_binding: body["source_file_role_binding"],
+          file_role_selection: file_roles.selection(file_roles.load, body["file_role_binding"]),
           merge: body["merge"], review_runtime: body["review_runtime"], operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
           platform: body["platform"], roles: body["roles"], source_charset: body["source_charset"], converter_deps: body.dig("converter_deps", "key"),
           reconciliation_policy: body["reconciliation_policy"], base_site: body["base_site"]&.slice("input_id", "delivery", "discourse_version", "schema_version", "site_schema_version", "ahead"),

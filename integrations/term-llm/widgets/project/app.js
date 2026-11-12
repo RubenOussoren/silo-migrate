@@ -2,6 +2,7 @@
 import { $, el, safe, short, toast, api, lists, explain, card, details, back, facts } from './ui.js';
 import { runsView } from './runs.js';
 import { findingsView } from './findings.js';
+import { filesView, currentSnapshot } from './files.js';
 
 const POLL_MS = 15000;
 const TABS = [['overview', 'Overview'], ['files', 'Files'], ['findings', 'Findings'], ['runs', 'Runs']];
@@ -14,7 +15,7 @@ const day = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { month:
 // IDs and hashes belong in Details, not in the sentence.
 const plain = (text) => text.replace(/\s*\b(?:plan|run|finding)-[0-9a-f]{32}\b/g, '').replace(/\s*\b[0-9a-f]{64}\b/g, '')
   .replace(/ (?:on the Project page|in the (?:Runs|Findings) (?:tab|widget))/g, '').replace(/\s+([.,])/g, '$1');
-const deliveryLabel = (record) => (record.kind === 'base_site' ? `Base site v${record.version}` : record.kind === 'launch' ? 'Launch' : `Development v${record.version}`);
+const deliveryLabel = (record) => (record.label ? safe(record.label) : null) || (record.kind === 'base_site' ? `Base site v${record.version}` : record.kind === 'launch' ? 'Launch' : `Development v${record.version}`);
 const fileText = (record) => {
   const first = (record.files || [])[0];
   const more = (record.file_count || 0) - 1;
@@ -45,6 +46,7 @@ function writeHash() {
 
 // What stops leaving a tab: an open finding with unsaved edits.
 function leaving() {
+  if (!fileView.leaving()) return false;
   if (!(views.findings && views.findings.unsaved())) return true;
   if (!confirm('Discard your edits to this finding?')) return false;
   views.findings.discard();
@@ -66,7 +68,12 @@ function go(tab, selected = null) {
   render();
 }
 
-const mount = (nodes) => $('content').replaceChildren(...nodes.filter(Boolean));
+const mount = (nodes) => {
+  const content = $('content'), next = nodes.filter(Boolean);
+  // Stable file forms survive polling, including focus, private drafts and preview acknowledgements.
+  if (next.length === content.childNodes.length && next.every((node, i) => node === content.childNodes[i])) return;
+  content.replaceChildren(...next);
+};
 const context = (tab) => ({
   get project() { return state.project; },
   get selected() { return state.selected; },
@@ -84,9 +91,9 @@ function warmLists(project) {
   return lists.load(`api/boards?${new URLSearchParams({ workspace: project })}`).catch(() => {});
 }
 
-function newest(kind) {
-  return ((state.files && state.files.deliveries) || []).find((record) => record.kind === kind && !record.replaced_by) || null;
-}
+const fileView = filesView({ get project() { return state.project; }, get files() { return state.files; }, render, refresh });
+
+function newest(kind) { return currentSnapshot(state.files, kind); }
 
 function renderData() {
   const development = newest('development');
@@ -95,9 +102,9 @@ function renderData() {
   // A merge project's source file is a Discourse backup: its name starts with the customer's site name.
   // This strip is on every tab (and in every screenshot), so it says what the file is. The Files tab has the names.
   const siteBackup = ((state.files && state.files.setup) || {}).platform === 'discourse';
-  if (development) parts.push(el('span', { class: 'badge' }, deliveryLabel(development).toUpperCase()), `${siteBackup ? 'source site backup · ' : fileText(development)}labelled ${day(development.labelled_at)}`);
-  if (launch) parts.push(el('span', { class: 'badge launch' }, 'LAUNCH RECEIVED'));
-  if (!parts.length) parts.push(el('span', { class: 'badge none' }, 'NO DATA LABELLED'));
+  if (development) parts.push(el('span', { class: 'badge' }, deliveryLabel(development).toUpperCase()), `${siteBackup ? 'source site backup · ' : fileText(development)}${state.files?.roles ? 'current source snapshot' : `labelled ${day(development.labelled_at)}`}`);
+  if (launch) parts.push(el('span', { class: 'badge launch' }, state.files?.roles ? `${deliveryLabel(launch).toUpperCase()} · CURRENT` : 'LAUNCH RECEIVED'));
+  if (!parts.length) parts.push(el('span', { class: 'badge none' }, state.files?.roles ? 'NO CURRENT SOURCE SNAPSHOT' : 'NO DATA LABELLED'));
   const base = newest('base_site');
   if (base) parts.push(el('span', { class: 'badge' }, deliveryLabel(base)), `sandbox backup · labelled ${day(base.labelled_at)}`);
   $('data').replaceChildren(...parts);
@@ -112,7 +119,7 @@ function filesWaiting() {
   const files = state.files;
   if (!files) return 0;
   const counts = files.counts || {};
-  return (counts.unlabelled ?? files.unlabelled_files.length) + (counts.refused || 0) + (counts.not_ready ?? files.not_ready_files.length) + files.unlabelled_data.length;
+  return (counts.unlabelled ?? (files.unlabelled_files || []).length) + (counts.refused || 0) + (counts.not_ready ?? (files.not_ready_files || []).length) + (files.unlabelled_data || []).length;
 }
 
 function renderTabs() {
@@ -290,31 +297,6 @@ function fileRows(items, right) {
   return el('div', { class: 'files' }, items.map((entry) => el('div', { class: 'file' }, el('span', {}, safe(entry.path)), el('span', {}, right(entry)))));
 }
 
-function newFilesCard(files) {
-  const selected = state.selectedFiles || new Set(files.unlabelled_files.map((entry) => entry.path));
-  state.selectedFiles = selected;
-  const list = el('div', { class: 'files' }, files.unlabelled_files.map((entry) => {
-    const box = el('input', { type: 'checkbox', checked: selected.has(entry.path), 'aria-label': `Select ${safe(entry.path)}` });
-    box.addEventListener('change', () => { if (box.checked) selected.add(entry.path); else selected.delete(entry.path); });
-    return el('label', { class: 'file' }, el('span', {}, box, ' ', safe(entry.path)), el('span', {}, `${size(entry.bytes)} · ${day(new Date(entry.mtime_ns / 1e6).toISOString())}`));
-  }));
-  const hidden = ((files.counts || {}).unlabelled || 0) - files.unlabelled_files.length;
-  const body = () => ({ files: files.unlabelled_files.filter((entry) => selected.has(entry.path)) });
-  const replacing = files.deliveries.some((record) => record.kind === 'launch' && !record.replaced_by);
-  let actions;
-  if (state.typing) {
-    const box = el('input', { class: 'confirm', placeholder: 'Type LAUNCH', autocomplete: 'off', 'aria-label': 'Type LAUNCH to confirm' });
-    const confirmButton = el('button', { type: 'button', class: 'btn launch', disabled: true, onclick: () => submitLabel('launch', { ...body(), confirm: 'LAUNCH', replaces_launch: replacing }) },
-      replacing ? 'Replace the launch data' : 'These are the launch files');
-    box.addEventListener('input', () => { confirmButton.disabled = box.value !== 'LAUNCH'; });
-    actions = el('div', { class: 'actions' }, box, confirmButton, el('button', { type: 'button', class: 'btn q', onclick: () => { state.typing = false; render(); } }, 'Cancel'));
-  } else {
-    actions = el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', onclick: () => submitLabel('development', body()) }, 'Development'),
-      el('button', { type: 'button', class: 'btn q', onclick: () => { state.typing = true; render(); } }, 'Launch'),
-      el('button', { type: 'button', class: 'btn q', onclick: () => submitLabel('base_site', body()) }, 'Base site'));
-  }
-  return card('NEW FILES, FOR YOU', 'What are these files for?', list, hidden > 0 ? el('p', { class: 'hint' }, `and ${hidden} more. Label these first, then the rest.`) : null, actions, el('p', { class: 'hint' }, 'Base site · a backup of the customer’s sandbox, without uploads. Review sites are built on top of it.'));
-}
 
 const PLATFORM = /^[a-z][a-z0-9_.-]{0,31}$/;
 
@@ -357,15 +339,17 @@ function setupCard(files, known) {
 }
 
 function renderFiles() {
-  const files = state.files;
-  if (!files) return [el('p', { class: 'quiet' }, 'Loading…')];
+  const raw = state.files;
+  if (!raw) return [el('p', { class: 'quiet' }, 'Loading…')];
+  const files = { deliveries: [], unlabelled_files: [], refused_files: [], not_ready_files: [], unlabelled_data: [], labelled_files: [], ...raw };
+  if (fileView.editing) return fileView.render(files, true);
   const setup = files.setup || { complete: files.initialized, platform: null };
-  if (!files.initialized && !files.not_ready_files.length && !files.unlabelled_files.length) {
+  if (!files.initialized && !files.not_ready_files.length && !(files.unlabelled_files || []).length) {
     return [el('p', { class: 'quiet' }, 'No files yet. Copy them to the drop folder with scp, then run silo intake as root.')];
   }
   const out = [];
   // Labels come after the workspace: Development and Launch data belong to its source.
-  if (!setup.complete && (files.initialized || files.unlabelled_files.length)) out.push(setupCard(files, setup.platform));
+  if (!setup.complete && (files.initialized || (files.unlabelled_files || []).length)) out.push(setupCard(files, setup.platform));
   const labels = files.initialized && (setup.complete || setup.platform);
   const labelled = state.labelResult;
   if (labelled && labelled.checks) out.push(card(labelled.delivery, 'SQL-only backup checked.',
@@ -378,14 +362,15 @@ function renderFiles() {
   if (files.refused_files.length) {
     out.push(card('NEEDS YOU', "These labelled files can't be taken: each is identical to data of the other kind. Remove them from the drop folder.", fileRows(files.refused_files, (entry) => entry.delivery)));
   }
-  if (files.not_ready_files.length) {
+  if ((files.not_ready_files || []).length) {
     out.push(card('NEEDS YOU', `Not handed over yet: run silo intake ${state.project} as root. Rename any file whose name shows �.`, fileRows(files.not_ready_files, (entry) => size(entry.bytes))));
   }
-  if (labels && files.unlabelled_files.length) out.push(newFilesCard(files));
+  out.push(...fileView.render(files, labels));
   if (files.labelled_files.length) out.push(el('p', { class: 'quiet' }, `${files.labelled_files.length} labelled file(s) are waiting for migration-data to take them.`));
+  if (files.roles) return out;
   const current = [newest('development'), newest('launch'), newest('base_site')].filter(Boolean);
   const row = (record, old) => el('div', { class: `item static ${old ? 'old' : ''}` }, el('div', {},
-    old ? el('span', {}, `${deliveryLabel(record)} · replaced`) : el('span', { class: `badge ${record.kind === 'launch' ? 'launch' : ''}` }, deliveryLabel(record).toUpperCase()),
+    old ? el('span', {}, `${deliveryLabel(record)} · earlier`) : el('span', { class: `badge ${record.kind === 'launch' ? 'launch' : ''}` }, deliveryLabel(record).toUpperCase()),
     el('small', {}, `${fileText(record)}labelled ${day(record.labelled_at)} by ${safe(record.labelled_by)}`)));
   const earlier = files.deliveries.filter((record) => !current.includes(record));
   if (current.length) out.push(el('h2', {}, 'CURRENT'), ...current.map((record) => row(record, false)));
@@ -458,6 +443,7 @@ function choose(project) {
   for (const view of Object.values(views)) view.reset();
   lists.clear();
   ++state.generation;
+  fileView.reset();
   state.project = project;
   state.selectedFiles = null; state.labelResult = null; state.setup = null;
   state.files = state.guide = null;

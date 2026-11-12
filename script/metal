@@ -45,7 +45,7 @@ PACKAGES = ("git", "curl", "ca-certificates", "python3", "util-linux", "gzip", "
 DEFAULTS = dict(SILO_ACCOUNT="silomig", SILO_PREFIX="/srv/silo-migrate", SILO_WORKSPACES="",
     SILO_REPO="https://github.com/RubenOussoren/silo-migrate.git", SILO_BRANCH="mvp/metal-installer",
     CONVERTER_REPO="https://github.com/discourse-org/discourse-converters.git", CONVERTER_BRANCH="main",
-    VERIFY_CONVERTER_BRANCH="mvp/metal-installer", ARTIFACT_PACKAGE="", TERM_LLM_VERSION=TERM_LLM_PINNED,
+    VERIFY_CONVERTER_BRANCH="mvp/metal-installer", ARTIFACT_PACKAGE="", TERM_LLM_VERSION=TERM_LLM_PINNED, TERM_LLM_PACKAGE="",
     TERM_LLM_PORT="18800", TERM_LLM_SERVICE="install", DOCKER_INSTALL="if-missing", PORT_RANGE="18080-18089", KEEP_RELEASES="3",
     VERIFY_MIN_AVAILABLE_MIB="8192", HUB_URL="", HUB_NODE_ID="", HUB_NODE_NAME="", HUB_SECRETS_FILE="")
 FRESH_CONFIG = """# Work-only; no imported providers, sessions, memory or jobs.
@@ -171,7 +171,7 @@ def read_config(path):
     prefix = result["SILO_PREFIX"]
     if result["SILO_WORKSPACES"] == "$SILO_PREFIX/workspaces" or not result["SILO_WORKSPACES"]:
         result["SILO_WORKSPACES"] = prefix + "/workspaces"
-    for key in ("SILO_PREFIX", "SILO_WORKSPACES", "ARTIFACT_PACKAGE"):
+    for key in ("SILO_PREFIX", "SILO_WORKSPACES", "ARTIFACT_PACKAGE", "TERM_LLM_PACKAGE"):
         value = result[key]
         if value and (not re.fullmatch(r"/[A-Za-z0-9_./-]+", value) or ".." in Path(value).parts or value == "/"):
             refuse("METAL_CONFIG_INVALID", "paths must be absolute simple paths without traversal")
@@ -676,6 +676,7 @@ def make_plan(allow=False):
         refuse("METAL_PREFLIGHT_REFUSED", "; ".join(osinfo["errors"]))
     commit = resolve(C["SILO_REPO"], C["SILO_BRANCH"])
     package = artifact()
+    native = private_node_info()
     entry = account_entry()
     if entry and (entry.pw_uid == 0 or entry.pw_dir != "/home/" + C["SILO_ACCOUNT"] or entry.pw_shell != "/bin/bash"):
         refuse("METAL_ACCOUNT_CONFLICT", "existing account must be non-root, use /home/ACCOUNT and /bin/bash; no automatic account modification")
@@ -708,6 +709,8 @@ def make_plan(allow=False):
     authority = directory_authority(dirs + account_dirs + [P/"term-llm"/C["TERM_LLM_VERSION"]])
     if C["ARTIFACT_PACKAGE"]:
         authority.update(directory_authority([Path(C["ARTIFACT_PACKAGE"])]))
+    if C.get("TERM_LLM_PACKAGE"):
+        authority.update(directory_authority([Path(C["TERM_LLM_PACKAGE"])]))
     for path in dirs:
         if path.is_symlink():
             refuse("METAL_PATH_CONFLICT", "managed directory is a symlink; inspect ownership manually")
@@ -717,7 +720,7 @@ def make_plan(allow=False):
             roots += [{"action": "directory", "path": str(path), "detail": "install directory owner=" + C["SILO_ACCOUNT"] + " mode=0750"}]
     if C["TERM_LLM_SERVICE"] != "skip" and not Path("/var/lib/systemd/linger", C["SILO_ACCOUNT"]).exists():
         roots += [{"action": "linger", "detail": "loginctl enable-linger " + C["SILO_ACCOUNT"]}]
-    versiondir = P/"term-llm"/C["TERM_LLM_VERSION"]
+    versiondir = term_destination().parent
     if (versiondir/"term-llm").exists() and ((versiondir/"binary.sha256").is_file() and (versiondir/"binary.sha256").read_text().strip() != sha(versiondir/"term-llm")):
         refuse("METAL_TERM_UNVERIFIED", "installed binary differs from verified receipt; preserve and inspect manually")
     state_paths = [versiondir/"binary.sha256", versiondir/"term-llm", P/"current", P/"previous", P/"state/install-manifest.json", P/"bin/term-llm", P/"bin/silo-migrate-control", P/"etc/silo-control.env", home()/".config/term-llm", home()/".config/term-llm/config.yaml", home()/".config/systemd/user/term-llm-web.service"]
@@ -725,6 +728,9 @@ def make_plan(allow=False):
     target = {"silo_repo": C["SILO_REPO"], "branch": C["SILO_BRANCH"], "commit": commit,
               "term_llm_version": C["TERM_LLM_VERSION"], "term_llm_sha256": PIN,
               "config_sha256": digest_bytes(canonical(C).encode()), "artifact_package": package}
+    if native:
+        target["term_llm_package"] = dict(native[2], manifest_sha256=sha(Path(C["TERM_LLM_PACKAGE"])/"manifest.json"))
+        target["term_llm_sha256"] = native[2]["binary_sha256"]
     old = load(P/"state/install-manifest.json") if (P/"state/install-manifest.json").is_file() else {}
     image_steps = []
     image_inventory = {}
@@ -752,7 +758,7 @@ def make_plan(allow=False):
     needs = image_repair or any(old.get(k) != v for k,v in target.items()) or not (P/"current").exists() or not (P/"bin/term-llm").exists() or not (P/"bin/silo-migrate-control").exists() or (P/"current").resolve() != P/"releases"/commit
     if needs:
         users = [
-            {"action": "term-llm", "detail": ("verify existing version/binary receipts (download skipped); ensure bin symlink" if (versiondir/"term-llm").exists() else "download https://github.com/samsaffron/term-llm/releases/download/v" + C["TERM_LLM_VERSION"] + "/term-llm_" + C["TERM_LLM_VERSION"] + "_linux_amd64.tar.gz; verify pinned SHA256 " + PIN + " AND release checksums.txt; install version directory and atomic bin symlink")},
+            {"action": "term-llm", "detail": ("verify/copy explicitly configured private-node package and probe required capabilities; preserve previous binary for rollback" if native else ("verify existing version/binary receipts (download skipped); ensure bin symlink" if (versiondir/"term-llm").exists() else "download https://github.com/samsaffron/term-llm/releases/download/v" + C["TERM_LLM_VERSION"] + "/term-llm_" + C["TERM_LLM_VERSION"] + "_linux_amd64.tar.gz; verify pinned SHA256 " + PIN + " AND release checksums.txt; install version directory and atomic bin symlink"))},
             {"action": "release", "detail": ("verify clean detached release (clone skipped): " if (P/"releases"/commit).exists() else "clone detached commit into ") + str(P/"releases"/commit) + "; validate release profile against package"},
             {"action": "artifacts", "detail": "verify SHA256SUMS/profile; " + "; ".join(image_steps) if package else "SKIPPED: no ARTIFACT_PACKAGE; shell/service install only, NOT migration-ready"},
             {"action": "configuration", "detail": "write control env and shim; fresh term-llm config/data only if absent; preserve existing account config; agents from the release (refuse conflicting old links); link ~/.config/term-llm/skills to the release skills if absent; atomic current switch"}]
@@ -953,7 +959,53 @@ def unseal(release):
     for directory, dirs, files in os.walk(release):
         os.chmod(directory, stat.S_IMODE(os.lstat(directory).st_mode) | 0o700)
 
+def private_customer_roots():
+    return (Path(C["SILO_WORKSPACES"]) if C.get("SILO_WORKSPACES") else P/"workspaces", P/"intake")
+
+
+def private_node_info():
+    if not C.get("TERM_LLM_PACKAGE"):
+        return None
+    node = module("private_node", "private-node")
+    try:
+        entry = account_entry()
+        with node.custodian(entry.pw_uid if entry else os.geteuid()):
+            expected = node.source(ROOT)
+            manifest = node.verify(C["TERM_LLM_PACKAGE"], expected, private_customer_roots())
+    except node.Refusal:
+        refuse("METAL_PRIVATE_NODE_INVALID", "private-node package does not match this release's source/patch/checksums; preserve and investigate")
+    return node, expected, manifest
+
+
+def term_destination():
+    if C.get("TERM_LLM_PACKAGE"):
+        node = module("private_node", "private-node")
+        try:
+            entry = account_entry()
+            with node.custodian(entry.pw_uid if entry else os.geteuid()):
+                return P/"term-llm"/node.variant(node.source(ROOT))/"term-llm"
+        except node.Refusal:
+            refuse("METAL_PRIVATE_NODE_INVALID", "private-node source receipt is invalid")
+    return P/"term-llm"/C["TERM_LLM_VERSION"]/"term-llm"
+
+
+def install_private_term():
+    node, expected, _manifest = private_node_info()
+    dest = term_destination()
+    try:
+        node.install(C["TERM_LLM_PACKAGE"], dest, expected, private_customer_roots())
+    except node.Refusal:
+        refuse("METAL_PRIVATE_NODE_INVALID", "private-node verification/capability probe failed; existing binary preserved")
+    # The helper probes capabilities, version and CLI on the same sealed bytes.
+    old = P/"bin/term-llm"
+    if old.is_symlink() and old.resolve() != dest:
+        symlink(old.resolve(), P/"bin/term-llm.previous")
+    symlink(dest, old)
+
+
 def install_term():
+    if C.get("TERM_LLM_PACKAGE"):
+        return install_private_term()
     version = C["TERM_LLM_VERSION"]
     dest = P/"term-llm"/version/"term-llm"
     if not dest.exists():
@@ -986,6 +1038,10 @@ def install_term():
     if old.is_symlink() and old.resolve() != dest:
         symlink(old.resolve(), P/"bin/term-llm.previous")
     symlink(dest, old)
+    validate_term_binary(dest, version)
+
+
+def validate_term_binary(dest, version):
     if not re.search(r"\bversion " + re.escape(version) + r"\b", output([dest, "--version"]) or ""):
         refuse("METAL_TERM_VERSION", "downloaded binary version mismatch")
     install_help = output([dest, "service", "install", "--help"]) or ""
@@ -1135,7 +1191,7 @@ def switch(release):
     symlink(release, current)
     return previous
 
-COMPANIONS = ("package-artifacts", "image_identity.py", "image_archive.py")
+COMPANIONS = ("package-artifacts", "image_identity.py", "image_archive.py", "private-node")
 
 def companions():
     # Helpers loaded from beside this script; a partial copy fails here, not mid-apply.
@@ -1343,7 +1399,14 @@ def term_llm_current():
     """Install this release's pinned term-llm when bin/term-llm is another version (the old one stays
     as bin/term-llm.previous for rollback --term-llm). True if it changed; silo update restarts."""
     global STAGE
-    if (P/"bin/term-llm").resolve() == P/"term-llm"/C["TERM_LLM_VERSION"]/"term-llm":
+    if (P/"bin/term-llm").resolve() == term_destination():
+        if C.get("TERM_LLM_PACKAGE"):
+            node, expected, _manifest = private_node_info()
+            try:
+                node.install(C["TERM_LLM_PACKAGE"], term_destination(), expected,
+                             private_customer_roots(), existing_only=True)
+            except node.Refusal:
+                refuse("METAL_PRIVATE_NODE_INVALID", "selected private binary/package failed verification; existing selection preserved")
         return False
     STAGE = "TERM_DOWNLOAD"
     install_term()
@@ -1366,7 +1429,7 @@ def node_term_llm():
     default agent it needs (0.9.99 won't serve web UI projects without one), else the previous
     term-llm goes back; then the project databases' rules. True if term-llm changed (restart)."""
     if not trust_agents():
-        if (P/"bin/term-llm").resolve() != P/"term-llm"/C["TERM_LLM_VERSION"]/"term-llm":
+        if (P/"bin/term-llm").resolve() != term_destination():
             print("METAL_TERM_NOT_UPDATED: term-llm stays at its current version until its agents are in ~/.config/term-llm/agents "
                   "(silo doctor shows the fix), then silo update again", flush=True)
         else:
@@ -1381,7 +1444,7 @@ def node_term_llm():
         elif changed:
             print("METAL_DEFAULT_AGENT: the new term-llm needs web.project_default_agent and no previous version could be put back: "
                   "the web UI won't start after a restart until it's set (silo doctor shows the fix)", flush=True)
-        if (P/"bin/term-llm").resolve() == P/"term-llm"/C["TERM_LLM_VERSION"]/"term-llm":
+        if (P/"bin/term-llm").resolve() == term_destination():
             mcp_rules()
         return False
     mcp_rules()

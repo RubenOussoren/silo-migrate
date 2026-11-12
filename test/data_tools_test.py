@@ -51,6 +51,7 @@ class FakeControl:
             ws = argv[2]
             root = self.base / ws
             (root / '.silo-migrate/named').mkdir(parents=True)
+            (root / '.silo-migrate').chmod(0o700)
             (root / 'inputs').mkdir(mode=0o700)
             (root / '.silo-migrate/named/state.json').write_text(json.dumps({'inputs': {}, 'datasets': {}}))
             return json.dumps({'version': 1, 'status': 'initialized'})
@@ -881,9 +882,10 @@ class DataToolsTest(unittest.TestCase):
         standard = self.base / 'arc/.silo-migrate/named/standard'
         state = json.loads((standard / 'state.json').read_text())
         state['findings'] = {key: dict(value) for key, value in (findings or {}).items()}
-        state['plans'] = {plan['plan_id']: {'body': {'operation': 'standard_' + plan['kind']}} for plan in (plans or [])}
+        dataset = json.loads((self.base / 'arc/.silo-migrate/data/workspace.json').read_text())['dataset_id']
+        state['plans'] = {plan['plan_id']: {'body': {'operation': 'standard_' + plan['kind'], 'dataset_id': plan.get('dataset_id', dataset)}} for plan in (plans or [])}
         for run in runs or []:
-            state['plans'].setdefault(run['plan_id'], {'body': {'operation': 'standard_' + run['kind']}})
+            state['plans'].setdefault(run['plan_id'], {'body': {'operation': 'standard_' + run['kind'], 'dataset_id': run.get('dataset_id', dataset)}})
         (standard / 'state.json').write_text(json.dumps(state))
         folder = standard / 'converter-pushes'
         folder.mkdir(exist_ok=True)
@@ -907,7 +909,7 @@ class DataToolsTest(unittest.TestCase):
         self.drop('dump.sql', DUMP)
         self.op('take', path='dump.sql', type='mysql-dump')
         (self.base / 'arc/.silo-migrate/data/db').mkdir(exist_ok=True)
-        (self.base / 'arc/.silo-migrate/data/db/state.json').write_text(json.dumps({'engine': 'mariadb', 'loads': [{'at': 'x'}]}))
+        (self.base / 'arc/.silo-migrate/data/db/state.json').write_text(json.dumps({'engine': 'mariadb', 'loads': [{'at': 'x', 'dataset_id': json.loads((self.base / 'arc/.silo-migrate/data/workspace.json').read_text())['dataset_id']}]}))
 
     def assertNext(self, who, text, guide=None):
         step = (guide or self.op('guide'))['next']
@@ -958,7 +960,7 @@ class DataToolsTest(unittest.TestCase):
         self.op('take', path='dump.sql', type='mysql-dump')
         self.assertNext('agent', 'data_db_load')
         (self.base / 'arc/.silo-migrate/data/db').mkdir(exist_ok=True)
-        (self.base / 'arc/.silo-migrate/data/db/state.json').write_text(json.dumps({'engine': 'mariadb', 'loads': [{'at': 'x'}]}))
+        (self.base / 'arc/.silo-migrate/data/db/state.json').write_text(json.dumps({'engine': 'mariadb', 'loads': [{'at': 'x', 'dataset_id': json.loads((self.base / 'arc/.silo-migrate/data/workspace.json').read_text())['dataset_id']}]}))
         self.assertNext('agent', 'data_propose_finding')
         finding = 'finding-' + '1' * 32
         self.guide_state(findings={finding: {'status': 'proposed', 'proposed_at': '2026-01-01T00:00:00Z'}})
@@ -1440,8 +1442,12 @@ class DataToolsTest(unittest.TestCase):
         self.base_backup()
         self.label('base_site')
         ws = self.d.Workspace(self.base, 'arc', ROOT, self.host, self.values, self.control)
+        with self.assertRaisesRegex(self.d.Refusal, 'NO_ACTIVE_SOURCE'):
+            self.d.job_delivery(ws, {})
+        # An initialized role registry never guesses an active source from old inputs.
+        self.op('delivery_label', kind='development', by='Reviewer', dataset_id=ws.meta()['dataset_id'])
         dataset, mounts = self.d.job_delivery(ws, {})
-        self.assertIsNone(dataset)
+        self.assertEqual(ws.meta()['dataset_id'], dataset)
         self.assertEqual(['/in/old.sql'], [target for _, target in mounts])
         self.op('extract', path='inputs/old.sql', into='legacy-extract')
         argv = ' '.join(self.docker.calls[-1][0])
@@ -1610,7 +1616,7 @@ class DataToolsTest(unittest.TestCase):
         """A discourse project with the source site's backup and the Base site taken."""
         self.auto_label = False
         self.op('create', platform='discourse')
-        (self.intake / self.SOURCE_BACKUP).write_bytes(b'invented archive bytes')
+        (self.intake / self.SOURCE_BACKUP).write_bytes(gzip.compress(b'invented archive bytes'))
         self.label('development')
         source = self.op('take', path=self.SOURCE_BACKUP, type='discourse-backup')['input_id']
         self.base_backup()
@@ -1635,7 +1641,7 @@ class DataToolsTest(unittest.TestCase):
 
     def test_a_merge_source_is_a_full_discourse_backup_in_a_discourse_project(self):
         self.create()  # a converter project
-        (self.intake / self.SOURCE_BACKUP).write_bytes(b'x')
+        (self.intake / self.SOURCE_BACKUP).write_bytes(gzip.compress(b'invented full backup'))
         self.refused('STANDARD_MERGE_SOURCE_INVALID', 'take', path=self.SOURCE_BACKUP, type='discourse-backup')
         self.assertTrue((self.intake / self.SOURCE_BACKUP).exists())
         self.refused('STANDARD_MERGE_NOT_DISCOURSE', 'merge_propose')
@@ -1645,7 +1651,7 @@ class DataToolsTest(unittest.TestCase):
         for name in ('backup.tar.gz', 'site-v2026-11-0-latest-20261104011110.sql.gz'):
             (self.intake / name).write_bytes(b'x')
             self.refused('STANDARD_MERGE_SOURCE_INVALID', 'take', path=name, type='discourse-backup')
-        (self.intake / self.SOURCE_BACKUP).write_bytes(b'x')
+        (self.intake / self.SOURCE_BACKUP).write_bytes(gzip.compress(b'invented full backup'))
         self.refused('STANDARD_MERGE_SOURCE_INVALID', 'take', path=self.SOURCE_BACKUP, type='discourse-backup', name='renamed.tar.gz')
         self.assertTrue(self.op('take', path=self.SOURCE_BACKUP, type='discourse-backup')['input_id'].startswith('input-'))
 
@@ -1697,7 +1703,7 @@ class DataToolsTest(unittest.TestCase):
         self.auto_label = False
         self.op('create', platform='discourse')
         self.refused('STANDARD_MERGE_SOURCE_NOT_TAKEN', 'merge_propose')
-        (self.intake / self.SOURCE_BACKUP).write_bytes(b'x')
+        (self.intake / self.SOURCE_BACKUP).write_bytes(gzip.compress(b'invented full backup'))
         self.label('development')
         self.op('take', path=self.SOURCE_BACKUP, type='discourse-backup')
         self.refused('STANDARD_MERGE_BASE_SITE_MISSING', 'merge_propose')
@@ -1706,7 +1712,7 @@ class DataToolsTest(unittest.TestCase):
         self.auto_label = False
         self.op('create', platform='discourse')
         self.assertNext('engineer', 'full backup (with uploads')
-        (self.intake / self.SOURCE_BACKUP).write_bytes(b'x')
+        (self.intake / self.SOURCE_BACKUP).write_bytes(gzip.compress(b'invented full backup'))
         self.label('development')
         guide = self.op('guide')
         self.assertNext('agent', 'type=discourse-backup', guide)
@@ -1866,7 +1872,8 @@ class DataToolsTest(unittest.TestCase):
 
     def test_a_script_reads_one_delivery_and_its_output_belongs_to_it(self):
         dev, launch = self.two_deliveries()
-        self.refused('STANDARD_ARGUMENTS_INVALID: delivery', 'script', code='puts 1', into='x')
+        ws = self.d.Workspace(self.base, 'arc', ROOT, self.host, self.values, self.control)
+        self.assertEqual(dev, self.d.job_delivery(ws, {})[0])  # explicit active Development is the default
         self.refused('STANDARD_ARGUMENTS_INVALID: delivery', 'script', code='puts 1', into='x', delivery='dataset-' + 'f' * 32)
         started = self.op('script', code='puts 1', into='fromdev', delivery=dev)
         argv = ' '.join(self.docker.argvs('run')[-1])

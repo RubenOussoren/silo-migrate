@@ -62,7 +62,7 @@ module SiloMigrate
         document = File.file?(path) && !File.symlink?(path) ? JSON.parse(File.read(path)) : nil
         deliveries = document.is_a?(Hash) ? document["deliveries"] : nil
         record = deliveries.is_a?(Hash) ? deliveries[dataset_id] : nil
-        unless record.is_a?(Hash) && %w[development launch base_site].include?(record["kind"]) && record["version"].is_a?(Integer) && !record["replaced_by"]
+        unless record.is_a?(Hash) && %w[development launch base_site].include?(record["kind"]) && record["version"].is_a?(Integer) && (!record["replaced_by"] || file_roles.load&.dig("snapshots", dataset_id, "eligible") == true)
           raise StandardWorkflowError, "STANDARD_DELIVERY_UNLABELLED"
         end
 
@@ -124,6 +124,7 @@ module SiloMigrate
 
         ids = roles.values.sort
         plan_id = @store.new_id("plan")
+        role_binding = file_role_binding(named, roles)
         body = {
           "operation" => CONVERT_OPERATION,
           "workspace_id" => named.fetch("workspace_id"),
@@ -154,8 +155,10 @@ module SiloMigrate
           ],
           "not_included" => ["import into Discourse", "uploads", "hosted restore", "DNS or cutover", "remote pushes"]
         }
+        body["file_role_binding"] = role_binding if role_binding
         digest = Digest::SHA256.hexdigest(canonical_json(body))
         @store.update do |current|
+          verify_file_role_proposal!(body, @store.named_state)
           current.fetch("plans")[plan_id] = {
             "id" => plan_id, "digest" => digest, "body" => body, "status" => "proposed", "created_at" => now, "approval" => nil, "run_id" => nil
           }

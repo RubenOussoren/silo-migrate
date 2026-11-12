@@ -47,6 +47,12 @@ Then open a chat with **migration-data** (Frontier only) in that project, for ex
 source database, and tell me the forum software and version, table prefix, charset and the
 main row counts. Then propose a schema finding with invented examples."
 
+## Small reference files through chat
+
+On a node with the **paired private-attachment native build**, open a new migration-data chat in the correct project and use the normal attachment control for an XLSX/CSV/TSV or small reference document. Ask the agent to keep it as a supporting reference and inspect the needed sheets/ranges. This does not replace or label Development/Launch/Base inputs and does not approve/change a run. Dumps/backups continue through intake. Do not attach customer files in coding chats.
+
+Stock 0.9.99 alone is not sufficient: `silo doctor` checks the native upload-context and session-lock capabilities, and supporting tools fail closed when absent. See [private chat attachments](chat-attachments.md) for limits, custody, the exact paired package requirement and deliberate operator installation; an ordinary update must not be described as enabling this feature without that package.
+
 ## The data agent (migration-data)
 
 migration-data is the only agent that handles customer data. Its tools (no approval prompts;

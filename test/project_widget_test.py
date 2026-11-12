@@ -175,6 +175,83 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
                 self.assertEqual(400, self.post(body)[0])
         self.assertEqual([], self.calls())
 
+    def test_role_preview_and_commit_allowlist_intent_and_inject_engineer_actor(self):
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        identity = {'path': 'mapping.xlsx', 'bytes': 123, 'mtime_ns': '2', 'ctime_ns': '3', 'ino': '4'}
+        change = {'action': 'classify', 'role': 'reference', 'files': [dict(identity, extra='ignored')],
+                  'via': 'chat', 'by': 'Someone else', 'op': 'db_reset', 'host_path': '/etc/passwd'}
+        for action in ('preview', 'commit'):
+            body = {'workspace': 'arc', 'change': change, 'by': 'Someone else', 'op': 'db_reset', 'digest': 'a' * 64}
+            status, _data, _ = self.request('POST', '/api/files/' + action, body, headers)
+            self.assertEqual(200, status)
+            argv, request = self.calls()[-1]
+            self.assertEqual(['data', 'arc'], argv)
+            expected = {'op': 'file_roles_' + action, 'by': self.m.runs.reviewer_name(),
+                        'change': {'action': 'classify', 'role': 'reference', 'files': [identity]}}
+            if action == 'commit':
+                expected['digest'] = 'a' * 64
+            self.assertEqual(expected, request)
+
+    def test_role_actions_require_scope_exact_shapes_and_commit_digest(self):
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        identity = {'path': 'a.sql', 'bytes': 1, 'mtime_ns': '2', 'ctime_ns': '3', 'ino': '4'}
+        valid = {'action': 'classify', 'role': 'reference', 'files': [identity]}
+        bad_changes = [None, [], {}, dict(valid, action='erase'), dict(valid, role='development'),
+                       dict(valid, files=[]), dict(valid, files=[dict(identity, path='../other/a')]),
+                       dict(valid, files=[dict(identity, path='/a')]), dict(valid, files=[identity, identity]),
+                       dict(valid, files=[dict(identity, bytes=True)]), dict(valid, files=[dict(identity, ino=4)]),
+                       dict(valid, kind='base_site'), dict(valid, confirm='yes'),
+                       {'action': 'correct', 'role': 'reference', 'file_ids': ['file-' + 'a' * 32], 'reason': ''},
+                       {'action': 'correct', 'role': 'reference', 'file_ids': ['../other'], 'reason': 'Mistake'},
+                       {'action': 'activate', 'dataset_id': '../other', 'reason': 'Mistake'},
+                       {'action': 'activate', 'dataset_id': 'dataset-' + 'b' * 32, 'reason': 'Mistake', 'files': []},
+                       dict(valid, role='uploads')]
+        for change in bad_changes:
+            with self.subTest(change=change):
+                self.assertEqual(400, self.request('POST', '/api/files/preview', {'workspace': 'arc', 'change': change}, headers)[0])
+        for workspace in ('../other', '', None):
+            self.assertEqual(400, self.request('POST', '/api/files/preview', {'workspace': workspace, 'change': valid}, headers)[0])
+        for digest in (None, 'b' * 63, 'B' * 64, [], 42):
+            self.assertEqual(400, self.request('POST', '/api/files/commit', {'workspace': 'arc', 'change': valid, 'digest': digest}, headers)[0])
+        for action in ('preview', 'commit'):
+            self.assertEqual(403, self.request('POST', '/api/files/' + action, {'workspace': 'arc', 'change': valid}, {'Content-Type': 'application/json'})[0])
+        self.assertEqual([], self.calls())
+
+    def test_correction_and_activation_forward_only_confined_ids_and_reason(self):
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        dataset = 'dataset-' + 'b' * 32
+        changes = [
+            {'action': 'correct', 'role': 'reference', 'file_ids': ['file-' + 'a' * 32],
+             'restore_dataset_id': dataset, 'reason': 'Spreadsheet was assigned as a source.'},
+            {'action': 'activate', 'dataset_id': dataset, 'reason': 'Restore the original source.'}]
+        for change in changes:
+            self.assertEqual(200, self.request('POST', '/api/files/preview', {'workspace': 'arc', 'change': change}, headers)[0])
+            self.assertEqual(change, self.calls()[-1][1]['change'])
+
+    def test_run_board_uses_checked_active_pointers_and_never_falls_back_on_bad_role_state(self):
+        role_path = self.base / 'arc/.silo-migrate/data/file-roles.json'
+        role_path.parent.mkdir(parents=True)
+        role_path.write_text('{}')  # the host, not this widget, validates this document
+        store = mock.Mock()
+        store.plans.return_value = {}
+        store.runs.return_value = {}
+        store.state.return_value = {}
+        store.pushes.return_value = []
+        with mock.patch.object(self.m.runs, 'Store', return_value=store), \
+                mock.patch.object(self.m.runs, 'overview', return_value={'plans': [], 'runs': []}), \
+                mock.patch.object(self.m, 'data', return_value={'roles': {'active': {'development': None}}}) as data, \
+                mock.patch.object(self.m.board, 'build_passes', return_value={}) as build:
+            self.m.passes_of(self.base, str(self.control), 'arc')
+            data.assert_called_once_with(str(self.control), 'arc', {'op': 'deliveries'}, timeout=30)
+            self.assertEqual({'development': None}, build.call_args.kwargs['active'])
+            data.return_value = {'roles': {}}
+            with self.assertRaisesRegex(self.m.Refused, 'STANDARD_FILE_ROLES_INVALID'):
+                self.m.passes_of(self.base, str(self.control), 'arc')
+            self.assertEqual(1, build.call_count)
+            role_path.unlink()
+            self.m.passes_of(self.base, str(self.control), 'arc')
+            self.assertIsNone(build.call_args.kwargs['active'])
+
     def test_only_the_label_action_exists(self):
         conn = self.request('POST', '/api/release', {'workspace': 'arc'}, {'X-Silo-Project': '1', 'Content-Type': 'application/json'})
         self.assertEqual(400, conn[0])

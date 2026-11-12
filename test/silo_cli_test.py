@@ -84,7 +84,8 @@ class SiloTest(unittest.TestCase):
     def healthy(self):
         listing = 'Available agents (2):\n\n  [user] /x/\n    converter-developer - a\n    migration-analyst - b\n'
         return {'service status': (0, 'ActiveState=active\n'), ' agents': (0, listing), 'sh op://Everybody/Snorlax LLM/credential --account discourse.1password.com': (0, 'secret'),
-                'auth status --json': (0, json.dumps({'loggedIn': True})), 'docker info': (0, '29.9.3\n')}
+                'auth status --json': (0, json.dumps({'loggedIn': True})), 'docker info': (0, '29.9.3\n'),
+                'capabilities --json': (0, json.dumps({'private_upload_context': 1, 'session_scope_lock': 1}))}
 
     def test_doctor_all_good(self):
         token = self.home / '.config/silo-migrate/github/token-discourse-org'
@@ -96,6 +97,18 @@ class SiloTest(unittest.TestCase):
         for name in ('web service', 'agents', 'ChatGPT sign-in', 'Frontier (op-cache)', 'Claude (claude-bin)', 'GitHub token', 'commit identity', 'Docker', 'release read-only'):
             self.assertEqual('OK', checks[name]['status'], (name, checks[name]))
         self.assertNotIn('secret', json.dumps(checks))
+
+    def test_doctor_checks_actual_private_attachment_capabilities(self):
+        checks = self.statuses(self.healthy())
+        self.assertEqual('OK', checks['private chat attachments']['status'])
+        for code, payload in ((1, ''), (0, '{}'), (0, '[]'), (0, 'invalid'),
+                              (0, '{"private_upload_context":1}')):
+            with self.subTest(payload=payload):
+                responses = dict(self.healthy(), **{'capabilities --json': (code, payload)})
+                check = self.statuses(responses)['private chat attachments']
+                self.assertEqual('WARN', check['status'])
+                self.assertIn('TERM_LLM_PACKAGE', check['fix'])
+                self.assertIn('normal intake', check['detail'])
 
     def test_doctor_checks_dbhub_servers_are_limited_without_naming_projects(self):
         self.assertEqual('OK', self.statuses(self.healthy())['DBHub']['status'])

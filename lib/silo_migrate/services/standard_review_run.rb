@@ -106,6 +106,7 @@ module SiloMigrate
         raise StandardWorkflowError, "STANDARD_RUNTIME_UNQUALIFIED" unless qualified || review_ready || allow_unqualified_runtime
 
         source_run, source_plan = review_source!(state, from_run)
+        verify_review_lineage!(source_plan, file_roles.load, @store.named_state)
         artifact = review_artifact_binding!(from_run, source_run, hash: true)
         named = @store.named_state
         roles = {}
@@ -145,6 +146,7 @@ module SiloMigrate
         short = plan_id.delete_prefix("plan-")[0, 8]
         ids = roles.values
         source_body = source_plan.fetch("body")
+        role_binding = file_role_binding(named, roles)
         body = {
           "operation" => REVIEW_OPERATION,
           "workspace_id" => named.fetch("workspace_id"),
@@ -188,8 +190,11 @@ module SiloMigrate
           end
           body["not_included"] = ["uploads and avatars", "hosted restore", "DNS or cutover", "remote pushes"]
         end
+        body["source_file_role_binding"] = source_body["file_role_binding"] if source_body["file_role_binding"]
+        body["file_role_binding"] = role_binding if role_binding
         digest = Digest::SHA256.hexdigest(canonical_json(body))
         @store.update do |current|
+          verify_file_role_proposal!(body, @store.named_state, source_plan: current.fetch("plans").fetch(source_plan.fetch("id")))
           current.fetch("plans")[plan_id] = {
             "id" => plan_id, "digest" => digest, "body" => body, "status" => "proposed", "created_at" => now, "approval" => nil, "run_id" => nil
           }
@@ -634,7 +639,7 @@ module SiloMigrate
 
       def review_stale_reason(plan, state)
         body = plan.fetch("body")
-        return "delivery" if body["base_site_generation"] && body["base_site_generation"] != review_base_generation
+        return "delivery" if !body["file_role_binding"] && body["base_site_generation"] && body["base_site_generation"] != review_base_generation
 
         named = @store.named_state
         ids = body.fetch("input_binding").map { |input| input["id"] }

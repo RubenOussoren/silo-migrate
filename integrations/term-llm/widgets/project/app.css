@@ -151,3 +151,16 @@ textarea.note { font: 14px/1.5 var(--font-sans); height: 72px; }
 textarea.note.tall { height: 110px; }
 .card .label { font-size: 12px; font-weight: 600; letter-spacing: .06em; color: var(--text-muted); margin: 14px 0 6px; }
 .banner.warn { background: var(--launch-soft); border-color: color-mix(in srgb, var(--launch) 40%, transparent); }
+/* File roles: source identity, associated assets and private references stay separate. */
+.role-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.role-file { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; border-top: 1px solid var(--border); padding: 14px 0; overflow-wrap: anywhere; }
+.role-file > div { min-width: 0; flex: 1; }
+.role-file small { display: block; margin-top: 5px; color: var(--text-muted); }
+.file-manage { flex-shrink: 0; font-size: 13px; }
+.file-manage summary { cursor: pointer; max-width: 180px; overflow-wrap: anywhere; }
+.file-manage .btn { margin-top: 8px; }
+.file-field { display: block; margin: 16px 0; font-size: 14px; }
+.file-field select, .file-field > input:not([type=checkbox]) { display: block; width: 100%; margin-top: 7px; padding: 9px 12px; font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 8px; }
+.file-preview:not(:empty) { border-top: 1px solid var(--border); margin-top: 20px; padding-top: 16px; }
+.file-preview dd { white-space: pre-wrap; }
+@media (max-width: 600px) { .role-heading, .role-file { flex-direction: column; align-items: stretch; } }

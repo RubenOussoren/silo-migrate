@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Offline native packaging. No download, service change or automatic install."""
+import argparse
+import contextlib
+import contextvars
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import struct
+import subprocess
+
+VERSION = "0.9.99"
+CAPABILITIES = {"private_upload_context": 1, "session_scope_lock": 1}
+MAX_BINARY = 256 * 1024 * 1024
+_CUSTODIAN = contextvars.ContextVar("private_node_custodian", default=None)
+
+
+class Refusal(ValueError):
+    pass
+
+
+def refuse():
+    raise Refusal("METAL_PRIVATE_NODE_INVALID")
+
+
+def location(path, customer_roots=()):
+    path = Path(os.path.abspath(path))
+    prefix = Path(os.environ.get("SILO_PREFIX", "/srv/silo-migrate"))
+    roots = [prefix / "intake", Path(os.environ.get("SILO_WORKSPACES", str(prefix / "workspaces"))), *customer_roots]
+    for root in roots:
+        # Check lexical and resolved forms; traversal itself also rejects links.
+        for candidate in (path, path.resolve()):
+            root = Path(os.path.abspath(root))
+            if candidate == root or root in candidate.parents or candidate == root.resolve() or root.resolve() in candidate.parents:
+                refuse()
+    return path
+
+
+@contextlib.contextmanager
+def custodian(uid):
+    """Root planning may explicitly name the eventual service custodian.
+
+    Account-side verification still runs with that account's real filesystem
+    permissions; this context grants no access or permission changes.
+    """
+    if os.geteuid() not in (0, uid):
+        refuse()
+    token = _CUSTODIAN.set(uid)
+    try:
+        yield
+    finally:
+        _CUSTODIAN.reset(token)
+
+
+def custody(info, directory=False):
+    intended = _CUSTODIAN.get()
+    if info.st_uid not in (0, os.geteuid() if intended is None else intended):
+        refuse()
+    # Only the system root-owned sticky /tmp-style parent may be shared.
+    shared = directory and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+    if info.st_mode & 0o022 and not shared:
+        refuse()
+
+
+@contextlib.contextmanager
+def trusted_dir(path, *, create=False, customer_roots=()):
+    path = location(path, customer_roots)
+    fd = None
+    try:
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        custody(os.fstat(fd), True)
+        for part in path.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            custody(os.fstat(fd), True)
+        # Holding this descriptor anchors all reads/writes even after rename.
+        yield fd
+    except OSError:
+        refuse()
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def read_at(directory, name, maximum, *, executable=False):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            custody(info)
+            if info.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                refuse()
+            if executable:
+                # Root checking a package cannot attest service-account access;
+                # the installer repeats these checks as that account before use.
+                shift = 6 if info.st_uid == os.geteuid() else 3 if info.st_gid in (*os.getgroups(), os.getegid()) else 0
+                if not info.st_mode & (1 << shift):
+                    refuse()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > maximum:
+                refuse()
+            data = stream.read(maximum + 1)
+            after = os.fstat(stream.fileno())
+            identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if len(data) > maximum or identity(info) != identity(after):
+                refuse()
+            return data
+    except OSError:
+        refuse()
+
+
+def read_regular(path, maximum, customer_roots=()):
+    path = location(path, customer_roots)
+    with trusted_dir(path.parent, customer_roots=customer_roots) as fd:
+        return read_at(fd, path.name, maximum)
+
+
+def source(root):
+    try:
+        value = json.loads(read_regular(Path(root) / "runtime/private-node-source.json", 8192))
+        if (value.get("version") != VERSION or not re.fullmatch(r"[0-9a-f]{40}", value.get("base_commit", "")) or
+                not re.fullmatch(r"[0-9a-f]{64}", value.get("patch_sha256", ""))):
+            refuse()
+        patch = read_regular(Path(root) / "integrations/term-llm/patches/private-attachments.patch", 4 * 1024 * 1024)
+        if hashlib.sha256(patch).hexdigest() != value["patch_sha256"]:
+            refuse()
+        return value
+    except (ValueError, TypeError, AttributeError):
+        refuse()
+
+
+def variant(expected):
+    identity = {key: expected[key] for key in ("version", "base_commit", "patch_sha256")}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return VERSION + "-private-" + digest
+
+
+def validate_elf(data):
+    """Structural ELF64 little-endian Linux amd64 executable, before any exec."""
+    if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01" or data[7] not in (0, 3):
+        refuse()
+    fields = struct.unpack_from("<HHIQQQIHHHHHH", data, 16)
+    kind, machine, version, entry, phoff, shoff, flags, ehsize, phsize, phnum, shsize, shnum, shstr = fields
+    if (kind not in (2, 3) or machine != 62 or version != 1 or ehsize != 64 or
+            phsize != 56 or not phnum or phnum == 65535 or phoff < 64 or phoff + phsize * phnum > len(data)):
+        refuse()
+    executable_entry = False
+    for i in range(phnum):
+        typ, perms, offset, address, physical, filesz, memsz, align = struct.unpack_from("<IIQQQQQQ", data, phoff + i * phsize)
+        if offset + filesz > len(data) or (typ == 1 and (filesz > memsz or address + memsz >= 2 ** 64)):
+            refuse()
+        if align not in (0, 1) and (align & (align - 1) or (typ == 1 and (address - offset) % align)):
+            refuse()
+        if typ == 1 and perms & 1 and address <= entry < address + memsz:
+            executable_entry = True
+    if not executable_entry or (shnum and (shsize != 64 or shoff < 64 or shoff + shsize * shnum > len(data) or shstr >= shnum)):
+        refuse()
+
+
+def verified_bytes(directory, expected, customer_roots=()):
+    try:
+        with trusted_dir(directory, customer_roots=customer_roots) as fd:
+            manifest = json.loads(read_at(fd, "manifest.json", 8192))
+            binary = read_at(fd, "term-llm", MAX_BINARY)
+            validate_elf(binary)
+            digest = hashlib.sha256(binary).hexdigest()
+            if (manifest != {"version": VERSION, "base_commit": expected["base_commit"],
+                             "patch_sha256": expected["patch_sha256"], "platform": "linux_amd64",
+                             "binary_sha256": digest, "capabilities": CAPABILITIES} or
+                    read_at(fd, "SHA256SUMS", 512).decode("ascii") != digest + "  term-llm\n"):
+                refuse()
+            return manifest, binary
+    except (ValueError, TypeError, UnicodeError):
+        refuse()
+
+
+def verify(directory, expected, customer_roots=()):
+    return verified_bytes(directory, expected, customer_roots)[0]
+
+
+def probe(data):
+    """Execute only a sealed kernel-held snapshot, never reopen an input pathname."""
+    validate_elf(data)
+    fd = None
+    try:
+        fd = os.memfd_create("private-node-verified", os.MFD_ALLOW_SEALING)
+        with os.fdopen(os.dup(fd), "wb") as stream:
+            stream.write(data)
+        os.fchmod(fd, 0o500)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        def execute(args, maximum=8192):
+            result = subprocess.run(["/proc/self/fd/" + str(fd), *args], pass_fds=(fd,), stdin=subprocess.DEVNULL,
+                                    capture_output=True, timeout=10, env={"PATH": "/usr/local/bin:/usr/bin:/bin"})
+            if result.returncode or len(result.stdout) > maximum:
+                refuse()
+            return result.stdout.decode("utf-8")
+        value = json.loads(execute(["capabilities", "--json"]))
+        if any(value.get(key) != required for key, required in CAPABILITIES.items()):
+            refuse()
+        if not re.search(r"\bversion " + re.escape(VERSION) + r"\b", execute(["--version"])):
+            refuse()
+        for args, flags in ((["service", "install", "--help"], ("--binary", "--no-start", "--dry-run")),
+                            (["serve", "--help"], ("--host", "--port", "--auth", "--approval", "--agent", "--projects", "--widgets-dir", "--extensions-dir", "--extensions"))):
+            help_text = execute(args, maximum=32 * 1024)
+            if any(flag not in help_text for flag in flags):
+                refuse()
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
+        refuse()
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def write_at(directory, name, data, mode=0o600):
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=directory)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        refuse()
+
+
+def receipts(manifest):
+    return {"binary.sha256": (manifest["binary_sha256"] + "\n").encode(),
+            "private-node.json": (json.dumps(manifest, sort_keys=True) + "\n").encode()}
+
+
+def install(directory, destination, expected, customer_roots=(), *, existing_only=False):
+    """Validate before selection. Existing installs must already have exact receipts."""
+    destination = location(destination, customer_roots)
+    manifest, data = verified_bytes(directory, expected, customer_roots)
+    with trusted_dir(destination.parent, create=not existing_only, customer_roots=customer_roots) as fd:
+        try:
+            os.stat(destination.name, dir_fd=fd, follow_symlinks=False)
+            exists = True
+        except FileNotFoundError:
+            exists = False
+        if exists:
+            installed = read_at(fd, destination.name, MAX_BINARY, executable=True)
+            if installed != data:
+                refuse()
+            for name, value in receipts(manifest).items():
+                if read_at(fd, name, 8192) != value:
+                    refuse()
+            probe(installed)
+        else:
+            if existing_only:
+                refuse()
+            probe(data)
+            write_at(fd, destination.name, data, 0o750)
+            for name, value in receipts(manifest).items():
+                write_at(fd, name, value)
+    return manifest
+
+
+def package(binary, destination, expected, customer_roots=()):
+    data = read_regular(binary, MAX_BINARY, customer_roots)
+    probe(data)
+    destination = location(destination, customer_roots)
+    digest = hashlib.sha256(data).hexdigest()
+    manifest = {"version": VERSION, "base_commit": expected["base_commit"], "patch_sha256": expected["patch_sha256"],
+                "platform": "linux_amd64", "binary_sha256": digest, "capabilities": CAPABILITIES}
+    with trusted_dir(destination.parent, create=True, customer_roots=customer_roots) as parent:
+        try:
+            os.mkdir(destination.name, 0o700, dir_fd=parent)
+            fd = os.open(destination.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        except OSError:
+            refuse()
+        try:
+            custody(os.fstat(fd), True)
+            write_at(fd, "term-llm", data, 0o750)
+            write_at(fd, "manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
+            write_at(fd, "SHA256SUMS", (digest + "  term-llm\n").encode())
+        finally:
+            os.close(fd)
+    return manifest
+
+
+def configured_roots(config):
+    """Read only literal location settings; never evaluate shell or customer files."""
+    values = {}
+    for line in read_regular(config, 64 * 1024).decode("utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if key in ("SILO_PREFIX", "SILO_WORKSPACES") and separator:
+            values[key] = value
+    prefix = values.get("SILO_PREFIX", "/srv/silo-migrate")
+    workspace = values.get("SILO_WORKSPACES") or prefix + "/workspaces"
+    if workspace == "$SILO_PREFIX/workspaces":
+        workspace = prefix + "/workspaces"
+    if not prefix.startswith("/") or not workspace.startswith("/"):
+        refuse()
+    return (Path(prefix) / "intake", Path(workspace))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("package", "verify"))
+    parser.add_argument("directory")
+    parser.add_argument("--binary")
+    parser.add_argument("--customer-root", action="append", default=[], help="additional custom workspace/intake root to refuse")
+    parser.add_argument("--metal-config",
+                        help="literal metal config supplying custom workspace/intake exclusion roots")
+    args = parser.parse_args()
+    config = args.metal_config or os.environ.get("SILO_METAL_CONFIG", "/etc/silo-migrate/metal.conf")
+    if os.path.lexists(config):
+        args.customer_root.extend(configured_roots(config))
+    elif args.metal_config or os.environ.get("SILO_METAL_CONFIG"):
+        refuse()
+    expected = source(Path(__file__).resolve().parent.parent)
+    result = package(args.binary, args.directory, expected, args.customer_root) if args.command == "package" and args.binary else verify(args.directory, expected, args.customer_root)
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

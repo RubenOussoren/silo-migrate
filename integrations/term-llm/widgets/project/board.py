@@ -66,7 +66,7 @@ def site_verdicts(reviews):
             for run_id, entry in current.items()}
 
 
-def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=()):
+def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=(), active=None):
     """plans/runs: the workbench's status views; bodies: {plan_id: body}; review_sites: {run_id: up?};
     pushes: raw push records; deliveries: {dataset_id: record}; reviews: site-reviews.json's entries."""
     verdicts = site_verdicts(reviews)
@@ -145,7 +145,7 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=
                         "full_head": head, "branch": proposal.get("branch"), "pushed_at": record.get("pushed_at"), "proposed_at": record.get("proposed_at"),
                         "findings": proposal.get("findings") or [], "used_by": used.get(head, [])})
     updates.sort(key=lambda update: _t(update.get("pushed_at") or update.get("proposed_at")), reverse=True)
-    return {"passes": ordered[::-1], "updates": updates, "banner": banner(ordered, updates, deliveries)}
+    return {"passes": ordered[::-1], "updates": updates, "banner": banner(ordered, updates, deliveries, active=active)}
 
 
 def merge_status(step):
@@ -193,8 +193,12 @@ def pass_status(group):
     return ("All checks matched", "ok")
 
 
-def banner(ordered, updates, deliveries):
-    """Something new that no pass has used yet: a pushed converter update, or newer data."""
+def banner(ordered, updates, deliveries, active=None):
+    """New work for the explicitly current source, not the newest arrival.
+
+    Missing role metadata retains legacy selection. An empty/null active pointer
+    is intentional and must never fall back to a corrected delivery.
+    """
     ran = [group for group in ordered if group["convert"]["run_id"]]
     if not ran or any(group["status"][0] in ("Waiting for your approval", "Running") for group in ordered):
         return None
@@ -203,7 +207,11 @@ def banner(ordered, updates, deliveries):
     merge = {"merge": True} if last.get("kind") == "merge" else {}  # the page words it for a merge project
     if pushed and not pushed[0]["used_by"]:
         return {"kind": "converter", "head": pushed[0]["head"], "title": pushed[0]["title"], "run_id": last["convert"]["run_id"], "next": last["number"] + 1, **merge}
-    newest = [record for record in sorted(deliveries.values(), key=lambda record: record.get("sequence", 0)) if record.get("kind") == "development" and not record.get("replaced_by")]
+    if active is None:
+        newest = [record for record in sorted(deliveries.values(), key=lambda record: record.get("sequence", 0)) if record.get("kind") == "development" and not record.get("replaced_by")]
+    else:
+        current = deliveries.get(active.get("development"))
+        newest = [current] if isinstance(current, dict) and current.get("kind") == "development" else []
     if newest and newest[-1].get("dataset_id") not in {group["dataset_id"] for group in ran}:
         return {"kind": "data", "label": "Development v%s" % newest[-1].get("version"), "next": last["number"] + 1, **merge}
     return None

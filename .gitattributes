@@ -1,0 +1,2 @@
+# Unified diffs contain context-prefix whitespace; check the native source itself.
+*.patch -whitespace

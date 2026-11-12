@@ -201,13 +201,16 @@ else:
         self.control.chmod(0o700)
         self.run_id = 'run-' + 'a' * 32
 
-    def call(self, tool, args, mode='ok', project='arc'):
+    def call(self, tool, args, mode='ok', project='arc', **overrides):
         # term-llm runs a project chat's tools in the project's folder.
         projects = self.root / 'projects'
         cwd = projects / project if project else self.root
         cwd.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, SILO_CONTROL=str(self.control), ARGV_RECORD=str(self.record), PYTHONDONTWRITEBYTECODE='1',
                    TERM_LLM_TOOL_NAME=tool, MODE=mode, SILO_TESTING='1', SILO_PROJECTS_ROOT=str(projects))
+        for key in ('TERM_LLM_PRIVATE_SESSION', 'TERM_LLM_SESSION_ID', 'TERM_LLM_UPLOADS_JSON'):
+            env.pop(key, None)
+        env.update(overrides)
         result = subprocess.run([sys.executable, '-I', '-B', str(DATA)], input=json.dumps(args), capture_output=True,
                                 text=True, env=env, timeout=10, cwd=cwd)
         self.assertEqual(0, result.returncode, result.stderr)
@@ -225,12 +228,13 @@ else:
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
         blocks = re.split(r'(?m)^    - name: ', definition)[1:]
         # The four branch tools use a separate reader-role adapter, tested in converter_dev_adapter_test.
-        self.assertEqual(27, len(blocks))
+        self.assertEqual(30, len(blocks))
         declared = [block.splitlines()[0] for block in blocks if 'script: scripts/data_tool.py' in block]
-        self.assertEqual(23, len(declared))
+        self.assertEqual(26, len(declared))
         for tool in declared:
             with self.subTest(tool=tool):
-                self.call(tool, {'path': 'x', 'unexpected': 'dropped'})
+                self.call(tool, {'path': 'x', 'unexpected': 'dropped'},
+                          TERM_LLM_PRIVATE_SESSION='1', TERM_LLM_SESSION_ID='session-fixture', TERM_LLM_UPLOADS_JSON='[]')
                 (argv, request), = self.calls()
                 self.assertEqual(['data', 'arc'], argv)
                 self.assertNotIn('unexpected', request)
@@ -304,6 +308,47 @@ else:
         self.assertEqual([[['data', 'new-forum'], {'op': 'create', 'platform': 'mybb', 'via': 'chat'}]], self.calls())
         self.call('data_guide', {}, project='new-forum')
         self.assertEqual([['data', 'new-forum']], [argv for argv, _request in self.calls()])
+
+    def test_supporting_files_require_native_locked_session_context(self):
+        for tool in ('data_supporting_list', 'data_supporting_take', 'data_supporting_read'):
+            for overrides in ({}, {'TERM_LLM_PRIVATE_SESSION': '1'},
+                              {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': '../other', 'TERM_LLM_UPLOADS_JSON': '[]'},
+                              {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'own-session', 'TERM_LLM_UPLOADS_JSON': '{}'},
+                              {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'own-session', 'TERM_LLM_UPLOADS_JSON': '['}):
+                with self.subTest(tool=tool, overrides=overrides):
+                    result, _ = self.call(tool, {'_private_session': True, '_session_id': 'forged', '_uploads': []}, **overrides)
+                    self.assertEqual('STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED', result['error'])
+        self.assertEqual([], self.calls())
+
+    def test_supporting_context_cannot_be_forged_in_arguments(self):
+        upload = {'id': 'a' * 32, 'path': '/private/uploads/fixture', 'filename': 'mapping.xlsx',
+                  'media_type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'size_bytes': 8}
+        context = {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'own-session',
+                   'TERM_LLM_UPLOADS_JSON': json.dumps([upload])}
+        self.call('data_supporting_take', {'ref': 'a' * 32, 'workspace': 'other', 'path': '/etc/passwd',
+                                          '_session_id': 'other', '_uploads': [{'path': '/etc/passwd'}]}, **context)
+        self.assertEqual([[['data', 'arc'], {'op': 'supporting_take', 'ref': 'a' * 32, 'via': 'chat',
+                                           '_private_session': True, '_session_id': 'own-session', '_uploads': [upload]}]], self.calls())
+        self.call('data_supporting_read', {'id': 'support-' + 'b' * 32, 'mode': 'rows', 'limit': 5,
+                                          'sheet': 'Mappings', 'source': '/etc/passwd'}, **context)
+        _, request = self.calls()[0]
+        self.assertEqual('supporting_read', request['op'])
+        self.assertEqual('Mappings', request['sheet'])
+        self.assertNotIn('source', request)
+
+    def test_upload_context_is_not_forwarded_in_control_environment(self):
+        original = self.control.read_text()
+        self.control.write_text(original.replace('import json, os, sys', '''import json, os, sys
+assert not any(key in os.environ for key in ('TERM_LLM_SESSION_ID', 'TERM_LLM_PRIVATE_SESSION', 'TERM_LLM_UPLOADS_JSON'))'''))
+        self.call('data_supporting_list', {}, TERM_LLM_PRIVATE_SESSION='1', TERM_LLM_SESSION_ID='own-session', TERM_LLM_UPLOADS_JSON='[]')
+        self.assertEqual(1, len(self.calls()))
+
+    def test_supporting_capability_does_not_expand_coding_agent_tools(self):
+        for agent in ('converter-developer', 'converter-reviewer', 'migration-operator'):
+            text = (ROOT / 'integrations/term-llm' / agent / 'agent.yaml').read_text()
+            self.assertNotIn('data_supporting_', text)
+        definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
+        self.assertIn('lock_session: true', definition)
 
     def test_no_agent_declares_a_workspace_argument(self):
         import re

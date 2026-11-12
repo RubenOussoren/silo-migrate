@@ -41,7 +41,12 @@ TOOLS = {
     "data_notes_write": ("notes_write", {"text"}, 60),
     "data_decide": ("decide", {"topic", "decision", "basis"}, 60),
     "data_decisions": ("decisions", set(), 60),
+    "data_supporting_list": ("supporting_list", set(), 60),
+    "data_supporting_take": ("supporting_take", {"ref"}, 60),
+    "data_supporting_read": ("supporting_read", {"id", "mode", "sheet", "offset", "limit", "columns"}, 90),
 }
+SUPPORTING_TOOLS = {"data_supporting_list", "data_supporting_take", "data_supporting_read"}
+SESSION = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
 
 
@@ -60,8 +65,30 @@ def control_path():
 
 def control_env():
     env = dict(os.environ)
+    # Native upload capabilities go only in the fixed supporting operation's
+    # stdin, not the environment of unrelated control/Git/Docker subprocesses.
+    for key in ("TERM_LLM_UPLOADS_JSON", "TERM_LLM_PRIVATE_SESSION", "TERM_LLM_SESSION_ID"):
+        env.pop(key, None)
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     return env
+
+
+def supporting_context():
+    """Only a locked native session can admit uploads. These protected variables
+    are set by the tool host, never accepted from a model's JSON arguments."""
+    session_id = os.environ.get("TERM_LLM_SESSION_ID", "")
+    raw = os.environ.get("TERM_LLM_UPLOADS_JSON", "")
+    if os.environ.get("TERM_LLM_PRIVATE_SESSION") != "1" or not SESSION.fullmatch(session_id):
+        return None
+    if not raw or len(raw.encode("utf-8")) > 64 * 1024:
+        return None
+    try:
+        uploads = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(uploads, list) or len(uploads) > 32:
+        return None
+    return {"_private_session": True, "_session_id": session_id, "_uploads": uploads}
 
 
 def fail(code):
@@ -115,6 +142,11 @@ def main():
     op, keys, timeout = TOOLS[tool]
     # "via": the host applies chat-only limits (a tool has 300 s); the agent can't set or drop it.
     request = {"op": op, **{key: value for key, value in args.items() if key in keys and value is not None}, "via": "chat"}
+    if tool in SUPPORTING_TOOLS:
+        context = supporting_context()
+        if context is None:
+            return fail("STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED")
+        request.update(context)
     try:
         result = subprocess.run([control_path(), "data", project], input=json.dumps(request).encode("utf-8"),
                                 capture_output=True, timeout=timeout, env=control_env())

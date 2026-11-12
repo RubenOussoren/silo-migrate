@@ -55,6 +55,16 @@ export async function api(path, body) {
 }
 
 const ERRORS = {
+  STANDARD_FILE_ROLES_STALE_PREVIEW: 'This file preview is out of date. Nothing was applied. Review a fresh preview before confirming again.',
+  STANDARD_FILE_ROLES_ACTIVE_DEPENDENCY: 'Affected work is active. Settle the active run or job before changing this assignment.',
+  STANDARD_FILE_ROLES_FILES_CHANGED: 'The incoming file identity changed. Reload the files and select them again.',
+  STANDARD_FILE_ROLES_RESTORE_REQUIRED: 'Select an eligible earlier source snapshot to restore before correcting the current source assignment.',
+  STANDARD_FILE_ROLES_SOURCE_INVALID: 'This is not a valid source backup for this platform. Keep the original full Discourse backup name and format.',
+  STANDARD_FILE_ROLES_SOURCE_PLATFORM_INVALID: 'These files cannot be used as source data for this project’s platform.',
+  STANDARD_FILE_ROLES_SNAPSHOT_INVALID: 'That snapshot is no longer eligible. Reload the Files view and choose another.',
+  STANDARD_FILE_ROLES_CONFIRM_LAUNCH: 'This change affects Launch. Type LAUNCH, then request a fresh preview.',
+  STANDARD_FILE_ROLES_REASON_REQUIRED: 'Explain why this assignment is being corrected or this snapshot is being activated.',
+  STANDARD_FILE_ROLES_ALREADY_ASSIGNED: 'These files have already been assigned. Use Manage → Correct assignment instead.',
   STANDARD_BASE_SITE_NEWER: 'The backup needs a newer Discourse application than the selected runtime. Check the Base backup and public-image availability; resetting the same plan alone will not fix this.',
   STANDARD_REVIEW_RUNTIME_CHANGED: 'The running review instance differs from the approved version. Reset this run and propose again to resolve the current Base site runtime.',
   STANDARD_REVIEW_RUNTIME_UNRESOLVED: 'A compatible review runtime could not be selected from the backup version. Check that this is an original versioned backup; an unsupported release needs node-admin help.',

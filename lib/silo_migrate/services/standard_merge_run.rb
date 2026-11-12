@@ -68,6 +68,7 @@ module SiloMigrate
         plan_id = @store.new_id("plan")
         review_port = select_review_port(state, port)
         ids = roles.values.sort
+        role_binding = file_role_binding(named, roles)
         body = {
           "operation" => MERGE_OPERATION, "workspace_id" => named.fetch("workspace_id"), "dataset_id" => delivery.fetch("dataset_id"),
           "delivery" => delivery, "platform" => "discourse", "roles" => roles, "base_site" => base,
@@ -88,7 +89,9 @@ module SiloMigrate
           "mutations" => ["restore the target sandbox in one isolated local review site", "load and migrate a disposable source copy, then merge it into the target", "take a full backup before creating the local review admin", "keep the review site until reset"],
           "not_included" => ["automatic count checks", "restore proof", "hosted restore", "DNS or cutover", "remote pushes"]
         }
+        body["file_role_binding"] = role_binding if role_binding
         @store.update do |current|
+          verify_file_role_proposal!(body, @store.named_state)
           current.fetch("plans")[plan_id] = { "id" => plan_id, "digest" => Digest::SHA256.hexdigest(canonical_json(body)), "body" => body,
                                             "status" => "proposed", "created_at" => now, "approval" => nil, "run_id" => nil }
         end
@@ -170,7 +173,7 @@ module SiloMigrate
 
       def merge_stale_reason(plan, state)
         body = plan.fetch("body")
-        return "delivery" if body["base_site_generation"] && body["base_site_generation"] != review_base_generation
+        return "delivery" if !body["file_role_binding"] && body["base_site_generation"] && body["base_site_generation"] != review_base_generation
 
         named = @store.named_state
         ids = body.fetch("roles").values

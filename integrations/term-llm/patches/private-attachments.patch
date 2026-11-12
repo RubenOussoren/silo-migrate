@@ -1,0 +1,2168 @@
+diff --git a/PACKAGES.md b/PACKAGES.md
+index b22f420aa6e9fb1ea7659f91c8fd9adc99881cfe..87b776ff0c2c0ec96fcc0a1d68ecf97165555590 100644
+--- a/PACKAGES.md
++++ b/PACKAGES.md
+@@ -178,6 +178,7 @@ One line per root-module package, generated from package doc comments by `make d
+ - `internal/session` — owns durable sessions, messages, steering persistence and SQLite storage.
+ - `internal/session/authordb` — owns the additive display-attribution schema and batched directory queries.
+ - `internal/session/notificationdb` — implements durable logical-turn ownership and fenced notification delivery on the session SQLite transaction.
++- `internal/session/policydb` — persists locked session policy intersections atomically.
+ - `internal/session/transcript` — adapts session writes to optional revision capabilities and identifies response-owned output.
+ - `internal/session/transcriptprefix` — compares persisted transcript prefixes for replacement and compaction.
+ - `internal/sessiontitle` — generates and validates short and long LLM session titles.
+diff --git a/cmd/capabilities.go b/cmd/capabilities.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0916f4eeaf7517bad31018ca61aced236bff94a
+--- /dev/null
++++ b/cmd/capabilities.go
+@@ -0,0 +1,19 @@
++package cmd
++
++import (
++	"encoding/json"
++
++	versionapp "github.com/samsaffron/term-llm/internal/app/version"
++	"github.com/spf13/cobra"
++)
++
++func init() {
++	command := &cobra.Command{
++		Use: "capabilities", Short: "Print native feature capability versions", Args: cobra.NoArgs,
++		RunE: func(cmd *cobra.Command, _ []string) error {
++			return json.NewEncoder(cmd.OutOrStdout()).Encode(versionapp.Capabilities())
++		},
++	}
++	command.Flags().Bool("json", false, "Print machine-readable JSON (the default)")
++	rootCmd.AddCommand(command)
++}
+diff --git a/docs-site/content/guides/agents.md b/docs-site/content/guides/agents.md
+index 9c58cdcfcb490c29c5eacee7adc7cb6ca9607c7d..864932074ad6d8520c6212432bca45bbb36b29e5 100644
+--- a/docs-site/content/guides/agents.md
++++ b/docs-site/content/guides/agents.md
+@@ -226,6 +226,14 @@ Automatic auxiliary calls for a restricted session — titles, interrupt classif
+ 
+ The guardian reviewer, memory batch commands, `sessions autotitle`, Telegram interrupt classification, and tools that call other services (`view_image` routing, `image_generate`, search) are configured by the operator and are not governed by the agent-level `allowed_models`. Provider-level restrictions still apply to their calls through text inference `providers`. The list governs term-llm's own model launches; it does not stop an agent from reaching another model through `shell` or HTTP. Restrict those with tool permissions.
+ 
++### Locking a sensitive conversation
++
++Agents may opt into `lock_session: true` alongside an explicit `allowed_models` list. The native runner then persists the effective model-policy chain and keeps the conversation's agent and project workspace fixed, including on branches. Attempts to retarget the protected transcript or compact it through a disallowed runtime fail before provider dispatch. Removing/widening the current definition does not erase the stored policy.
++
++Locked sessions require durable storage in the native serve/Responses runner. Direct `ask`, interactive TUI chat/handover, progressive runs and provider debug logging are currently refused rather than silently weakening the boundary. Start a new locked conversation instead of retrofitting an old unprotected one. This is not a general data-loss-prevention boundary against an operator manually copying text into another conversation; configure auxiliary routes deliberately.
++
++Custom scripts receive reserved `TERM_LLM_SESSION_ID`, `TERM_LLM_UPLOADS_JSON` and `TERM_LLM_PRIVATE_SESSION` variables from the admitted run context. The upload JSON is bounded metadata for structured user file uploads in that session, not arbitrary file mentions or assistant/tool outputs. It is not a filesystem capability: a consuming host must still confine paths, validate descriptors and enforce its own project authorization. Per-tool configuration and inherited environment cannot override these variables. `term-llm capabilities --json` reports these additive native interfaces.
++
+ ## Time grounding
+ 
+ Time grounding is disabled unless an agent explicitly opts in:
+diff --git a/docs-site/content/reference/cli.md b/docs-site/content/reference/cli.md
+index 697ee3f946aab2a248d0e91fbb41e20d145bcd28..cdc1b488107b322a45e00d0544b83e6bda52ed03 100644
+--- a/docs-site/content/reference/cli.md
++++ b/docs-site/content/reference/cli.md
+@@ -221,6 +221,14 @@ Measure client-observed LLM streaming and input-processing performance
+ | `--timeout` | duration | Hard timeout per request |
+ | `--warmup` | int | Warmup runs per scenario (-1 uses the mode profile) |
+ 
++### `term-llm capabilities`
++
++Print native feature capability versions
++
++| Flag | Type | Description |
++|---|---|---|
++| `--json` | bool | Print machine-readable JSON (the default) |
++
+ ### `term-llm chat`
+ 
+ Start an interactive chat session
+diff --git a/internal/agents/agent.go b/internal/agents/agent.go
+index 586041a87c98882b5f2216d6fbc4f6ea62002cec..0d8a1266033f1228af3f7ff62fa0065d2cd62dba 100644
+--- a/internal/agents/agent.go
++++ b/internal/agents/agent.go
+@@ -54,6 +54,8 @@ type Agent struct {
+ 	Model    string `yaml:"model,omitempty"`
+ 	// AllowedModels restricts this agent to provider:model or provider:* entries when set.
+ 	AllowedModels []string `yaml:"allowed_models,omitempty"`
++	// LockSession makes the effective policy and session identity sticky.
++	LockSession bool `yaml:"lock_session,omitempty"`
+ 
+ 	// Tool configuration
+ 	Tools ToolsConfig `yaml:"tools,omitempty"`
+@@ -445,6 +447,9 @@ func (a *Agent) Validate() error {
+ 	if a.Name == "" {
+ 		return fmt.Errorf("agent name is required")
+ 	}
++	if a.LockSession && len(a.AllowedModels) == 0 {
++		return fmt.Errorf("lock_session requires explicit allowed_models")
++	}
+ 	for _, entry := range a.AllowedModels {
+ 		if !validAllowedModelEntry(entry) {
+ 			return fmt.Errorf("invalid allowed_models entry %q: expected provider:model or provider:*", entry)
+diff --git a/internal/app/ask/prepare.go b/internal/app/ask/prepare.go
+index 64e8ca5e4e767338e01ca53f9e3adc04302ba55f..7a99062eb4d60d0a2b8290b486d6a55a13089e1e 100644
+--- a/internal/app/ask/prepare.go
++++ b/internal/app/ask/prepare.go
+@@ -46,8 +46,12 @@ func prepareAskConversation(ctx context.Context, cfg *config.Config, provider co
+ 		}
+ 		now := time.Now()
+ 		sess = &session.Session{ID: sessionID, Provider: provider.Name(), Model: model, Mode: session.ModeAsk, Agent: agentName, CreatedAt: now, UpdatedAt: now, Search: settings.Search, Tools: settings.Tools, MCP: settings.MCP, ApprovalMode: runapproval.ForColdPersistence(approval), Status: session.StatusActive}
++		sess.ProviderKey = cfg.DefaultProvider
++		sess.ModelPolicy = appruntime.ModelPolicyForSession(sess, agent)
+ 		sess.CWD = settings.PrimaryWorkspace
+-		_ = store.Create(ctx, sess)
++		if err := store.Create(ctx, sess); err != nil && sess.ModelPolicy.LockSession {
++			return preparedAskConversation{}, fmt.Errorf("persist locked session: %w", err)
++		}
+ 	}
+ 	if ticket != nil {
+ 		if ticket.Owner() {
+diff --git a/internal/app/ask/private_session_test.go b/internal/app/ask/private_session_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0eb08f39dec9f93dd0e2ad9156feee1a0c70a087
+--- /dev/null
++++ b/internal/app/ask/private_session_test.go
+@@ -0,0 +1,83 @@
++package ask
++
++import (
++	"context"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/config"
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session"
++)
++
++func TestDirectAskRejectsLockedSessionsBeforeProviderSetup(t *testing.T) {
++	for _, tc := range []struct {
++		name                                      string
++		resume, lockedAgent, debug, raw, retarget bool
++	}{
++		{name: "new", lockedAgent: true},
++		{name: "debug", lockedAgent: true, debug: true},
++		{name: "debugraw", lockedAgent: true, raw: true},
++		{name: "locked-resume", resume: true},
++		{name: "resume-debug", resume: true, debug: true},
++		{name: "resume-debugraw", resume: true, raw: true},
++		{name: "retarget", resume: true, retarget: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv("HOME", t.TempDir())
++			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
++			t.Setenv("XDG_DATA_HOME", t.TempDir())
++			t.Chdir(t.TempDir())
++			agentDir := t.TempDir()
++			body := "name: private\nprovider: mock\nmodel: mock-model\nallowed_models: [mock:mock-model]\n"
++			if tc.lockedAgent {
++				body += "lock_session: true\n"
++			}
++			if err := os.WriteFile(filepath.Join(agentDir, "agent.yaml"), []byte(body), 0600); err != nil {
++				t.Fatal(err)
++			}
++			db := filepath.Join(t.TempDir(), "sessions.db")
++			cfg := &config.Config{DefaultProvider: "mock", Providers: map[string]config.ProviderConfig{"mock": {Model: "mock-model"}}}
++			cfg.Sessions.Enabled = true
++			cfg.Sessions.Path = db
++			opts := Options{Agent: agentDir, Debug: tc.debug, DebugRaw: tc.raw, Text: true, Porcelain: true}
++			if tc.resume {
++				store, err := session.NewSQLiteStore(session.Config{Enabled: true, Path: db})
++				if err != nil {
++					t.Fatal(err)
++				}
++				policy := modelpolicy.Policy{LockSession: true}.With(agentDir, []string{"mock:mock-model"})
++				sess := &session.Session{ID: session.NewID(), Agent: agentDir, Provider: "mock", ProviderKey: "mock", Model: "mock-model", ModelPolicy: policy}
++				if err := store.Create(context.Background(), sess); err != nil {
++					t.Fatal(err)
++				}
++				if err := store.AddMessage(context.Background(), sess.ID, session.NewMessage(sess.ID, core.UserText("must not replay"), -1)); err != nil {
++					t.Fatal(err)
++				}
++				store.Close()
++				opts.Resume, opts.Changed.Resume = sess.ID, true
++				if tc.retarget {
++					opts.Provider = "other:forbidden"
++				}
++			}
++			provider := mockprovider.NewMockProvider("mock").AddTextResponse("must not run")
++			deps := testDependencies(io.Discard, io.Discard)
++			deps.LoadConfig = func() (*config.Config, error) { return cfg, nil }
++			deps.SessionStore.DBPath = db
++			created := false
++			deps.NewProvider = func(*config.Config, bool) (core.Provider, error) { created = true; return provider, nil }
++			err := Run(context.Background(), []string{"question"}, opts, deps)
++			if err == nil || !strings.Contains(err.Error(), "locked sessions are not supported by direct ask") {
++				t.Fatalf("error=%v", err)
++			}
++			if created || len(provider.RecordedRequests()) != 0 {
++				t.Fatal("locked ask reached provider setup/dispatch")
++			}
++		})
++	}
++}
+diff --git a/internal/app/ask/run.go b/internal/app/ask/run.go
+index d0f404539952ed00859093ae2f659ec35af407aa..690fd63cba0aaf033b3672af499d23eefe48ab7d 100644
+--- a/internal/app/ask/run.go
++++ b/internal/app/ask/run.go
+@@ -79,6 +79,11 @@ func Run(ctx context.Context, args []string, opts Options, deps Dependencies) er
+ 	if err != nil {
+ 		return err
+ 	}
++	// Direct ask cannot enforce the private-session scope contract yet. Refuse
++	// both new locked agents and persisted locks before history or provider setup.
++	if (agent != nil && agent.LockSession) || (resumeSession != nil && resumeSession.ModelPolicy.LockSession) {
++		return fmt.Errorf("locked sessions are not supported by direct ask")
++	}
+ 
+ 	var preparedMCP *mcpstart.PreparedSelection
+ 	if opts.Changed.MCP {
+diff --git a/internal/app/chat/session.go b/internal/app/chat/session.go
+index ba95b29ef178ae69bc2302188a4052c8920e03e2..228c7d36c4aea02f0a3bbfbd9b833b14b32246c5 100644
+--- a/internal/app/chat/session.go
++++ b/internal/app/chat/session.go
+@@ -134,6 +134,9 @@ func (r *chatInvocation) buildChatSessionRuntime(ctx context.Context, launch cha
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if (agent != nil && agent.LockSession) || (sess != nil && sess.ModelPolicy.LockSession) {
++		return nil, fmt.Errorf("locked sessions require the native runner; interactive chat is not supported")
++	}
+ 	var preparedMCP *mcpstart.PreparedSelection
+ 	if r.opts.Changed.MCP {
+ 		preparedMCP, err = mcpstart.PrepareSelection(agents.PolicyIdentity(agent), r.opts.MCP, true, warnings, r.deps.LoadMCPConfig)
+@@ -584,7 +587,13 @@ func (r *chatInvocation) buildChatSessionRuntime(ctx context.Context, launch cha
+ 	model.PersistApprovalMode(desiredApprovalMode)
+ 
+ 	// Wire agent resolver, lister, and current agent for /handover support
+-	model.SetAgentResolver(runtime.LoadAgent)
++	model.SetAgentResolver(func(name string, cfg *config.Config) (*agents.Agent, error) {
++		next, err := runtime.LoadAgent(name, cfg)
++		if err == nil && next != nil && next.LockSession {
++			return nil, fmt.Errorf("locked agents do not support interactive handover")
++		}
++		return next, err
++	})
+ 	currentRuntimeContext := chat.RuntimeSystemContext{
+ 		SystemPrompt: cfg.Chat.Instructions,
+ 		ApplySkills:  skillContextApplier(skillsSetup),
+diff --git a/internal/app/runtime/model.go b/internal/app/runtime/model.go
+index 954f06c04b088439645c508fb57ee0bddda63a55..cb5e467667e0604ec41c509e2cf4d542f214940a 100644
+--- a/internal/app/runtime/model.go
++++ b/internal/app/runtime/model.go
+@@ -22,6 +22,8 @@ type ModelSelectionInput struct {
+ 	Inherited                                          modelpolicy.Policy
+ 	Parent                                             runpkg.ParentModel
+ 	ResumeModel                                        runpkg.ParentModel
++	Run                                                *runpkg.Request
++	Debug                                              bool
+ }
+ 
+ // SelectRunModel is the single selection/admission path for CLI and delegated
+@@ -59,10 +61,16 @@ func SelectRunModel(cfg *config.Config, in ModelSelectionInput) (ModelSelection,
+ 	policy := in.Inherited
+ 	if in.Agent != nil {
+ 		policy = policy.With(agentName, in.Agent.AllowedModels)
++		policy.LockSession = policy.LockSession || in.Agent.LockSession
+ 	}
+ 	if err := policy.CheckWithConfig(cfg, agentName, selected.Provider, selected.Model); err != nil {
+ 		return selected, policy, err
+ 	}
++	if in.Run != nil {
++		if err := CheckLockedRun(policy, cfg, *in.Run, selected, in.Debug); err != nil {
++			return selected, policy, err
++		}
++	}
+ 	return selected, policy, nil
+ }
+ 
+@@ -73,6 +81,7 @@ func ModelPolicyForSession(sess *session.Session, agent *agents.Agent) modelpoli
+ 	}
+ 	if agent != nil {
+ 		policy = policy.With(agent.Name, agent.AllowedModels)
++		policy.LockSession = policy.LockSession || agent.LockSession
+ 	}
+ 	return policy
+ }
+diff --git a/internal/app/runtime/private_admission_test.go b/internal/app/runtime/private_admission_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b58d3d535767b908c22cc8a66132b55245be2167
+--- /dev/null
++++ b/internal/app/runtime/private_admission_test.go
+@@ -0,0 +1,72 @@
++package runtime
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session"
++)
++
++// Embedding only Store deliberately hides native optional capabilities.
++type nonAtomicPrivateStore struct{ session.Store }
++
++func TestPrivateAdmissionRequiresNativeAtomicStore(t *testing.T) {
++	store, saved, cfg := lockedSessionFixture(t)
++	ctx := core.ContextWithSessionID(context.Background(), saved.ID)
++	unsupported := &nonAtomicPrivateStore{Store: store}
++	admitted, _, err := AdmitPrivateSession(ctx, unsupported, core.Request{SessionID: saved.ID}, saved.ModelPolicy, cfg, saved.Agent, saved.CWD, "debug", "allowed")
++	if err == nil || !strings.Contains(err.Error(), "atomic native") || core.PrivateSessionFromContext(admitted) {
++		t.Fatalf("unsupported store admitted private request: %v", err)
++	}
++	// The native logging decorator is explicitly unwrapped; its best-effort
++	// Update semantics must never replace the strict admission transaction.
++	logging := session.NewLoggingStore(store, func(string, ...any) {})
++	admitted, effective, err := AdmitPrivateSession(ctx, logging, core.Request{SessionID: saved.ID}, saved.ModelPolicy, cfg, saved.Agent, saved.CWD, "debug", "allowed")
++	if err != nil || !effective.LockSession || !core.PrivateSessionFromContext(admitted) {
++		t.Fatalf("native decorated admission: %+v %v", effective, err)
++	}
++}
++
++func TestPrivateAdmissionDenialDoesNotPersistCallerRules(t *testing.T) {
++	store, saved, cfg := lockedSessionFixture(t)
++	for _, tc := range []struct {
++		name       string
++		request    core.Request
++		agent, cwd string
++	}{
++		{"debug", core.Request{SessionID: saved.ID, Debug: true}, saved.Agent, saved.CWD},
++		{"debugraw", core.Request{SessionID: saved.ID, DebugRaw: true}, saved.Agent, saved.CWD},
++		{"agent", core.Request{SessionID: saved.ID}, "other", saved.CWD},
++		{"workspace", core.Request{SessionID: saved.ID}, saved.Agent, t.TempDir()},
++		{"continuation-model", core.Request{SessionID: saved.ID, Resume: &core.Continuation{Request: core.Request{SessionID: saved.ID, Model: "denied"}}}, saved.Agent, saved.CWD},
++		{"continuation-session", core.Request{SessionID: saved.ID, Resume: &core.Continuation{Request: core.Request{SessionID: "foreign", Model: "allowed"}}}, saved.Agent, saved.CWD},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			incoming := saved.ModelPolicy.With("caller", []string{"debug:*"})
++			ctx := core.ContextWithSessionID(context.Background(), saved.ID)
++			admitted, _, err := AdmitPrivateSession(ctx, store, tc.request, incoming, cfg, tc.agent, tc.cwd, "debug", "allowed")
++			if err == nil || core.PrivateSessionFromContext(admitted) {
++				t.Fatal("invalid atomic admission accepted")
++			}
++			latest, getErr := store.Get(ctx, saved.ID)
++			if getErr != nil || len(latest.ModelPolicy.Rules) != len(saved.ModelPolicy.Rules) {
++				t.Fatalf("denial persisted caller restriction: %+v %v", latest, getErr)
++			}
++		})
++	}
++	// Ordinary unlocked adapters retain their non-private legacy behavior.
++	unlocked := *saved
++	unlocked.ID = session.NewID()
++	unlocked.ModelPolicy = modelpolicy.Policy{}
++	if err := store.Create(context.Background(), &unlocked); err != nil {
++		t.Fatal(err)
++	}
++	ctx := core.ContextWithSessionID(context.Background(), unlocked.ID)
++	admitted, effective, err := AdmitPrivateSession(ctx, &nonAtomicPrivateStore{Store: store}, core.Request{SessionID: unlocked.ID}, modelpolicy.Policy{}, cfg, unlocked.Agent, unlocked.CWD, "debug", "allowed")
++	if err != nil || effective.LockSession || core.PrivateSessionFromContext(admitted) {
++		t.Fatalf("ordinary adapter behavior changed: %v", err)
++	}
++}
+diff --git a/internal/app/runtime/private_session.go b/internal/app/runtime/private_session.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..485234ac272ce5a06d504a3d9d0b9a09c1ce797e
+--- /dev/null
++++ b/internal/app/runtime/private_session.go
+@@ -0,0 +1,121 @@
++package runtime
++
++import (
++	"context"
++	"fmt"
++	"path/filepath"
++
++	"github.com/samsaffron/term-llm/internal/config"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	runpkg "github.com/samsaffron/term-llm/internal/run"
++	"github.com/samsaffron/term-llm/internal/session"
++	"github.com/samsaffron/term-llm/internal/session/policydb"
++)
++
++func LockedModelPolicy(policy modelpolicy.Policy) modelpolicy.Policy {
++	if policy.LockSession {
++		return policy
++	}
++	return modelpolicy.Policy{}
++}
++
++// AdmitPrivateSession runs before history projection or provider dispatch. Only
++// durable, identity-checked locked sessions receive the host-only marker.
++func AdmitPrivateSession(ctx context.Context, store session.Store, req core.Request, policy modelpolicy.Policy, cfg *config.Config, agent, cwd, provider, model string) (context.Context, modelpolicy.Policy, error) {
++	if store == nil || req.SessionID == "" {
++		if policy.LockSession {
++			return ctx, policy, fmt.Errorf("locked session requires durable session storage")
++		}
++		return ctx, policy, nil
++	}
++	saved, lookupErr := store.Get(ctx, req.SessionID)
++	// The initial read only discovers unsupported-store locks. Native stores
++	// always re-read and validate under their SQLite writer reservation, even if
++	// this snapshot is unlocked. No admission decision uses its stale policy.
++	nativeStore := store
++	for {
++		logging, ok := nativeStore.(*session.LoggingStore)
++		if !ok {
++			break
++		}
++		nativeStore = logging.Store
++	}
++	atomic, supported := nativeStore.(policydb.Store)
++	if !supported {
++		if lookupErr != nil || saved == nil {
++			return ctx, policy, fmt.Errorf("session scope unavailable for atomic admission")
++		}
++		if saved.ModelPolicy.LockSession || policy.LockSession {
++			return ctx, policy, fmt.Errorf("locked session requires atomic native admission storage")
++		}
++		return ctx, policy, nil
++	}
++	effective, err := atomic.AdmitPrivateSession(ctx, policydb.AdmissionInput{Request: req, Policy: policy, Config: cfg, Agent: agent, CWD: cwd, Provider: provider, Model: model})
++	if err != nil {
++		return ctx, policy, err
++	}
++	if effective.LockSession {
++		ctx = core.ContextWithPrivateSession(ctx, req.SessionID)
++	}
++	return ctx, effective, nil
++}
++
++// CheckSessionScope rejects retargeting a locked transcript before history is loaded.
++// Empty request fields mean reuse the saved identity, never choose a new one.
++func CheckSessionScope(s *session.Session, agent, cwd string) error {
++	if s == nil || !s.ModelPolicy.LockSession {
++		return nil
++	}
++	if agent != "" && agent != s.Agent {
++		return fmt.Errorf("locked session cannot change agent")
++	}
++	saved := s.CWD
++	if s.WorktreeDir != "" {
++		saved = s.WorktreeDir
++	}
++	if cwd != "" && filepath.Clean(cwd) != filepath.Clean(saved) {
++		return fmt.Errorf("locked session cannot change workspace")
++	}
++	return nil
++}
++
++// CheckLockedRun closes the engine checkpoint's inner model/session
++// override before provider state import or any history replay.
++func CheckLockedRun(policy modelpolicy.Policy, cfg *config.Config, req runpkg.Request, selected ModelSelection, debug bool) error {
++	if !policy.LockSession {
++		return nil
++	}
++	if debug || req.Debug || req.DebugRaw {
++		return fmt.Errorf("locked sessions do not support provider debug logging")
++	}
++	if req.Progressive != nil {
++		return fmt.Errorf("locked sessions do not support progressive runs")
++	}
++	if req.Continuation == nil {
++		return nil
++	}
++	saved := req.Continuation.Request
++	if saved.SessionID != req.SessionID {
++		return fmt.Errorf("locked continuation cannot change session")
++	}
++	return policy.CheckWithConfig(cfg, req.AgentName, selected.Provider, saved.Model)
++}
++
++func PersistedRunPolicy(inherited, effective modelpolicy.Policy) modelpolicy.Policy {
++	if effective.LockSession {
++		return effective
++	}
++	return inherited
++}
++
++// PrivateSessionExecutionContext transfers admission into a separately owned
++// execution context without replacing its cancellation, deadline or other values.
++func PrivateSessionExecutionContext(ctx, admitted context.Context, sessionID string) context.Context {
++	ctx = core.ContextWithSessionID(ctx, sessionID)
++	if core.PrivateSessionFromContext(admitted) && core.SessionIDFromContext(admitted) == sessionID {
++		ctx = core.ContextWithPrivateSession(ctx, sessionID)
++	}
++	return ctx
++}
+diff --git a/internal/app/runtime/private_session_test.go b/internal/app/runtime/private_session_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..510e81707d95b3803538d59e21063ff1f76bc78f
+--- /dev/null
++++ b/internal/app/runtime/private_session_test.go
+@@ -0,0 +1,96 @@
++package runtime
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/agents"
++	"github.com/samsaffron/term-llm/internal/config"
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	runpkg "github.com/samsaffron/term-llm/internal/run"
++	"github.com/samsaffron/term-llm/internal/session"
++)
++
++func lockedSessionFixture(t *testing.T) (*session.SQLiteStore, *session.Session, *config.Config) {
++	t.Helper()
++	store, err := session.NewSQLiteStore(session.Config{Enabled: true, Path: filepath.Join(t.TempDir(), "sessions.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { store.Close() })
++	dir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte("name: private\nprovider: debug\nmodel: allowed\nallowed_models: [debug:allowed]\nlock_session: true\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	policy := modelpolicy.Policy{}.With("private", []string{"debug:allowed"}).With("ancestor", []string{"debug:*"})
++	policy.LockSession = true
++	saved := &session.Session{ID: session.NewID(), Agent: dir, CWD: t.TempDir(), Provider: "debug", ProviderKey: "debug", Model: "allowed", ModelPolicy: policy}
++	if err := store.Create(context.Background(), saved); err != nil {
++		t.Fatal(err)
++	}
++	cfg := &config.Config{DefaultProvider: "debug", Providers: map[string]config.ProviderConfig{"debug": {Model: "allowed", FastProvider: "wrong", FastModel: "denied"}, "wrong": {Model: "denied"}}}
++	return store, saved, cfg
++}
++func TestLockedSessionModelAndScopeAdmission(t *testing.T) {
++	store, saved, cfg := lockedSessionFixture(t)
++	for _, tc := range []struct{ name, agent, cwd, provider, model string }{
++		{"resume", saved.Agent, saved.CWD, "debug", "allowed"},
++		{"agent", "coding", saved.CWD, "debug", "allowed"},
++		{"workspace", saved.Agent, t.TempDir(), "debug", "allowed"},
++		{"provider", saved.Agent, saved.CWD, "wrong", "denied"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			ctx, _, err := AdmitPrivateSession(context.Background(), store, core.Request{SessionID: saved.ID}, saved.ModelPolicy, cfg, tc.agent, tc.cwd, tc.provider, tc.model)
++			if tc.name != "resume" {
++				if err == nil {
++					t.Fatal("retarget admitted")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !core.PrivateSessionFromContext(core.ContextWithSessionID(ctx, saved.ID)) {
++				t.Fatal("private marker absent after admission")
++			}
++			if core.PrivateSessionFromContext(core.ContextWithSessionID(ctx, "foreign")) {
++				t.Fatal("private marker crossed sessions")
++			}
++		})
++	}
++	// Saved own rules survive a loosened current definition and a new provider.
++	if err := saved.ModelPolicy.CheckWithConfig(cfg, "private", "wrong", "denied"); err == nil {
++		t.Fatal("sticky model rule lost")
++	}
++	agent, inherited, resume, err := ResolveRunAgent(context.Background(), runpkg.Request{SessionID: saved.ID, Resume: true}, cfg, store)
++	if err != nil || agent == nil || !inherited.LockSession || resume.Provider != "debug" {
++		t.Fatalf("resolve: %+v %+v %v", agent, inherited, err)
++	}
++	if _, _, _, err := ResolveRunAgent(context.Background(), runpkg.Request{SessionID: saved.ID, AgentName: "coding", Resume: true}, cfg, store); err == nil {
++		t.Fatal("agent retarget reached agent loader")
++	}
++	aux, err := AuxProviderForPolicy(cfg, inherited, ModelSelection{Provider: "debug", Model: "allowed"}, "debug")
++	if err != nil || aux == nil {
++		t.Fatalf("policy-safe auxiliary fallback: %v", err)
++	}
++	if got := aux.Name(); got != "debug:allowed" {
++		t.Fatalf("wrong auxiliary provider: %q", got)
++	}
++}
++func TestLockedEffectivePolicyAndDefaultAgents(t *testing.T) {
++	inherited := modelpolicy.Policy{}.With("parent", []string{"debug:*"})
++	own := &agents.Agent{Name: "private", Provider: "debug", Model: "allowed", LockSession: true, AllowedModels: []string{"debug:allowed"}}
++	cfg := &config.Config{DefaultProvider: "debug", Providers: map[string]config.ProviderConfig{"debug": {Model: "allowed"}, "wrong": {Model: "denied"}}}
++	_, policy, err := SelectRunModel(cfg, ModelSelectionInput{Agent: own, Inherited: inherited})
++	if err != nil || !policy.LockSession || len(LockedModelPolicy(policy).Rules) != 2 {
++		t.Fatalf("effective policy: %+v %v", policy, err)
++	}
++	own.LockSession = false
++	_, policy, err = SelectRunModel(cfg, ModelSelectionInput{Agent: own, Inherited: inherited})
++	if err != nil || policy.LockSession || LockedModelPolicy(policy).Restricted() {
++		t.Fatalf("default agent behavior changed: %+v %v", policy, err)
++	}
++}
+diff --git a/internal/app/runtime/run_agent.go b/internal/app/runtime/run_agent.go
+index 433952dacbe6f3ccb59c1b490102dcda83e000c1..c537ffb0b97ff324e133b7a62f0c493494b75fbe 100644
+--- a/internal/app/runtime/run_agent.go
++++ b/internal/app/runtime/run_agent.go
+@@ -28,6 +28,9 @@ func ResolveRunAgent(ctx context.Context, req runpkg.Request, cfg *config.Config
+ 	var agent *agents.Agent
+ 	var err error
+ 	if sess != nil {
++		if err := CheckSessionScope(sess, req.AgentName, req.Cwd); err != nil {
++			return nil, inherited, resume, err
++		}
+ 		inherited = sess.ModelPolicy.Append(inherited)
+ 		if req.Resume {
+ 			resume = runpkg.ParentModel{Provider: ResolveSessionProviderKey(cfg, sess), Model: sess.Model}
+diff --git a/internal/app/serve/private_admission_race_test.go b/internal/app/serve/private_admission_race_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..3466995d795378de199c395ba3605521285f98af
+--- /dev/null
++++ b/internal/app/serve/private_admission_race_test.go
+@@ -0,0 +1,128 @@
++package serve
++
++import (
++	"context"
++	"path/filepath"
++	"reflect"
++	"sync/atomic"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	runpkg "github.com/samsaffron/term-llm/internal/run"
++	"github.com/samsaffron/term-llm/internal/session"
++)
++
++// Admission's initial Get returns an intentionally stale snapshot, without
++// holding any SQLite connection or writer reservation while the test pauses.
++type pausedAdmissionStore struct {
++	*session.SQLiteStore
++	armed        atomic.Bool
++	read, resume chan struct{}
++}
++
++func (s *pausedAdmissionStore) Get(ctx context.Context, id string) (*session.Session, error) {
++	saved, err := s.SQLiteStore.Get(ctx, id)
++	if s.armed.CompareAndSwap(true, false) {
++		close(s.read)
++		select {
++		case <-s.resume:
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}
++	return saved, err
++}
++
++func TestPrivateAdmissionUsesLatestPolicyAtProviderBoundary(t *testing.T) {
++	for _, kind := range []string{"turn", "compaction"} {
++		for _, selected := range []string{"allowed", "other"} {
++			t.Run(kind+"/"+selected, func(t *testing.T) {
++				ctx, cancel := context.WithCancel(context.Background())
++				defer cancel()
++				cfg, agent := modelAllowlistFixture(t, "debug:allowed, debug:other")
++				path := filepath.Join(t.TempDir(), "sessions.db")
++				first, err := session.NewSQLiteStore(session.Config{Enabled: true, Path: path})
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer first.Close()
++				second, err := session.NewSQLiteStore(session.Config{Enabled: true, Path: path})
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer second.Close()
++				store := &pausedAdmissionStore{SQLiteStore: first, read: make(chan struct{}), resume: make(chan struct{})}
++				broad := modelpolicy.Policy{LockSession: true}.With("private", []string{"debug:allowed", "debug:other"})
++				saved := &session.Session{ID: session.NewID(), Agent: agent, CWD: t.TempDir(), Provider: "debug", ProviderKey: "debug", Model: selected, ModelPolicy: broad}
++				if err := first.Create(ctx, saved); err != nil {
++					t.Fatal(err)
++				}
++				for _, msg := range []core.Message{core.UserText("fixture question"), core.AssistantText("fixture answer")} {
++					if err := first.AddMessage(ctx, saved.ID, session.NewMessage(saved.ID, msg, -1)); err != nil {
++						t.Fatal(err)
++					}
++				}
++				provider := mockprovider.NewMockProvider("mock").AddTextResponse("fixture response")
++				runner := &cmdRunner{baseCfg: cfg, defaults: cmdRunnerOptions{Store: store, Tools: "spawn_agent", ToolsSet: true}}
++				env, err := runner.prepare(ctx, runpkg.Request{SessionID: saved.ID, Resume: true, AgentName: agent, Cwd: saved.CWD, Provider: "debug:" + selected, ProviderInstance: provider, ModelPolicy: broad.With("runtime-B", []string{"debug:" + selected})}, nil)
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer env.Close()
++				store.armed.Store(true)
++				done := make(chan error, 1)
++				go func() {
++					if kind == "compaction" {
++						_, err := env.runtime.compactSession(ctx, saved.ID)
++						done <- err
++						return
++					}
++					_, err := env.runtime.RunWithEvents(ctx, true, false, []core.Message{core.UserText("follow-up")}, env.llmReq, nil)
++					done <- err
++				}()
++				select {
++				case <-store.read:
++				case err := <-done:
++					t.Fatalf("request returned before admission checkpoint: %v", err)
++				}
++				narrowed := *saved
++				narrowed.ModelPolicy = broad.With("concurrent-A", []string{"debug:allowed"})
++				err = second.Update(ctx, &narrowed)
++				close(store.resume)
++				if err != nil {
++					t.Fatal(err)
++				}
++				err = <-done
++				if selected == "other" {
++					if err == nil {
++						t.Fatal("stale B-only admission was accepted after A-only commit")
++					}
++					if len(provider.RecordedRequests()) != 0 {
++						t.Fatal("denied admission dispatched a provider request")
++					}
++					latest, getErr := first.Get(ctx, saved.ID)
++					if getErr != nil || !latest.ModelPolicy.Allows("debug", "allowed") || len(latest.ModelPolicy.Rules) != 2 {
++						t.Fatalf("denial poisoned policy: %+v %v", latest, getErr)
++					}
++					return
++				}
++				if err != nil {
++					t.Fatal(err)
++				}
++				if len(provider.RecordedRequests()) == 0 {
++					t.Fatal("allowed admission did not exercise provider boundary")
++				}
++				latest, getErr := first.Get(ctx, saved.ID)
++				if getErr != nil || !reflect.DeepEqual(env.runtime.modelPolicy, latest.ModelPolicy) || len(latest.ModelPolicy.Rules) != 4 {
++					t.Fatalf("runtime lost committed intersection: runtime=%+v saved=%+v err=%v", env.runtime.modelPolicy, latest, getErr)
++				}
++				if spawn := env.runtime.spawnRunner; spawn == nil || !reflect.DeepEqual(spawn.modelPolicyState().Policy, latest.ModelPolicy) {
++					t.Fatal("child policy source did not inherit the committed admission intersection")
++				}
++
++			})
++		}
++	}
++}
+diff --git a/internal/app/serve/private_compaction_context_test.go b/internal/app/serve/private_compaction_context_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..662a80e21f39d25bd7af5d6f5d8c98706fdd499c
+--- /dev/null
++++ b/internal/app/serve/private_compaction_context_test.go
+@@ -0,0 +1,65 @@
++package serve
++
++import (
++	"context"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++)
++
++type privateCompactionContextProvider struct {
++	core.Provider
++	native bool
++	check  func(context.Context)
++}
++
++func (p *privateCompactionContextProvider) Stream(ctx context.Context, req core.Request) (core.Stream, error) {
++	p.check(ctx)
++	return p.Provider.Stream(ctx, req)
++}
++func (p *privateCompactionContextProvider) NativeCompact(ctx context.Context, req core.NativeCompactRequest) (*core.NativeCompactResult, error) {
++	if !p.native {
++		return nil, core.ErrNativeCompactUnavailable
++	}
++	p.check(ctx)
++	return &core.NativeCompactResult{PreTokens: 900, PostTokens: 300}, nil
++}
++
++func TestLockedCompactionPropagatesAdmissionToProviderContext(t *testing.T) {
++	for _, native := range []bool{false, true} {
++		t.Run(map[bool]string{false: "soft", true: "native"}[native], func(t *testing.T) {
++			calls := 0
++			provider := &privateCompactionContextProvider{Provider: mockprovider.NewMockProvider("mock").AddTextResponse("compacted fixture"), native: native}
++			rt, _ := newServeCompactionTestRuntime(t, provider)
++			policy := modelpolicy.Policy{LockSession: true}.With("private", []string{"mock:mock-model"})
++			rt.modelPolicy, rt.sessionMeta.ModelPolicy = policy, policy
++			if err := rt.store.Update(context.Background(), rt.sessionMeta); err != nil {
++				t.Fatal(err)
++			}
++			type executionKey struct{}
++			provider.check = func(ctx context.Context) {
++				calls++
++				if !core.PrivateSessionFromContext(ctx) || core.SessionIDFromContext(ctx) != rt.sessionMeta.ID {
++					t.Fatal("provider did not receive scoped private admission")
++				}
++				if ctx.Value(executionKey{}) != "execution" {
++					t.Fatal("execution context lost")
++				}
++			}
++			prepared, err := rt.prepareCompaction(context.Background(), rt.sessionMeta.ID)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer prepared.release()
++			// Asynchronous HTTP scheduling supplies a different execution context.
++			if _, err := prepared.execute(context.WithValue(context.Background(), executionKey{}, "execution")); err != nil {
++				t.Fatal(err)
++			}
++			if calls == 0 {
++				t.Fatal("provider boundary not exercised")
++			}
++		})
++	}
++}
+diff --git a/internal/app/serve/private_policy_resume_test.go b/internal/app/serve/private_policy_resume_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..07246797acf1602fca3ccdbdfc2f2e2516a9acbd
+--- /dev/null
++++ b/internal/app/serve/private_policy_resume_test.go
+@@ -0,0 +1,61 @@
++package serve
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++	runpkg "github.com/samsaffron/term-llm/internal/run"
++)
++
++func TestLockedRunnerResumePersistsNarrowedAgentPolicy(t *testing.T) {
++	ctx := context.Background()
++	cfg, agent := modelAllowlistFixture(t, "debug:allowed, debug:other")
++	writeAgent := func(allowed string) {
++		t.Helper()
++		body := fmt.Sprintf("name: reviewer\nprovider: debug\nmodel: allowed\nallowed_models: [%s]\nlock_session: true\n", allowed)
++		if err := os.WriteFile(filepath.Join(agent, "agent.yaml"), []byte(body), 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	writeAgent("debug:allowed, debug:other")
++	store := reviewSessionStore(t)
++	runner := &cmdRunner{baseCfg: cfg, defaults: cmdRunnerOptions{Store: store}}
++	env, err := runner.prepare(ctx, runpkg.Request{AgentName: agent, Cwd: t.TempDir(), Platform: runpkg.PlatformJob, Persist: true}, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	id, cwd := env.req.SessionID, env.req.Cwd
++	env.Close()
++	stale, err := store.Get(ctx, id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	writeAgent("debug:allowed")
++	_, err = runner.Run(ctx, runpkg.Request{SessionID: id, Resume: true, AgentName: agent, Cwd: cwd, Platform: runpkg.PlatformJob, Persist: true, ProviderInstance: mockprovider.NewMockProvider("mock").AddTextResponse("admitted narrow resume"), Messages: []core.Message{core.UserText("resume")}}, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// A stale runtime update and a widened definition must not erase the
++	// restriction captured by the intervening narrowed-agent resume.
++	if err := store.Update(ctx, stale); err != nil {
++		t.Fatal(err)
++	}
++	writeAgent("debug:allowed, debug:other")
++	provider := mockprovider.NewMockProvider("wrong").AddTextResponse("must not replay")
++	_, err = runner.Run(ctx, runpkg.Request{SessionID: id, Resume: true, AgentName: agent, Cwd: cwd, Provider: "debug:other", ProviderInstance: provider, Messages: []core.Message{core.UserText("follow-up")}}, nil)
++	if err == nil {
++		t.Fatal("widened agent escaped persisted narrowed policy")
++	}
++	if len(provider.RecordedRequests()) != 0 {
++		t.Fatal("denied resume reached provider")
++	}
++	saved, err := store.Get(ctx, id)
++	if err != nil || saved.ModelPolicy.Allows("debug", "other") {
++		t.Fatalf("narrowed policy not durable: %+v %v", saved, err)
++	}
++}
+diff --git a/internal/app/serve/private_session_test.go b/internal/app/serve/private_session_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..31d17cc96392789d2379b2ddfac70f19752bd33c
+--- /dev/null
++++ b/internal/app/serve/private_session_test.go
+@@ -0,0 +1,100 @@
++package serve
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	runpkg "github.com/samsaffron/term-llm/internal/run"
++	"github.com/samsaffron/term-llm/internal/session"
++)
++
++func TestLockedRunnerPersistsEffectivePolicyAndRejectsReplayRetarget(t *testing.T) {
++	cfg, agent := modelAllowlistFixture(t, "debug:allowed")
++	path := filepath.Join(agent, "agent.yaml")
++	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = file.WriteString("lock_session: true\n"); err != nil {
++		t.Fatal(err)
++	}
++	file.Close()
++	store := reviewSessionStore(t)
++	runner := &cmdRunner{baseCfg: cfg, defaults: cmdRunnerOptions{Store: store}}
++	env, err := runner.prepare(context.Background(), runpkg.Request{AgentName: agent, Cwd: t.TempDir(), Platform: runpkg.PlatformJob, Persist: true, ModelPolicy: modelpolicy.Policy{}.With("parent", []string{"debug:*"})}, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer env.Close()
++	saved, err := store.Get(context.Background(), env.req.SessionID)
++	if err != nil || !saved.ModelPolicy.LockSession || len(saved.ModelPolicy.Rules) != 2 {
++		t.Fatalf("effective policy not durable: %+v %v", saved, err)
++	}
++	anchor := session.NewMessage(saved.ID, core.UserText("invented sensitive fixture"), -1)
++	if err := store.AddMessage(context.Background(), saved.ID, anchor); err != nil {
++		t.Fatal(err)
++	}
++	branch, err := store.CreateBranch(context.Background(), saved.ID, session.CreateBranchOptions{AnchorMessageID: anchor.ID})
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, id := range []string{saved.ID, branch.Session.ID} {
++		for _, tc := range []struct{ name, agent, provider, cwd string }{
++			{"provider", agent, "other:denied", saved.CWD}, {"agent", "coding", "debug:allowed", saved.CWD}, {"workspace", agent, "debug:allowed", t.TempDir()},
++		} {
++			t.Run(tc.name+id, func(t *testing.T) {
++				wrong := mockprovider.NewMockProvider("wrong").AddTextResponse("must not run")
++				_, err := runner.Run(context.Background(), runpkg.Request{SessionID: id, Resume: true, AgentName: tc.agent, Cwd: tc.cwd, Provider: tc.provider, ProviderInstance: wrong, Messages: []core.Message{core.UserText("invented follow-up")}}, nil)
++				if err == nil {
++					t.Fatal("locked replay retarget accepted")
++				}
++				if len(wrong.RecordedRequests()) != 0 {
++					t.Fatal("history reached wrong provider")
++				}
++			})
++		}
++	}
++	// Removing the agent flag or widening its current policy must not erase the
++	// session's captured own rule, including on branches.
++	if err := os.WriteFile(path, []byte("name: reviewer\nprovider: other\nmodel: denied\nallowed_models: [other:*]\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, _, _, err := runner.resolveRunModel(context.Background(), runpkg.Request{SessionID: saved.ID, Resume: true, Provider: "other:denied"}); err == nil {
++		t.Fatal("loosened definition escaped saved policy")
++	}
++}
++
++func TestLockedCompactionRejectsWrongProviderAndKeepsPolicy(t *testing.T) {
++	provider := mockprovider.NewMockProvider("mock").AddTextResponse("invented compacted brief")
++	rt, _ := newServeCompactionTestRuntime(t, provider)
++	policy := modelpolicy.Policy{}.With("private", []string{"mock:mock-model"})
++	policy.LockSession = true
++	rt.modelPolicy, rt.sessionMeta.ModelPolicy = policy, policy
++	if err := rt.store.Update(context.Background(), rt.sessionMeta); err != nil {
++		t.Fatal(err)
++	}
++	rt.providerKey = "wrong"
++	if _, err := rt.compactSession(context.Background(), rt.sessionMeta.ID); err == nil {
++		t.Fatal("wrong-provider compaction admitted")
++	}
++	if len(provider.RecordedRequests()) != 0 {
++		t.Fatal("history reached provider before compaction policy check")
++	}
++	rt.providerKey = "mock"
++	if _, err := rt.compactSession(context.Background(), rt.sessionMeta.ID); err != nil {
++		t.Fatal(err)
++	}
++	requests := provider.RecordedRequests()
++	if len(requests) == 0 || requests[0].Model != "mock-model" {
++		t.Fatalf("compaction used wrong model: %+v", requests)
++	}
++	saved, err := rt.store.Get(context.Background(), rt.sessionMeta.ID)
++	if err != nil || !saved.ModelPolicy.LockSession || len(saved.ModelPolicy.Rules) != 1 {
++		t.Fatalf("compaction lost policy: %+v %v", saved, err)
++	}
++}
+diff --git a/internal/app/serve/runner.go b/internal/app/serve/runner.go
+index 0ba0188c62005bc52c3cc68b5fdcb3bd9098236d..b3a787d64f7997b2d9d64c21a5af628140fbb433 100644
+--- a/internal/app/serve/runner.go
++++ b/internal/app/serve/runner.go
+@@ -197,8 +197,7 @@ func includeConfiguredRunnerTools(req runpkg.Request) bool {
+ 
+ // resolveRunModel admits the same immutable request used to build the runtime.
+ // Child preflight calls this before emitting a started event.
+-// runModelPolicies separates the rules inherited from ancestors (persisted on
+-// the session) from the effective chain that also includes the agent's own rule.
++// runModelPolicies persists the effective chain for locked sessions, ancestors otherwise.
+ type runModelPolicies struct{ Effective, Inherited modelpolicy.Policy }
+ 
+ func (r *cmdRunner) resolveRunModel(ctx context.Context, req runpkg.Request) (*config.Config, *agents.Agent, appruntime.ModelSelection, runModelPolicies, error) {
+@@ -212,7 +211,7 @@ func (r *cmdRunner) resolveRunModel(ctx context.Context, req runpkg.Request) (*c
+ 		providerFlag = strings.TrimSpace(r.defaults.Provider)
+ 	}
+ 	cmdProvider, cmdModel, _, _ := r.commandConfig(cfg)
+-	selected, effective, err := appruntime.SelectRunModel(cfg, appruntime.ModelSelectionInput{Agent: agent, CmdProvider: cmdProvider, CmdModel: cmdModel, ProviderFlag: providerFlag, ModelOverride: req.Model, Fast: r.defaults.Fast, Inherited: inherited, Parent: req.ParentModel, ResumeModel: resume})
++	selected, effective, err := appruntime.SelectRunModel(cfg, appruntime.ModelSelectionInput{Agent: agent, CmdProvider: cmdProvider, CmdModel: cmdModel, ProviderFlag: providerFlag, ModelOverride: req.Model, Fast: r.defaults.Fast, Inherited: inherited, Parent: req.ParentModel, ResumeModel: resume, Run: &req, Debug: r.defaults.Debug || r.defaults.DebugRaw})
+ 	if err != nil {
+ 		return nil, nil, appruntime.ModelSelection{}, runModelPolicies{}, err
+ 	}
+@@ -221,7 +220,7 @@ func (r *cmdRunner) resolveRunModel(ctx context.Context, req runpkg.Request) (*c
+ 		// describe the concrete fast target that was checked above.
+ 		cfg.ApplyOverrides(selected.Provider, selected.Model)
+ 	}
+-	return cfg, agent, selected, runModelPolicies{Effective: effective, Inherited: inherited}, nil
++	return cfg, agent, selected, runModelPolicies{Effective: effective, Inherited: appruntime.PersistedRunPolicy(inherited, effective)}, nil
+ }
+ 
+ func (r *cmdRunner) prepare(ctx context.Context, req runpkg.Request, sink runpkg.EventSink) (*cmdRunEnvironment, error) {
+@@ -335,7 +334,7 @@ func (r *cmdRunner) prepare(ctx context.Context, req runpkg.Request, sink runpkg
+ 			if err == nil && spawnRunner != nil {
+ 				spawnRunner.SetChildRunObserver(r.defaults.ChildRunObserver)
+ 				spawnRunner.SetModelPolicySource(func() ParentModelState {
+-					return ParentModelState{Policy: policy, Provider: selected.Provider, Model: selected.Model}
++					return ParentModelState{Policy: runtime.modelPolicy, Provider: selected.Provider, Model: selected.Model}
+ 				})
+ 			}
+ 			return err
+@@ -361,7 +360,7 @@ func (r *cmdRunner) prepare(ctx context.Context, req runpkg.Request, sink runpkg
+ 		}
+ 		if toolMgr != nil {
+ 			state := func() (modelpolicy.Policy, runpkg.ParentModel) {
+-				return policy, runpkg.ParentModel{Provider: selected.Provider, Model: selected.Model}
++				return runtime.modelPolicy, runpkg.ParentModel{Provider: selected.Provider, Model: selected.Model}
+ 			}
+ 			toolMgr.Registry.SetAgentModelAdmission(state, func(ctx context.Context, name, model string, inherited modelpolicy.Policy, parent runpkg.ParentModel) error {
+ 				checker := &cmdRunner{baseCfg: r.baseCfg}
+diff --git a/internal/app/serve/serve_compaction.go b/internal/app/serve/serve_compaction.go
+index 3089543f38077a346f9caedcb90baf95e1cf720d..e4eccb76df34ea18041682cb110333c5a72bab3a 100644
+--- a/internal/app/serve/serve_compaction.go
++++ b/internal/app/serve/serve_compaction.go
+@@ -7,6 +7,7 @@ import (
+ 	"log/slog"
+ 	"strings"
+ 
++	"github.com/samsaffron/term-llm/internal/app/runtime"
+ 	"github.com/samsaffron/term-llm/internal/llm"
+ 	"github.com/samsaffron/term-llm/internal/llm/core"
+ 	"github.com/samsaffron/term-llm/internal/llm/engine"
+@@ -19,17 +20,17 @@ var (
+ )
+ 
+ type preparedSessionCompaction struct {
+-	rt           *serveRuntime
+-	sessionID    string
+-	history      []core.Message
+-	systemPrompt string
+-	model        string
+-	config       engine.CompactionConfig
++	rt              *serveRuntime
++	history         []core.Message
++	systemPrompt    string
++	model           string
++	config          engine.CompactionConfig
++	admittedContext context.Context
+ }
+ 
+ // prepareCompaction reserves both admission and the runtime mutex. The owner
+ // must call release, including if scheduling the prepared work fails.
+-func (rt *serveRuntime) prepareCompaction(ctx context.Context, sessionID string) (*preparedSessionCompaction, error) {
++func (rt *serveRuntime) prepareCompaction(ctx context.Context, sessionID string) (prepared *preparedSessionCompaction, err error) {
+ 	if rt == nil {
+ 		return nil, errServeCompactionUnavailable
+ 	}
+@@ -40,7 +41,7 @@ func (rt *serveRuntime) prepareCompaction(ctx context.Context, sessionID string)
+ 		rt.compacting.Store(false)
+ 		return nil, errServeSessionBusy
+ 	}
+-	prepared := &preparedSessionCompaction{rt: rt, sessionID: sessionID}
++	prepared = &preparedSessionCompaction{rt: rt}
+ 	if rt.provider == nil || rt.store == nil || strings.TrimSpace(sessionID) == "" {
+ 		prepared.release()
+ 		return nil, errServeCompactionUnavailable
+@@ -49,6 +50,10 @@ func (rt *serveRuntime) prepareCompaction(ctx context.Context, sessionID string)
+ 		prepared.release()
+ 		return nil, errServeCompactionUnavailable
+ 	}
++	if prepared.admittedContext, rt.modelPolicy, err = runtime.AdmitPrivateSession(core.ContextWithSessionID(ctx, sessionID), rt.store, core.Request{SessionID: sessionID}, rt.modelPolicy, rt.modelPolicyConfig, rt.agentName, rt.privateScopeDir(), rt.providerKey, rt.defaultModel); err != nil {
++		prepared.release()
++		return nil, err
++	}
+ 	// A runtime rehydrated after restart restores provider resume state only
+ 	// when a turn starts; native compaction needs it before any turn.
+ 	rt.restoreProviderState(ctx, sessionID)
+@@ -79,8 +84,7 @@ func (rt *serveRuntime) prepareCompaction(ctx context.Context, sessionID string)
+ 		config.InputLimit = limit
+ 	}
+ 
+-	prepared.history, prepared.systemPrompt = history, systemPrompt
+-	prepared.model, prepared.config = model, config
++	prepared.history, prepared.systemPrompt, prepared.model, prepared.config = history, systemPrompt, model, config
+ 	return prepared, nil
+ }
+ 
+@@ -102,7 +106,8 @@ func (rt *serveRuntime) compactSession(ctx context.Context, sessionID string) (*
+ }
+ 
+ func (p *preparedSessionCompaction) execute(ctx context.Context) (*engine.CompactionResult, error) {
+-	rt, sessionID := p.rt, p.sessionID
++	rt, sessionID := p.rt, core.SessionIDFromContext(p.admittedContext)
++	ctx = runtime.PrivateSessionExecutionContext(ctx, p.admittedContext, sessionID)
+ 	// Providers that own their context (claude-bin) compact natively in place;
+ 	// term-llm's transcript is left untouched.
+ 	if native, ok, err := llm.NativeCompact(ctx, rt.provider, core.NativeCompactRequest{SystemPrompt: p.systemPrompt, Model: p.model}); ok {
+diff --git a/internal/app/serve/serve_handlers.go b/internal/app/serve/serve_handlers.go
+index 427de233bff5eb3c40df5086e22692ec689dcfb5..771b91eea00cac1b555cd9c31bcbe758a8394493 100644
+--- a/internal/app/serve/serve_handlers.go
++++ b/internal/app/serve/serve_handlers.go
+@@ -3636,7 +3636,7 @@ func (s *serveServer) ensurePersistedSessionForProjectBinding(ctx context.Contex
+ 	now := time.Now()
+ 	provisional := &session.Session{
+ 		ID: sessionID, Provider: providerName, ProviderKey: providerKey, Model: model,
+-		Mode: session.ModeChat, Origin: session.OriginWeb, Agent: rt.agentName,
++		Mode: session.ModeChat, Origin: session.OriginWeb, Agent: rt.agentName, ModelPolicy: appruntime.LockedModelPolicy(rt.modelPolicy),
+ 		CreatedAt: now, UpdatedAt: now, Search: rt.search, Tools: rt.toolsSetting,
+ 		MCP: rt.mcpSetting, Status: session.StatusActive,
+ 	}
+@@ -3724,6 +3724,7 @@ func (s *serveServer) syncPersistedSessionRuntime(ctx context.Context, sessionID
+ 			Mode:        session.ModeChat,
+ 			Origin:      session.OriginWeb,
+ 			Agent:       rt.agentName,
++			ModelPolicy: appruntime.LockedModelPolicy(rt.modelPolicy),
+ 			CreatedAt:   time.Now(),
+ 			UpdatedAt:   time.Now(),
+ 			Search:      rt.search,
+diff --git a/internal/app/serve/serve_run_context.go b/internal/app/serve/serve_run_context.go
+index c4ae3e0ce3a1418ed2bb5f49c562282fd34264a8..b21f2f7c312a227a3f17945b5003d85b0bbbb429 100644
+--- a/internal/app/serve/serve_run_context.go
++++ b/internal/app/serve/serve_run_context.go
+@@ -62,3 +62,10 @@ func (rt *serveRuntime) prepareRunContext(ctx context.Context, collaboration too
+ 	req.ReasoningEffort = effort
+ 	return ctx, model, effort
+ }
++
++func (rt *serveRuntime) privateScopeDir() string {
++	if rt.settings == nil {
++		return ""
++	}
++	return rt.settings.PrimaryWorkspace
++}
+diff --git a/internal/app/serve/serve_runtime.go b/internal/app/serve/serve_runtime.go
+index b40fe55dea45d2b3adbb46b2047c54eb2cc48d91..56a5e85245ee0ee8bc18304fd02caf226ea2c6e2 100644
+--- a/internal/app/serve/serve_runtime.go
++++ b/internal/app/serve/serve_runtime.go
+@@ -1078,6 +1078,7 @@ func (rt *serveRuntime) ensureSessionInStore(ctx context.Context, sessionID stri
+ 		Mode:        session.ModeChat,
+ 		Origin:      session.OriginWeb,
+ 		Agent:       rt.agentName,
++		ModelPolicy: runtime.LockedModelPolicy(rt.modelPolicy),
+ 		CreatedAt:   time.Now(),
+ 		UpdatedAt:   time.Now(),
+ 		Search:      rt.search,
+@@ -1177,6 +1178,7 @@ func (rt *serveRuntime) ensurePersistedSession(ctx context.Context, sessionID st
+ 		Mode:        session.ModeChat,
+ 		Origin:      session.OriginWeb,
+ 		Agent:       rt.agentName,
++		ModelPolicy: runtime.LockedModelPolicy(rt.modelPolicy),
+ 		CreatedAt:   time.Now(),
+ 		UpdatedAt:   time.Now(),
+ 		Search:      rt.search,
+@@ -1946,6 +1948,10 @@ func (rt *serveRuntime) runOnce(ctx context.Context, stateful bool, replaceHisto
+ 		rt.dropTrailingUserHistory(inputMessages)
+ 	}
+ 
++	ctx, rt.modelPolicy, err = runtime.AdmitPrivateSession(ctx, rt.goalStore, req, rt.modelPolicy, rt.modelPolicyConfig, rt.agentName, rt.privateScopeDir(), rt.providerKey, rt.defaultModel)
++	if err != nil {
++		return serveRunResult{}, err
++	}
+ 	rushInitial := rushFromContext(ctx)
+ 	runSpec := serveRunSpec{stateful: stateful, persisted: persisted, replaceHistory: replaceHistory, batchInitial: collaborationBinding.Required || rushInitial != nil}
+ 	historyPreparation := rt.prepareRunHistory(ctx, runSpec, req.SessionID, inputMessages, &req, time.Now)
+diff --git a/internal/app/version/capabilities.go b/internal/app/version/capabilities.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..79312b50438dac795e6b3c70155519817eb4d33f
+--- /dev/null
++++ b/internal/app/version/capabilities.go
+@@ -0,0 +1,7 @@
++package version
++
++// Capabilities reports additive native interfaces, independently of release
++// version strings. Installers must probe the actual paired binary.
++func Capabilities() map[string]int {
++	return map[string]int{"private_upload_context": 1, "session_scope_lock": 1}
++}
+diff --git a/internal/llm/core/upload_context.go b/internal/llm/core/upload_context.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d754156e9896ab80d39fae0d18f196de944628ae
+--- /dev/null
++++ b/internal/llm/core/upload_context.go
+@@ -0,0 +1,128 @@
++package core
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/samsaffron/term-llm/internal/appdata"
++)
++
++// ContextWithRequestSession binds an explicit request identity, while legacy
++// callers which omit it retain their trusted context identity (e.g. agent tools).
++func ContextWithRequestSession(ctx context.Context, sessionID string) (context.Context, string) {
++	if sessionID == "" {
++		return ctx, SessionIDFromContext(ctx)
++	}
++	return ContextWithSessionID(ctx, sessionID), sessionID
++}
++
++// UploadReference is metadata only. Hosts must reopen beneath their fixed upload
++// root and validate the descriptor before reading; this is not a file capability.
++type UploadReference struct {
++	ID        string `json:"id"`
++	Path      string `json:"path"`
++	Filename  string `json:"filename"`
++	MediaType string `json:"media_type"`
++	SizeBytes int64  `json:"size_bytes"`
++}
++
++type uploadContextKey struct{}
++type uploadContext struct{ sessionID, metadata string }
++
++// ContextWithUserUploads binds a bounded snapshot of structured user file parts
++// to the active session. Approval-only prefixes and assistant/tool output must
++// never be supplied here. Missing files, symlinks and bare FilePath mentions do
++// not constitute uploads. No file content is read.
++func ContextWithUserUploads(ctx context.Context, sessionID string, messages []Message) context.Context {
++	refs := make([]UploadReference, 0)
++	dataDir, err := appdata.GetDataDir()
++	if err == nil && sessionID != "" {
++		root := filepath.Join(dataDir, "uploads")
++		seen := map[string]bool{}
++		for _, msg := range messages {
++			if msg.Role != RoleUser {
++				continue
++			}
++			for _, part := range msg.Parts {
++				if len(refs) == 32 {
++					break
++				}
++				if part.Type != PartFile || part.FileData == nil || !filepath.IsAbs(part.FilePath) {
++					continue
++				}
++				if len(part.FileData.Filename)+len(part.FileData.MediaType)+len(part.FilePath) > 64<<10 {
++					continue
++				}
++				path := filepath.Clean(part.FilePath)
++				rel, err := filepath.Rel(root, path)
++				if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || seen[path] {
++					continue
++				}
++				// Reject every symlink component, including the upload root itself.
++				resolved, err := filepath.EvalSymlinks(path)
++				if err != nil || resolved != path {
++					continue
++				}
++				info, err := os.Lstat(path)
++				if err != nil || !info.Mode().IsRegular() {
++					continue
++				}
++				sum := sha256.Sum256([]byte(path))
++				ref := UploadReference{ID: hex.EncodeToString(sum[:16]), Path: path, Filename: part.FileData.Filename, MediaType: part.FileData.MediaType, SizeBytes: info.Size()}
++				candidate := append(refs, ref)
++				encoded, err := json.Marshal(candidate)
++				if err != nil || len(encoded) > 64<<10 {
++					continue
++				}
++				refs = candidate
++				seen[path] = true
++			}
++		}
++	}
++	encoded, _ := json.Marshal(refs)
++	return context.WithValue(ctx, uploadContextKey{}, uploadContext{sessionID, string(encoded)})
++}
++
++// UserUploadsJSONFromContext returns [] unless the trusted snapshot belongs to
++// this exact active session. It never consults tool arguments or process env.
++func UserUploadsJSONFromContext(ctx context.Context) string {
++	v, ok := ctx.Value(uploadContextKey{}).(uploadContext)
++	if !ok || v.sessionID == "" || v.sessionID != SessionIDFromContext(ctx) {
++		return "[]"
++	}
++	return v.metadata
++}
++
++// PrivateSession context is installed only after durable host scope admission.
++type privateSessionKey struct{}
++
++func ContextWithPrivateSession(ctx context.Context, sessionID string) context.Context {
++	return context.WithValue(ctx, privateSessionKey{}, sessionID)
++}
++func PrivateSessionFromContext(ctx context.Context) bool {
++	id, _ := ctx.Value(privateSessionKey{}).(string)
++	return id != "" && id == SessionIDFromContext(ctx)
++}
++
++// Reserved host context is never inherited or chosen by a tool definition.
++func CustomToolEnvironment(ctx context.Context, env []string) []string {
++	out := make([]string, 0, len(env)+3)
++	for _, entry := range env {
++		key, _, _ := strings.Cut(entry, "=")
++		switch key {
++		case "TERM_LLM_SESSION_ID", "TERM_LLM_UPLOADS_JSON", "TERM_LLM_PRIVATE_SESSION":
++			continue
++		}
++		out = append(out, entry)
++	}
++	private := ""
++	if PrivateSessionFromContext(ctx) {
++		private = "1"
++	}
++	return append(out, "TERM_LLM_SESSION_ID="+SessionIDFromContext(ctx), "TERM_LLM_UPLOADS_JSON="+UserUploadsJSONFromContext(ctx), "TERM_LLM_PRIVATE_SESSION="+private)
++}
+diff --git a/internal/llm/core/upload_context_test.go b/internal/llm/core/upload_context_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..34de818fe02737df4b723cedbd3a98191ed0a432
+--- /dev/null
++++ b/internal/llm/core/upload_context_test.go
+@@ -0,0 +1,96 @@
++package core
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestRequestSessionPreservesInheritedIdentityWhenOmitted(t *testing.T) {
++	ctx := ContextWithSessionID(context.Background(), "trusted-parent")
++	inherited, id := ContextWithRequestSession(ctx, "")
++	if id != "trusted-parent" || SessionIDFromContext(inherited) != id {
++		t.Fatal("omitted request erased trusted agent lifecycle identity")
++	}
++	explicit, id := ContextWithRequestSession(ctx, "explicit-request")
++	if id != "explicit-request" || SessionIDFromContext(explicit) != id {
++		t.Fatal("explicit request did not bind its own identity")
++	}
++}
++
++func uploadFixture(t *testing.T, name string) Part {
++	t.Helper()
++	root := filepath.Join(os.Getenv("XDG_DATA_HOME"), "term-llm", "uploads")
++	if err := os.MkdirAll(root, 0700); err != nil {
++		t.Fatal(err)
++	}
++	path := filepath.Join(root, name)
++	if err := os.WriteFile(path, []byte("invented fixture"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	return Part{Type: PartFile, FilePath: path, FileData: &ToolFileData{Filename: name, MediaType: "application/octet-stream", SizeBytes: 999, Base64: "NEVER_IN_ENV"}}
++}
++func TestUserUploadContextAdmission(t *testing.T) {
++	t.Setenv("XDG_DATA_HOME", t.TempDir())
++	own := uploadFixture(t, "own.bin")
++	sibling := uploadFixture(t, "other.bin")
++	outside := filepath.Join(t.TempDir(), "outside.bin")
++	if err := os.WriteFile(outside, []byte("outside"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	link := uploadFixture(t, "link.bin")
++	if err := os.Remove(link.FilePath); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(own.FilePath, link.FilePath); err != nil {
++		t.Fatal(err)
++	}
++	messages := []Message{
++		{Role: RoleUser, Parts: []Part{own, own, {Type: PartFile, FilePath: sibling.FilePath}, {Type: PartText, Text: sibling.FilePath}, {Type: PartFile, FilePath: outside, FileData: own.FileData}, link}},
++		{Role: RoleAssistant, Parts: []Part{sibling}}, {Role: RoleTool, Parts: []Part{sibling}},
++	}
++	ctx := ContextWithSessionID(context.Background(), "own-session")
++	ctx = ContextWithUserUploads(ctx, "own-session", messages)
++	raw := UserUploadsJSONFromContext(ctx)
++	var refs []UploadReference
++	if err := json.Unmarshal([]byte(raw), &refs); err != nil {
++		t.Fatal(err)
++	}
++	if len(refs) != 1 || refs[0].Path != own.FilePath || refs[0].SizeBytes != 16 || len(refs[0].ID) != 32 {
++		t.Fatalf("unexpected references: %+v", refs)
++	}
++	if strings.Contains(raw, "NEVER_IN_ENV") {
++		t.Fatal("file bytes in metadata")
++	}
++	if got := UserUploadsJSONFromContext(ContextWithSessionID(ctx, "foreign")); got != "[]" {
++		t.Fatal("foreign session received references")
++	}
++	if got := UserUploadsJSONFromContext(ContextWithUserUploads(ctx, "", messages)); got != "[]" {
++		t.Fatal("unbound references admitted")
++	}
++}
++func TestUserUploadContextLimits(t *testing.T) {
++	t.Setenv("XDG_DATA_HOME", t.TempDir())
++	var parts []Part
++	for i := 0; i < 40; i++ {
++		parts = append(parts, uploadFixture(t, fmt.Sprintf("%d.bin", i)))
++	}
++	ctx := ContextWithSessionID(context.Background(), "s")
++	raw := UserUploadsJSONFromContext(ContextWithUserUploads(ctx, "s", []Message{{Role: RoleUser, Parts: parts}}))
++	var refs []UploadReference
++	if err := json.Unmarshal([]byte(raw), &refs); err != nil {
++		t.Fatal(err)
++	}
++	if len(refs) != 32 || len(raw) > 64<<10 {
++		t.Fatalf("limits: count=%d bytes=%d", len(refs), len(raw))
++	}
++	parts[0].FileData.Filename = strings.Repeat("x", 64<<10)
++	raw = UserUploadsJSONFromContext(ContextWithUserUploads(ctx, "s", []Message{{Role: RoleUser, Parts: parts[:1]}}))
++	if raw != "[]" {
++		t.Fatal("oversized metadata admitted")
++	}
++}
+diff --git a/internal/llm/engine/continuation.go b/internal/llm/engine/continuation.go
+index d5f493b29071f96ed2bfa5232ca9e7028f7f0f04..e1d948c635d7740320c4cc71f10f655b4c2e79e9 100644
+--- a/internal/llm/engine/continuation.go
++++ b/internal/llm/engine/continuation.go
+@@ -69,7 +69,7 @@ func (e *Engine) resumePending(ctx context.Context, req *core.Request, resume *c
+ 			return err
+ 		}
+ 	}
+-	results, err := e.executeToolCalls(ctx, calls, req.ParallelToolCalls, send, req.Debug, req.DebugRaw, buildApprovalTranscript(req.ApprovalTranscriptPrefix, req.Messages, core.Message{}))
++	results, err := e.executeToolCalls(core.ContextWithUserUploads(ctx, req.SessionID, req.Messages), calls, req.ParallelToolCalls, send, req.Debug, req.DebugRaw, buildApprovalTranscript(req.ApprovalTranscriptPrefix, req.Messages, core.Message{}))
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/internal/llm/engine/run_turn.go b/internal/llm/engine/run_turn.go
+index 9f2c10c9bf4e07a5cfe7c33f47422ac8cceb9208..1f9a0355ff51316ffcd4b09a3da85f6ac3aba8ac 100644
+--- a/internal/llm/engine/run_turn.go
++++ b/internal/llm/engine/run_turn.go
+@@ -219,7 +219,7 @@ func (h *providerTurnToolEvents) handleSync(event core.Event) error {
+ 		}
+ 		transcript := buildApprovalTranscript(h.run.req.ApprovalTranscriptPrefix, h.run.req.Messages, approvalAssistant, approvalResults...)
+ 		h.send.TrySend(core.Event{Type: core.EventToolExecStart, ToolCallID: call.ID, ToolName: call.Name, ToolInfo: call.ToolInfo, ToolArgs: call.Arguments})
+-		return h.engine.executeSingleToolCallOutcomeSafe(core.ContextWithApprovalTranscript(toolCtx, transcript), call, h.send, h.run.req.Debug, h.run.req.DebugRaw)
++		return h.engine.executeSingleToolCallOutcomeSafe(core.ContextWithApprovalTranscript(core.ContextWithUserUploads(toolCtx, h.run.req.SessionID, h.run.req.Messages), transcript), call, h.send, h.run.req.Debug, h.run.req.DebugRaw)
+ 	}, func(outcome toolCallOutcome) {
+ 		select {
+ 		case response <- core.ToolExecutionResponse{Result: outcome.output, Err: outcome.err}:
+diff --git a/internal/llm/engine/stream.go b/internal/llm/engine/stream.go
+index 21e111844a46bbec9422d158d99dc2d497d856a2..59d146cb8640168d242e7fe65d08c74569dec114 100644
+--- a/internal/llm/engine/stream.go
++++ b/internal/llm/engine/stream.go
+@@ -27,6 +27,7 @@ func (e *Engine) Stream(ctx context.Context, req core.Request) (core.Stream, err
+ 			}
+ 		}
+ 	}
++	ctx, req.SessionID = core.ContextWithRequestSession(ctx, req.SessionID)
+ 	ctx = env.withDebugDiagnosticSink(ctx, e.debugLogger)
+ 	// Until this request is proven agentic, it has no boundary at which it can
+ 	// consume steering. This also clears accepting state left by a prior run.
+diff --git a/internal/llm/engine/turn_completion.go b/internal/llm/engine/turn_completion.go
+index 3127b1099fe03acf517b306af2dcaa7d49c7c10d..c1796aad7db8a04b69579190652c6b3f8c9bf81d 100644
+--- a/internal/llm/engine/turn_completion.go
++++ b/internal/llm/engine/turn_completion.go
+@@ -488,7 +488,7 @@ func (e *Engine) completeAsyncTurn(c *engineTurnCompletion) error {
+ 	}
+ 
+ 	transcriptForApproval := buildApprovalTranscript(req.ApprovalTranscriptPrefix, req.Messages, assistantMsg)
+-	toolResults, err := e.executeToolCalls(ctx, registered, req.ParallelToolCalls, send, req.Debug, req.DebugRaw, transcriptForApproval)
++	toolResults, err := e.executeToolCalls(core.ContextWithUserUploads(ctx, req.SessionID, req.Messages), registered, req.ParallelToolCalls, send, req.Debug, req.DebugRaw, transcriptForApproval)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/internal/llm/engine/turn_recovery.go b/internal/llm/engine/turn_recovery.go
+index 6368aa76eb5eecddc9df7e883609b1d99596e12b..7e3a428556bf5acc6d631dd89c18801345e03bce 100644
+--- a/internal/llm/engine/turn_recovery.go
++++ b/internal/llm/engine/turn_recovery.go
+@@ -230,7 +230,7 @@ func (e *Engine) recoverCommittedTurn(r *engineTurnRecovery, cause error) (bool,
+ 	}
+ 
+ 	transcriptForApproval := buildApprovalTranscript(req.ApprovalTranscriptPrefix, req.Messages, assistantMsg)
+-	toolResults, err := e.executeToolCalls(ctx, registered, req.ParallelToolCalls, send, req.Debug, req.DebugRaw, transcriptForApproval)
++	toolResults, err := e.executeToolCalls(core.ContextWithUserUploads(ctx, req.SessionID, req.Messages), registered, req.ParallelToolCalls, send, req.Debug, req.DebugRaw, transcriptForApproval)
+ 	if err != nil {
+ 		return false, err
+ 	}
+diff --git a/internal/llm/engine/upload_context_test.go b/internal/llm/engine/upload_context_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fcc479c2ceef888bb3b401c62962539050e5a81
+--- /dev/null
++++ b/internal/llm/engine/upload_context_test.go
+@@ -0,0 +1,66 @@
++package engine
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++)
++
++type uploadProbeTool struct{ got string }
++
++func (*uploadProbeTool) Preview(json.RawMessage) string { return "" }
++
++func (p *uploadProbeTool) Spec() core.ToolSpec {
++	return core.ToolSpec{Name: "upload_probe", Description: "fixture", Schema: map[string]any{"type": "object"}}
++}
++func (p *uploadProbeTool) Execute(ctx context.Context, _ json.RawMessage) (core.ToolOutput, error) {
++	p.got = core.UserUploadsJSONFromContext(ctx)
++	return core.TextOutput("fixture"), nil
++}
++func TestEngineUploadContextExcludesApprovalPrefix(t *testing.T) {
++	t.Setenv("XDG_DATA_HOME", t.TempDir())
++	root := filepath.Join(os.Getenv("XDG_DATA_HOME"), "term-llm", "uploads")
++	if err := os.MkdirAll(root, 0700); err != nil {
++		t.Fatal(err)
++	}
++	part := func(name string) core.Part {
++		path := filepath.Join(root, name)
++		if err := os.WriteFile(path, []byte("invented"), 0600); err != nil {
++			t.Fatal(err)
++		}
++		return core.Part{Type: core.PartFile, FilePath: path, FileData: &core.ToolFileData{Filename: name}}
++	}
++	own, foreign := part("own.bin"), part("foreign.bin")
++	for _, inline := range []bool{false, true} {
++		t.Run(map[bool]string{false: "api", true: "inline"}[inline], func(t *testing.T) {
++			provider := mockprovider.NewMockProvider("mock").AddTurn(mockprovider.MockTurn{InlineTools: inline, ToolCalls: []core.ToolCall{{ID: "call", Name: "upload_probe", Arguments: json.RawMessage(`{}`)}}}).AddTextResponse("done")
++			probe := &uploadProbeTool{}
++			e := NewEngine(provider, NewToolRegistry())
++			e.RegisterTool(probe)
++			stream, err := e.Stream(context.Background(), core.Request{SessionID: "own", Messages: []core.Message{{Role: core.RoleUser, Parts: []core.Part{own}}, {Role: core.RoleAssistant, Parts: []core.Part{foreign}}}, ApprovalTranscriptPrefix: []core.Message{{Role: core.RoleUser, Parts: []core.Part{foreign}}}, Tools: []core.ToolSpec{probe.Spec()}, MaxTurns: 3})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer stream.Close()
++			for {
++				_, err := stream.Recv()
++				if err == io.EOF {
++					break
++				}
++				if err != nil {
++					t.Fatal(err)
++				}
++			}
++			if !strings.Contains(probe.got, own.FilePath) || strings.Contains(probe.got, foreign.FilePath) {
++				t.Fatalf("tool context: %s", probe.got)
++			}
++		})
++	}
++}
+diff --git a/internal/modelpolicy/policy.go b/internal/modelpolicy/policy.go
+index fa1fc493bf223eb7af99a70d0e5b5790ca6ea535..9aaad8fc3c43deb1660c7c99e922233c79a66f37 100644
+--- a/internal/modelpolicy/policy.go
++++ b/internal/modelpolicy/policy.go
+@@ -16,7 +16,8 @@ type Rule struct {
+ }
+ 
+ type Policy struct {
+-	Rules []Rule `json:"rules,omitempty"`
++	LockSession bool   `json:"lock_session,omitempty"`
++	Rules       []Rule `json:"rules,omitempty"`
+ }
+ 
+ func (p Policy) With(agent string, allowed []string) Policy {
+@@ -25,13 +26,13 @@ func (p Policy) With(agent string, allowed []string) Policy {
+ 		// parent snapshot over the same persisted ancestry) adds nothing.
+ 		return p
+ 	}
+-	next := Policy{Rules: append([]Rule(nil), p.Rules...)}
++	next := Policy{LockSession: p.LockSession, Rules: append([]Rule(nil), p.Rules...)}
+ 	next.Rules = append(next.Rules, Rule{Agent: agent, Allowed: append([]string(nil), allowed...)})
+ 	return next
+ }
+ 
+ func (p Policy) Append(other Policy) Policy {
+-	out := Policy{Rules: append([]Rule(nil), p.Rules...)}
++	out := Policy{LockSession: p.LockSession || other.LockSession, Rules: append([]Rule(nil), p.Rules...)}
+ 	for _, rule := range other.Rules {
+ 		out = out.With(rule.Agent, rule.Allowed)
+ 	}
+diff --git a/internal/session/policydb/admission.go b/internal/session/policydb/admission.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..405c546166a80653461fbf489456bea4beadbdab
+--- /dev/null
++++ b/internal/session/policydb/admission.go
+@@ -0,0 +1,99 @@
++package policydb
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"fmt"
++	"path/filepath"
++
++	"github.com/samsaffron/term-llm/internal/config"
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/sqliteutil"
++)
++
++// AdmissionInput identifies the exact provider request and host-owned scope.
++type AdmissionInput struct {
++	Request                     core.Request
++	Policy                      modelpolicy.Policy
++	Config                      *config.Config
++	Agent, CWD, Provider, Model string
++}
++
++// Store is the optional native capability required for private admission.
++// Implementations must validate and persist against the latest durable policy
++// under one writer reservation, returning only the committed intersection.
++type Store interface {
++	AdmitPrivateSession(context.Context, AdmissionInput) (modelpolicy.Policy, error)
++}
++
++// Admit validates identity and model before persisting any new restrictions.
++// Denial rolls back, so an incompatible caller cannot poison the saved policy.
++func Admit(ctx context.Context, db *sql.DB, in AdmissionInput, available bool) (modelpolicy.Policy, error) {
++	if !available {
++		return modelpolicy.Policy{}, fmt.Errorf("atomic private session admission is unavailable")
++	}
++	var effective modelpolicy.Policy
++	err := sqliteutil.WithImmediateMigrationTx(ctx, db, func(tx sqliteutil.Executor) error {
++		var raw sql.NullString
++		var agent, cwd, worktree string
++		if err := tx.QueryRow(`SELECT model_policy, COALESCE(agent, ''), COALESCE(cwd, ''), COALESCE(worktree_dir, '') FROM sessions WHERE id = ?`, in.Request.SessionID).Scan(&raw, &agent, &cwd, &worktree); err != nil {
++			return fmt.Errorf("load private session admission scope: %w", err)
++		}
++		var saved modelpolicy.Policy
++		if raw.Valid {
++			if err := json.Unmarshal([]byte(raw.String), &saved); err != nil {
++				return fmt.Errorf("decode private session policy: %w", err)
++			}
++		}
++		if !saved.LockSession && !in.Policy.LockSession {
++			effective = in.Policy
++			return nil
++		}
++		if !saved.LockSession || !in.Policy.LockSession {
++			return fmt.Errorf("locked session requires a locked runtime")
++		}
++		if in.Request.Debug || in.Request.DebugRaw {
++			return fmt.Errorf("locked sessions do not support provider debug logging")
++		}
++		if agent != in.Agent {
++			return fmt.Errorf("locked session cannot change agent")
++		}
++		if worktree != "" {
++			cwd = worktree
++		}
++		if in.CWD == "" && cwd != "" {
++			return fmt.Errorf("locked session workspace is unavailable")
++		}
++		if in.CWD != "" && filepath.Clean(in.CWD) != filepath.Clean(cwd) {
++			return fmt.Errorf("locked session cannot change workspace")
++		}
++		effective = saved.Append(in.Policy)
++		model := in.Model
++		if in.Request.Model != "" {
++			model = in.Request.Model
++		}
++		if err := effective.CheckWithConfig(in.Config, in.Agent, in.Provider, model); err != nil {
++			return err
++		}
++		if in.Request.Resume != nil {
++			continuation := in.Request.Resume.Request
++			if continuation.SessionID != in.Request.SessionID {
++				return fmt.Errorf("locked continuation cannot change session")
++			}
++			if err := effective.CheckWithConfig(in.Config, in.Agent, in.Provider, continuation.Model); err != nil {
++				return err
++			}
++		}
++		if len(effective.Rules) == len(saved.Rules) {
++			return nil
++		}
++		_, err := tx.Exec(`UPDATE sessions SET model_policy = ? WHERE id = ?`, JSON(effective), in.Request.SessionID)
++		return err
++	})
++	if err != nil {
++		return modelpolicy.Policy{}, err
++	}
++	return effective, nil
++}
+diff --git a/internal/session/policydb/update.go b/internal/session/policydb/update.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c93e8263ccadc2f3308e754bf4eac2de61fdcf7
+--- /dev/null
++++ b/internal/session/policydb/update.go
+@@ -0,0 +1,67 @@
++// Package policydb persists locked session policy intersections atomically.
++package policydb
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"fmt"
++
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++)
++
++// Update serializes policy intersection with the metadata write.
++// A deferred read transaction is insufficient: two writers could both read the
++// broad policy before either persists a restriction. BEGIN IMMEDIATE takes the
++// SQLite writer reservation before reading, including across store instances.
++// The query's final arguments must be policy, id, and five identity guard values.
++func Update(ctx context.Context, db *sql.DB, query string, args []any, id string, incoming modelpolicy.Policy, available bool) (sql.Result, error) {
++	if !available {
++		return db.ExecContext(ctx, query, args...)
++	}
++	conn, err := db.Conn(ctx)
++	if err != nil {
++		return nil, err
++	}
++	defer conn.Close()
++	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
++		return nil, err
++	}
++	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
++	var raw sql.NullString
++	if err := conn.QueryRowContext(ctx, "SELECT model_policy FROM sessions WHERE id = ?", id).Scan(&raw); err != nil {
++		return nil, err
++	}
++	var saved modelpolicy.Policy
++	if raw.Valid {
++		if err := json.Unmarshal([]byte(raw.String), &saved); err != nil {
++			return nil, fmt.Errorf("decode persisted model policy: %w", err)
++		}
++	}
++	if saved.LockSession {
++		// Rules are an ordered intersection, not a replacement allowlist. Keep the
++		// durable lock even when a stale caller supplies an empty/unlocked policy.
++		// Update's final arguments are policy, id, and five identity guard values.
++		args[len(args)-7] = JSON(saved.Append(incoming))
++	}
++	result, err := conn.ExecContext(ctx, query, args...)
++	if err != nil {
++		return nil, err
++	}
++	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
++		return nil, err
++	}
++	return result, nil
++}
++
++// JSON encodes a session policy, preserving a lock even without model rules.
++func JSON(policy modelpolicy.Policy) any {
++	if !policy.Restricted() && !policy.LockSession {
++		return nil
++	}
++	encoded, err := json.Marshal(policy)
++	if err != nil {
++		return nil
++	}
++	return string(encoded)
++}
+diff --git a/internal/session/scope_lock_test.go b/internal/session/scope_lock_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cb57363b63cd61683f0db66ee9118ed54edf599
+--- /dev/null
++++ b/internal/session/scope_lock_test.go
+@@ -0,0 +1,74 @@
++package session
++
++import (
++	"context"
++	"path/filepath"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++)
++
++func TestLockedSessionScopePersistenceAndBranch(t *testing.T) {
++	ctx := context.Background()
++	store, err := NewSQLiteStore(Config{Enabled: true, Path: filepath.Join(t.TempDir(), "sessions.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	policy := modelpolicy.Policy{}.With("private", []string{"debug:allowed"}).With("parent", []string{"debug:*"})
++	policy.LockSession = true
++	saved := &Session{ID: NewID(), Agent: "private", CWD: "/invented/project", Provider: "debug", ProviderKey: "debug", Model: "allowed", ModelPolicy: policy}
++	if err := store.Create(ctx, saved); err != nil {
++		t.Fatal(err)
++	}
++	msg := NewMessage(saved.ID, core.UserText("invented fixture"), -1)
++	if err := store.AddMessage(ctx, saved.ID, msg); err != nil {
++		t.Fatal(err)
++	}
++	for _, tc := range []struct {
++		name   string
++		mutate func(*Session)
++	}{
++		{"agent", func(s *Session) { s.Agent = "coding" }}, {"workspace", func(s *Session) { s.CWD = "/other" }}, {"worktree", func(s *Session) { s.WorktreeDir = "/other" }},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			next := *saved
++			tc.mutate(&next)
++			if err := store.Update(ctx, &next); err == nil {
++				t.Fatal("scope retarget accepted")
++			}
++		})
++	}
++	next := *saved
++	next.ModelPolicy = modelpolicy.Policy{}
++	next.Name = "rename permitted"
++	if err := store.Update(ctx, &next); err != nil {
++		t.Fatal(err)
++	}
++	got, err := store.Get(ctx, saved.ID)
++	if err != nil || !got.ModelPolicy.LockSession || len(got.ModelPolicy.Rules) != 2 {
++		t.Fatalf("sticky policy lost: %+v %v", got, err)
++	}
++	if err := store.AssignSessionProject(ctx, saved.ID, "other", saved.CWD, ""); err == nil {
++		t.Fatal("project retarget accepted")
++	}
++	if _, err := store.BindSessionWorkspace(ctx, saved.ID, SessionWorkspaceBinding{ProjectID: "other", CWD: "/other"}); err == nil {
++		t.Fatal("workspace rebind accepted")
++	}
++	if _, err := store.SwitchSessionWorkspace(ctx, saved.ID, SessionWorkspaceBinding{ProjectID: "other", CWD: "/other"}); err == nil {
++		t.Fatal("workspace switch accepted")
++	}
++	branch, err := store.CreateBranch(ctx, saved.ID, CreateBranchOptions{AnchorMessageID: msg.ID})
++	if err != nil {
++		t.Fatal(err)
++	}
++	child, err := store.Get(ctx, branch.Session.ID)
++	if err != nil || !child.ModelPolicy.LockSession || len(child.ModelPolicy.Rules) != 2 || child.Agent != saved.Agent || child.CWD != saved.CWD {
++		t.Fatalf("branch scope: %+v %v", child, err)
++	}
++	child.Agent = "coding"
++	if err := store.Update(ctx, child); err == nil {
++		t.Fatal("branch retarget accepted")
++	}
++}
+diff --git a/internal/session/sqlite_projects.go b/internal/session/sqlite_projects.go
+index 2512fb1aa15d8bb4b80737f531fad51b01ea029c..90d2c2044aea7af8a2eaa6f5b925e398311ad195 100644
+--- a/internal/session/sqlite_projects.go
++++ b/internal/session/sqlite_projects.go
+@@ -291,6 +291,7 @@ func (s *SQLiteStore) BootstrapProject(ctx context.Context, p *Project, matching
+ 		if _, err := conn.ExecContext(ctx, `
+ 			UPDATE sessions SET project_id = ?
+ 			WHERE id = ? AND project_id IS NULL
++			  AND COALESCE(json_extract(model_policy, '$.lock_session'), 0) = 0
+ 			  AND COALESCE(cwd, '') = ?
+ 			  AND COALESCE(worktree_dir, '') = ?`,
+ 			p.ID, match.ID, match.CWD, match.WorktreeDir); err != nil {
+@@ -331,6 +332,7 @@ func (s *SQLiteStore) ClaimProjectSessions(ctx context.Context, projectID string
+ 			result, err := tx.ExecContext(ctx, `
+ 				UPDATE sessions SET project_id = ?
+ 				WHERE id = ? AND project_id IS NULL
++			  AND COALESCE(json_extract(model_policy, '$.lock_session'), 0) = 0
+ 				  AND COALESCE(cwd, '') = ?
+ 				  AND COALESCE(worktree_dir, '') = ?`,
+ 				projectID, match.ID, match.CWD, match.WorktreeDir)
+@@ -357,6 +359,7 @@ func (s *SQLiteStore) AssignSessionProject(ctx context.Context, sessionID, proje
+ 	result, err := s.db.ExecContext(ctx, `
+ 		UPDATE sessions SET project_id = ?
+ 		WHERE id = ? AND project_id IS NULL
++			  AND COALESCE(json_extract(model_policy, '$.lock_session'), 0) = 0
+ 		  AND COALESCE(cwd, '') = ?
+ 		  AND COALESCE(worktree_dir, '') = ?`, projectID, sessionID, expectedCWD, expectedWorktreeDir)
+ 	if err != nil {
+@@ -388,7 +391,8 @@ func (s *SQLiteStore) SwitchSessionWorkspace(ctx context.Context, sessionID stri
+ 	result, err := s.db.ExecContext(ctx, `
+ 		UPDATE sessions
+ 		SET cwd = ?, worktree_dir = NULLIF(?, ''), updated_at = ?
+-		WHERE id = ? AND project_id = ?`,
++		WHERE id = ? AND project_id = ?
++		  AND COALESCE(json_extract(model_policy, '$.lock_session'), 0) = 0`,
+ 		binding.CWD, binding.WorktreeDir, time.Now().UTC(), sessionID, binding.ProjectID)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("switch session workspace: %w", err)
+@@ -423,11 +427,12 @@ func (s *SQLiteStore) BindSessionWorkspace(ctx context.Context, sessionID string
+ 		    worktree_dir = CASE WHEN COALESCE(worktree_dir, '') = '' THEN NULLIF(?, '') ELSE worktree_dir END,
+ 		    updated_at = ?
+ 		WHERE id = ?
++		  AND (COALESCE(json_extract(model_policy, '$.lock_session'), 0) = 0 OR (COALESCE(project_id, '') = ? AND COALESCE(cwd, '') = ? AND COALESCE(worktree_dir, '') = ?) OR (COALESCE(project_id, '') = '' AND COALESCE(cwd, '') = '' AND COALESCE(worktree_dir, '') = '' AND NOT EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id)))
+ 		  AND (COALESCE(project_id, '') = '' OR COALESCE(project_id, '') = ?)
+ 		  AND (COALESCE(cwd, '') = '' OR COALESCE(cwd, '') = ?)
+ 		  AND (COALESCE(worktree_dir, '') = '' OR COALESCE(worktree_dir, '') = ?)`,
+ 		binding.ProjectID, binding.CWD, binding.WorktreeDir, now, sessionID,
+-		binding.ProjectID, binding.CWD, binding.WorktreeDir)
++		binding.ProjectID, binding.CWD, binding.WorktreeDir, binding.ProjectID, binding.CWD, binding.WorktreeDir)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("bind session workspace: %w", err)
+ 	}
+diff --git a/internal/session/sqlite_session_policy.go b/internal/session/sqlite_session_policy.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..2710d3d855c1dd64023d77b375adc357602c506d
+--- /dev/null
++++ b/internal/session/sqlite_session_policy.go
+@@ -0,0 +1,13 @@
++package session
++
++import (
++	"context"
++
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session/policydb"
++)
++
++// AdmitPrivateSession validates and persists private admission atomically.
++func (s *SQLiteStore) AdmitPrivateSession(ctx context.Context, in policydb.AdmissionInput) (modelpolicy.Policy, error) {
++	return policydb.Admit(ctx, s.db, in, s.hasModelPolicy)
++}
+diff --git a/internal/session/sqlite_session_policy_test.go b/internal/session/sqlite_session_policy_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a54809d0e85d948b7d611bc564553d34a7bf2261
+--- /dev/null
++++ b/internal/session/sqlite_session_policy_test.go
+@@ -0,0 +1,95 @@
++package session
++
++import (
++	"context"
++	"path/filepath"
++	"sync"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++)
++
++func TestLockedSessionPolicyPersistsNarrowingAgainstStaleWriters(t *testing.T) {
++	ctx := context.Background()
++	path := filepath.Join(t.TempDir(), "sessions.db")
++	store, err := NewSQLiteStore(Config{Enabled: true, Path: path})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	other, err := NewSQLiteStore(Config{Enabled: true, Path: path})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer other.Close()
++	broad := modelpolicy.Policy{LockSession: true}.With("private", []string{"debug:A", "debug:B"})
++	sess := &Session{ID: NewID(), Agent: "private", CWD: "/fixture", ModelPolicy: broad}
++	if err := store.Create(ctx, sess); err != nil {
++		t.Fatal(err)
++	}
++	stale := *sess
++	narrow := *sess
++	narrow.ModelPolicy = broad.With("private", []string{"debug:A"})
++	if err := store.Update(ctx, &narrow); err != nil {
++		t.Fatal(err)
++	}
++	// Simulate a later widened agent and stale runtime snapshots on independent
++	// SQLite connections. Neither may replace the durable intersection.
++	var wg sync.WaitGroup
++	errs := make(chan error, 8)
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			next := stale
++			writer := store
++			if i%2 == 0 {
++				writer = other
++				next.ModelPolicy = modelpolicy.Policy{}
++			}
++			errs <- writer.Update(ctx, &next)
++		}(i)
++	}
++	wg.Wait()
++	close(errs)
++	for err := range errs {
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	saved, err := store.Get(ctx, sess.ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	resumed := saved.ModelPolicy.Append(broad)
++	if !resumed.LockSession || !resumed.Allows("debug", "A") || resumed.Allows("debug", "B") {
++		t.Fatalf("narrowing lost: %+v", resumed)
++	}
++	if len(saved.ModelPolicy.Rules) != 2 {
++		t.Fatalf("duplicate or lost rules: %+v", saved.ModelPolicy)
++	}
++}
++
++func TestUnlockedSessionPolicyUpdateRemainsReplaceable(t *testing.T) {
++	ctx := context.Background()
++	store, err := NewSQLiteStore(Config{Enabled: true, Path: filepath.Join(t.TempDir(), "sessions.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	sess := &Session{ID: NewID(), ModelPolicy: modelpolicy.Policy{}.With("old", []string{"debug:A"})}
++	if err := store.Create(ctx, sess); err != nil {
++		t.Fatal(err)
++	}
++	sess.ModelPolicy = modelpolicy.Policy{}.With("new", []string{"debug:B"})
++	if err := store.Update(ctx, sess); err != nil {
++		t.Fatal(err)
++	}
++	saved, err := store.Get(ctx, sess.ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if saved.ModelPolicy.LockSession || !saved.ModelPolicy.Allows("debug", "B") || saved.ModelPolicy.Allows("debug", "A") {
++		t.Fatalf("unlocked replacement changed: %+v", saved.ModelPolicy)
++	}
++}
+diff --git a/internal/session/sqlite_sessions.go b/internal/session/sqlite_sessions.go
+index f532245370c621858db13c8e58a9452bc4687b9e..8f651a3a08f20253e7f7738ec20264b05f8a798e 100644
+--- a/internal/session/sqlite_sessions.go
++++ b/internal/session/sqlite_sessions.go
+@@ -10,9 +10,9 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/samsaffron/term-llm/internal/modelpolicy"
+ 	planpkg "github.com/samsaffron/term-llm/internal/plan"
+ 	"github.com/samsaffron/term-llm/internal/runtimeoutput"
++	"github.com/samsaffron/term-llm/internal/session/policydb"
+ )
+ 
+ func (s *SQLiteStore) Create(ctx context.Context, sess *Session) error {
+@@ -101,7 +101,7 @@ func (s *SQLiteStore) Create(ctx context.Context, sess *Session) error {
+ 		if s.hasModelPolicy {
+ 			modelPolicyCol = ", model_policy"
+ 			modelPolicyPlaceholder = ", ?"
+-			modelPolicyArgs = []any{sessionModelPolicyJSON(sess.ModelPolicy)}
++			modelPolicyArgs = []any{policydb.JSON(sess.ModelPolicy)}
+ 		}
+ 		pinOrderCol := ""
+ 		pinOrderPlaceholder := ""
+@@ -342,11 +342,15 @@ func (s *SQLiteStore) Update(ctx context.Context, sess *Session) error {
+ 		args = append(args, shareJSONString(sess.Share))
+ 	}
+ 	if s.hasModelPolicy {
+-		args = append(args, sessionModelPolicyJSON(sess.ModelPolicy))
++		args = append(args, policydb.JSON(sess.ModelPolicy))
+ 	}
+ 	args = append(args, sess.ID)
++	if s.hasModelPolicy {
++		query += ` AND (COALESCE(json_extract(model_policy, '$.lock_session'), 0) = 0 OR (COALESCE(agent, '') = ? AND COALESCE(cwd, '') = ? AND COALESCE(worktree_dir, '') = ? AND COALESCE(project_id, '') = ?) OR (COALESCE(agent, '') = ? AND COALESCE(project_id, '') = '' AND COALESCE(cwd, '') = '' AND COALESCE(worktree_dir, '') = '' AND NOT EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id)))`
++		args = append(args, sess.Agent, sess.CWD, sess.WorktreeDir, sess.ProjectID, sess.Agent)
++	}
+ 
+-	result, err := s.db.ExecContext(ctx, query, args...)
++	result, err := policydb.Update(ctx, s.db, query, args, sess.ID, sess.ModelPolicy, s.hasModelPolicy)
+ 	if err != nil {
+ 		return fmt.Errorf("update session: %w", err)
+ 	}
+@@ -988,16 +992,5 @@ func (s *SQLiteStore) List(ctx context.Context, opts ListOptions) ([]SessionSumm
+ 	return results, rows.Err()
+ }
+ 
+-func sessionModelPolicyJSON(policy modelpolicy.Policy) any {
+-	if !policy.Restricted() {
+-		return nil
+-	}
+-	encoded, err := json.Marshal(policy)
+-	if err != nil {
+-		return nil
+-	}
+-	return string(encoded)
+-}
+-
+ // AddMessage adds a message to a session.
+ // If msg.Sequence < 0, the sequence number is auto-allocated atomically.
+diff --git a/internal/tools/custom_tool.go b/internal/tools/custom_tool.go
+index 2f16ac34cde4449f4db431cded6568d73a29863e..33269c9711e8cb48edd4f08ff233ca25b43fd30c 100644
+--- a/internal/tools/custom_tool.go
++++ b/internal/tools/custom_tool.go
+@@ -140,6 +140,8 @@ func (t *CustomScriptTool) Execute(ctx context.Context, args json.RawMessage) (c
+ 		env = append(env, fmt.Sprintf("%s=%s", k, v))
+ 	}
+ 
++	env = core.CustomToolEnvironment(ctx, env)
++
+ 	stdout := newLimitedBuffer(t.limits.MaxBytes)
+ 	stderr := newLimitedBuffer(t.limits.MaxBytes)
+ 
+diff --git a/internal/tools/private_upload_env_test.go b/internal/tools/private_upload_env_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d323ca955411e032168743218f0cd1f8e928e948
+--- /dev/null
++++ b/internal/tools/private_upload_env_test.go
+@@ -0,0 +1,64 @@
++package tools
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/agents"
++	"github.com/samsaffron/term-llm/internal/llm/core"
++)
++
++func TestCustomScriptTrustedUploadEnvironment(t *testing.T) {
++	t.Setenv("XDG_DATA_HOME", t.TempDir())
++	for _, key := range []string{"TERM_LLM_SESSION_ID", "TERM_LLM_UPLOADS_JSON", "TERM_LLM_PRIVATE_SESSION"} {
++		t.Setenv(key, "inherited-forgery")
++	}
++	root := filepath.Join(os.Getenv("XDG_DATA_HOME"), "term-llm", "uploads")
++	if err := os.MkdirAll(root, 0700); err != nil {
++		t.Fatal(err)
++	}
++	own := filepath.Join(root, "own.bin")
++	if err := os.WriteFile(own, []byte("invented"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	dir := t.TempDir()
++	writeScript(t, dir, "env.sh", "#!/bin/sh\nprintf '%s\\n%s\\n%s' \"$TERM_LLM_SESSION_ID\" \"$TERM_LLM_UPLOADS_JSON\" \"$TERM_LLM_PRIVATE_SESSION\"\n")
++	tool := makeCustomTool(t, dir, agents.CustomToolDef{Name: "context_probe", Script: "env.sh", Call: "json", Env: map[string]string{"TERM_LLM_SESSION_ID": "tool-forgery", "TERM_LLM_UPLOADS_JSON": "tool-forgery", "TERM_LLM_PRIVATE_SESSION": "1"}})
++	ctx := core.ContextWithSessionID(context.Background(), "selected-session")
++	ctx = core.ContextWithUserUploads(ctx, "selected-session", []core.Message{{Role: core.RoleUser, Parts: []core.Part{{Type: core.PartFile, FilePath: own, FileData: &core.ToolFileData{Filename: "own.bin"}}}}})
++	for _, locked := range []bool{false, true} {
++		callCtx := ctx
++		if locked {
++			callCtx = core.ContextWithPrivateSession(callCtx, "selected-session")
++		}
++		output, err := tool.Execute(callCtx, json.RawMessage(`{"session_id":"argument-forgery","path":"/not/an/upload"}`))
++		if err != nil || output.IsError {
++			t.Fatalf("execution: %v %+v", err, output)
++		}
++		text := output.Content
++		if !strings.Contains(text, "selected-session") || !strings.Contains(text, own) || strings.Contains(text, "forgery") {
++			t.Fatalf("unexpected env: %s", text)
++		}
++		lines := strings.Split(strings.TrimSpace(text), "\n")
++		// Tool output is formatted as a shell result, so assert the private marker
++		// in the raw environment helper independently of presentation.
++		_ = lines
++		env := strings.Join(core.CustomToolEnvironment(callCtx, nil), "\n")
++		want := "TERM_LLM_PRIVATE_SESSION="
++		if locked {
++			want += "1"
++		}
++		if !strings.HasSuffix(env, want) {
++			t.Fatalf("private marker: %s", env)
++		}
++	}
++	foreign := core.ContextWithSessionID(ctx, "other-session")
++	env := strings.Join(core.CustomToolEnvironment(foreign, nil), "\n")
++	if !strings.Contains(env, "TERM_LLM_UPLOADS_JSON=[]") {
++		t.Fatal("references crossed sessions")
++	}
++}
