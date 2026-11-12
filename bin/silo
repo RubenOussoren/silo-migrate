@@ -232,7 +232,7 @@ def term_llm_version(entry, runner):
     return tuple(int(part) for part in match.groups()) if match else None
 
 
-def dbhub_check(add, entry, runner, trusted):
+def dbhub_check(add, entry, runner, trusted, private_scope=True):
     """Projects' DBHub servers (db-<project>) must have config.yaml's rule limiting them to
     migration-data, term-llm must enforce it, and migration-data must be an agent the rule can name
     (`trusted`, from the agents check). Only counts are printed: project names can identify customers."""
@@ -248,6 +248,11 @@ def dbhub_check(add, entry, runner, trusted):
         return
     if not ours:
         add("OK", "DBHub", "no project database servers yet")
+        return
+    if not private_scope:
+        add("FAIL", "DBHub", "%d project database servers exist but native private conversation protection is unavailable" % len(ours),
+            "do not use private analysis; arrange the separately approved coordinated generic native update; "
+            "doctor reports only and does not disable existing servers or change configuration")
         return
     try:
         rules = tools.mcp_rules_of((config / "config.yaml").read_text())
@@ -308,11 +313,19 @@ def doctor_checks(entry, runner=run):
         capabilities = json.loads(native.stdout) if native.returncode == 0 else {}
     except (ValueError, TypeError):
         capabilities = {}
+    private_scope = (isinstance(capabilities, dict)
+                     and all(type(capabilities.get(key)) is int and capabilities[key] == 1
+                             for key in ("session_scope_lock", "custom_tool_session_context")))
+    add("OK" if private_scope else "FAIL", "private data conversations",
+        "durable conversation policy and trusted custom-tool context supported" if private_scope
+        else "private tools and project DBHub must not be enabled on this native build",
+        None if private_scope else "arrange a separately approved reviewed native TERM_LLM_PACKAGE handoff; "
+        "this needs generic conversation protection, not the old attachment package; see docs/intake-preparation.md")
     private_uploads = (isinstance(capabilities, dict) and capabilities.get("private_upload_context") == 1
                        and capabilities.get("session_scope_lock") == 1)
     add("OK" if private_uploads else "WARN", "private chat attachments",
-        "native upload context and locked sessions supported" if private_uploads else "unavailable: use normal intake, not private chat uploads",
-        None if private_uploads else "install the reviewed paired TERM_LLM_PACKAGE, then update; see docs/chat-attachments.md")
+        "native upload context and locked sessions supported" if private_uploads else "deferred: use normal intake only after private data conversations pass",
+        None if private_uploads else "chat drag/drop is outside this release; do not install the old paired TERM_LLM_PACKAGE to enable it")
 
     expected = shipped_agents(current)
     listing = runner(as_account([term_llm(), "agents"], entry), timeout=30).stdout or ""
@@ -369,7 +382,7 @@ def doctor_checks(entry, runner=run):
         add("OK" if reserved else "WARN", "widget folder", "reserved for " + entry.pw_name + " at boot" if reserved else str(WIDGET_RUNTIME) + " not reserved",
             None if reserved else "silo update")
 
-    dbhub_check(add, entry, runner, trusted)
+    dbhub_check(add, entry, runner, trusted, private_scope=private_scope)
 
     chatgpt = (home / ".config/term-llm/chatgpt_oauth.json").is_file()
     add("OK" if chatgpt else "FAIL", "ChatGPT sign-in", "credential present" if chatgpt else "not signed in",

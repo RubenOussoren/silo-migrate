@@ -22,6 +22,7 @@ require_relative "../review_runtime"
 require_relative "prebuilt_stack"
 require_relative "standard_oracle"
 require_relative "discourse_archive"
+require_relative "standard_run_inputs"
 require_relative "standard_convert_run"
 require_relative "standard_review_run"
 require_relative "standard_merge_run"
@@ -37,6 +38,7 @@ module SiloMigrate
     # and a fixed recovery instruction; nothing retries or repairs itself.
     class StandardWorkflowService
       include DiscourseArchive
+      include StandardRunInputs
       include StandardConvertRun
       include StandardReviewRun
       include StandardMergeRun
@@ -48,6 +50,7 @@ module SiloMigrate
         "launch_snapshot_from_preimport_baseline" => "supported_synthetic",
         "standard_convert" => "supported_real_data_convert_and_reconcile_only",
         "standard_review" => "supported_real_data_local_review_import_without_uploads",
+        "standard_master_lists" => "supported_committed_exporter_on_disposable_source_copy",
         "other_existing_converters" => "not_implemented_in_workbench",
         "new_converter_development" => "not_implemented_in_workbench",
         "delta_import" => "not_implemented_requires_base_lineage",
@@ -93,6 +96,10 @@ module SiloMigrate
         "STANDARD_MERGE_SETTINGS_INVALID" => "Register a valid merge settings mapping and re-plan.",
         "STANDARD_MERGE_SCHEMA" => "Inspect private schema evidence, correct the layer or runtime and re-plan.",
         "STANDARD_MERGE_FAILED" => "Inspect private merge evidence, reset the dirty run and re-plan.",
+        "STANDARD_RUN_INPUTS_INVALID" => "The run-input manifest does not match registered inputs, the source or the converter's settings contract. Correct and register it, then propose a new plan.",
+        "STANDARD_RUN_INPUTS_MUTATED" => "The converter changed, removed or added run-input files outside the plan's declared generated files. Inspect private evidence, reset this run, then re-plan.",
+        "STANDARD_PREPARATION_INVALID" => "The preparation review metadata is malformed, cites a missing reference or claims code/input/setting this plan does not bind. Correct it, then propose a new plan.",
+        "STANDARD_PREPARATION_UNRESOLVED" => "A material question has no resolution. Resolve it, exclude it explicitly or narrow the scope, then propose a new plan.",
         "STANDARD_INTERNAL" => "An unexpected failure occurred. Inspect private evidence, reset this run, then re-plan."
       }.freeze
 
@@ -535,7 +542,7 @@ module SiloMigrate
           # Persist "removed" only after the sweep, so a failed reset stays dirty and
           # keeps blocking new runs. Retrying is safe: absent resources are skipped.
           sweep_run_resources(run_id)
-          convert_leftovers!(run_id) if convert_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+          convert_leftovers!(run_id) if source_db_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
           # The review admin's sign-in is useless once its site is gone (also a setup file a crash left).
           if review_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {})) || merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
             %w[admin-password review-setup.env].each { |name| FileUtils.rm_f(@store.run_dir(run_id, "private", name)) }
@@ -584,19 +591,33 @@ module SiloMigrate
         }
       end
 
-      def show_plan(plan_id)
+      # detail: the engineer's (or the trusted private analyst's own proposal) view, with the
+      # preparation's analyst text and run inputs' logical names/lineage. The default is the
+      # clean projection for agent/operator surfaces: contract, counts and digests only.
+      def show_plan(plan_id, detail: false)
         state = @store.load
         plan = state.fetch("plans")[plan_id]
         raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless plan
 
-        public_plan(plan, state)
+        public_plan(plan, state, detail: detail)
       end
 
-      def show_run(run_id)
+      # detail: the engineer's view adds the private run-input and master-list evidence
+      # (names, digests, violations); the default stays counts only.
+      def show_run(run_id, detail: false)
         run = @store.load.fetch("runs")[run_id]
         raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
 
-        public_run(run, held: @store.op_lock_held?)
+        result = public_run(run, held: @store.op_lock_held?)
+        return result unless detail
+
+        extra = {}
+        path = @store.run_dir(run_id, "evidence", "run-inputs.json")
+        extra[:run_inputs_evidence] = JSON.parse(File.read(path)) if File.file?(path) && !File.symlink?(path)
+        extra[:master_lists_files] = run.dig("artifacts", "master_lists", "files") if run.dig("artifacts", "master_lists")
+        result.merge(extra)
+      rescue JSON::ParserError
+        result
       end
 
       # Engineer-only private view: where the evidence is on disk, not its content.
@@ -736,8 +757,10 @@ module SiloMigrate
       def stale_reason(plan, state)
         role_reason = file_role_stale_reason(plan)
         return role_reason if role_reason
+        reference_reason = references_stale_reason(plan)
+        return reference_reason if reference_reason
         return merge_stale_reason(plan, state) if merge_plan?(plan)
-        return convert_stale_reason(plan, state) if convert_plan?(plan)
+        return convert_stale_reason(plan, state) if source_db_plan?(plan)
         return review_stale_reason(plan, state) if review_plan?(plan)
 
         body = plan.fetch("body")
@@ -811,7 +834,7 @@ module SiloMigrate
       # Docker enforces each limit; the host lock stops a second workspace starting
       # while this one is between containers.
       def operation_admission!(plan, state)
-        return convert_admission!(plan.fetch("body")) if convert_plan?(plan)
+        return convert_admission!(plan.fetch("body")) if source_db_plan?(plan)
         return review_capacity!(plan.dig("body", "limits")) if review_plan?(plan) || merge_plan?(plan)
 
         admission!(state)
@@ -999,7 +1022,7 @@ module SiloMigrate
         stale = stale_reason(plan, @store.load)
         raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
         return merge_preflight(run_id, plan) if merge_plan?(plan)
-        return convert_preflight(run_id, plan) if convert_plan?(plan)
+        return convert_preflight(run_id, plan) if source_db_plan?(plan)
         return review_preflight(run_id, plan) if review_plan?(plan)
 
         named = @store.named_state
@@ -1829,7 +1852,7 @@ module SiloMigrate
       # Fixed fields only. Logs, private evidence, paths, passwords and raw failure
       # detail never appear here; failures are a fixed code plus fixed recovery.
 
-      def public_plan(plan, state, summary: false)
+      def public_plan(plan, state, summary: false, detail: false)
         body = plan.fetch("body")
         result = { plan_id: plan["id"], digest: plan["digest"], status: plan_status(plan, state), run_id: plan["run_id"], created_at: plan["created_at"], approved_by: plan.dig("approval", "reviewer"), delivery: body["delivery"],
                    file_role_lineage_current: file_role_lineage_current?(plan) }
@@ -1848,7 +1871,9 @@ module SiloMigrate
           app_revision: body["app_revision"], converter_revision: body["converter_revision"], code_identity: body["code_identity"],
           instances: (body["instances"] || {}).transform_values { |target| target.slice("name", "port", "hostname") },
           outputs: body["outputs"], mutations: body["mutations"], not_included: body["not_included"], version: 1
-        )
+        ).merge(body.key?("run_inputs") ? { run_inputs: run_inputs_projection(body["run_inputs"], detail: detail) } : {})
+          .merge(body.key?("master_lists") ? { master_lists: body["master_lists"] } : {})
+          .merge(body.key?("preparation") ? { preparation: preparation_projection(body["preparation"], detail: detail) } : {})
       end
 
       def plan_status(plan, state)
@@ -1867,7 +1892,7 @@ module SiloMigrate
           # Never the per-check reconciliation numbers: they are derived from customer data.
           assertions: run["assertions"], results: run["results"].slice("input_count", "input_bytes", "baseline_mode", "imported_users", "imported_topics", "imported_posts", "imported_attachments",
                                                                        "merge", "conversion_summary", "reconciliation_checks", "reconciliation_matched", "reconciliation_differs", "reconciliation_errors",
-                                                                       "review_url", "import_issues", "base_site", "base_site_ahead", "base_site_unknown_migrations", "site_schema_version", "base_discourse_version", "base_schema_version", "discourse_version", "schema_version", "backup_discourse_version", "backup_schema_version", "review_runtime"),
+                                                                       "review_url", "import_issues", "run_inputs", "master_lists", "base_site", "base_site_ahead", "base_site_unknown_migrations", "site_schema_version", "base_discourse_version", "base_schema_version", "discourse_version", "schema_version", "backup_discourse_version", "backup_schema_version", "review_runtime"),
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
         if status == "not_started"
@@ -1890,7 +1915,7 @@ module SiloMigrate
       end
 
       def public_artifacts(artifacts)
-        %w[intermediate uploads_db baseline final backup].each_with_object({}) do |key, result|
+        %w[intermediate uploads_db baseline final backup master_lists].each_with_object({}) do |key, result|
           next unless artifacts[key]
 
           result[key] = artifacts[key].slice("filename", "sha256", "bytes", "label")

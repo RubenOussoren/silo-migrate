@@ -12,9 +12,10 @@ import re
 import stat
 import struct
 import subprocess
+import tempfile
 
-VERSION = "0.9.99"
-CAPABILITIES = {"private_upload_context": 1, "session_scope_lock": 1}
+VERSION = "0.9.103"
+CAPABILITIES = {"custom_tool_session_context": 1, "session_scope_lock": 1}
 MAX_BINARY = 256 * 1024 * 1024
 _CUSTODIAN = contextvars.ContextVar("private_node_custodian", default=None)
 
@@ -130,7 +131,7 @@ def source(root):
         if (value.get("version") != VERSION or not re.fullmatch(r"[0-9a-f]{40}", value.get("base_commit", "")) or
                 not re.fullmatch(r"[0-9a-f]{64}", value.get("patch_sha256", ""))):
             refuse()
-        patch = read_regular(Path(root) / "integrations/term-llm/patches/private-attachments.patch", 4 * 1024 * 1024)
+        patch = read_regular(Path(root) / "integrations/term-llm/patches/conversation-scope.patch", 4 * 1024 * 1024)
         if hashlib.sha256(patch).hexdigest() != value["patch_sha256"]:
             refuse()
         return value
@@ -198,15 +199,21 @@ def probe(data):
         os.fchmod(fd, 0o500)
         fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
         def execute(args, maximum=8192):
-            result = subprocess.run(["/proc/self/fd/" + str(fd), *args], pass_fds=(fd,), stdin=subprocess.DEVNULL,
-                                    capture_output=True, timeout=10, env={"PATH": "/usr/local/bin:/usr/bin:/bin"})
+            # Fixed introspection commands still get a disposable HOME/XDG: a
+            # future native pre-run hook must never read the operator's config.
+            with tempfile.TemporaryDirectory(prefix="silo-native-probe-") as home:
+                result = subprocess.run(["/proc/self/fd/" + str(fd), *args], pass_fds=(fd,), stdin=subprocess.DEVNULL,
+                                        capture_output=True, timeout=10,
+                                        env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": home,
+                                             "XDG_CONFIG_HOME": home + "/config", "XDG_DATA_HOME": home + "/data",
+                                             "XDG_CACHE_HOME": home + "/cache"})
             if result.returncode or len(result.stdout) > maximum:
                 refuse()
             return result.stdout.decode("utf-8")
         value = json.loads(execute(["capabilities", "--json"]))
-        if any(value.get(key) != required for key, required in CAPABILITIES.items()):
+        if any(type(value.get(key)) is not int or value[key] != required for key, required in CAPABILITIES.items()):
             refuse()
-        if not re.search(r"\bversion " + re.escape(VERSION) + r"\b", execute(["--version"])):
+        if not re.search(r"\bversion v?" + re.escape(VERSION) + r"\b", execute(["--version"])):
             refuse()
         for args, flags in ((["service", "install", "--help"], ("--binary", "--no-start", "--dry-run")),
                             (["serve", "--help"], ("--host", "--port", "--auth", "--approval", "--agent", "--projects", "--widgets-dir", "--extensions-dir", "--extensions"))):

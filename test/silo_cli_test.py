@@ -85,7 +85,7 @@ class SiloTest(unittest.TestCase):
         listing = 'Available agents (2):\n\n  [user] /x/\n    converter-developer - a\n    migration-analyst - b\n'
         return {'service status': (0, 'ActiveState=active\n'), ' agents': (0, listing), 'sh op://Everybody/Snorlax LLM/credential --account discourse.1password.com': (0, 'secret'),
                 'auth status --json': (0, json.dumps({'loggedIn': True})), 'docker info': (0, '29.9.3\n'),
-                'capabilities --json': (0, json.dumps({'private_upload_context': 1, 'session_scope_lock': 1}))}
+                'capabilities --json': (0, json.dumps({'private_upload_context': 1, 'session_scope_lock': 1, 'custom_tool_session_context': 1}))}
 
     def test_doctor_all_good(self):
         token = self.home / '.config/silo-migrate/github/token-discourse-org'
@@ -109,6 +109,23 @@ class SiloTest(unittest.TestCase):
                 self.assertEqual('WARN', check['status'])
                 self.assertIn('TERM_LLM_PACKAGE', check['fix'])
                 self.assertIn('normal intake', check['detail'])
+
+    def test_doctor_generic_private_scope_is_separate_from_deferred_chat_uploads(self):
+        generic = {'session_scope_lock': 1, 'custom_tool_session_context': 1}
+        checks = self.statuses(dict(self.healthy(), **{'capabilities --json': (0, json.dumps(generic))}))
+        self.assertEqual('OK', checks['private data conversations']['status'])
+        self.assertEqual('WARN', checks['private chat attachments']['status'])
+        self.assertIn('do not install the old', checks['private chat attachments']['fix'])
+        config = self.home / '.config/term-llm/mcp.json'
+        config.write_text(json.dumps({'servers': {'db-private-canary': {
+            'command': '/srv/silo-migrate/bin/silo-migrate-control', 'args': ['dbhub', 'private-canary']}}}))
+        before = config.read_bytes()
+        checks = self.statuses(dict(self.healthy(), **{'capabilities --json': (0, '{"session_scope_lock":1}')}))
+        self.assertEqual('FAIL', checks['private data conversations']['status'])
+        self.assertEqual('FAIL', checks['DBHub']['status'])
+        self.assertIn('1 project database servers', checks['DBHub']['detail'])
+        self.assertNotIn('private-canary', json.dumps(checks))
+        self.assertEqual(before, config.read_bytes())
 
     def test_doctor_checks_dbhub_servers_are_limited_without_naming_projects(self):
         self.assertEqual('OK', self.statuses(self.healthy())['DBHub']['status'])

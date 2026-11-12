@@ -147,6 +147,7 @@ const ERRORS = {
   STANDARD_DOCKER_UNAVAILABLE: "Docker didn't answer. Try again, or ask for help (silo doctor).",
   STANDARD_CHATS_UNREADABLE: "term-llm's chat list couldn't be read. Try again in a moment.",
   STANDARD_STATE_INVALID: "This project's workbench state can't be read, so its review sites can't be found. Ask for help.",
+  STANDARD_PLAN_NOT_READY: 'This plan is not ready: a material question, required code or an exact prepared input is unresolved. Nothing was approved or started.',
   STANDARD_REFERENCE_INVALID: "That isn't on the server any more. The page has been refreshed.",
 };
 export const explain = (error) => ERRORS[String(error.message).split(':')[0]] || `That didn't work: ${error.message}`;

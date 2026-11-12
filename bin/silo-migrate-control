@@ -15,7 +15,7 @@ CONTROL_REF = "ruby@sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b83
 # Same qualified control payload as runtime/profiles/discourse-2026.11.0-latest-3158c750.json.
 DEFAULT_PROFILE = "discourse-2026.11.0-latest-3158c750"
 KEYS = {"SILO_MIGRATE_BASE_PATH", "SILO_CONTROL_GEMS", "SILO_CONTROL_SITE_CACHE",
-        "SILO_RUNTIME_PROFILES_DIR", "SILO_CONTROL_IMAGE_REF"}
+        "SILO_RUNTIME_PROFILES_DIR", "SILO_CONTROL_IMAGE_REF", "SILO_PROTECTED_SESSIONS"}
 
 
 def refuse(code):
@@ -65,7 +65,8 @@ def settings():
             if not line or line.startswith("#"):
                 continue
             key, separator, value = line.partition("=")
-            if not separator or key not in KEYS or key in seen or not value or "\x00" in value:
+            if (not separator or key not in KEYS or key in seen or not value or "\x00" in value
+                    or (key == "SILO_PROTECTED_SESSIONS" and value not in ("0", "1"))):
                 refuse("STANDARD_CONTROL_CONFIG_INVALID")
             seen.add(key)
             values[key] = value

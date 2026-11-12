@@ -1,0 +1,3200 @@
+diff --git a/PACKAGES.md b/PACKAGES.md
+index 28ef9330..f8c248fd 100644
+--- a/PACKAGES.md
++++ b/PACKAGES.md
+@@ -59,7 +59,7 @@ One line per root-module package, generated from package doc comments by `make d
+ - `internal/app/upgrade` — implements `term-llm upgrade`, installing a release through internal/update.
+ - `internal/app/uploads` — validates and reads first-party web attachments and resizes images for models.
+ - `internal/app/usage` — implements `term-llm usage`: local token reports plus provider billing and limit checks.
+-- `internal/app/version` — implements `term-llm version` over linker-injected build metadata.
++- `internal/app/version` — implements `term-llm version` and `term-llm capabilities` over build metadata.
+ - `internal/appdata` — resolves term-llm's XDG data directory.
+ - `internal/atomicfile` — replaces files atomically and flushes the containing directory where the platform supports it.
+ - `internal/audio` — implements the text-to-speech providers behind `term-llm audio`.
+@@ -180,6 +180,7 @@ One line per root-module package, generated from package doc comments by `make d
+ - `internal/session` — owns durable sessions, messages, steering persistence and SQLite storage.
+ - `internal/session/authordb` — owns the additive display-attribution schema and batched directory queries.
+ - `internal/session/notificationdb` — implements durable logical-turn ownership and fenced notification delivery on the session SQLite transaction.
++- `internal/session/scopedb` — owns durable conversation scope locks: the immutable-identity trigger and atomic admission of locked session policies.
+ - `internal/session/transcript` — adapts session writes to optional revision capabilities and identifies response-owned output.
+ - `internal/session/transcriptprefix` — compares persisted transcript prefixes for replacement and compaction.
+ - `internal/sessiontitle` — generates and validates short and long LLM session titles.
+diff --git a/cmd/capabilities.go b/cmd/capabilities.go
+new file mode 100644
+index 00000000..52c41e63
+--- /dev/null
++++ b/cmd/capabilities.go
+@@ -0,0 +1,7 @@
++package cmd
++
++import versionapp "github.com/samsaffron/term-llm/internal/app/version"
++
++func init() {
++	rootCmd.AddCommand(versionapp.NewCapabilitiesCommand())
++}
+diff --git a/cmd/loop.go b/cmd/loop.go
+index 9348422b..31172bf9 100644
+--- a/cmd/loop.go
++++ b/cmd/loop.go
+@@ -270,6 +270,9 @@ func runLoop(cmd *cobra.Command, args []string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if err := appruntime.RefuseLockedDirectRun(nil, agent, "loop"); err != nil {
++		return err
++	}
+ 
+ 	// Apply provider overrides before resolving the prompt so it is built for
+ 	// the provider/model the loop will actually run.
+diff --git a/docs-site/content/guides/agents.md b/docs-site/content/guides/agents.md
+index 9c58cdcf..8c0f7d47 100644
+--- a/docs-site/content/guides/agents.md
++++ b/docs-site/content/guides/agents.md
+@@ -226,6 +226,33 @@ Automatic auxiliary calls for a restricted session — titles, interrupt classif
+ 
+ The guardian reviewer, memory batch commands, `sessions autotitle`, Telegram interrupt classification, and tools that call other services (`view_image` routing, `image_generate`, search) are configured by the operator and are not governed by the agent-level `allowed_models`. Provider-level restrictions still apply to their calls through text inference `providers`. The list governs term-llm's own model launches; it does not stop an agent from reaching another model through `shell` or HTTP. Restrict those with tool permissions.
+ 
++### Locking a conversation
++
++`lock_session: true` opts an agent's conversations into a durable scope. It is off by default and requires an explicit `allowed_models` list:
++
++```yaml
++name: private
++allowed_models: [debug:allowed]
++lock_session: true
++```
++
++When the serve runner (web UI, Responses API, jobs and child agents) first runs a conversation with this agent, it stores the complete effective model policy with the session before any history reaches a provider. That policy includes inherited rules, the agent's own rule, and that rule narrowed by the provider `allowed_models` in force at that moment. From then on:
++
++- The rules only narrow. Widening the agent definition or provider configuration later does not widen a locked conversation, and removing `lock_session` from the definition does not unlock it.
++- The conversation's agent cannot change, and its workspace (directory, worktree and assigned project) cannot change once it has messages. This applies after restarts, on resume, on branches (which keep the lock) and to any later writer: the session database rejects the change itself.
++- The runtime's current model, any requested model and any continuation checkpoint are checked against the merged stored policy before anything reaches a provider. The first admission binds the runtime's workspace to a conversation that has none, and a runtime bound to a different workspace is refused once the conversation has history.
++- In-place model and effort switches within the policy work. Operations that would send history outside per-turn admission are refused instead: side questions, branch path notes (summarized branch context), cross-model swaps (handover to another provider), manual compaction, switching a voice session to the conversation, `hub_delegate`, and MCP sampling (MCP servers cannot request model calls in a locked run, including through a configured sampling model override). Automatic compaction runs on the admitted model, and automatic titles and interrupt classification use only a model the stored policy allows. Provider debug logging is disabled for locked runs.
++- Child agents of a locked conversation are locked too. Their custom tools receive the child's own session ID, not the parent's.
++- `session_directory` (used by other agents) omits locked conversations and their transcript snippets.
++- Web search follows the locked agent's own `search` setting. A request or UI search toggle, or the host's `--search` default, cannot enable it, and without `search: true` the built-in `web_search` and `read_url` tools are neither offered nor callable in that run.
++- Locked conversations are skipped by memory mining, insights, memory freshening and `sessions autotitle`.
++- An existing unlocked conversation with history cannot be retrofitted; start a new conversation instead. A runtime that was not admitted as locked cannot serve a locked conversation.
++- Surfaces that do not use the serve runner's per-turn admission refuse locked agents and sessions instead of weakening the boundary: direct `ask`, `loop`, the interactive `chat` TUI (including `/resume` into a locked conversation and handover) and progressive job runs. Runs without durable session storage, such as `exec` without a stored session, are refused.
++
++Custom script tools in a locked run receive trusted [session context](/reference/built-in-tools/#custom-tools). Integrations can check for this support with `term-llm capabilities --json`, which prints `{"custom_tool_session_context":1,"session_scope_lock":1}`. Builds without the command or without a key do not support it.
++
++The lock governs term-llm's own model launches and conversation identity. It does not stop a tool from sending data elsewhere through `shell`, HTTP or an MCP server. Restrict those with tool permissions. Operator-configured services such as search, `view_image` routing and `image_generate` still follow their own configuration.
++
+ ## Time grounding
+ 
+ Time grounding is disabled unless an agent explicitly opts in:
+diff --git a/docs-site/content/reference/built-in-tools.md b/docs-site/content/reference/built-in-tools.md
+index 7a562694..1235721e 100644
+--- a/docs-site/content/reference/built-in-tools.md
++++ b/docs-site/content/reference/built-in-tools.md
+@@ -252,7 +252,11 @@ Custom tools run from the session working directory when the session is bound to
+ | `timeout_seconds` | | Execution timeout in seconds (default 30, max 3600; an earlier parent deadline or cancellation still applies) |
+ | `env` | | Extra environment variables to set when running the script |
+ 
+-Scripts run with `TERM_LLM_AGENT_DIR` and `TERM_LLM_TOOL_NAME` set. Symlinks are resolved and containment-checked. Scripts cannot escape the agent directory. No approval prompt is shown; scripts in the agent directory are implicitly trusted.
++Scripts run with `TERM_LLM_AGENT_DIR` and `TERM_LLM_TOOL_NAME` set.
++
++`TERM_LLM_SESSION_ID`, `TERM_LLM_PRIVATE_SESSION` and `TERM_LLM_UPLOADS_JSON` are reserved for host-provided session context. They are always removed from the inherited environment, and an agent whose custom tool `env` sets one of them (in any letter case) fails validation. Only for a run the host admitted as a [locked conversation](/guides/agents/#locking-a-conversation) are `TERM_LLM_SESSION_ID` (the host's session ID) and `TERM_LLM_PRIVATE_SESSION=1` set; tool arguments from the model cannot set them. `TERM_LLM_UPLOADS_JSON` is never set. A script that needs session context should require `TERM_LLM_PRIVATE_SESSION=1` together with a non-empty session ID and refuse otherwise. `term-llm capabilities --json` reports `custom_tool_session_context` when this contract is available.
++
++Symlinks are resolved and containment-checked. Scripts cannot escape the agent directory. No approval prompt is shown; scripts in the agent directory are implicitly trusted.
+ 
+ ### Tool Permissions
+ 
+diff --git a/docs-site/content/reference/cli.md b/docs-site/content/reference/cli.md
+index 9595d996..b89280af 100644
+--- a/docs-site/content/reference/cli.md
++++ b/docs-site/content/reference/cli.md
+@@ -221,6 +221,14 @@ Measure client-observed LLM streaming and input-processing performance
+ | `--timeout` | duration | Hard timeout per request |
+ | `--warmup` | int | Warmup runs per scenario (-1 uses the mode profile) |
+ 
++### `term-llm capabilities`
++
++Print native interface capability versions as JSON
++
++| Flag | Type | Description |
++|---|---|---|
++| `--json` | bool | Print machine-readable JSON (the only format) |
++
+ ### `term-llm chat`
+ 
+ Start an interactive chat session
+diff --git a/internal/agents/agent.go b/internal/agents/agent.go
+index 586041a8..f84fd809 100644
+--- a/internal/agents/agent.go
++++ b/internal/agents/agent.go
+@@ -54,6 +54,8 @@ type Agent struct {
+ 	Model    string `yaml:"model,omitempty"`
+ 	// AllowedModels restricts this agent to provider:model or provider:* entries when set.
+ 	AllowedModels []string `yaml:"allowed_models,omitempty"`
++	// LockSession opts conversations into a durable, fixed policy and identity.
++	LockSession bool `yaml:"lock_session,omitempty"`
+ 
+ 	// Tool configuration
+ 	Tools ToolsConfig `yaml:"tools,omitempty"`
+@@ -445,6 +447,9 @@ func (a *Agent) Validate() error {
+ 	if a.Name == "" {
+ 		return fmt.Errorf("agent name is required")
+ 	}
++	if a.LockSession && len(a.AllowedModels) == 0 {
++		return fmt.Errorf("lock_session requires an explicit allowed_models list")
++	}
+ 	for _, entry := range a.AllowedModels {
+ 		if !validAllowedModelEntry(entry) {
+ 			return fmt.Errorf("invalid allowed_models entry %q: expected provider:model or provider:*", entry)
+@@ -666,6 +671,11 @@ func validateCustomTools(defs []CustomToolDef) error {
+ 		if filepath.IsAbs(def.Script) {
+ 			return fmt.Errorf("tools.custom %q: script must be a relative path (got %q)", def.Name, def.Script)
+ 		}
++		for key := range def.Env {
++			if IsReservedCustomToolEnv(key) {
++				return fmt.Errorf("tools.custom %q: env %q is reserved for host-provided session context", def.Name, key)
++			}
++		}
+ 		// Input schema, if provided, must have type: object at root
+ 		if def.Input != nil {
+ 			t, ok := def.Input["type"]
+diff --git a/internal/agents/session_context.go b/internal/agents/session_context.go
+new file mode 100644
+index 00000000..a986844a
+--- /dev/null
++++ b/internal/agents/session_context.go
+@@ -0,0 +1,28 @@
++package agents
++
++import "strings"
++
++// Host-reserved custom tool environment. Only the host sets these, from the
++// admitted run context; inherited process values and per-tool env never pass.
++const (
++	// EnvSessionID carries the host session ID of an admitted locked session.
++	EnvSessionID = "TERM_LLM_SESSION_ID"
++	// EnvPrivateSession is "1" only for an admitted locked session.
++	EnvPrivateSession = "TERM_LLM_PRIVATE_SESSION"
++	// EnvUploadsJSON is reserved and never set by this host.
++	EnvUploadsJSON = "TERM_LLM_UPLOADS_JSON"
++)
++
++var reservedCustomToolEnv = []string{EnvSessionID, EnvPrivateSession, EnvUploadsJSON}
++
++// IsReservedCustomToolEnv reports whether name is host-reserved session
++// context. Matching ignores case so platforms with case-insensitive
++// environments cannot be used to smuggle a forged value.
++func IsReservedCustomToolEnv(name string) bool {
++	for _, reserved := range reservedCustomToolEnv {
++		if strings.EqualFold(strings.TrimSpace(name), reserved) {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/internal/agents/session_context_test.go b/internal/agents/session_context_test.go
+new file mode 100644
+index 00000000..9794edf8
+--- /dev/null
++++ b/internal/agents/session_context_test.go
+@@ -0,0 +1,34 @@
++package agents
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestLockSessionRequiresAllowedModels(t *testing.T) {
++	a := &Agent{Name: "private", LockSession: true}
++	if err := a.Validate(); err == nil || !strings.Contains(err.Error(), "lock_session") {
++		t.Fatalf("Validate() = %v, want lock_session error", err)
++	}
++	a.AllowedModels = []string{"debug:allowed"}
++	if err := a.Validate(); err != nil {
++		t.Fatalf("Validate() = %v", err)
++	}
++}
++
++func TestCustomToolEnvRejectsReservedSessionContext(t *testing.T) {
++	for _, key := range []string{EnvSessionID, EnvPrivateSession, EnvUploadsJSON, "term_llm_private_session"} {
++		a := &Agent{Name: "tools", Tools: ToolsConfig{Custom: []CustomToolDef{{
++			Name: "lookup", Description: "d", Script: "s.sh", Env: map[string]string{key: "forged"},
++		}}}}
++		if err := a.Validate(); err == nil || !strings.Contains(err.Error(), "reserved") {
++			t.Fatalf("%s: Validate() = %v, want reserved error", key, err)
++		}
++	}
++	a := &Agent{Name: "tools", Tools: ToolsConfig{Custom: []CustomToolDef{{
++		Name: "lookup", Description: "d", Script: "s.sh", Env: map[string]string{"TERM_LLM_OTHER": "ok"},
++	}}}}
++	if err := a.Validate(); err != nil {
++		t.Fatalf("ordinary env rejected: %v", err)
++	}
++}
+diff --git a/internal/app/ask/run.go b/internal/app/ask/run.go
+index d35dfa0c..c98d8875 100644
+--- a/internal/app/ask/run.go
++++ b/internal/app/ask/run.go
+@@ -105,6 +105,9 @@ func Run(ctx context.Context, args []string, opts Options, deps Dependencies) er
+ 	if err != nil {
+ 		return err
+ 	}
++	if err := appruntime.RefuseLockedDirectRun(nil, agent, "ask"); err != nil {
++		return err
++	}
+ 
+ 	bootstrap.InitThemeFromConfig(cfg)
+ 
+@@ -206,6 +209,9 @@ func Run(ctx context.Context, args []string, opts Options, deps Dependencies) er
+ 		// The model was selected above; a resumed session only adds its persisted
+ 		// inherited rules and the rule of the agent it was created for.
+ 		askPolicy = appruntime.ModelPolicyForSession(sess, agent)
++		if err := appruntime.RefuseLockedDirectRun(sess, agent, "ask"); err != nil {
++			return err
++		}
+ 		agentName := ""
+ 		if agent != nil {
+ 			agentName = agent.Name
+diff --git a/internal/app/chat/scope_lock_test.go b/internal/app/chat/scope_lock_test.go
+new file mode 100644
+index 00000000..e901557c
+--- /dev/null
++++ b/internal/app/chat/scope_lock_test.go
+@@ -0,0 +1,65 @@
++package chat
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/app/runtime/bootstrap"
++	appserve "github.com/samsaffron/term-llm/internal/app/serve"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
++)
++
++// In-TUI /resume, /fork, /thread and /tree switches and quit-and-relaunch
++// resumes all build their runtime here; a locked target is refused before any
++// engine or provider exists.
++func TestChatRuntimeRefusesLockedSessionResume(t *testing.T) {
++	t.Setenv("HOME", t.TempDir())
++	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
++	t.Setenv("XDG_DATA_HOME", t.TempDir())
++	t.Chdir(t.TempDir())
++	cfgDir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "term-llm")
++	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte("default_provider: debug\nproviders:\n  debug:\n    model: fast\nsessions:\n  enabled: true\nskills:\n  enabled: false\nchat:\n  terminal_title: off\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	dbPath := filepath.Join(t.TempDir(), "sessions.db")
++	store, err := session.NewStore(session.Config{Enabled: true, Path: dbPath})
++	if err != nil {
++		t.Fatal(err)
++	}
++	locked := &session.Session{ID: session.NewID(), Provider: "debug:fast", ProviderKey: "debug", Model: "fast", CWD: t.TempDir(), Mode: session.ModeChat,
++		ModelPolicy: modelpolicy.Policy{LockSession: true}.With("private", []string{"debug:fast"})}
++	if err := store.Create(context.Background(), locked); err != nil {
++		t.Fatal(err)
++	}
++	if got, err := store.Get(context.Background(), locked.ID); err != nil || !got.ModelPolicy.LockSession {
++		t.Fatalf("fixture lock not persisted: %+v, %v", got, err)
++	}
++	if err := store.Close(); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(appserve.SwapProcessSessionInputs(appserve.NewSessionInputCoordinator()))
++	r := testInvocation()
++	r.deps.SessionStore.DBPath = dbPath
++	r.deps.MemoryPaths.DBPath = filepath.Join(t.TempDir(), "memory.db")
++	r.deps.LoadConfig = bootstrap.LoadConfigWithSetup
++	r.deps.CreateDebugLogger = bootstrap.CreateDebugLogger
++	r.deps.StdoutIsTerminal = func() bool { return false }
++	// The same launch the in-process session switcher builds.
++	rt, err := r.buildChatSessionRuntime(context.Background(), chatSessionLaunch{
++		resumeRequested: true, resumeID: locked.ID, relaunchHandoff: &chatRelaunchHandoff{branchPrefill: "draft"},
++	}, nil)
++	if rt != nil {
++		rt.cleanupResources()
++	}
++	if !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("locked resume = %v, want scope refusal", err)
++	}
++}
+diff --git a/internal/app/chat/session.go b/internal/app/chat/session.go
+index ba95b29e..83c7996c 100644
+--- a/internal/app/chat/session.go
++++ b/internal/app/chat/session.go
+@@ -134,6 +134,9 @@ func (r *chatInvocation) buildChatSessionRuntime(ctx context.Context, launch cha
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if err := runtime.RefuseLockedDirectRun(sess, agent, "interactive chat"); err != nil {
++		return nil, err
++	}
+ 	var preparedMCP *mcpstart.PreparedSelection
+ 	if r.opts.Changed.MCP {
+ 		preparedMCP, err = mcpstart.PrepareSelection(agents.PolicyIdentity(agent), r.opts.MCP, true, warnings, r.deps.LoadMCPConfig)
+@@ -584,7 +587,16 @@ func (r *chatInvocation) buildChatSessionRuntime(ctx context.Context, launch cha
+ 	model.PersistApprovalMode(desiredApprovalMode)
+ 
+ 	// Wire agent resolver, lister, and current agent for /handover support
+-	model.SetAgentResolver(runtime.LoadAgent)
++	model.SetAgentResolver(func(name string, cfg *config.Config) (*agents.Agent, error) {
++		resolved, err := runtime.LoadAgent(name, cfg)
++		if err == nil {
++			err = runtime.RefuseLockedDirectRun(nil, resolved, "interactive chat handover")
++		}
++		if err != nil {
++			return nil, err
++		}
++		return resolved, nil
++	})
+ 	currentRuntimeContext := chat.RuntimeSystemContext{
+ 		SystemPrompt: cfg.Chat.Instructions,
+ 		ApplySkills:  skillContextApplier(skillsSetup),
+diff --git a/internal/app/memory/freshen.go b/internal/app/memory/freshen.go
+index 55b21d7d..64f37f4f 100644
+--- a/internal/app/memory/freshen.go
++++ b/internal/app/memory/freshen.go
+@@ -509,7 +509,7 @@ func listUpdateRecentSessions(ctx context.Context, sessStore session.Store, agen
+ 		seen[summary.ID] = struct{}{}
+ 	}
+ 
+-	if current != nil {
++	if current != nil && !current.ModelPolicy.LockSession {
+ 		if _, exists := seen[current.ID]; !exists && sessionAgentOrDefault(current.Agent) == agentName && (updatedAtOrAfter.IsZero() || !current.UpdatedAt.Before(updatedAtOrAfter)) {
+ 			sessions = append(sessions, memoryUpdateRecentSession{
+ 				ID:        current.ID,
+diff --git a/internal/app/memory/mine.go b/internal/app/memory/mine.go
+index 6cce50d3..bd139634 100644
+--- a/internal/app/memory/mine.go
++++ b/internal/app/memory/mine.go
+@@ -685,7 +685,9 @@ func (opts MineOptions) buildMemoryMineCandidate(ctx context.Context, store sess
+ 	if err != nil {
+ 		return memoryMineCandidate{}, false, fmt.Errorf("get session %s: %w", summary.ID, err)
+ 	}
+-	if sess == nil {
++	if sess == nil || sess.ModelPolicy.LockSession {
++		// Locked conversations never feed memory, even from stores that
++		// ignore the list filter.
+ 		return memoryMineCandidate{}, false, nil
+ 	}
+ 
+diff --git a/internal/app/memory/scope_lock_test.go b/internal/app/memory/scope_lock_test.go
+new file mode 100644
+index 00000000..719eb279
+--- /dev/null
++++ b/internal/app/memory/scope_lock_test.go
+@@ -0,0 +1,47 @@
++package memory
++
++import (
++	"context"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
++)
++
++func TestMemorySourcesExcludeLockedSessions(t *testing.T) {
++	ctx := context.Background()
++	store, err := session.NewSQLiteStore(session.Config{Enabled: true, Path: filepath.Join(t.TempDir(), "sessions.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	old := time.Now().Add(-48 * time.Hour)
++	locked := &session.Session{ID: session.NewID(), Provider: "debug", Model: "allowed", Agent: "private", Status: session.StatusComplete, CreatedAt: old, UpdatedAt: old}
++	plain := &session.Session{ID: session.NewID(), Provider: "debug", Model: "allowed", Agent: "plain", Status: session.StatusComplete, CreatedAt: old, UpdatedAt: old}
++	for _, s := range []*session.Session{locked, plain} {
++		if err := store.Create(ctx, s); err != nil {
++			t.Fatal(err)
++		}
++	}
++	policy := modelpolicy.Lock(nil, modelpolicy.Policy{}.With("private", []string{"debug:allowed"}))
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: locked.ID, Agent: "private", Policy: policy}); err != nil {
++		t.Fatal(err)
++	}
++	sources, err := listMemorySourceSessions(ctx, store, "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, s := range sources {
++		if s.ID == locked.ID {
++			t.Fatal("locked session listed as a memory source")
++		}
++	}
++	// Defence in depth for stores that ignore the list filter.
++	_, ok, err := (MineOptions{}).buildMemoryMineCandidate(ctx, store, session.SessionSummary{ID: locked.ID, UpdatedAt: old, Status: session.StatusComplete}, "", time.Time{})
++	if err != nil || ok {
++		t.Fatalf("locked candidate built: ok=%v err=%v", ok, err)
++	}
++}
+diff --git a/internal/app/memory/shared.go b/internal/app/memory/shared.go
+index 7a7cd246..477a2c3a 100644
+--- a/internal/app/memory/shared.go
++++ b/internal/app/memory/shared.go
+@@ -58,11 +58,13 @@ func listMemorySourceSessions(ctx context.Context, store session.Store, agent st
+ 		var beforeNumber int64
+ 		for {
+ 			page, err := store.List(ctx, session.ListOptions{
+-				Agent:            agent,
+-				Status:           status,
+-				Limit:            pageSize,
+-				BeforeNumber:     beforeNumber,
+-				SortByNumberDesc: true,
++				Agent:  agent,
++				Status: status,
++				// Locked conversations never feed memory mining or insights.
++				ExcludeScopeLocked: true,
++				Limit:              pageSize,
++				BeforeNumber:       beforeNumber,
++				SortByNumberDesc:   true,
+ 			})
+ 			if err != nil {
+ 				return nil, err
+diff --git a/internal/app/runtime/mcpstart/mcpstart.go b/internal/app/runtime/mcpstart/mcpstart.go
+index 256bc432..53904a17 100644
+--- a/internal/app/runtime/mcpstart/mcpstart.go
++++ b/internal/app/runtime/mcpstart/mcpstart.go
+@@ -28,6 +28,9 @@ type MCPOptions struct {
+ 	Model             string
+ 	YoloMode          bool
+ 	ToolDiscovery     config.ToolDiscoveryConfig
++	// NoSampling installs no sampling handler, so servers cannot request model
++	// calls; locked conversations set it because sampling bypasses admission.
++	NoSampling bool
+ }
+ 
+ // EnableMCPServersWithFeedback initializes MCP servers with user feedback.
+@@ -49,7 +52,7 @@ func EnableMCPServersWithFeedback(ctx context.Context, mcpFlag string, engine *e
+ func enableLoadedServers(ctx context.Context, mcpManager *mcp.Manager, selection string, engine *engine.Engine, errWriter io.Writer, opts *MCPOptions) (*mcp.Manager, error) {
+ 	serverNames := ParseServerList(selection)
+ 	// Set up sampling handler if provider is available
+-	if opts != nil && opts.Provider != nil {
++	if opts != nil && opts.Provider != nil && !opts.NoSampling {
+ 		mcpManager.SetSamplingProvider(opts.Provider, opts.Model, opts.YoloMode)
+ 	}
+ 
+diff --git a/internal/app/runtime/mcpstart/sampling_lock_test.go b/internal/app/runtime/mcpstart/sampling_lock_test.go
+new file mode 100644
+index 00000000..d26763d4
+--- /dev/null
++++ b/internal/app/runtime/mcpstart/sampling_lock_test.go
+@@ -0,0 +1,26 @@
++package mcpstart
++
++import (
++	"context"
++	"io"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/engine"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++	"github.com/samsaffron/term-llm/internal/mcp"
++)
++
++// Locked serve runs pass NoSampling; ordinary runs keep the sampling handler.
++func TestEnableLoadedServersNoSamplingInstallsNoHandler(t *testing.T) {
++	for _, noSampling := range []bool{true, false} {
++		manager := mcp.NewManagerWithConfig(&mcp.Config{Servers: map[string]mcp.ServerConfig{}})
++		// The handler is decided before any server starts; the empty
++		// selection's startup error is irrelevant here.
++		_, _ = enableLoadedServers(context.Background(), manager, "", engine.NewEngine(mockprovider.NewMockProvider("debug"), nil), io.Discard, &MCPOptions{
++			Provider: mockprovider.NewMockProvider("debug"), Model: "allowed", NoSampling: noSampling,
++		})
++		if got := manager.GetSamplingHandler() != nil; got == noSampling {
++			t.Fatalf("NoSampling=%v installed handler=%v", noSampling, got)
++		}
++	}
++}
+diff --git a/internal/app/runtime/model.go b/internal/app/runtime/model.go
+index 954f06c0..07e6e9d1 100644
+--- a/internal/app/runtime/model.go
++++ b/internal/app/runtime/model.go
+@@ -60,6 +60,11 @@ func SelectRunModel(cfg *config.Config, in ModelSelectionInput) (ModelSelection,
+ 	if in.Agent != nil {
+ 		policy = policy.With(agentName, in.Agent.AllowedModels)
+ 	}
++	if policy.LockSession || (in.Agent != nil && in.Agent.LockSession) {
++		// A locked conversation persists its complete effective chain, frozen
++		// against later provider allowlist widening.
++		policy = modelpolicy.Lock(cfg, policy)
++	}
+ 	if err := policy.CheckWithConfig(cfg, agentName, selected.Provider, selected.Model); err != nil {
+ 		return selected, policy, err
+ 	}
+@@ -73,6 +78,7 @@ func ModelPolicyForSession(sess *session.Session, agent *agents.Agent) modelpoli
+ 	}
+ 	if agent != nil {
+ 		policy = policy.With(agent.Name, agent.AllowedModels)
++		policy.LockSession = policy.LockSession || agent.LockSession
+ 	}
+ 	return policy
+ }
+diff --git a/internal/app/runtime/run_agent.go b/internal/app/runtime/run_agent.go
+index 433952da..aa54a80a 100644
+--- a/internal/app/runtime/run_agent.go
++++ b/internal/app/runtime/run_agent.go
+@@ -33,7 +33,11 @@ func ResolveRunAgent(ctx context.Context, req runpkg.Request, cfg *config.Config
+ 			resume = runpkg.ParentModel{Provider: ResolveSessionProviderKey(cfg, sess), Model: sess.Model}
+ 		}
+ 	}
+-	persisted := sess != nil && ((req.AgentName != "" && req.AgentName == sess.Agent) || (req.Resume && strings.TrimSpace(req.AgentName) == ""))
++	if err := CheckLockedSessionScope(sess, "", req.Cwd); err != nil {
++		return nil, inherited, resume, err
++	}
++	locked := sess != nil && sess.ModelPolicy.LockSession
++	persisted := sess != nil && ((req.AgentName != "" && req.AgentName == sess.Agent) || ((req.Resume || locked) && strings.TrimSpace(req.AgentName) == ""))
+ 	if persisted {
+ 		agent, err = LoadPersistedAgent(sess.Agent, cfg)
+ 	} else {
+@@ -42,6 +46,17 @@ func ResolveRunAgent(ctx context.Context, req runpkg.Request, cfg *config.Config
+ 	if err != nil {
+ 		return nil, inherited, resume, err
+ 	}
++	// Progressive runs bypass per-turn scope admission.
++	lockedRun := modelpolicy.Policy{LockSession: inherited.LockSession || (agent != nil && agent.LockSession)}
++	if err := RefuseLockedProgressive(lockedRun, req.Progressive != nil); err != nil {
++		return nil, inherited, resume, err
++	}
++	if locked && !persisted {
++		// Compare resolved identities: a local agent persists its path.
++		if err := CheckLockedSessionScope(sess, agents.Reference(agent), ""); err != nil {
++			return nil, inherited, resume, err
++		}
++	}
+ 	if !persisted && strings.TrimSpace(req.AgentName) != "" && agent == nil {
+ 		return nil, inherited, resume, fmt.Errorf("agent %q not found", req.AgentName)
+ 	}
+diff --git a/internal/app/runtime/session_admission.go b/internal/app/runtime/session_admission.go
+new file mode 100644
+index 00000000..d68bceda
+--- /dev/null
++++ b/internal/app/runtime/session_admission.go
+@@ -0,0 +1,172 @@
++package runtime
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"strings"
++
++	"github.com/samsaffron/term-llm/internal/config"
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
++)
++
++// ScopeRun is the host-resolved identity of one runtime turn.
++type ScopeRun struct {
++	Agent, ProviderKey string
++	// Model is the runtime's current model, used when the request names none.
++	Model string
++	// Workspace is the runtime's effective tool directory ("" when unbound).
++	Workspace string
++	Policy    modelpolicy.Policy
++	Config    *config.Config
++	// Detached marks a stateless run that neither loads nor persists the
++	// session row: its history is caller-supplied. An unlocked detached run
++	// tolerates an unreadable store; every other run fails closed.
++	Detached bool
++	// Tools is the runtime's engine registry. A locked run whose own agent
++	// does not enable search loses the always-registered search tools.
++	Tools interface{ UnregisterTool(string) }
++}
++
++// AdmitSessionScope runs before history reaches a provider. A locked runtime
++// persists (or narrows) the durable lock atomically and marks the returned
++// context so host tools receive trusted session context. An unlocked runtime
++// may not serve a locked row. Ordinary unlocked sessions pay one read. On
++// error the input context and policy are returned unchanged. A detached
++// unlocked run (stateless, not persisted) proceeds when the row is unreadable.
++func AdmitSessionScope(ctx context.Context, store session.Store, req *core.Request, run ScopeRun) (context.Context, modelpolicy.Policy, error) {
++	if !run.Policy.LockSession {
++		if store == nil || req.SessionID == "" {
++			return ctx, run.Policy, nil
++		}
++		// A missing row cannot be locked. Any other lookup failure (busy,
++		// undecodable policy) fails closed: the row might be locked.
++		saved, err := store.Get(ctx, req.SessionID)
++		if errors.Is(err, session.ErrNotFound) || (err == nil && saved == nil) {
++			return ctx, run.Policy, nil
++		}
++		if err != nil {
++			if run.Detached {
++				return ctx, run.Policy, nil
++			}
++			return ctx, run.Policy, fmt.Errorf("check session scope: %w", err)
++		}
++		if saved.ModelPolicy.LockSession {
++			return ctx, run.Policy, fmt.Errorf("%w: locked session requires its locked agent runtime", scopedb.ErrScope)
++		}
++		return ctx, run.Policy, nil
++	}
++	if store == nil || req.SessionID == "" {
++		return ctx, run.Policy, fmt.Errorf("%w: locked agent %q requires durable session storage", scopedb.ErrScope, run.Agent)
++	}
++	admitter, ok := scopeAdmitter(store)
++	if !ok {
++		return ctx, run.Policy, fmt.Errorf("%w: session store cannot admit locked sessions atomically", scopedb.ErrScope)
++	}
++	model := strings.TrimSpace(req.Model)
++	if model == "" {
++		model = strings.TrimSpace(run.Model)
++	}
++	// The current model and any continuation are checked against the merged
++	// durable policy inside the admission transaction, before anything is
++	// persisted or sent.
++	effective, err := admitter.AdmitSessionScope(ctx, scopedb.Admission{SessionID: req.SessionID, Agent: run.Agent, Workspace: run.Workspace, Policy: run.Policy,
++		Check: func(effective modelpolicy.Policy) error {
++			if err := effective.CheckWithConfig(run.Config, run.Agent, run.ProviderKey, model); err != nil {
++				return err
++			}
++			return checkLockedContinuation(effective, *req, run)
++		}})
++	if err != nil {
++		return ctx, run.Policy, err
++	}
++	enforceLockedAgentSearch(req, run)
++	// Provider payload debug logging would copy the transcript outside the
++	// session store; locked runs never emit it.
++	req.Debug, req.DebugRaw = false, false
++	return core.ContextWithLockedSession(ctx, req.SessionID), effective, nil
++}
++
++// enforceLockedAgentSearch applies the locked agent's own search setting: a
++// request, UI toggle or host --search flag cannot enable web search, and the
++// engine's always-registered web_search/read_url become neither offered nor
++// callable. An unloadable definition fails closed.
++func enforceLockedAgentSearch(req *core.Request, run ScopeRun) {
++	if run.Config != nil {
++		if agent, err := LoadPersistedAgent(run.Agent, run.Config); err == nil && agent != nil && agent.Search {
++			return
++		}
++	}
++	req.Search = false
++	kept := req.Tools[:0:0]
++	for _, spec := range req.Tools {
++		if spec.Name != core.WebSearchToolName && spec.Name != core.ReadURLToolName {
++			kept = append(kept, spec)
++		}
++	}
++	req.Tools = kept
++	if run.Tools != nil {
++		run.Tools.UnregisterTool(core.WebSearchToolName)
++		run.Tools.UnregisterTool(core.ReadURLToolName)
++	}
++}
++
++// checkLockedContinuation closes an engine checkpoint's inner request: it must
++// belong to the same session and its saved model must satisfy the lock.
++func checkLockedContinuation(policy modelpolicy.Policy, req core.Request, run ScopeRun) error {
++	if req.Resume == nil {
++		return nil
++	}
++	saved := req.Resume.Request
++	if saved.SessionID != "" && saved.SessionID != req.SessionID {
++		return fmt.Errorf("%w: locked continuation cannot change session", scopedb.ErrScope)
++	}
++	if model := strings.TrimSpace(saved.Model); model != "" {
++		return policy.CheckWithConfig(run.Config, run.Agent, run.ProviderKey, model)
++	}
++	return nil
++}
++
++// scopeAdmitter unwraps logging decorators to find native scope admission.
++func scopeAdmitter(store session.Store) (scopedb.Admitter, bool) {
++	for store != nil {
++		if admitter, ok := store.(scopedb.Admitter); ok {
++			return admitter, true
++		}
++		logging, ok := store.(*session.LoggingStore)
++		if !ok || logging == nil {
++			return nil, false
++		}
++		store = logging.Store
++	}
++	return nil, false
++}
++
++// RefuseLockedProgressive fails closed for progressive runs, which bypass
++// per-turn scope admission.
++func RefuseLockedProgressive(policy modelpolicy.Policy, progressive bool) error {
++	if progressive && policy.LockSession {
++		return fmt.Errorf("%w: locked sessions do not support progressive runs", scopedb.ErrScope)
++	}
++	return nil
++}
++
++// RefuseLockedAux fails closed for host operations that send a session's
++// history to a provider outside the per-turn scope admission (side questions,
++// cross-model swap handovers, manual compaction). Locked conversations do not
++// support them; ordinary sessions are unaffected.
++func RefuseLockedAux(policy modelpolicy.Policy, operation string) error {
++	return RefuseLockedAuxIf(policy.LockSession, operation)
++}
++
++// RefuseLockedAuxIf is RefuseLockedAux for a lock known from several sources,
++// such as a stored row and a live runtime whose row is not yet locked.
++func RefuseLockedAuxIf(locked bool, operation string) error {
++	if locked {
++		return fmt.Errorf("%w: %s are unavailable in locked sessions", scopedb.ErrScope, operation)
++	}
++	return nil
++}
+diff --git a/internal/app/runtime/session_admission_test.go b/internal/app/runtime/session_admission_test.go
+new file mode 100644
+index 00000000..3fe8e1c2
+--- /dev/null
++++ b/internal/app/runtime/session_admission_test.go
+@@ -0,0 +1,148 @@
++package runtime
++
++import (
++	"context"
++	"errors"
++	"path/filepath"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
++)
++
++func TestAdmitSessionScopeMarksOnlyLockedRuns(t *testing.T) {
++	ctx := context.Background()
++	cfg := testSelectConfig()
++	sqlite, err := session.NewSQLiteStore(session.Config{Enabled: true, Path: filepath.Join(t.TempDir(), "sessions.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer sqlite.Close()
++	store := session.NewLoggingStore(sqlite, nil) // decorators must not hide native admission
++	plain := &session.Session{ID: session.NewID(), Provider: "debug", Model: "allowed", Agent: "plain"}
++	locked := &session.Session{ID: session.NewID(), Provider: "debug", Model: "allowed", Agent: "private"}
++	for _, s := range []*session.Session{plain, locked} {
++		if err := store.Create(ctx, s); err != nil {
++			t.Fatal(err)
++		}
++	}
++	marked := func(ctx context.Context, id string) string {
++		return core.LockedSessionFromContext(core.ContextWithSessionID(ctx, id))
++	}
++	gotCtx, policy, err := AdmitSessionScope(ctx, store, &core.Request{SessionID: plain.ID}, ScopeRun{Agent: "plain"})
++	if err != nil || marked(gotCtx, plain.ID) != "" || policy.LockSession {
++		t.Fatalf("unlocked admission = %v", err)
++	}
++	lockedRun := ScopeRun{Agent: "private", ProviderKey: "debug", Model: "allowed", Config: cfg,
++		Policy: modelpolicy.Lock(cfg, modelpolicy.Policy{}.With("private", []string{"debug:allowed"}))}
++	resume := &core.Continuation{Request: core.Request{SessionID: locked.ID, Model: "denied-model"}}
++	if _, _, err := AdmitSessionScope(ctx, store, &core.Request{SessionID: locked.ID, Resume: resume}, lockedRun); err == nil {
++		t.Fatal("locked continuation with disallowed model admitted")
++	}
++	other := &core.Continuation{Request: core.Request{SessionID: "another", Model: "allowed"}}
++	if _, _, err := AdmitSessionScope(ctx, store, &core.Request{SessionID: locked.ID, Resume: other}, lockedRun); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("cross-session continuation = %v", err)
++	}
++	gotCtx, policy, err = AdmitSessionScope(ctx, store, &core.Request{SessionID: locked.ID}, lockedRun)
++	if err != nil || marked(gotCtx, locked.ID) != locked.ID || !policy.LockSession {
++		t.Fatalf("locked admission = %v", err)
++	}
++	if _, _, err := AdmitSessionScope(ctx, store, &core.Request{SessionID: locked.ID}, ScopeRun{Agent: "private"}); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("stale unlocked runtime = %v", err)
++	}
++	if _, _, err := AdmitSessionScope(ctx, nil, &core.Request{SessionID: "x"}, lockedRun); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("storeless locked runtime = %v", err)
++	}
++	if _, _, err := AdmitSessionScope(ctx, &session.NoopStore{}, &core.Request{SessionID: "x"}, lockedRun); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("non-native locked store = %v", err)
++	}
++	if err := RefuseLockedProgressive(lockedRun.Policy, true); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("progressive = %v", err)
++	}
++	if err := RefuseLockedProgressive(modelpolicy.Policy{}, true); err != nil {
++		t.Fatalf("ordinary progressive = %v", err)
++	}
++}
++
++type recordingUnregister []string
++
++func (r *recordingUnregister) UnregisterTool(name string) { *r = append(*r, name) }
++
++func TestEnforceLockedAgentSearchFailsClosed(t *testing.T) {
++	req := &core.Request{Search: true, Tools: []core.ToolSpec{{Name: core.WebSearchToolName}, {Name: "update_plan"}, {Name: core.ReadURLToolName}}}
++	var removed recordingUnregister
++	enforceLockedAgentSearch(req, ScopeRun{Agent: "missing-definition", Tools: &removed})
++	if req.Search || len(req.Tools) != 1 || req.Tools[0].Name != "update_plan" {
++		t.Fatalf("request after enforcement = %+v", req)
++	}
++	if len(removed) != 2 {
++		t.Fatalf("unregistered = %v", removed)
++	}
++}
++
++type failingGetStore struct{ *session.NoopStore }
++
++func (failingGetStore) Get(context.Context, string) (*session.Session, error) {
++	return nil, errors.New("database is locked")
++}
++
++func TestAdmitSessionScopeChecksMergedPolicyModelAndWorkspace(t *testing.T) {
++	ctx := context.Background()
++	cfg := testSelectConfig()
++	store, err := session.NewSQLiteStore(session.Config{Enabled: true, Path: filepath.Join(t.TempDir(), "sessions.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	sess := &session.Session{ID: session.NewID(), Provider: "debug", Model: "allowed", Agent: "private", CWD: "/work/a"}
++	if err := store.Create(ctx, sess); err != nil {
++		t.Fatal(err)
++	}
++	locked := modelpolicy.Lock(cfg, modelpolicy.Policy{}.With("private", []string{"debug:allowed"}))
++	run := ScopeRun{Agent: "private", ProviderKey: "debug", Model: "allowed", Workspace: "/work/a", Config: cfg, Policy: locked}
++	if _, _, err := AdmitSessionScope(ctx, store, &core.Request{SessionID: sess.ID}, run); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.AddMessage(ctx, sess.ID, session.NewMessage(sess.ID, core.UserText("history"), -1)); err != nil {
++		t.Fatal(err)
++	}
++
++	// After a restart the agent definition was widened to another provider;
++	// the runtime's own chain no longer carries the saved rule. The merged
++	// durable policy still refuses the runtime's model before any egress.
++	widened := ScopeRun{Agent: "private", ProviderKey: "other", Model: "denied", Workspace: "/work/a", Config: cfg,
++		Policy: modelpolicy.Lock(cfg, modelpolicy.Policy{}.With("private", []string{"debug:*", "other:*"}))}
++	gotCtx, _, err := AdmitSessionScope(ctx, store, &core.Request{SessionID: sess.ID}, widened)
++	if err == nil || core.LockedSessionFromContext(core.ContextWithSessionID(gotCtx, sess.ID)) != "" {
++		t.Fatalf("widened runtime admission = %v", err)
++	}
++	if _, _, err := AdmitSessionScope(ctx, store, &core.Request{SessionID: sess.ID, Model: "denied"}, run); err == nil {
++		t.Fatal("request model outside the locked policy admitted")
++	}
++	saved, _ := store.Get(ctx, sess.ID)
++	if err := saved.ModelPolicy.Check("private", "other", "denied"); err == nil {
++		t.Fatal("refused admission widened the persisted policy")
++	}
++
++	// A runtime bound to a different workspace is refused once history exists.
++	moved := run
++	moved.Workspace = "/work/b"
++	if _, _, err := AdmitSessionScope(ctx, store, &core.Request{SessionID: sess.ID}, moved); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("moved workspace admission = %v", err)
++	}
++
++	// Unlocked runtimes fail closed when the row cannot be read.
++	if _, _, err := AdmitSessionScope(ctx, failingGetStore{&session.NoopStore{}}, &core.Request{SessionID: "x"}, ScopeRun{Agent: "plain"}); err == nil {
++		t.Fatal("unreadable row admitted to an unlocked runtime")
++	}
++	// A detached (stateless, unpersisted) unlocked run keeps working; a
++	// detached locked run still needs the store.
++	if _, _, err := AdmitSessionScope(ctx, failingGetStore{&session.NoopStore{}}, &core.Request{SessionID: "x"}, ScopeRun{Agent: "plain", Detached: true}); err != nil {
++		t.Fatalf("detached unlocked run refused: %v", err)
++	}
++	if _, _, err := AdmitSessionScope(ctx, failingGetStore{&session.NoopStore{}}, &core.Request{SessionID: "x"}, ScopeRun{Agent: "private", Detached: true, Policy: locked}); err == nil {
++		t.Fatal("detached locked run admitted without atomic admission")
++	}
++}
+diff --git a/internal/app/runtime/session_scope.go b/internal/app/runtime/session_scope.go
+new file mode 100644
+index 00000000..4d03fff9
+--- /dev/null
++++ b/internal/app/runtime/session_scope.go
+@@ -0,0 +1,73 @@
++package runtime
++
++import (
++	"fmt"
++	"path/filepath"
++	"strings"
++
++	"github.com/samsaffron/term-llm/internal/agents"
++	"github.com/samsaffron/term-llm/internal/config"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
++)
++
++// CheckLockedSessionScope refuses retargeting a locked conversation before any
++// runtime, history projection or provider is built. Empty requested values
++// reuse the durable identity; they never select a new one.
++func CheckLockedSessionScope(sess *session.Session, agentName, cwd string) error {
++	if sess == nil || !sess.ModelPolicy.LockSession {
++		return nil
++	}
++	if agentName = strings.TrimSpace(agentName); agentName != "" && agentName != sess.Agent {
++		return fmt.Errorf("%w: locked session cannot change agent from %q to %q", scopedb.ErrScope, sess.Agent, agentName)
++	}
++	saved := strings.TrimSpace(sess.WorktreeDir)
++	if saved == "" {
++		saved = strings.TrimSpace(sess.CWD)
++	}
++	if cwd = strings.TrimSpace(cwd); cwd != "" && saved != "" && filepath.Clean(cwd) != filepath.Clean(saved) {
++		return fmt.Errorf("%w: locked session cannot change workspace", scopedb.ErrScope)
++	}
++	return nil
++}
++
++// RefuseLockedDirectRun fails closed for surfaces that run their own engine
++// outside the serve runner's per-turn scope admission (direct `ask`, the
++// interactive chat TUI). Locked conversations run through `term-llm serve`.
++func RefuseLockedDirectRun(sess *session.Session, agent *agents.Agent, surface string) error {
++	if (agent != nil && agent.LockSession) || (sess != nil && sess.ModelPolicy.LockSession) {
++		return fmt.Errorf("%w: locked sessions are unavailable in %s; use term-llm serve (web/API or jobs)", scopedb.ErrScope, surface)
++	}
++	return nil
++}
++
++// SessionModelPolicy returns a durable session's effective policy: its
++// persisted chain (including any lock) plus its own agent's current rule.
++// An agent whose definition is missing keeps only the persisted chain; an
++// invalid definition fails rather than lifting the agent's restriction.
++func SessionModelPolicy(cfg *config.Config, sess *session.Session) (modelpolicy.Policy, error) {
++	if sess == nil {
++		return modelpolicy.Policy{}, fmt.Errorf("session is unavailable")
++	}
++	if strings.TrimSpace(sess.Agent) == "" {
++		return sess.ModelPolicy, nil
++	}
++	if cfg == nil {
++		return modelpolicy.Policy{}, fmt.Errorf("load session agent %q: configuration is unavailable", sess.Agent)
++	}
++	agent, err := LoadPersistedAgent(sess.Agent, cfg)
++	if err != nil {
++		return modelpolicy.Policy{}, fmt.Errorf("load session agent %q for model policy: %w", sess.Agent, err)
++	}
++	return ModelPolicyForSession(sess, agent), nil
++}
++
++// PersistedRunPolicy is the policy stored with a run's session: the inherited
++// chain, or for a locked run the complete chain including its own rule.
++func PersistedRunPolicy(inherited, effective modelpolicy.Policy) modelpolicy.Policy {
++	if effective.LockSession {
++		return effective
++	}
++	return inherited
++}
+diff --git a/internal/app/runtime/session_scope_test.go b/internal/app/runtime/session_scope_test.go
+new file mode 100644
+index 00000000..0594977f
+--- /dev/null
++++ b/internal/app/runtime/session_scope_test.go
+@@ -0,0 +1,76 @@
++package runtime
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/agents"
++	"github.com/samsaffron/term-llm/internal/config"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
++)
++
++func TestCheckLockedSessionScope(t *testing.T) {
++	locked := &session.Session{Agent: "private", CWD: "/work/a", ModelPolicy: modelpolicy.Policy{LockSession: true}}
++	for _, tc := range []struct {
++		name, agent, cwd string
++		sess             *session.Session
++		refuse           bool
++	}{
++		{name: "reuse", sess: locked},
++		{name: "same identity", sess: locked, agent: "private", cwd: "/work/a/"},
++		{name: "other agent", sess: locked, agent: "other", refuse: true},
++		{name: "other workspace", sess: locked, cwd: "/work/b", refuse: true},
++		{name: "unlocked retarget", sess: &session.Session{Agent: "private", CWD: "/work/a"}, agent: "other", cwd: "/x"},
++		{name: "no session", agent: "other"},
++	} {
++		err := CheckLockedSessionScope(tc.sess, tc.agent, tc.cwd)
++		if got := errors.Is(err, scopedb.ErrScope); got != tc.refuse {
++			t.Errorf("%s: err=%v, refuse=%v", tc.name, err, tc.refuse)
++		}
++	}
++}
++
++func TestRefuseLockedDirectRun(t *testing.T) {
++	if err := RefuseLockedDirectRun(nil, &agents.Agent{Name: "plain"}, "ask"); err != nil {
++		t.Fatalf("ordinary agent refused: %v", err)
++	}
++	if err := RefuseLockedDirectRun(nil, &agents.Agent{Name: "p", LockSession: true}, "ask"); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("locked agent = %v", err)
++	}
++	if err := RefuseLockedDirectRun(&session.Session{ModelPolicy: modelpolicy.Policy{LockSession: true}}, nil, "ask"); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("locked session = %v", err)
++	}
++}
++
++func TestSelectRunModelLocksEffectivePolicy(t *testing.T) {
++	cfg := testSelectConfig()
++	agent := &agents.Agent{Name: "private", Provider: "debug", Model: "allowed", AllowedModels: []string{"debug:allowed"}, LockSession: true}
++	_, policy, err := SelectRunModel(cfg, ModelSelectionInput{Agent: agent})
++	if err != nil || !policy.LockSession || !policy.Restricted() {
++		t.Fatalf("SelectRunModel policy=%+v err=%v", policy, err)
++	}
++	if _, _, err := SelectRunModel(cfg, ModelSelectionInput{Agent: agent, ProviderFlag: "other:denied"}); err == nil {
++		t.Fatal("locked agent accepted disallowed override")
++	}
++	plain := &agents.Agent{Name: "plain", Provider: "debug", Model: "allowed"}
++	if _, policy, err := SelectRunModel(cfg, ModelSelectionInput{Agent: plain}); err != nil || policy.LockSession || policy.Restricted() {
++		t.Fatalf("ordinary policy=%+v err=%v", policy, err)
++	}
++}
++
++func testSelectConfig() *config.Config {
++	return &config.Config{DefaultProvider: "debug", Providers: map[string]config.ProviderConfig{
++		"debug": {Model: "allowed"}, "other": {Model: "denied"},
++	}}
++}
++
++func TestRefuseLockedAux(t *testing.T) {
++	if err := RefuseLockedAux(modelpolicy.Policy{}, "side questions"); err != nil {
++		t.Fatalf("ordinary = %v", err)
++	}
++	if err := RefuseLockedAux(modelpolicy.Policy{LockSession: true}, "cross-model swaps"); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("locked = %v", err)
++	}
++}
+diff --git a/internal/app/serve/agent_model_review_host_test.go b/internal/app/serve/agent_model_review_host_test.go
+index 4c01d6de..4926b2d9 100644
+--- a/internal/app/serve/agent_model_review_host_test.go
++++ b/internal/app/serve/agent_model_review_host_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/samsaffron/term-llm/internal/agents"
++	appruntime "github.com/samsaffron/term-llm/internal/app/runtime"
+ 	"github.com/samsaffron/term-llm/internal/config"
+ 	"github.com/samsaffron/term-llm/internal/llm/core"
+ 	"github.com/samsaffron/term-llm/internal/llm/engine"
+@@ -66,21 +67,21 @@ func TestSessionModelPolicyMissingAgentVersusInvalidDefinition(t *testing.T) {
+ 	s := &serveServer{cfgRef: cfg}
+ 	persisted := modelpolicy.Policy{}.With("ancestor", []string{"debug:*"})
+ 	sess := &session.Session{Agent: dir, ModelPolicy: persisted}
+-	policy, err := s.sessionModelPolicy(sess)
++	policy, err := appruntime.SessionModelPolicy(s.cfgRef, sess)
+ 	if err != nil || len(policy.Rules) != 2 {
+ 		t.Fatalf("valid agent = %+v, %v", policy, err)
+ 	}
+ 	if err := os.Remove(filepath.Join(dir, "agent.yaml")); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	policy, err = s.sessionModelPolicy(sess)
++	policy, err = appruntime.SessionModelPolicy(s.cfgRef, sess)
+ 	if err != nil || len(policy.Rules) != 1 {
+ 		t.Fatalf("deleted agent = %+v, %v", policy, err)
+ 	}
+ 	if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte("name: reviewer\nallowed_models: [\n"), 0600); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if _, err := s.sessionModelPolicy(sess); err == nil {
++	if _, err := appruntime.SessionModelPolicy(s.cfgRef, sess); err == nil {
+ 		t.Fatal("invalid definition lifted agent policy")
+ 	}
+ }
+diff --git a/internal/app/serve/runner.go b/internal/app/serve/runner.go
+index 0ba0188c..d3475ba8 100644
+--- a/internal/app/serve/runner.go
++++ b/internal/app/serve/runner.go
+@@ -221,7 +221,7 @@ func (r *cmdRunner) resolveRunModel(ctx context.Context, req runpkg.Request) (*c
+ 		// describe the concrete fast target that was checked above.
+ 		cfg.ApplyOverrides(selected.Provider, selected.Model)
+ 	}
+-	return cfg, agent, selected, runModelPolicies{Effective: effective, Inherited: inherited}, nil
++	return cfg, agent, selected, runModelPolicies{Effective: effective, Inherited: appruntime.PersistedRunPolicy(inherited, effective)}, nil
+ }
+ 
+ func (r *cmdRunner) prepare(ctx context.Context, req runpkg.Request, sink runpkg.EventSink) (*cmdRunEnvironment, error) {
+@@ -410,6 +410,7 @@ func (r *cmdRunner) prepare(ctx context.Context, req runpkg.Request, sink runpkg
+ 		provider:            provider,
+ 		providerKey:         cfg.DefaultProvider,
+ 		modelPolicy:         policy,
++		scopeLocked:         policy.LockSession,
+ 		modelPolicyConfig:   cfg,
+ 		engine:              engine,
+ 		toolMgr:             toolMgr,
+@@ -481,7 +482,7 @@ func (r *cmdRunner) prepare(ctx context.Context, req runpkg.Request, sink runpkg
+ 	if !borrowedEngine && preparedMCP.Active != "" {
+ 		mgr, err := preparedMCP.Enable(ctx, engine, r.errWriter(), &mcpstart.MCPOptions{
+ 			PolicyIdentity: agents.PolicyIdentity(agent), ImplicitSelection: !req.MCPExplicit,
+-			Provider: provider, Model: modelName, YoloMode: yoloMode, ToolDiscovery: cfg.ToolDiscovery,
++			Provider: provider, Model: modelName, YoloMode: yoloMode, ToolDiscovery: cfg.ToolDiscovery, NoSampling: policy.LockSession,
+ 		})
+ 		if err != nil {
+ 			return nil, err
+diff --git a/internal/app/serve/serve_autotitle.go b/internal/app/serve/serve_autotitle.go
+index c3e05064..5428004b 100644
+--- a/internal/app/serve/serve_autotitle.go
++++ b/internal/app/serve/serve_autotitle.go
+@@ -11,7 +11,6 @@ import (
+ 	appruntime "github.com/samsaffron/term-llm/internal/app/runtime"
+ 	"github.com/samsaffron/term-llm/internal/llm"
+ 	"github.com/samsaffron/term-llm/internal/llm/core"
+-	"github.com/samsaffron/term-llm/internal/modelpolicy"
+ 	"github.com/samsaffron/term-llm/internal/restart"
+ 	"github.com/samsaffron/term-llm/internal/session"
+ 	"github.com/samsaffron/term-llm/internal/sessiontitle"
+@@ -117,7 +116,7 @@ func (s *serveServer) runAutoTitle(ctx context.Context, sessionID, providerKey s
+ 		return
+ 	}
+ 
+-	policy, err := s.sessionModelPolicy(sess)
++	policy, err := appruntime.SessionModelPolicy(s.cfgRef, sess)
+ 	if err != nil {
+ 		log.Printf("[serve] auto-title policy unavailable for %s: %v", sessionID, err)
+ 		return
+@@ -227,20 +226,3 @@ func (s *serveServer) stopAutoTitles() {
+ 	s.autoTitleMu.Unlock()
+ 	s.autoTitleWG.Wait()
+ }
+-
+-func (s *serveServer) sessionModelPolicy(sess *session.Session) (modelpolicy.Policy, error) {
+-	if sess == nil {
+-		return modelpolicy.Policy{}, fmt.Errorf("session is unavailable")
+-	}
+-	if strings.TrimSpace(sess.Agent) == "" {
+-		return sess.ModelPolicy, nil
+-	}
+-	if s.cfgRef == nil {
+-		return modelpolicy.Policy{}, fmt.Errorf("load session agent %q: configuration is unavailable", sess.Agent)
+-	}
+-	agent, err := appruntime.LoadPersistedAgent(sess.Agent, s.cfgRef)
+-	if err != nil {
+-		return modelpolicy.Policy{}, fmt.Errorf("load session agent %q for model policy: %w", sess.Agent, err)
+-	}
+-	return appruntime.ModelPolicyForSession(sess, agent), nil
+-}
+diff --git a/internal/app/serve/serve_compaction_handler.go b/internal/app/serve/serve_compaction_handler.go
+index 0b0bcc18..1fde1977 100644
+--- a/internal/app/serve/serve_compaction_handler.go
++++ b/internal/app/serve/serve_compaction_handler.go
+@@ -21,6 +21,9 @@ func (s *serveServer) handleSessionRuntimeCompact(w http.ResponseWriter, r *http
+ 	if err != nil || sess == nil {
+ 		writeOpenAIError(w, http.StatusNotFound, "not_found_error", "session not found")
+ 		return
++	} else if err := appruntime.RefuseLockedAux(sess.ModelPolicy, "manual compactions"); err != nil {
++		writeOpenAIError(w, http.StatusConflict, "conflict_error", err.Error())
++		return
+ 	}
+ 	providerKey := strings.TrimSpace(sess.ProviderKey)
+ 	if providerKey == "" {
+diff --git a/internal/app/serve/serve_handlers.go b/internal/app/serve/serve_handlers.go
+index d6d788f9..44a77ac6 100644
+--- a/internal/app/serve/serve_handlers.go
++++ b/internal/app/serve/serve_handlers.go
+@@ -2482,7 +2482,7 @@ func (s *serveServer) handleSessionTitleRefine(w http.ResponseWriter, r *http.Re
+ 		return
+ 	}
+ 
+-	policy, policyErr := s.sessionModelPolicy(sess)
++	policy, policyErr := appruntime.SessionModelPolicy(s.cfgRef, sess)
+ 	if policyErr != nil {
+ 		writeOpenAIError(w, http.StatusInternalServerError, "server_error", "title model policy unavailable: "+policyErr.Error())
+ 		return
+diff --git a/internal/app/serve/serve_live.go b/internal/app/serve/serve_live.go
+index ca58cca6..055f73e5 100644
+--- a/internal/app/serve/serve_live.go
++++ b/internal/app/serve/serve_live.go
+@@ -19,6 +19,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/gorilla/websocket"
++	appruntime "github.com/samsaffron/term-llm/internal/app/runtime"
+ 	"github.com/samsaffron/term-llm/internal/app/serve/liveprogress"
+ 	"github.com/samsaffron/term-llm/internal/config"
+ 	"github.com/samsaffron/term-llm/internal/linkeddevices"
+@@ -1502,6 +1503,8 @@ func (s *serveServer) resolveLiveSwitchTarget(ctx context.Context, selector stri
+ 		// rejected target is also one the directory can never offer. A parented
+ 		// fork is not necessarily a subagent, so the message names both forms.
+ 		return liveSwitchTarget{}, fmt.Errorf("%w: chat session %s is a child session (subagent or fork) and cannot be driven by voice", errLiveSwitchInvalidTarget, sess.ID)
++	} else if err := appruntime.RefuseLockedAux(sess.ModelPolicy, "voice session switches"); err != nil {
++		return liveSwitchTarget{}, fmt.Errorf("%w: %w", errLiveSwitchInvalidTarget, err)
+ 	}
+ 	lastActivity := sess.UpdatedAt
+ 	if lastActivity.IsZero() {
+diff --git a/internal/app/serve/serve_live_control.go b/internal/app/serve/serve_live_control.go
+index 472b146c..89f42389 100644
+--- a/internal/app/serve/serve_live_control.go
++++ b/internal/app/serve/serve_live_control.go
+@@ -627,7 +627,7 @@ func (s *serveServer) newLiveControlProvider(ctx context.Context, sessionID stri
+ 		if sess == nil {
+ 			return nil, fmt.Errorf("live control session %q is unavailable", sessionID)
+ 		}
+-		policy, err = s.sessionModelPolicy(sess)
++		policy, err = appruntime.SessionModelPolicy(s.cfgRef, sess)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/internal/app/serve/serve_mcp_handler.go b/internal/app/serve/serve_mcp_handler.go
+index cee7de3b..21ddc27d 100644
+--- a/internal/app/serve/serve_mcp_handler.go
++++ b/internal/app/serve/serve_mcp_handler.go
+@@ -121,7 +121,7 @@ func (rt *serveRuntime) ensureMCPManagerLocked() error {
+ 		// later retry would skip setup and leave all deferred wrappers invisible.
+ 		rt.setMCPManager(mgr)
+ 	}
+-	if rt.provider != nil {
++	if rt.provider != nil && !rt.scopeLocked { // locked: no sampling handler (bypasses admission)
+ 		rt.mcpManager.SetSamplingProvider(rt.provider, rt.defaultModel, rt.yoloEnabled())
+ 	}
+ 	return nil
+diff --git a/internal/app/serve/serve_model_swap.go b/internal/app/serve/serve_model_swap.go
+index 26f121aa..05b43ac8 100644
+--- a/internal/app/serve/serve_model_swap.go
++++ b/internal/app/serve/serve_model_swap.go
+@@ -203,6 +203,8 @@ func (s *serveServer) beginResponseModelSwap(ctx context.Context, sessionID stri
+ 	}
+ 	if previous == nil {
+ 		return nil, fmt.Errorf("session %q has no previous runtime", sessionID)
++	} else if err := appruntime.RefuseLockedAuxIf(previous.scopeLocked, "cross-model swaps"); err != nil {
++		return nil, err
+ 	}
+ 	// Hydrate recreated runtimes before snapshotting so handover and naive
+ 	// continuation start from the persisted pre-turn conversation.
+diff --git a/internal/app/serve/serve_responses_durable.go b/internal/app/serve/serve_responses_durable.go
+index 467c4e59..49c52e5f 100644
+--- a/internal/app/serve/serve_responses_durable.go
++++ b/internal/app/serve/serve_responses_durable.go
+@@ -174,6 +174,8 @@ func (s *serveServer) generateBranchPathNote(ctx context.Context, sourceSessionI
+ 	sess, err := s.store.Get(ctx, sourceSessionID)
+ 	if err != nil || sess == nil {
+ 		return nil, http.StatusBadRequest, "branch source was not found"
++	} else if err := appruntime.RefuseLockedAux(sess.ModelPolicy, "branch path notes"); err != nil {
++		return nil, http.StatusConflict, err.Error() // admission locks a row before its first message
+ 	}
+ 	providerName := strings.TrimSpace(sess.ProviderKey)
+ 	if providerName == "" {
+diff --git a/internal/app/serve/serve_runtime.go b/internal/app/serve/serve_runtime.go
+index b40fe55d..fd823e88 100644
+--- a/internal/app/serve/serve_runtime.go
++++ b/internal/app/serve/serve_runtime.go
+@@ -53,6 +53,7 @@ type serveRuntime struct {
+ 	providerKey          string
+ 	modelPolicy          modelpolicy.Policy
+ 	modelPolicyConfig    *config.Config
++	scopeLocked          bool // fixed at construction (locks are never cleared); race-free read
+ 	// swapCandidate marks the runtime a model swap is installing. It runs a
+ 	// provider the session row does not name until its first turn persists, so
+ 	// it must survive a status poll in that window. Request handlers read it
+@@ -1925,6 +1926,9 @@ func (rt *serveRuntime) runOnce(ctx context.Context, stateful bool, replaceHisto
+ 		}
+ 		return serveRunResult{}, errServeSessionPersistence
+ 	}
++	if ctx, rt.modelPolicy, err = runtime.AdmitSessionScope(ctx, rt.store, &req, runtime.ScopeRun{Agent: rt.agentName, ProviderKey: runtimeProviderKey(rt), Model: rt.defaultModel, Workspace: rt.toolMgr.BaseDir(), Policy: rt.modelPolicy, Config: rt.modelPolicyConfig, Tools: rt.engine, Detached: !stateful && !persisted}); err != nil {
++		return serveRunResult{}, err
++	}
+ 	if persisted {
+ 		rt.persistStatus(ctx, req.SessionID, session.StatusActive)
+ 	}
+diff --git a/internal/app/serve/serve_session_directory.go b/internal/app/serve/serve_session_directory.go
+index bd0a1a2b..67eb9d62 100644
+--- a/internal/app/serve/serve_session_directory.go
++++ b/internal/app/serve/serve_session_directory.go
+@@ -72,7 +72,7 @@ func (s *serveServer) sessionDirectory(ctx context.Context, q sessionDirectoryQu
+ 	case query != "":
+ 		matches, err := s.store.Search(ctx, session.SearchOptions{
+ 			Query: query, Limit: limit, Archived: q.IncludeArchived,
+-			ProjectID: projectID, ExcludeSubagents: true,
++			ProjectID: projectID, ExcludeSubagents: true, ExcludeScopeLocked: true,
+ 		})
+ 		if err != nil {
+ 			return nil, fmt.Errorf("search sessions: %w", err)
+@@ -123,7 +123,7 @@ func (s *serveServer) sessionDirectory(ctx context.Context, q sessionDirectoryQu
+ 		}
+ 		summaries, err := s.store.List(ctx, session.ListOptions{
+ 			IDs: ids, Limit: -1, Archived: true, SortByActivity: true,
+-			ExcludeSubagents: true, ProjectID: projectID,
++			ExcludeSubagents: true, ProjectID: projectID, ExcludeScopeLocked: true,
+ 		})
+ 		if err != nil {
+ 			return nil, fmt.Errorf("list running sessions: %w", err)
+@@ -143,7 +143,7 @@ func (s *serveServer) sessionDirectory(ctx context.Context, q sessionDirectoryQu
+ 	default:
+ 		summaries, err := s.store.List(ctx, session.ListOptions{
+ 			Limit: limit, Archived: q.IncludeArchived, SortByActivity: true,
+-			ExcludeSubagents: true, ProjectID: projectID,
++			ExcludeSubagents: true, ProjectID: projectID, ExcludeScopeLocked: true,
+ 		})
+ 		if err != nil {
+ 			return nil, fmt.Errorf("list sessions: %w", err)
+diff --git a/internal/app/serve/serve_side_question.go b/internal/app/serve/serve_side_question.go
+index e908cd2c..6c0d3469 100644
+--- a/internal/app/serve/serve_side_question.go
++++ b/internal/app/serve/serve_side_question.go
+@@ -601,7 +601,7 @@ func (s *serveServer) runtimeForSideQuestion(ctx context.Context, sessionID stri
+ 		if !inMemory {
+ 			return nil, session.ErrNotFound
+ 		}
+-		return rt, nil
++		return rt, appruntime.RefuseLockedAuxIf(rt.scopeLocked, "side questions")
+ 	}
+ 	meta, err := s.store.Get(ctx, sessionID)
+ 	if err != nil {
+@@ -609,6 +609,8 @@ func (s *serveServer) runtimeForSideQuestion(ctx context.Context, sessionID stri
+ 	}
+ 	if meta == nil {
+ 		return nil, session.ErrNotFound
++	} else if err := appruntime.RefuseLockedAuxIf(meta.ModelPolicy.LockSession || (inMemory && rt.scopeLocked), "side questions"); err != nil {
++		return nil, err
+ 	}
+ 	if inMemory {
+ 		rt.sideQuestion.mu.Lock()
+diff --git a/internal/app/serve/serve_skills.go b/internal/app/serve/serve_skills.go
+index cdc15d3c..4ca9042a 100644
+--- a/internal/app/serve/serve_skills.go
++++ b/internal/app/serve/serve_skills.go
+@@ -752,7 +752,7 @@ func (s *serveServer) serveSkillChildRunner(ctx context.Context, sessionID strin
+ 		if sess == nil {
+ 			return nil, fmt.Errorf("parent session %q is unavailable", sessionID)
+ 		}
+-		policy, err := s.sessionModelPolicy(sess)
++		policy, err := appruntime.SessionModelPolicy(s.cfgRef, sess)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/internal/app/serve/session_scope_paths_test.go b/internal/app/serve/session_scope_paths_test.go
+new file mode 100644
+index 00000000..c19bbe87
+--- /dev/null
++++ b/internal/app/serve/session_scope_paths_test.go
+@@ -0,0 +1,190 @@
++package serve
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"slices"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	runpkg "github.com/samsaffron/term-llm/internal/run"
++	"github.com/samsaffron/term-llm/internal/runtimeoutput"
++	"github.com/samsaffron/term-llm/internal/session"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
++)
++
++// Not parallel: it redirects the process-wide raw debug sink to a file.
++func TestLockedRunNeverWritesRawDebugTranscript(t *testing.T) {
++	f := newScopeFixture(t)
++	plain := writeScopeAgent(t, filepath.Dir(f.private), "plaindebug", "name: plaindebug\nprovider: debug\nmodel: allowed\n")
++	logDir := t.TempDir()
++	closeLog, err := runtimeoutput.Start(logDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer closeLog()
++	run := func(agent, marker string) *mockprovider.MockProvider {
++		provider := mockprovider.NewMockProvider("debug").AddTextResponse("reply")
++		includeTools := false
++		runner := newCmdRunner(f.cfg, cmdRunnerOptions{Store: f.store, Debug: true, DebugRaw: true, ErrWriter: io.Discard})
++		if _, err := runner.Run(context.Background(), runpkg.Request{
++			Platform: runpkg.PlatformConsole, SessionID: session.NewID(), AgentName: agent, Persist: true, Stateful: true,
++			Debug: true, DebugRaw: true, Messages: []core.Message{core.UserText(marker)}, IncludeConfiguredTools: &includeTools, ProviderInstance: provider,
++		}, eventSinkFunc(func(core.Event) {})); err != nil {
++			t.Fatalf("%s run: %v", agent, err)
++		}
++		return provider
++	}
++	locked := run(f.private, "invented-locked-raw-marker")
++	for i, req := range locked.RecordedRequests() {
++		if req.Debug || req.DebugRaw {
++			t.Fatalf("locked provider request %d kept debug flags", i)
++		}
++	}
++	// Control: the same host flags still log an ordinary run, so the sink works.
++	run(plain, "invented-plain-raw-marker")
++	closeLog()
++	logged, err := os.ReadFile(filepath.Join(logDir, "tui.log"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(string(logged), "invented-locked-raw-marker") {
++		t.Fatal("raw debug output contains the locked transcript")
++	}
++	if !strings.Contains(string(logged), "invented-plain-raw-marker") {
++		t.Fatal("control run did not reach the raw debug sink; test cannot observe logging")
++	}
++}
++
++// A live locked runtime refuses side questions even before its row shows the
++// lock (first admission not yet committed).
++func TestSideQuestionRefusesLiveLockedRuntimeBeforePersist(t *testing.T) {
++	f := newScopeFixture(t)
++	ctx := context.Background()
++	id := session.NewID()
++	if err := f.store.Create(ctx, &session.Session{ID: id, Provider: "debug", Model: "allowed", Agent: "private"}); err != nil {
++		t.Fatal(err)
++	}
++	srv := &serveServer{store: f.store, cfgRef: f.cfg, sessionMgr: newServeSessionManager(time.Minute, 10, nil)}
++	rt := &serveRuntime{modelPolicy: modelpolicy.Policy{LockSession: true}, scopeLocked: true}
++	srv.sessionMgr.sessions[id] = rt
++	if _, err := srv.runtimeForSideQuestion(ctx, id); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("side question on live locked runtime = %v, want scope refusal", err)
++	}
++	srv.store = nil
++	if _, err := srv.runtimeForSideQuestion(ctx, id); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("store-less side question on live locked runtime = %v, want scope refusal", err)
++	}
++}
++
++func TestBranchHTTPOfLockedSessionKeepsIdentityAndPolicy(t *testing.T) {
++	f := newScopeFixture(t)
++	ctx := context.Background()
++	id := session.NewID()
++	workspace := t.TempDir()
++	f.privateProvider.AddTextResponse("reply")
++	includeTools := false
++	if _, err := newCmdRunner(f.cfg, cmdRunnerOptions{Store: f.store}).Run(ctx, runpkg.Request{
++		Platform: runpkg.PlatformConsole, SessionID: id, AgentName: f.private, Persist: true, Stateful: true, Cwd: workspace,
++		Messages: []core.Message{core.UserText("turn")}, IncludeConfiguredTools: &includeTools, ProviderInstance: f.privateProvider,
++	}, eventSinkFunc(func(core.Event) {})); err != nil {
++		t.Fatalf("locked first turn: %v", err)
++	}
++	parent, err := f.store.Get(ctx, id)
++	if err != nil || parent.CWD == "" {
++		t.Fatalf("parent = %+v, %v", parent, err)
++	}
++	project := &session.Project{Name: "scope", CanonicalDir: parent.CWD}
++	if err := f.store.CreateProject(ctx, project); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.store.AssignSessionProject(ctx, id, project.ID, parent.CWD, parent.WorktreeDir); err != nil {
++		t.Fatalf("first project assignment: %v", err)
++	}
++	if parent, err = f.store.Get(ctx, id); err != nil || parent.ProjectID != project.ID {
++		t.Fatalf("parent after project = %+v, %v", parent, err)
++	}
++	messages, err := f.store.GetMessages(ctx, id, 0, 0)
++	if err != nil || len(messages) == 0 {
++		t.Fatalf("messages = %d, %v", len(messages), err)
++	}
++	anchor := messages[len(messages)-1].ID
++
++	srv := &serveServer{store: f.store, cfgRef: f.cfg, sessionMgr: newServeSessionManager(time.Minute, 10, nil)}
++	body, _ := json.Marshal(map[string]any{"anchor_message_id": anchor, "idempotency_key": "scope-branch"})
++	out := httptest.NewRecorder()
++	srv.handleCreateSessionBranch(out, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body))), id)
++	if out.Code != http.StatusCreated {
++		t.Fatalf("branch = %d %s", out.Code, out.Body.String())
++	}
++	var resp createSessionBranchResponse
++	if err := json.Unmarshal(out.Body.Bytes(), &resp); err != nil || resp.Session.ID == "" || resp.Session.ID == id {
++		t.Fatalf("branch response = %+v, %v", resp, err)
++	}
++	child, err := f.store.Get(ctx, resp.Session.ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if child.Agent != parent.Agent || child.CWD != parent.CWD || child.WorktreeDir != parent.WorktreeDir || child.ProjectID != parent.ProjectID {
++		t.Fatalf("branch identity = agent %q cwd %q worktree %q project %q; parent %q %q %q %q",
++			child.Agent, child.CWD, child.WorktreeDir, child.ProjectID, parent.Agent, parent.CWD, parent.WorktreeDir, parent.ProjectID)
++	}
++	if !child.ModelPolicy.LockSession || !slices.EqualFunc(child.ModelPolicy.Rules, parent.ModelPolicy.Rules, func(a, b modelpolicy.Rule) bool {
++		return a.Agent == b.Agent && slices.Equal(a.Allowed, b.Allowed)
++	}) {
++		t.Fatalf("branch policy = %+v, parent %+v", child.ModelPolicy, parent.ModelPolicy)
++	}
++	// The branch is as locked as its parent: another agent cannot take it over.
++	before := len(f.unlockedProvider.RecordedRequests())
++	if err := f.run(t, child.ID, f.other, f.unlockedProvider, "retarget"); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("branch retarget = %v, want scope refusal", err)
++	}
++	if got := len(f.unlockedProvider.RecordedRequests()); got != before {
++		t.Fatalf("branch retarget dispatched %d provider request(s)", got-before)
++	}
++}
++
++func TestBranchPathNotesRefusedForLockedSourceBeforeProvider(t *testing.T) {
++	f := newScopeFixture(t)
++	ctx := context.Background()
++	lockedID, plainID := session.NewID(), session.NewID()
++	if err := f.run(t, lockedID, f.private, f.privateProvider, "invented private marker"); err != nil {
++		t.Fatalf("locked turn: %v", err)
++	}
++	if err := f.run(t, plainID, f.other, f.unlockedProvider, "ordinary"); err != nil {
++		t.Fatalf("ordinary turn: %v", err)
++	}
++	built := 0
++	srv := &serveServer{store: f.store, cfgRef: f.cfg, sessionMgr: newServeSessionManager(time.Minute, 10, nil),
++		pathNotesProviderFactory: func(string, string) (core.Provider, error) {
++			built++
++			return nil, errors.New("helper unavailable in test")
++		}}
++	source := []core.Message{core.UserText("invented private marker")}
++	if note, status, msg := srv.generateBranchPathNote(ctx, lockedID, source, "summary", ""); note != nil || status != http.StatusConflict || !strings.Contains(msg, "locked") {
++		t.Fatalf("locked path note = %v %d %q, want conflict refusal", note, status, msg)
++	}
++	if built != 0 {
++		t.Fatalf("locked path note constructed %d helper provider(s)", built)
++	}
++	// Ordinary sessions still reach the helper; an empty mode still needs none.
++	if _, status, _ := srv.generateBranchPathNote(ctx, plainID, source, "summary", ""); status == http.StatusConflict && built == 0 {
++		t.Fatal("ordinary path note was refused")
++	}
++	if built != 1 {
++		t.Fatalf("ordinary path note built %d helper provider(s), want 1", built)
++	}
++	if note, status, _ := srv.generateBranchPathNote(ctx, lockedID, source, "", ""); note != nil || status != 0 {
++		t.Fatalf("empty mode = %v %d, want no helper", note, status)
++	}
++}
+diff --git a/internal/app/serve/session_scope_sampling_test.go b/internal/app/serve/session_scope_sampling_test.go
+new file mode 100644
+index 00000000..0a84d102
+--- /dev/null
++++ b/internal/app/serve/session_scope_sampling_test.go
+@@ -0,0 +1,89 @@
++package serve
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/modelcontextprotocol/go-sdk/mcp"
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++	termmcp "github.com/samsaffron/term-llm/internal/mcp"
++	runpkg "github.com/samsaffron/term-llm/internal/run"
++	"github.com/samsaffron/term-llm/internal/session"
++)
++
++// MCP sampling sends server-chosen prompts to the runtime provider, optionally
++// with a configured Sampling.Model override, outside per-turn admission. A
++// locked runtime installs no sampling handler at all, so neither the default
++// nor the override model can be reached; an ordinary runtime is unchanged.
++func TestLockedRuntimeInstallsNoMCPSamplingHandler(t *testing.T) {
++	f := newScopeFixture(t)
++	ctx := context.Background()
++	id := session.NewID()
++	if err := f.run(t, id, f.private, f.privateProvider, "invented private marker"); err != nil {
++		t.Fatalf("locked first turn: %v", err)
++	}
++	// Resume under a definition that no longer opts into lock_session: the
++	// persisted lock still marks the runtime locked.
++	widened := "name: private\nprovider: debug\nmodel: allowed\nallowed_models: [debug:*, other:*]\n"
++	if err := os.WriteFile(filepath.Join(f.private, "agent.yaml"), []byte(widened), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	includeTools := false
++	resumed, err := newCmdRunner(f.cfg, cmdRunnerOptions{Store: f.store}).(*cmdRunner).prepare(ctx, runpkg.Request{
++		Platform: runpkg.PlatformConsole, SessionID: id, Persist: true, Stateful: true, Resume: true,
++		Messages: []core.Message{core.UserText("again")}, IncludeConfiguredTools: &includeTools, ProviderInstance: mockprovider.NewMockProvider("debug"),
++	}, eventSinkFunc(func(core.Event) {}))
++	if err != nil {
++		t.Fatalf("prepare resumed locked session: %v", err)
++	}
++	defer resumed.Close()
++	if !resumed.runtime.scopeLocked {
++		t.Fatal("resumed persisted-lock runtime is not marked locked")
++	}
++
++	locked := mockprovider.NewMockProvider("debug")
++	plain := mockprovider.NewMockProvider("debug").AddTextResponse("sampled")
++	for name, tc := range map[string]struct {
++		rt       *serveRuntime
++		provider *mockprovider.MockProvider
++	}{
++		"initially locked":  {&serveRuntime{provider: locked, defaultModel: "allowed", scopeLocked: true}, locked},
++		"resumed persisted": {resumed.runtime, nil},
++	} {
++		if tc.rt.mcpManager != nil {
++			tc.rt.setMCPManager(nil)
++		}
++		if err := tc.rt.ensureMCPManagerLocked(); err != nil {
++			t.Fatalf("%s: ensure MCP manager: %v", name, err)
++		}
++		if h := tc.rt.mcpManager.GetSamplingHandler(); h != nil {
++			t.Fatalf("%s: locked runtime installed an MCP sampling handler", name)
++		}
++		if tc.provider != nil && len(tc.provider.RecordedRequests()) != 0 {
++			t.Fatalf("%s: locked runtime dispatched sampling", name)
++		}
++	}
++
++	// Ordinary runtimes keep sampling, including the configured model override.
++	ordinary := &serveRuntime{provider: plain, defaultModel: "allowed"}
++	if err := ordinary.ensureMCPManagerLocked(); err != nil {
++		t.Fatal(err)
++	}
++	handler := ordinary.mcpManager.GetSamplingHandler()
++	if handler == nil {
++		t.Fatal("ordinary runtime lost its MCP sampling handler")
++	}
++	enabled := true
++	handler.SetServerConfig("srv", termmcp.ServerConfig{Sampling: &termmcp.SamplingConfig{Enabled: &enabled, AutoApprove: true, Model: "override"}})
++	if _, err := handler.Handle(ctx, "srv", &mcp.CreateMessageRequest{Params: &mcp.CreateMessageParams{
++		Messages: []*mcp.SamplingMessage{{Role: "user", Content: &mcp.TextContent{Text: "hi"}}}, MaxTokens: 10,
++	}}); err != nil {
++		t.Fatalf("ordinary sampling: %v", err)
++	}
++	if got := plain.RecordedRequests(); len(got) != 1 || got[0].Model != "override" {
++		t.Fatalf("ordinary sampling requests = %+v, want one override request", got)
++	}
++}
+diff --git a/internal/app/serve/session_scope_test.go b/internal/app/serve/session_scope_test.go
+new file mode 100644
+index 00000000..023a3922
+--- /dev/null
++++ b/internal/app/serve/session_scope_test.go
+@@ -0,0 +1,325 @@
++package serve
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"slices"
++	"strings"
++	"testing"
++	"time"
++
++	appruntime "github.com/samsaffron/term-llm/internal/app/runtime"
++	"github.com/samsaffron/term-llm/internal/config"
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/llm/mockprovider"
++	runpkg "github.com/samsaffron/term-llm/internal/run"
++	"github.com/samsaffron/term-llm/internal/session"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
++)
++
++type scopeFixture struct {
++	cfg              *config.Config
++	store            *session.SQLiteStore
++	private, other   string
++	privateProvider  *mockprovider.MockProvider
++	unlockedProvider *mockprovider.MockProvider
++}
++
++func writeScopeAgent(t *testing.T, root, name, body string) string {
++	t.Helper()
++	dir := filepath.Join(root, name)
++	if err := os.MkdirAll(dir, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte(body), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	return dir
++}
++
++func newScopeFixture(t *testing.T) *scopeFixture {
++	t.Helper()
++	root := t.TempDir()
++	store, err := session.NewSQLiteStore(session.Config{Enabled: true, Path: filepath.Join(t.TempDir(), "sessions.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = store.Close() })
++	return &scopeFixture{
++		cfg: &config.Config{DefaultProvider: "debug", Providers: map[string]config.ProviderConfig{
++			"debug": {Model: "allowed"}, "other": {Model: "denied"},
++		}, Agents: config.AgentsConfig{SearchPaths: []string{root}}},
++		store:            store,
++		private:          writeScopeAgent(t, root, "private", "name: private\nprovider: debug\nmodel: allowed\nallowed_models: [debug:allowed]\nlock_session: true\n"),
++		other:            writeScopeAgent(t, root, "other", "name: other\nprovider: other\nmodel: denied\n"),
++		privateProvider:  mockprovider.NewMockProvider("debug"),
++		unlockedProvider: mockprovider.NewMockProvider("other"),
++	}
++}
++
++func (f *scopeFixture) run(t *testing.T, id, agent string, provider *mockprovider.MockProvider, text string) error {
++	t.Helper()
++	provider.AddTextResponse("reply")
++	includeTools := false
++	runner := newCmdRunner(f.cfg, cmdRunnerOptions{Store: f.store})
++	_, err := runner.Run(context.Background(), runpkg.Request{
++		Platform: runpkg.PlatformConsole, SessionID: id, AgentName: agent, Persist: true, Stateful: true,
++		Cwd: "", Messages: []core.Message{core.UserText(text)}, IncludeConfiguredTools: &includeTools, ProviderInstance: provider,
++	}, eventSinkFunc(func(core.Event) {}))
++	return err
++}
++
++func TestLockedSessionPersistsFullPolicyAndRefusesRetarget(t *testing.T) {
++	f := newScopeFixture(t)
++	ctx := context.Background()
++	id := session.NewID()
++	if err := f.run(t, id, f.private, f.privateProvider, "invented private marker"); err != nil {
++		t.Fatalf("locked first turn: %v", err)
++	}
++	saved, err := f.store.Get(ctx, id)
++	if err != nil || !saved.ModelPolicy.LockSession || !saved.ModelPolicy.Restricted() || saved.Agent != f.private {
++		t.Fatalf("persisted session = %+v, %v", saved, err)
++	}
++	// The gap observed on stock builds: a restarted host retargets the agent.
++	// A fresh runner (no warm runtime) models the restart.
++	if err := f.run(t, id, f.other, f.unlockedProvider, "after restart"); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("retarget error = %v, want scope refusal", err)
++	}
++	if got := len(f.unlockedProvider.RecordedRequests()); got != 0 {
++		t.Fatalf("disallowed provider received %d request(s)", got)
++	}
++	// Even if the stored agent definition later drops its restriction, the
++	// persisted lock keeps the conversation on its admitted policy.
++	after, _ := f.store.Get(ctx, id)
++	if after.Agent != f.private || !after.ModelPolicy.LockSession {
++		t.Fatalf("session identity changed: %+v", after)
++	}
++	if err := after.ModelPolicy.Check(f.private, "other", "denied"); err == nil {
++		t.Fatal("persisted locked policy allows the disallowed model")
++	}
++	// Same-agent continuation still works.
++	if err := f.run(t, id, "", f.privateProvider, "continue"); err != nil {
++		t.Fatalf("same-agent continuation: %v", err)
++	}
++}
++
++func TestUnlockedSessionBehaviourUnchanged(t *testing.T) {
++	f := newScopeFixture(t)
++	ctx := context.Background()
++	id := session.NewID()
++	if err := f.run(t, id, f.other, f.unlockedProvider, "ordinary"); err != nil {
++		t.Fatalf("ordinary turn: %v", err)
++	}
++	saved, err := f.store.Get(ctx, id)
++	if err != nil || saved.ModelPolicy.LockSession || saved.ModelPolicy.Restricted() {
++		t.Fatalf("ordinary session policy = %+v, %v", saved, err)
++	}
++	// An unlocked conversation with history cannot be retrofitted into a lock.
++	if err := f.run(t, id, f.private, f.privateProvider, "retrofit"); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("retrofit error = %v, want scope refusal", err)
++	}
++	if got := len(f.privateProvider.RecordedRequests()); got != 0 {
++		t.Fatalf("retrofit reached provider %d time(s)", got)
++	}
++}
++
++func TestLockedSessionSurvivesDefinitionWideningAndAuxRouting(t *testing.T) {
++	f := newScopeFixture(t)
++	ctx := context.Background()
++	id := session.NewID()
++	if err := f.run(t, id, f.private, f.privateProvider, "invented private marker"); err != nil {
++		t.Fatalf("locked first turn: %v", err)
++	}
++	// The operator later widens the definition and removes lock_session.
++	widened := "name: private\nprovider: debug\nmodel: allowed\nallowed_models: [debug:*, other:*]\n"
++	if err := os.WriteFile(filepath.Join(f.private, "agent.yaml"), []byte(widened), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	saved, err := f.store.Get(ctx, id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	policy, err := appruntime.SessionModelPolicy(f.cfg, saved)
++	if err != nil || !policy.LockSession {
++		t.Fatalf("session policy after widening = %+v, %v", policy, err)
++	}
++	if err := policy.CheckWithConfig(f.cfg, f.private, "other", "denied"); err == nil {
++		t.Fatal("widened definition widened the locked conversation")
++	}
++	// A resumed turn that asks for the newly "allowed" model is refused before dispatch.
++	f.unlockedProvider.AddTextResponse("must not run")
++	includeTools := false
++	_, err = newCmdRunner(f.cfg, cmdRunnerOptions{Store: f.store}).Run(ctx, runpkg.Request{
++		Platform: runpkg.PlatformConsole, SessionID: id, Provider: "other:denied", Persist: true, Stateful: true, Resume: true,
++		Messages: []core.Message{core.UserText("switch")}, IncludeConfiguredTools: &includeTools, ProviderInstance: f.unlockedProvider,
++	}, eventSinkFunc(func(core.Event) {}))
++	if err == nil {
++		t.Fatal("resume onto a disallowed provider admitted")
++	}
++	if got := len(f.unlockedProvider.RecordedRequests()); got != 0 {
++		t.Fatalf("disallowed provider received %d request(s)", got)
++	}
++	// Auxiliary calls (titles, interrupt classification) route only to allowed models.
++	f.cfg.Providers["debug"] = config.ProviderConfig{Model: "allowed", FastProvider: "other", FastModel: "denied"}
++	aux, err := appruntime.AuxProviderForPolicy(f.cfg, policy, appruntime.ModelSelection{Provider: "debug", Model: "allowed"}, "debug")
++	if err != nil || aux == nil {
++		t.Fatalf("aux provider = %v, %v", aux, err)
++	}
++	if name := aux.Name(); strings.Contains(name, "denied") {
++		t.Fatalf("aux routed to disallowed model %q", name)
++	}
++}
++
++func offeredToolNames(req core.Request) []string {
++	names := make([]string, 0, len(req.Tools))
++	for _, spec := range req.Tools {
++		names = append(names, spec.Name)
++	}
++	return names
++}
++
++func TestLockedAgentSearchSettingCannotBeWidened(t *testing.T) {
++	f := newScopeFixture(t)
++	root := filepath.Dir(f.private)
++	locked := writeScopeAgent(t, root, "lockednosearch", "name: lockednosearch\nprovider: debug\nmodel: allowed\nallowed_models: [debug:allowed]\nlock_session: true\ntools:\n  enabled: [update_plan]\n")
++	plain := writeScopeAgent(t, root, "plainnosearch", "name: plainnosearch\nprovider: debug\nmodel: allowed\ntools:\n  enabled: [update_plan]\n")
++	search := true
++	run := func(agent string, provider *mockprovider.MockProvider) error {
++		_, err := newCmdRunner(f.cfg, cmdRunnerOptions{Store: f.store}).Run(context.Background(), runpkg.Request{
++			Platform: runpkg.PlatformConsole, SessionID: session.NewID(), AgentName: agent, Persist: true, Stateful: true,
++			// A request/UI search toggle asks for search the agent does not enable.
++			Search: &search, Messages: []core.Message{core.UserText("look this up")}, ProviderInstance: provider,
++		}, eventSinkFunc(func(core.Event) {}))
++		return err
++	}
++
++	// Locked: neither offered nor callable, even when the model names it.
++	lockedProvider := mockprovider.NewMockProvider("debug").
++		AddToolCall("call-1", core.WebSearchToolName, map[string]string{"query": "invented"}).
++		AddTextResponse("done")
++	if err := run(locked, lockedProvider); err != nil {
++		t.Fatalf("locked run: %v", err)
++	}
++	requests := lockedProvider.RecordedRequests()
++	if len(requests) == 0 {
++		t.Fatal("locked run made no provider request")
++	}
++	for i, req := range requests {
++		for _, name := range offeredToolNames(req) {
++			if name == core.WebSearchToolName || name == core.ReadURLToolName {
++				t.Fatalf("locked request %d offered %s: %v", i, name, offeredToolNames(req))
++			}
++		}
++		if req.Search {
++			t.Fatalf("locked request %d enabled native search", i)
++		}
++		for _, msg := range req.Messages {
++			for _, part := range msg.Parts {
++				if part.ToolResult != nil && part.ToolResult.ID == "call-1" && !strings.Contains(part.ToolResult.Content, "not registered") {
++					t.Fatalf("unoffered web_search executed: %q", part.ToolResult.Content)
++				}
++			}
++		}
++	}
++	// The host never executed it: an unregistered call ends the server-side
++	// turn instead of producing a search result for a follow-up request.
++	if len(requests) != 1 {
++		t.Fatalf("locked run made %d provider requests, want 1", len(requests))
++	}
++
++	// Ordinary unlocked behaviour is unchanged: the request toggle still applies.
++	plainProvider := mockprovider.NewMockProvider("debug").AddTextResponse("done")
++	if err := run(plain, plainProvider); err != nil {
++		t.Fatalf("unlocked run: %v", err)
++	}
++	if names := offeredToolNames(plainProvider.RecordedRequests()[0]); !slices.Contains(names, core.WebSearchToolName) {
++		t.Fatalf("unlocked request lost search toggle: %v", names)
++	}
++}
++
++func TestLockedSessionAuxiliaryPathsFailClosed(t *testing.T) {
++	f := newScopeFixture(t)
++	ctx := context.Background()
++	id := session.NewID()
++	if err := f.run(t, id, f.private, f.privateProvider, "invented private marker"); err != nil {
++		t.Fatalf("locked first turn: %v", err)
++	}
++	plainID := session.NewID()
++	if err := f.run(t, plainID, f.other, f.unlockedProvider, "invented private marker"); err != nil {
++		t.Fatalf("ordinary turn: %v", err)
++	}
++	srv := &serveServer{store: f.store, cfgRef: f.cfg, sessionMgr: newServeSessionManager(time.Minute, 10, nil)}
++	before := len(f.privateProvider.RecordedRequests())
++
++	if _, err := srv.runtimeForSideQuestion(ctx, id); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("side question = %v, want scope refusal", err)
++	}
++	out := httptest.NewRecorder()
++	srv.handleSessionRuntimeCompact(out, httptest.NewRequest(http.MethodPost, "/", nil), id)
++	if out.Code != http.StatusConflict || !strings.Contains(out.Body.String(), "locked") {
++		t.Fatalf("manual compaction = %d %s", out.Code, out.Body.String())
++	}
++	if _, err := srv.resolveLiveSwitchTarget(ctx, id); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("voice switch = %v, want scope refusal", err)
++	}
++	if _, err := srv.resolveLiveSwitchTarget(ctx, plainID); err != nil {
++		t.Fatalf("ordinary voice switch = %v", err)
++	}
++	// Other agents' session_directory never sees locked rows or snippets.
++	for _, q := range []sessionDirectoryQuery{{}, {Query: "invented"}} {
++		entries, err := srv.sessionDirectory(ctx, q)
++		if err != nil {
++			t.Fatal(err)
++		}
++		seenPlain := false
++		for _, entry := range entries {
++			if entry.ID == id {
++				t.Fatalf("session_directory %+v exposed the locked session", q)
++			}
++			seenPlain = seenPlain || entry.ID == plainID
++		}
++		if !seenPlain {
++			t.Fatalf("session_directory %+v lost the ordinary session: %+v", q, entries)
++		}
++	}
++	if got := len(f.privateProvider.RecordedRequests()); got != before {
++		t.Fatalf("auxiliary refusals dispatched %d provider request(s)", got-before)
++	}
++}
++
++func TestLockedSessionRefusesWorkspaceRetargetAfterRestart(t *testing.T) {
++	f := newScopeFixture(t)
++	ctx := context.Background()
++	id := session.NewID()
++	first, second := t.TempDir(), t.TempDir()
++	run := func(cwd string, provider *mockprovider.MockProvider) error {
++		provider.AddTextResponse("reply")
++		includeTools := false
++		_, err := newCmdRunner(f.cfg, cmdRunnerOptions{Store: f.store}).Run(ctx, runpkg.Request{
++			Platform: runpkg.PlatformConsole, SessionID: id, AgentName: f.private, Persist: true, Stateful: true, Cwd: cwd,
++			Messages: []core.Message{core.UserText("turn")}, IncludeConfiguredTools: &includeTools, ProviderInstance: provider,
++		}, eventSinkFunc(func(core.Event) {}))
++		return err
++	}
++	if err := run(first, f.privateProvider); err != nil {
++		t.Fatalf("locked first turn: %v", err)
++	}
++	saved, _ := f.store.Get(ctx, id)
++	if saved.CWD == "" {
++		t.Fatal("locked first turn did not bind a workspace")
++	}
++	moved := mockprovider.NewMockProvider("debug")
++	if err := run(second, moved); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("workspace retarget = %v, want scope refusal", err)
++	}
++	if got := len(moved.RecordedRequests()); got != 0 {
++		t.Fatalf("retargeted workspace dispatched %d request(s)", got)
++	}
++	if after, _ := f.store.Get(ctx, id); after.CWD != saved.CWD {
++		t.Fatalf("workspace changed from %q to %q", saved.CWD, after.CWD)
++	}
++}
+diff --git a/internal/app/sessions/autotitle.go b/internal/app/sessions/autotitle.go
+index 339b8b81..85a74e08 100644
+--- a/internal/app/sessions/autotitle.go
++++ b/internal/app/sessions/autotitle.go
+@@ -92,7 +92,9 @@ func (a App) Autotitle(cmd *cobra.Command, args []string) error {
+ 			fmt.Fprintf(cmd.ErrOrStderr(), "#%d load failed: %v\n", summary.Number, err)
+ 			continue
+ 		}
+-		if sess == nil {
++		if sess == nil || sess.ModelPolicy.LockSession {
++			// The batch command uses the operator's fast model, not the
++			// session's locked policy; locked conversations are never sent.
+ 			continue
+ 		}
+ 		if a.AutotitleMinAge > 0 && time.Since(sess.UpdatedAt) < a.AutotitleMinAge {
+diff --git a/internal/app/version/capabilities.go b/internal/app/version/capabilities.go
+new file mode 100644
+index 00000000..57557210
+--- /dev/null
++++ b/internal/app/version/capabilities.go
+@@ -0,0 +1,44 @@
++package version
++
++import (
++	"encoding/json"
++	"fmt"
++
++	"github.com/spf13/cobra"
++)
++
++// Capabilities reports additive native interfaces that external integrations
++// may require before enabling dependent behaviour. Keys are stable; a value is
++// the interface version (incremented only for incompatible changes). Absent
++// keys, or a binary without this command, mean the interface is unsupported.
++func Capabilities() map[string]int {
++	return map[string]int{
++		// agent.yaml lock_session: durable policy and fixed agent/workspace.
++		"session_scope_lock": 1,
++		// Host-reserved TERM_LLM_SESSION_ID/TERM_LLM_PRIVATE_SESSION for
++		// admitted locked sessions; reserved names cannot be inherited/forged.
++		"custom_tool_session_context": 1,
++	}
++}
++
++// NewCapabilitiesCommand builds `term-llm capabilities [--json]`.
++func NewCapabilitiesCommand() *cobra.Command {
++	command := &cobra.Command{
++		Use:   "capabilities",
++		Short: "Print native interface capability versions as JSON",
++		Args:  cobra.NoArgs,
++		RunE:  RunCapabilities,
++	}
++	command.Flags().Bool("json", true, "Print machine-readable JSON (the only format)")
++	return command
++}
++
++// RunCapabilities prints Capabilities as one JSON object.
++func RunCapabilities(cmd *cobra.Command, _ []string) error {
++	encoded, err := json.Marshal(Capabilities())
++	if err != nil {
++		return fmt.Errorf("encode capabilities: %w", err)
++	}
++	_, err = fmt.Fprintln(cmd.OutOrStdout(), string(encoded))
++	return err
++}
+diff --git a/internal/app/version/capabilities_test.go b/internal/app/version/capabilities_test.go
+new file mode 100644
+index 00000000..b85da684
+--- /dev/null
++++ b/internal/app/version/capabilities_test.go
+@@ -0,0 +1,34 @@
++package version
++
++import (
++	"bytes"
++	"encoding/json"
++	"testing"
++
++	"github.com/spf13/cobra"
++)
++
++func TestCapabilitiesJSONContract(t *testing.T) {
++	var out bytes.Buffer
++	cmd := &cobra.Command{}
++	cmd.SetOut(&out)
++	if err := RunCapabilities(cmd, nil); err != nil {
++		t.Fatal(err)
++	}
++	var got map[string]int
++	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
++		t.Fatalf("output %q is not a JSON object: %v", out.String(), err)
++	}
++	want := map[string]int{"session_scope_lock": 1, "custom_tool_session_context": 1}
++	if len(got) != len(want) {
++		t.Fatalf("capabilities = %v, want %v", got, want)
++	}
++	for key, version := range want {
++		if got[key] != version {
++			t.Fatalf("capabilities = %v, want %v", got, want)
++		}
++	}
++	if _, ok := got["private_upload_context"]; ok {
++		t.Fatal("upload context must not be advertised")
++	}
++}
+diff --git a/internal/app/version/doc.go b/internal/app/version/doc.go
+index 314fd6e9..35b83b08 100644
+--- a/internal/app/version/doc.go
++++ b/internal/app/version/doc.go
+@@ -1,2 +1,2 @@
+-// Package version implements `term-llm version` over linker-injected build metadata.
++// Package version implements `term-llm version` and `term-llm capabilities` over build metadata.
+ package version
+diff --git a/internal/llm/core/session_scope.go b/internal/llm/core/session_scope.go
+new file mode 100644
+index 00000000..58da409e
+--- /dev/null
++++ b/internal/llm/core/session_scope.go
+@@ -0,0 +1,31 @@
++package core
++
++import "context"
++
++type lockedSessionKey struct{}
++
++// ContextWithLockedSession records that the host admitted sessionID as a locked
++// conversation for this run. Only host admission code may call this; model
++// output and tool arguments never reach it.
++func ContextWithLockedSession(ctx context.Context, sessionID string) context.Context {
++	if sessionID == "" {
++		return ctx
++	}
++	return context.WithValue(ctx, lockedSessionKey{}, sessionID)
++}
++
++// LockedSessionFromContext returns the admitted locked session ID, or "" when
++// the run was not admitted as locked or the engine session differs.
++func LockedSessionFromContext(ctx context.Context) string {
++	if ctx == nil {
++		return ""
++	}
++	id, _ := ctx.Value(lockedSessionKey{}).(string)
++	if id == "" {
++		return ""
++	}
++	if engineID := SessionIDFromContext(ctx); engineID != "" && engineID != id {
++		return ""
++	}
++	return id
++}
+diff --git a/internal/modelpolicy/lock.go b/internal/modelpolicy/lock.go
+new file mode 100644
+index 00000000..fd2f06fb
+--- /dev/null
++++ b/internal/modelpolicy/lock.go
+@@ -0,0 +1,33 @@
++package modelpolicy
++
++import (
++	"slices"
++
++	"github.com/samsaffron/term-llm/internal/config"
++)
++
++// lockSnapshotSuffix labels a rule frozen from provider allowlists at lock time.
++const lockSnapshotSuffix = " (provider allowlist at lock)"
++
++// Lock returns the policy persisted for a locked conversation: the complete
++// effective chain, marked locked, plus each rule narrowed by the provider
++// allowlists in force at admission. Rules only intersect, so a later widening
++// of an agent definition or of provider configuration cannot widen the
++// conversation; narrowing still applies because live checks keep using the
++// current configuration too.
++func Lock(cfg *config.Config, effective Policy) Policy {
++	out := Policy{Rules: append([]Rule(nil), effective.Rules...), LockSession: true}
++	if cfg == nil {
++		return out
++	}
++	for _, rule := range effective.Rules {
++		narrowed := deniedAllowedForConfig(cfg, rule.Allowed)
++		if !slices.Equal(narrowed, rule.Allowed) {
++			out = out.With(rule.Agent+lockSnapshotSuffix, narrowed)
++		}
++	}
++	return out
++}
++
++// Locked reports whether the policy fixes conversation identity.
++func (p Policy) Locked() bool { return p.LockSession }
+diff --git a/internal/modelpolicy/lock_test.go b/internal/modelpolicy/lock_test.go
+new file mode 100644
+index 00000000..495c6036
+--- /dev/null
++++ b/internal/modelpolicy/lock_test.go
+@@ -0,0 +1,45 @@
++package modelpolicy
++
++import (
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/config"
++)
++
++func TestLockPreservedByComposition(t *testing.T) {
++	locked := Policy{LockSession: true}.With("owner", []string{"debug:allowed"})
++	if !locked.LockSession || !locked.With("child", []string{"debug:*"}).LockSession {
++		t.Fatal("With dropped the lock")
++	}
++	if !(Policy{}).Append(locked).LockSession || !locked.Append(Policy{}).LockSession {
++		t.Fatal("Append dropped the lock")
++	}
++	if (Policy{}).With("a", []string{"debug:x"}).LockSession {
++		t.Fatal("ordinary policy became locked")
++	}
++}
++
++func TestLockSnapshotsProviderAllowlist(t *testing.T) {
++	cfg := &config.Config{Providers: map[string]config.ProviderConfig{
++		"debug": {AllowedModels: []string{"allowed", "second"}},
++	}}
++	effective := Policy{}.With("owner", []string{"debug:*"})
++	locked := Lock(cfg, effective)
++	if !locked.LockSession || len(locked.Rules) != 2 {
++		t.Fatalf("Lock() = %+v, want original rule plus snapshot", locked)
++	}
++	// Widening the provider later must not widen the locked conversation.
++	widened := &config.Config{Providers: map[string]config.ProviderConfig{"debug": {}}}
++	if err := locked.CheckWithConfig(widened, "owner", "debug", "later-added"); err == nil {
++		t.Fatal("locked policy allowed a model added after locking")
++	}
++	if err := locked.CheckWithConfig(widened, "owner", "debug", "allowed"); err != nil {
++		t.Fatalf("locked policy denied snapshot model: %v", err)
++	}
++	if again := Lock(cfg, locked); len(again.Rules) != len(locked.Rules) {
++		t.Fatalf("re-locking grew rules: %+v", again.Rules)
++	}
++	if plain := Lock(nil, effective); !plain.LockSession || len(plain.Rules) != 1 {
++		t.Fatalf("Lock(nil) = %+v", plain)
++	}
++}
+diff --git a/internal/modelpolicy/policy.go b/internal/modelpolicy/policy.go
+index fa1fc493..eaedc75b 100644
+--- a/internal/modelpolicy/policy.go
++++ b/internal/modelpolicy/policy.go
+@@ -17,6 +17,9 @@ type Rule struct {
+ 
+ type Policy struct {
+ 	Rules []Rule `json:"rules,omitempty"`
++	// LockSession marks a conversation whose persisted policy and identity
++	// (agent and workspace) are fixed. A lock is never cleared by composition.
++	LockSession bool `json:"lock_session,omitempty"`
+ }
+ 
+ func (p Policy) With(agent string, allowed []string) Policy {
+@@ -25,13 +28,13 @@ func (p Policy) With(agent string, allowed []string) Policy {
+ 		// parent snapshot over the same persisted ancestry) adds nothing.
+ 		return p
+ 	}
+-	next := Policy{Rules: append([]Rule(nil), p.Rules...)}
++	next := Policy{Rules: append([]Rule(nil), p.Rules...), LockSession: p.LockSession}
+ 	next.Rules = append(next.Rules, Rule{Agent: agent, Allowed: append([]string(nil), allowed...)})
+ 	return next
+ }
+ 
+ func (p Policy) Append(other Policy) Policy {
+-	out := Policy{Rules: append([]Rule(nil), p.Rules...)}
++	out := Policy{Rules: append([]Rule(nil), p.Rules...), LockSession: p.LockSession || other.LockSession}
+ 	for _, rule := range other.Rules {
+ 		out = out.With(rule.Agent, rule.Allowed)
+ 	}
+diff --git a/internal/session/README.md b/internal/session/README.md
+index 7683a52d..f13c17d2 100644
+--- a/internal/session/README.md
++++ b/internal/session/README.md
+@@ -108,3 +108,26 @@ provider context. The previous v68 binary rejects the new marker for writes;
+ read-only queries ignore the new fields. Stop older writers before upgrading;
+ restore a backup to downgrade. Old binaries rewriting pairing grants drop their
+ approver snapshots, so those devices need pairing again.
++
++## Locked conversation scope (schema 70)
++
++Migration 70 adds the `sessions_scope_lock_bu` trigger; it adds no columns and
++no row carries a lock after upgrade. A lock is the `lock_session` flag inside
++`sessions.model_policy`, written only by `scopedb.Admit` under one `BEGIN
++IMMEDIATE` reservation (`SQLiteStore.AdmitSessionScope`). Admission refuses an
++agent change, an unlocked runtime on a locked row, and locking a row that
++already has messages; it only ever appends (narrows) policy rules. A locked
++row without history and without a cwd or worktree adopts the runtime's
++workspace in the same transaction.
++
++The trigger makes every other writer fail closed: a locked row's lock flag
++cannot be cleared, its stored rules must remain an unchanged prefix of the new
++rules (compared rule by rule, not by count), its agent cannot change, and its cwd, worktree and an
++assigned project cannot change once messages exist. `Update` additionally
++leaves a locked `model_policy` untouched instead of applying a stale caller's
++policy. Branches copy the lock with the rest of the identity. Batch readers that
++must not see locked conversations pass `ListOptions.ExcludeScopeLocked`.
++
++The v69 binary rejects the v70 marker for read-write use, so it cannot bypass
++a lock; opened read-only it ignores the trigger and the `lock_session` field.
++Stop older writers before upgrading; downgrade by restoring a backup.
+diff --git a/internal/session/scope_lock_test.go b/internal/session/scope_lock_test.go
+new file mode 100644
+index 00000000..7aac2eb6
+--- /dev/null
++++ b/internal/session/scope_lock_test.go
+@@ -0,0 +1,174 @@
++package session
++
++import (
++	"context"
++	"errors"
++	"path/filepath"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/llm/core"
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
++)
++
++func newScopeTestStore(t *testing.T) *SQLiteStore {
++	t.Helper()
++	store, err := NewSQLiteStore(Config{Enabled: true, Path: filepath.Join(t.TempDir(), "sessions.db")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = store.Close() })
++	return store
++}
++
++func lockedTestPolicy() modelpolicy.Policy {
++	return modelpolicy.Lock(nil, modelpolicy.Policy{}.With("private", []string{"debug:allowed"}))
++}
++
++func createScopeSession(t *testing.T, store *SQLiteStore, agent, cwd string) *Session {
++	t.Helper()
++	sess := &Session{ID: NewID(), Provider: "debug", Model: "allowed", Agent: agent, CWD: cwd}
++	if err := store.Create(context.Background(), sess); err != nil {
++		t.Fatal(err)
++	}
++	return sess
++}
++
++func TestAdmitSessionScopeLocksAndFreezesIdentity(t *testing.T) {
++	ctx := context.Background()
++	store := newScopeTestStore(t)
++	sess := createScopeSession(t, store, "private", "/work/a")
++	effective, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: sess.ID, Agent: "private", Policy: lockedTestPolicy()})
++	if err != nil || !effective.LockSession {
++		t.Fatalf("admit = %+v, %v", effective, err)
++	}
++	addBranchTestMessage(t, store, sess.ID, core.UserText("private text"))
++	got, err := store.Get(ctx, sess.ID)
++	if err != nil || !got.ModelPolicy.LockSession || len(got.ModelPolicy.Rules) != 1 {
++		t.Fatalf("persisted = %+v, %v", got, err)
++	}
++
++	// Generic full-row writers with stale identity keep the locked scope but
++	// still persist allowed metadata (status, title, usage).
++	stale := *got
++	stale.Agent, stale.CWD, stale.WorktreeDir = "other", "/work/b", "/work/b"
++	stale.ModelPolicy = modelpolicy.Policy{}.With("other", []string{"other:*"})
++	stale.Name, stale.Status = "renamed", StatusComplete
++	if err := store.Update(ctx, &stale); err != nil {
++		t.Fatalf("stale metadata update failed: %v", err)
++	}
++	after, _ := store.Get(ctx, sess.ID)
++	if !after.ModelPolicy.LockSession || len(after.ModelPolicy.Rules) != 1 || after.ModelPolicy.Rules[0].Agent != "private" ||
++		after.Agent != "private" || after.CWD != "/work/a" || after.WorktreeDir != "" || after.Name != "renamed" || after.Status != StatusComplete {
++		t.Fatalf("after stale update = %+v", after)
++	}
++	// Raw writers fail closed in SQLite itself.
++	looser := `{"rules":[{"agent":"private","allowed":["debug:*","other:*"]}],"lock_session":true}`
++	for name, stmt := range map[string]string{
++		"clear policy":       `UPDATE sessions SET model_policy = NULL WHERE id = ?`,
++		"unlock":             `UPDATE sessions SET model_policy = '{"rules":[{"agent":"private","allowed":["debug:allowed"]}]}' WHERE id = ?`,
++		"same-length loosen": `UPDATE sessions SET model_policy = '` + looser + `' WHERE id = ?`,
++		"longer, changed prefix": `UPDATE sessions SET model_policy = '{"rules":[{"agent":"private","allowed":["other:*"]},` +
++			`{"agent":"private","allowed":["debug:allowed"]}],"lock_session":true}' WHERE id = ?`,
++		"retarget agent":      `UPDATE sessions SET agent = 'other' WHERE id = ?`,
++		"move workspace":      `UPDATE sessions SET cwd = '/work/b' WHERE id = ?`,
++		"bind other worktree": `UPDATE sessions SET worktree_dir = '/work/b' WHERE id = ?`,
++	} {
++		if _, err := store.db.Exec(stmt, sess.ID); err == nil {
++			t.Fatalf("raw SQL %s succeeded on a locked row", name)
++		}
++	}
++
++	// Admission rejects a different agent and an unlocked runtime.
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: sess.ID, Agent: "other", Policy: lockedTestPolicy()}); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("other agent admit = %v", err)
++	}
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: sess.ID, Agent: "private"}); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("unlocked runtime admit = %v", err)
++	}
++	// Narrowing persists; repeats are idempotent.
++	narrower := lockedTestPolicy().With("child", []string{"debug:allowed"})
++	if effective, err = store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: sess.ID, Agent: "private", Policy: narrower}); err != nil || len(effective.Rules) != 2 {
++		t.Fatalf("narrow admit = %+v, %v", effective, err)
++	}
++	if after, _ = store.Get(ctx, sess.ID); len(after.ModelPolicy.Rules) != 2 {
++		t.Fatalf("narrowing not persisted: %+v", after.ModelPolicy)
++	}
++}
++
++func TestAdmitSessionScopeBindsUnboundWorkspaceBeforeHistory(t *testing.T) {
++	ctx := context.Background()
++	store := newScopeTestStore(t)
++	sess := createScopeSession(t, store, "private", "")
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: sess.ID, Agent: "private", Workspace: "/work/a", Policy: lockedTestPolicy()}); err != nil {
++		t.Fatal(err)
++	}
++	if got, _ := store.Get(ctx, sess.ID); got.CWD != "/work/a" {
++		t.Fatalf("unbound locked row cwd = %q, want runtime workspace", got.CWD)
++	}
++	addBranchTestMessage(t, store, sess.ID, core.UserText("private text"))
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: sess.ID, Agent: "private", Workspace: "/work/b", Policy: lockedTestPolicy()}); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("retargeted workspace admit = %v", err)
++	}
++}
++
++func TestAdmitSessionScopeRefusesRetrofitAndKeepsUnlockedRowsUnchanged(t *testing.T) {
++	ctx := context.Background()
++	store := newScopeTestStore(t)
++	plain := createScopeSession(t, store, "other", "")
++	addBranchTestMessage(t, store, plain.ID, core.UserText("ordinary"))
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: plain.ID, Agent: "other"}); err != nil {
++		t.Fatalf("unlocked admit = %v", err)
++	}
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: plain.ID, Agent: "other", Policy: lockedTestPolicy()}); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("retrofit admit = %v, want refusal", err)
++	}
++	got, _ := store.Get(ctx, plain.ID)
++	if got.ModelPolicy.LockSession || got.ModelPolicy.Restricted() {
++		t.Fatalf("unlocked row changed: %+v", got.ModelPolicy)
++	}
++	// Ordinary sessions keep full metadata mobility.
++	got.Agent, got.CWD = "another", "/elsewhere"
++	if err := store.Update(ctx, got); err != nil {
++		t.Fatalf("ordinary update: %v", err)
++	}
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: "missing", Agent: "private", Policy: lockedTestPolicy()}); !errors.Is(err, scopedb.ErrScope) {
++		t.Fatalf("missing locked row admit = %v", err)
++	}
++}
++
++func TestScopeLockedSessionsExcludedFromPrivacyListings(t *testing.T) {
++	ctx := context.Background()
++	store := newScopeTestStore(t)
++	locked := createScopeSession(t, store, "private", "")
++	plain := createScopeSession(t, store, "other", "")
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: locked.ID, Agent: "private", Policy: lockedTestPolicy()}); err != nil {
++		t.Fatal(err)
++	}
++	all, err := store.List(ctx, ListOptions{Limit: -1})
++	if err != nil || len(all) != 2 {
++		t.Fatalf("List = %d, %v", len(all), err)
++	}
++	filtered, err := store.List(ctx, ListOptions{Limit: -1, ExcludeScopeLocked: true})
++	if err != nil || len(filtered) != 1 || filtered[0].ID != plain.ID {
++		t.Fatalf("filtered List = %+v, %v", filtered, err)
++	}
++}
++
++func TestBranchOfLockedSessionKeepsLock(t *testing.T) {
++	ctx := context.Background()
++	store := newScopeTestStore(t)
++	sess := createScopeSession(t, store, "private", "/work/a")
++	if _, err := store.AdmitSessionScope(ctx, scopedb.Admission{SessionID: sess.ID, Agent: "private", Policy: lockedTestPolicy()}); err != nil {
++		t.Fatal(err)
++	}
++	anchor := addBranchTestMessage(t, store, sess.ID, core.UserText("branch me"))
++	branch, err := store.CreateBranch(ctx, sess.ID, CreateBranchOptions{AnchorMessageID: anchor.ID})
++	if err != nil {
++		t.Fatal(err)
++	}
++	got, err := store.Get(ctx, branch.Session.ID)
++	if err != nil || !got.ModelPolicy.LockSession || got.Agent != "private" || got.CWD != "/work/a" {
++		t.Fatalf("branch = %+v, %v", got, err)
++	}
++}
+diff --git a/internal/session/scope_migration_test.go b/internal/session/scope_migration_test.go
+new file mode 100644
+index 00000000..bd65b546
+--- /dev/null
++++ b/internal/session/scope_migration_test.go
+@@ -0,0 +1,92 @@
++package session
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"reflect"
++	"slices"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/sqliteutil"
++)
++
++func scopeV69Fixture(t *testing.T) *sql.DB {
++	t.Helper()
++	db, err := sql.Open("sqlite", ":memory:")
++	if err != nil {
++		t.Fatal(err)
++	}
++	db.SetMaxOpenConns(1)
++	t.Cleanup(func() { _ = db.Close() })
++	if err := initSchema(db); err != nil {
++		t.Fatal(err)
++	}
++	_, err = db.Exec(`DROP TRIGGER sessions_scope_lock_bu; UPDATE schema_version SET version=69;
++ INSERT INTO sessions(id,provider,model,agent,model_policy,created_at,updated_at) VALUES('legacy','mock','mock','old','{"rules":[{"agent":"old","allowed":["mock:*"]}]}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return db
++}
++
++func triggerExists(t *testing.T, db *sql.DB) bool {
++	t.Helper()
++	var n int
++	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='sessions_scope_lock_bu'`).Scan(&n); err != nil {
++		t.Fatal(err)
++	}
++	return n == 1
++}
++
++func TestScopeMigrationV70RollbackRetryAndSignature(t *testing.T) {
++	db := scopeV69Fixture(t)
++	original := migrations
++	t.Cleanup(func() { migrations = original })
++	migrations = append([]migration(nil), original...)
++	index := slices.IndexFunc(migrations, func(m migration) bool { return m.version == 70 })
++	up := migrations[index].up
++	migrations[index].up = func(db schemaExecutor) error {
++		if err := up(db); err != nil {
++			return err
++		}
++		return errors.New("scope migration canary failure")
++	}
++	if err := initSchema(db); err == nil {
++		t.Fatal("expected rollback")
++	}
++	var version int
++	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil || version != 69 || triggerExists(t, db) {
++		t.Fatalf("after rollback version=%d err=%v trigger=%v", version, err, triggerExists(t, db))
++	}
++	migrations = original
++	if err := initSchema(db); err != nil {
++		t.Fatal(err)
++	}
++	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil || version != schemaVersion || !triggerExists(t, db) {
++		t.Fatalf("after retry version=%d err=%v", version, err)
++	}
++	// Existing rows carry no lock and keep ordinary mobility.
++	if _, err := db.Exec(`UPDATE sessions SET agent='new', model_policy=NULL WHERE id='legacy'`); err != nil {
++		t.Fatalf("legacy row update: %v", err)
++	}
++	fresh, err := sql.Open("sqlite", ":memory:")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer fresh.Close()
++	if err := initSchema(fresh); err != nil {
++		t.Fatal(err)
++	}
++	got, err := sqliteutil.SchemaSignature(context.Background(), db)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want, err := sqliteutil.SchemaSignature(context.Background(), fresh)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("fresh/migrated schema differ\ngot=%v\nwant=%v", got, want)
++	}
++}
+diff --git a/internal/session/scopedb/scope.go b/internal/session/scopedb/scope.go
+new file mode 100644
+index 00000000..380caf86
+--- /dev/null
++++ b/internal/session/scopedb/scope.go
+@@ -0,0 +1,197 @@
++// Package scopedb owns durable conversation scope locks: the immutable-identity
++// trigger and atomic admission of locked session policies.
++package scopedb
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"path/filepath"
++	"strings"
++
++	"github.com/samsaffron/term-llm/internal/modelpolicy"
++	"github.com/samsaffron/term-llm/internal/sqliteutil"
++)
++
++// LockedSQL is true for a locked sessions row. Generic full-row writers keep
++// a locked row's agent and policy instead of applying (possibly stale) values.
++const LockedSQL = "COALESCE(json_extract(model_policy, '$.lock_session'), 0) = 1"
++
++// FrozenWorkspaceSQL is true once a locked sessions row has history; generic
++// writers then keep its cwd and worktree.
++const FrozenWorkspaceSQL = "(" + LockedSQL + " AND EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id))"
++
++// ExcludeLockedClause returns a sessions-alias ("s.") filter omitting locked
++// rows when exclude is set, for listings that feed other models or memory.
++func ExcludeLockedClause(exclude bool) string {
++	if !exclude {
++		return ""
++	}
++	return " AND COALESCE(json_extract(s.model_policy, '$.lock_session'), 0) = 0"
++}
++
++// SchemaV70 freezes a locked session's identity inside SQLite so every writer
++// fails closed. The lock cannot be cleared and the persisted rules must remain
++// an unchanged prefix of the new rules (rules only narrow); the agent is fixed;
++// the workspace (cwd, worktree and an assigned project) is fixed once the
++// transcript has messages. A first project assignment of an unchanged
++// workspace remains allowed.
++const SchemaV70 = `
++CREATE TRIGGER IF NOT EXISTS sessions_scope_lock_bu BEFORE UPDATE ON sessions
++WHEN COALESCE(json_extract(OLD.model_policy, '$.lock_session'), 0) = 1
++BEGIN
++ SELECT RAISE(ABORT, 'locked session scope is immutable')
++ WHERE COALESCE(json_extract(NEW.model_policy, '$.lock_session'), 0) <> 1
++  OR EXISTS (SELECT 1 FROM json_each(OLD.model_policy, '$.rules') AS old_rule
++             WHERE old_rule.value IS NOT json_extract(NEW.model_policy, '$.rules[' || old_rule.key || ']'))
++  OR COALESCE(NEW.agent, '') <> COALESCE(OLD.agent, '')
++  OR ((COALESCE(NEW.cwd, '') <> COALESCE(OLD.cwd, '')
++       OR COALESCE(NEW.worktree_dir, '') <> COALESCE(OLD.worktree_dir, '')
++       OR (COALESCE(OLD.project_id, '') <> '' AND COALESCE(NEW.project_id, '') <> OLD.project_id))
++      AND EXISTS (SELECT 1 FROM messages WHERE session_id = OLD.id));
++END;
++`
++
++// MigrateV70 installs the scope-lock trigger. Existing rows carry no lock.
++func MigrateV70(db sqliteutil.Executor) error {
++	if _, err := db.Exec(SchemaV70); err != nil {
++		return fmt.Errorf("create session scope lock trigger: %w", err)
++	}
++	return nil
++}
++
++// Admitter is implemented by stores that can atomically admit locked
++// conversations. Hosts must refuse a locked run when a store lacks it.
++type Admitter interface {
++	AdmitSessionScope(ctx context.Context, in Admission) (modelpolicy.Policy, error)
++}
++
++// PolicyJSON encodes a session policy column value; nil means no policy.
++func PolicyJSON(policy modelpolicy.Policy) any {
++	if !policy.Restricted() && !policy.LockSession {
++		return nil
++	}
++	encoded, err := json.Marshal(policy)
++	if err != nil {
++		return nil
++	}
++	return string(encoded)
++}
++
++// ErrScope reports a refused locked-session admission.
++var ErrScope = errors.New("session scope lock")
++
++// Admission is the host-resolved identity of one run.
++type Admission struct {
++	SessionID string
++	Agent     string
++	// Workspace is the runtime's effective directory; empty means unbound.
++	Workspace string
++	// Policy is the runtime's effective policy. It must be locked
++	// (modelpolicy.Lock) when the runtime's agent opts into lock_session.
++	Policy modelpolicy.Policy
++	// Check validates the run against the merged effective policy before
++	// anything is persisted; an error aborts admission.
++	Check func(modelpolicy.Policy) error
++}
++
++func scopeErr(format string, args ...any) error {
++	return fmt.Errorf("%w: "+format, append([]any{ErrScope}, args...)...)
++}
++
++// Admit validates the run against the latest durable row under one SQLite
++// writer reservation and persists a new or narrowed lock. It returns the
++// committed effective policy. Unlocked rows with unlocked runtimes are not
++// modified.
++func Admit(ctx context.Context, db *sql.DB, in Admission, available bool) (modelpolicy.Policy, error) {
++	if !available {
++		return modelpolicy.Policy{}, scopeErr("session store lacks model policy support")
++	}
++	effective := in.Policy
++	err := sqliteutil.WithImmediateMigrationTx(ctx, db, func(tx sqliteutil.Executor) error {
++		var raw sql.NullString
++		var agent, cwd, worktree string
++		var hasMessages bool
++		err := tx.QueryRow(`SELECT model_policy, COALESCE(agent, ''), COALESCE(cwd, ''), COALESCE(worktree_dir, ''),
++			EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id) FROM sessions WHERE id = ?`, in.SessionID).
++			Scan(&raw, &agent, &cwd, &worktree, &hasMessages)
++		if errors.Is(err, sql.ErrNoRows) {
++			if in.Policy.LockSession {
++				return scopeErr("locked session %q is not persisted", in.SessionID)
++			}
++			return nil
++		}
++		if err != nil {
++			return fmt.Errorf("load session scope: %w", err)
++		}
++		var saved modelpolicy.Policy
++		if raw.Valid && strings.TrimSpace(raw.String) != "" {
++			if err := json.Unmarshal([]byte(raw.String), &saved); err != nil {
++				return fmt.Errorf("decode session policy: %w", err)
++			}
++		}
++		switch {
++		case !saved.LockSession && !in.Policy.LockSession:
++			return nil
++		case saved.LockSession && !in.Policy.LockSession:
++			return scopeErr("locked session requires its locked agent runtime")
++		case !saved.LockSession && hasMessages:
++			return scopeErr("cannot lock a conversation that already has history; start a new conversation")
++		}
++		if agent != "" && agent != in.Agent {
++			return scopeErr("locked session cannot change agent from %q to %q", agent, in.Agent)
++		}
++		if saved.LockSession && hasMessages {
++			if savedWorkspace := firstNonEmpty(worktree, cwd); savedWorkspace != "" && in.Workspace != "" && filepath.Clean(savedWorkspace) != filepath.Clean(in.Workspace) {
++				return scopeErr("locked session cannot change workspace")
++			}
++		}
++		effective = saved.Append(in.Policy)
++		effective.LockSession = true
++		if in.Check != nil {
++			if err := in.Check(effective); err != nil {
++				return err
++			}
++		}
++		// An unbound row without history adopts the runtime's workspace in
++		// this same transaction, before any tool runs; the trigger freezes it
++		// once the first message lands.
++		bind := !hasMessages && firstNonEmpty(worktree, cwd) == "" && strings.TrimSpace(in.Workspace) != ""
++		if bind {
++			cwd = filepath.Clean(in.Workspace)
++		}
++		if saved.LockSession && agent != "" && !bind && len(effective.Rules) == len(saved.Rules) {
++			return nil
++		}
++		encoded, err := json.Marshal(effective)
++		if err != nil {
++			return fmt.Errorf("encode session policy: %w", err)
++		}
++		if _, err := tx.Exec(`UPDATE sessions SET model_policy = ?, agent = ?, cwd = ? WHERE id = ?`, string(encoded), in.Agent, nullIfEmpty(cwd), in.SessionID); err != nil {
++			return fmt.Errorf("persist session scope lock: %w", err)
++		}
++		return nil
++	})
++	if err != nil {
++		return modelpolicy.Policy{}, err
++	}
++	return effective, nil
++}
++
++func firstNonEmpty(values ...string) string {
++	for _, v := range values {
++		if strings.TrimSpace(v) != "" {
++			return v
++		}
++	}
++	return ""
++}
++
++func nullIfEmpty(value string) any {
++	if value == "" {
++		return nil
++	}
++	return value
++}
+diff --git a/internal/session/sqlite_authors_test.go b/internal/session/sqlite_authors_test.go
+index 024ba391..da998093 100644
+--- a/internal/session/sqlite_authors_test.go
++++ b/internal/session/sqlite_authors_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"database/sql"
+ 	"errors"
+ 	"reflect"
++	"slices"
+ 	"testing"
+ 
+ 	"github.com/samsaffron/term-llm/internal/llm/core"
+@@ -140,7 +141,7 @@ func TestAuthorMigrationV69PreservationRollbackRetryAndSignature(t *testing.T) {
+ 	original := migrations
+ 	t.Cleanup(func() { migrations = original })
+ 	migrations = append([]migration(nil), original...)
+-	last := len(migrations) - 1
++	last := slices.IndexFunc(migrations, func(m migration) bool { return m.version == 69 })
+ 	up := migrations[last].up
+ 	migrations[last].up = func(db schemaExecutor) error {
+ 		if err := up(db); err != nil {
+diff --git a/internal/session/sqlite_migrations.go b/internal/session/sqlite_migrations.go
+index 6879bbb3..4e658765 100644
+--- a/internal/session/sqlite_migrations.go
++++ b/internal/session/sqlite_migrations.go
+@@ -12,7 +12,7 @@ import (
+ // Increment when adding new migrations.
+ const (
+ 	projectSchemaVersion = 47
+-	schemaVersion        = 69
++	schemaVersion        = 70
+ )
+ 
+ // migration represents a schema migration.
+diff --git a/internal/session/sqlite_schema.go b/internal/session/sqlite_schema.go
+index 3a007700..9e376d62 100644
+--- a/internal/session/sqlite_schema.go
++++ b/internal/session/sqlite_schema.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	"github.com/samsaffron/term-llm/internal/runtimeoutput"
+ 	"github.com/samsaffron/term-llm/internal/session/notificationdb"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
+ 	"github.com/samsaffron/term-llm/internal/sqliteutil"
+ )
+ 
+@@ -1369,6 +1370,7 @@ var migrations = []migration{
+ 	},
+ 	{version: 68, description: "durable notification turn ownership and fenced candidates", up: notificationdb.MigrateV68},
+ 	{version: 69, description: "display-only message authors and session starters", up: migrateAuthorsV69},
++	{version: 70, description: "immutable locked session scope", up: scopedb.MigrateV70},
+ }
+ 
+ // backfillProjectOrderV61 freezes the order the sidebar last showed projects
+@@ -1722,7 +1724,7 @@ func initSchema(db *sql.DB) error {
+ 			if userTables != 0 {
+ 				return fmt.Errorf("unknown unversioned session schema: found %d unrelated tables; restore a backup or move the database aside to recreate it", userTables)
+ 			}
+-			if _, err := tx.Exec(canonicalSessionSchema + notificationdb.SchemaV68 + authorSchemaV69); err != nil {
++			if _, err := tx.Exec(canonicalSessionSchema + notificationdb.SchemaV68 + authorSchemaV69 + scopedb.SchemaV70); err != nil {
+ 				return fmt.Errorf("bootstrap canonical session schema: %w", err)
+ 			}
+ 			if err := ensureCurrentSessionIndexes(tx); err != nil {
+diff --git a/internal/session/sqlite_search.go b/internal/session/sqlite_search.go
+index 941eaefb..dc8333c7 100644
+--- a/internal/session/sqlite_search.go
++++ b/internal/session/sqlite_search.go
+@@ -5,6 +5,7 @@ import (
+ 	"database/sql"
+ 	"fmt"
+ 
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
+ 	"github.com/samsaffron/term-llm/internal/sqlitefts"
+ )
+ 
+@@ -66,6 +67,7 @@ func (s *SQLiteStore) Search(ctx context.Context, opts SearchOptions) ([]SearchR
+ 	if opts.ExcludeSubagents {
+ 		filterClause += " AND s.parent_id IS NULL"
+ 	}
++	filterClause += scopedb.ExcludeLockedClause(opts.ExcludeScopeLocked && s.hasModelPolicy)
+ 	if opts.ProjectID != "" {
+ 		if !s.hasProjectID {
+ 			return []SearchResult{}, nil
+diff --git a/internal/session/sqlite_sessions.go b/internal/session/sqlite_sessions.go
+index 5c8f1cf1..6a36f0ba 100644
+--- a/internal/session/sqlite_sessions.go
++++ b/internal/session/sqlite_sessions.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/samsaffron/term-llm/internal/modelpolicy"
+ 	planpkg "github.com/samsaffron/term-llm/internal/plan"
+ 	"github.com/samsaffron/term-llm/internal/runtimeoutput"
++	"github.com/samsaffron/term-llm/internal/session/scopedb"
+ )
+ 
+ func (s *SQLiteStore) Create(ctx context.Context, sess *Session) error {
+@@ -101,7 +102,7 @@ func (s *SQLiteStore) Create(ctx context.Context, sess *Session) error {
+ 		if s.hasModelPolicy {
+ 			modelPolicyCol = ", model_policy"
+ 			modelPolicyPlaceholder = ", ?"
+-			modelPolicyArgs = []any{sessionModelPolicyJSON(sess.ModelPolicy)}
++			modelPolicyArgs = []any{scopedb.PolicyJSON(sess.ModelPolicy)}
+ 		}
+ 		pinOrderCol := ""
+ 		pinOrderPlaceholder := ""
+@@ -277,9 +278,9 @@ func (s *SQLiteStore) Update(ctx context.Context, sess *Session) error {
+ 		// Once a session has a project, its execution snapshot is immutable. This
+ 		// database-side guard also prevents a stale full-row metadata update from
+ 		// racing a successful BindSessionWorkspace and restoring old paths.
+-		cwdAssignment = "cwd = CASE WHEN COALESCE(project_id, '') <> '' THEN cwd ELSE ? END"
++		cwdAssignment = "cwd = CASE WHEN COALESCE(project_id, '') <> '' OR " + scopedb.FrozenWorkspaceSQL + " THEN cwd ELSE ? END"
+ 		if s.hasWorktreeDir {
+-			worktreeDirClause = ", worktree_dir = CASE WHEN COALESCE(project_id, '') <> '' THEN worktree_dir ELSE ? END"
++			worktreeDirClause = ", worktree_dir = CASE WHEN COALESCE(project_id, '') <> '' OR " + scopedb.FrozenWorkspaceSQL + " THEN worktree_dir ELSE ? END"
+ 		}
+ 	}
+ 	goalClause := ""
+@@ -288,7 +289,7 @@ func (s *SQLiteStore) Update(ctx context.Context, sess *Session) error {
+ 	}
+ 	modelPolicyClause := ""
+ 	if s.hasModelPolicy {
+-		modelPolicyClause = ", model_policy = COALESCE(?, model_policy)"
++		modelPolicyClause = ", model_policy = CASE WHEN " + scopedb.LockedSQL + " THEN model_policy ELSE COALESCE(?, model_policy) END"
+ 	}
+ 	shareClause := ""
+ 	if s.hasShare {
+@@ -298,7 +299,7 @@ func (s *SQLiteStore) Update(ctx context.Context, sess *Session) error {
+ 		UPDATE sessions SET name = ?, summary = ?, generated_short_title = ?, generated_long_title = ?, title_source = ?, title_generated_at = ?, title_basis_msg_seq = ?` +
+ 		titleSkippedAtClause + `,
+ 		       provider = ?, provider_key = ?, model = ?` + reasoningEffortClause + reasoningModeClause + `, mode = ?` + approvalModeClause + `, origin = ?,
+-		       agent = CASE WHEN COALESCE(agent, '') <> '' AND COALESCE(?, '') = '' THEN agent ELSE ? END, ` + cwdAssignment + worktreeDirClause + `,
++		       agent = CASE WHEN (COALESCE(agent, '') <> '' AND COALESCE(?, '') = '') OR ` + scopedb.LockedSQL + ` THEN agent ELSE ? END, ` + cwdAssignment + worktreeDirClause + `,
+ 		       updated_at = ?, archived = ?, parent_id = ?, search = ?, tools = ?, mcp = ?,
+ 		       status = ?, tags = ?` + goalClause + shareClause + modelPolicyClause + `
+ 		WHERE id = ?`
+@@ -342,7 +343,7 @@ func (s *SQLiteStore) Update(ctx context.Context, sess *Session) error {
+ 		args = append(args, shareJSONString(sess.Share))
+ 	}
+ 	if s.hasModelPolicy {
+-		args = append(args, sessionModelPolicyJSON(sess.ModelPolicy))
++		args = append(args, scopedb.PolicyJSON(sess.ModelPolicy))
+ 	}
+ 	args = append(args, sess.ID)
+ 
+@@ -357,6 +358,11 @@ func (s *SQLiteStore) Update(ctx context.Context, sess *Session) error {
+ 	return nil
+ }
+ 
++// AdmitSessionScope validates and persists a locked session scope atomically.
++func (s *SQLiteStore) AdmitSessionScope(ctx context.Context, in scopedb.Admission) (modelpolicy.Policy, error) {
++	return scopedb.Admit(ctx, s.db, in, s.hasModelPolicy)
++}
++
+ // UpdateGoal updates only the persisted goal state for a session.
+ func (s *SQLiteStore) UpdateGoal(ctx context.Context, id string, goal *Goal) error {
+ 	if !s.hasGoal {
+@@ -849,6 +855,7 @@ func (s *SQLiteStore) List(ctx context.Context, opts ListOptions) ([]SessionSumm
+ 	} else if opts.ExcludeSubagents {
+ 		query += " AND s.parent_id IS NULL"
+ 	}
++	query += scopedb.ExcludeLockedClause(opts.ExcludeScopeLocked && s.hasModelPolicy)
+ 	if opts.Name != "" {
+ 		query += " AND s.name = ?"
+ 		args = append(args, opts.Name)
+@@ -999,16 +1006,5 @@ func (s *SQLiteStore) List(ctx context.Context, opts ListOptions) ([]SessionSumm
+ 	return results, rows.Err()
+ }
+ 
+-func sessionModelPolicyJSON(policy modelpolicy.Policy) any {
+-	if !policy.Restricted() {
+-		return nil
+-	}
+-	encoded, err := json.Marshal(policy)
+-	if err != nil {
+-		return nil
+-	}
+-	return string(encoded)
+-}
+-
+ // AddMessage adds a message to a session.
+ // If msg.Sequence < 0, the sequence number is auto-allocated atomically.
+diff --git a/internal/session/types.go b/internal/session/types.go
+index 3978d9a2..bc26f319 100644
+--- a/internal/session/types.go
++++ b/internal/session/types.go
+@@ -195,28 +195,29 @@ type SessionSummary struct {
+ 
+ // ListOptions configures session listing.
+ type ListOptions struct {
+-	CreatedBy        string
+-	IDs              []string              // Restrict to these stable session IDs (deduplicated by the store)
+-	Name             string                // Filter by name
+-	Provider         string                // Filter by provider
+-	Model            string                // Filter by model
+-	Mode             SessionMode           // Filter by mode (chat, ask, plan, exec)
+-	Agent            string                // Filter by agent; empty persisted agents belong to "default"
+-	Status           SessionStatus         // Filter by status
+-	Tag              string                // Filter by tag (substring match)
+-	Categories       []string              // Sidebar/web categories (all, chat, web, ask, plan, exec)
+-	Limit            int                   // Max results (0 = use default, negative = unlimited)
+-	Offset           int                   // Pagination offset
+-	BeforeNumber     int64                 // Keyset cursor: only sessions with number < this value
+-	SortByNumberDesc bool                  // Order by session number descending instead of activity sort
+-	Archived         bool                  // Include archived sessions
+-	SortByActivity   bool                  // Sort by last_message_at (web sidebar); defaults to last_user_message_at
+-	ProjectID        string                // Restrict to one stable project ID
+-	NoProject        bool                  // Restrict to legacy sessions with a null project ID
+-	ProjectCursor    *ProjectSessionCursor // Group-bound keyset cursor for project sidebar paging
+-	ParentID         string                // Restrict to direct child sessions of this parent
+-	ExcludeSubagents bool                  // Hide machine-generated child-agent sessions
+-	SidebarVisible   bool                  // Hide parentless terminal runs (ask/plan/exec) the web sidebar never shows
++	CreatedBy          string
++	IDs                []string              // Restrict to these stable session IDs (deduplicated by the store)
++	Name               string                // Filter by name
++	Provider           string                // Filter by provider
++	Model              string                // Filter by model
++	Mode               SessionMode           // Filter by mode (chat, ask, plan, exec)
++	Agent              string                // Filter by agent; empty persisted agents belong to "default"
++	Status             SessionStatus         // Filter by status
++	Tag                string                // Filter by tag (substring match)
++	Categories         []string              // Sidebar/web categories (all, chat, web, ask, plan, exec)
++	Limit              int                   // Max results (0 = use default, negative = unlimited)
++	Offset             int                   // Pagination offset
++	BeforeNumber       int64                 // Keyset cursor: only sessions with number < this value
++	SortByNumberDesc   bool                  // Order by session number descending instead of activity sort
++	Archived           bool                  // Include archived sessions
++	SortByActivity     bool                  // Sort by last_message_at (web sidebar); defaults to last_user_message_at
++	ProjectID          string                // Restrict to one stable project ID
++	NoProject          bool                  // Restrict to legacy sessions with a null project ID
++	ProjectCursor      *ProjectSessionCursor // Group-bound keyset cursor for project sidebar paging
++	ParentID           string                // Restrict to direct child sessions of this parent
++	ExcludeSubagents   bool                  // Hide machine-generated child-agent sessions
++	ExcludeScopeLocked bool                  // Omit sessions with a durable scope lock (privacy-sensitive batch readers)
++	SidebarVisible     bool                  // Hide parentless terminal runs (ask/plan/exec) the web sidebar never shows
+ }
+ 
+ // SearchSort selects the ordering of distinct session search results.
+@@ -230,14 +231,15 @@ const (
+ 
+ // SearchOptions configures session full-text search.
+ type SearchOptions struct {
+-	CreatedBy        string
+-	Sort             SearchSort // Empty means relevance; date sorts use last message time (creation fallback)
+-	Query            string     // Text query to search for
+-	Categories       []string   // Sidebar/web categories (all, chat, web, ask, plan, exec)
+-	Limit            int        // Max results (0 = use default)
+-	Archived         bool       // Include archived sessions
+-	ProjectID        string     // Restrict to one stable project ID
+-	ExcludeSubagents bool       // Hide machine-generated child-agent sessions
++	CreatedBy          string
++	Sort               SearchSort // Empty means relevance; date sorts use last message time (creation fallback)
++	Query              string     // Text query to search for
++	Categories         []string   // Sidebar/web categories (all, chat, web, ask, plan, exec)
++	Limit              int        // Max results (0 = use default)
++	Archived           bool       // Include archived sessions
++	ProjectID          string     // Restrict to one stable project ID
++	ExcludeSubagents   bool       // Hide machine-generated child-agent sessions
++	ExcludeScopeLocked bool       // Omit sessions with a durable scope lock
+ }
+ 
+ // SearchResult represents a search match.
+diff --git a/internal/sqliteutil/README.md b/internal/sqliteutil/README.md
+index 90d74ed9..a82432a9 100644
+--- a/internal/sqliteutil/README.md
++++ b/internal/sqliteutil/README.md
+@@ -54,6 +54,8 @@ Use version-named, immutable table SQL. Create the replacement table, copy an ex
+ 
+ A process running an older binary concurrently with a new migrator is not granted write coordination beyond SQLite locking. Deploy one write-capable version at a time during these first marker transitions.
+ 
++- Session v70 adds only the `sessions_scope_lock_bu` trigger that freezes locked conversation identity. The v69 binary rejects v70 for read-write use; read-only it ignores the trigger and the `lock_session` policy field. Stop older writers before upgrading and restore a backup to downgrade.
++
+ ## Errors and operations
+ 
+ Migration errors should identify the store, observed and supported versions, migration version and description, and failed operation. Callback failures leave the previously committed marker safe. Lock acquisition uses the configured SQLite `busy_timeout`; expiry returns a retryable contextual error rather than spinning indefinitely.
+diff --git a/internal/tools/custom_tool.go b/internal/tools/custom_tool.go
+index 2f16ac34..ccf809f0 100644
+--- a/internal/tools/custom_tool.go
++++ b/internal/tools/custom_tool.go
+@@ -133,12 +133,7 @@ func (t *CustomScriptTool) Execute(ctx context.Context, args json.RawMessage) (c
+ 	defer cancel()
+ 
+ 	// Build environment: inherit + agent-specific vars + per-tool env
+-	env := os.Environ()
+-	env = append(env, fmt.Sprintf("TERM_LLM_AGENT_DIR=%s", t.agentDir))
+-	env = append(env, fmt.Sprintf("TERM_LLM_TOOL_NAME=%s", t.def.Name))
+-	for k, v := range t.def.Env {
+-		env = append(env, fmt.Sprintf("%s=%s", k, v))
+-	}
++	env := customToolEnvironment(ctx, os.Environ(), t.agentDir, t.def)
+ 
+ 	stdout := newLimitedBuffer(t.limits.MaxBytes)
+ 	stderr := newLimitedBuffer(t.limits.MaxBytes)
+diff --git a/internal/tools/custom_tool_env.go b/internal/tools/custom_tool_env.go
+new file mode 100644
+index 00000000..bb102236
+--- /dev/null
++++ b/internal/tools/custom_tool_env.go
+@@ -0,0 +1,36 @@
++package tools
++
++import (
++	"context"
++	"fmt"
++	"strings"
++
++	"github.com/samsaffron/term-llm/internal/agents"
++	"github.com/samsaffron/term-llm/internal/llm/core"
++)
++
++// customToolEnvironment builds a script's environment: the inherited process
++// environment and per-tool env with host-reserved session context removed,
++// then that context set only from the host-admitted run.
++func customToolEnvironment(ctx context.Context, inherited []string, agentDir string, def agents.CustomToolDef) []string {
++	env := make([]string, 0, len(inherited)+len(def.Env)+4)
++	for _, entry := range inherited {
++		name, _, _ := strings.Cut(entry, "=")
++		if !agents.IsReservedCustomToolEnv(name) {
++			env = append(env, entry)
++		}
++	}
++	env = append(env, fmt.Sprintf("TERM_LLM_AGENT_DIR=%s", agentDir))
++	env = append(env, fmt.Sprintf("TERM_LLM_TOOL_NAME=%s", def.Name))
++	for k, v := range def.Env {
++		// Validation rejects reserved names; this also covers definitions
++		// constructed without validation.
++		if !agents.IsReservedCustomToolEnv(k) {
++			env = append(env, fmt.Sprintf("%s=%s", k, v))
++		}
++	}
++	if id := core.LockedSessionFromContext(ctx); id != "" {
++		env = append(env, agents.EnvSessionID+"="+id, agents.EnvPrivateSession+"=1")
++	}
++	return env
++}
+diff --git a/internal/tools/custom_tool_env_test.go b/internal/tools/custom_tool_env_test.go
+new file mode 100644
+index 00000000..372d33ea
+--- /dev/null
++++ b/internal/tools/custom_tool_env_test.go
+@@ -0,0 +1,77 @@
++package tools
++
++import (
++	"context"
++	"slices"
++	"strings"
++	"testing"
++
++	"github.com/samsaffron/term-llm/internal/agents"
++	"github.com/samsaffron/term-llm/internal/llm/core"
++)
++
++func envValues(env []string, name string) []string {
++	var out []string
++	for _, entry := range env {
++		if key, value, _ := strings.Cut(entry, "="); key == name {
++			out = append(out, value)
++		}
++	}
++	return out
++}
++
++func TestCustomToolEnvironmentStripsForgedSessionContext(t *testing.T) {
++	inherited := []string{"PATH=/bin", "TERM_LLM_SESSION_ID=forged", "TERM_LLM_PRIVATE_SESSION=1", "TERM_LLM_UPLOADS_JSON=[]"}
++	// A definition constructed without validation still cannot forge context.
++	def := agents.CustomToolDef{Name: "lookup", Env: map[string]string{"TERM_LLM_SESSION_ID": "tool-forged", "KEEP": "yes"}}
++	for _, tc := range []struct {
++		name        string
++		ctx         context.Context
++		wantSession []string
++		wantPrivate []string
++	}{
++		{name: "unlocked ordinary run", ctx: core.ContextWithSessionID(context.Background(), "plain")},
++		{name: "locked admitted run", ctx: core.ContextWithLockedSession(core.ContextWithSessionID(context.Background(), "locked"), "locked"), wantSession: []string{"locked"}, wantPrivate: []string{"1"}},
++		{name: "engine session mismatch", ctx: core.ContextWithLockedSession(core.ContextWithSessionID(context.Background(), "child"), "parent")},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			env := customToolEnvironment(tc.ctx, inherited, "/agent", def)
++			if got := envValues(env, agents.EnvSessionID); !slices.Equal(got, tc.wantSession) {
++				t.Fatalf("session id = %v, want %v", got, tc.wantSession)
++			}
++			if got := envValues(env, agents.EnvPrivateSession); !slices.Equal(got, tc.wantPrivate) {
++				t.Fatalf("private = %v, want %v", got, tc.wantPrivate)
++			}
++			if got := envValues(env, agents.EnvUploadsJSON); len(got) != 0 {
++				t.Fatalf("uploads = %v, want none", got)
++			}
++			if !slices.Equal(envValues(env, "KEEP"), []string{"yes"}) || !slices.Equal(envValues(env, "PATH"), []string{"/bin"}) {
++				t.Fatalf("ordinary env lost: %v", env)
++			}
++		})
++	}
++}
++
++func TestCustomScriptToolExecuteReceivesOnlyHostSessionContext(t *testing.T) {
++	if testing.Short() {
++		t.Skip("runs a shell script")
++	}
++	dir := t.TempDir()
++	writeScript(t, dir, "ctx.sh", "#!/bin/sh\necho \"id=${TERM_LLM_SESSION_ID:-none} private=${TERM_LLM_PRIVATE_SESSION:-none} uploads=${TERM_LLM_UPLOADS_JSON:-none}\"\n")
++	t.Setenv("TERM_LLM_SESSION_ID", "inherited-forgery")
++	t.Setenv("TERM_LLM_PRIVATE_SESSION", "1")
++	t.Setenv("TERM_LLM_UPLOADS_JSON", "[\"forged\"]")
++	tool := makeCustomTool(t, dir, agents.CustomToolDef{Name: "ctx", Description: "d", Script: "ctx.sh", Env: map[string]string{"TERM_LLM_PRIVATE_SESSION": "1"}})
++	// Model arguments are only script input; they cannot set context.
++	args := []byte(`{"TERM_LLM_SESSION_ID":"model-forgery"}`)
++
++	plain, err := tool.Execute(core.ContextWithSessionID(context.Background(), "plain"), args)
++	if err != nil || !strings.Contains(plain.Content, "id=none private=none uploads=none") {
++		t.Fatalf("unlocked output = %q, %v", plain.Content, err)
++	}
++	lockedCtx := core.ContextWithLockedSession(core.ContextWithSessionID(context.Background(), "sess-1"), "sess-1")
++	locked, err := tool.Execute(lockedCtx, args)
++	if err != nil || !strings.Contains(locked.Content, "id=sess-1 private=1 uploads=none") {
++		t.Fatalf("locked output = %q, %v", locked.Content, err)
++	}
++}
+diff --git a/internal/tools/hub_delegate.go b/internal/tools/hub_delegate.go
+index dc6aca91..d7ef9b8b 100644
+--- a/internal/tools/hub_delegate.go
++++ b/internal/tools/hub_delegate.go
+@@ -306,6 +306,9 @@ func (t *HubDelegateTool) Execute(ctx context.Context, args json.RawMessage) (co
+ 	if strings.TrimSpace(a.Prompt) == "" {
+ 		return core.TextOutput(formatQueuedAgentError(ErrInvalidParams, "prompt is required")), nil
+ 	}
++	if core.LockedSessionFromContext(ctx) != "" || (t.modelPolicySource != nil && t.modelPolicySource().LockSession) {
++		return core.TextOutput(formatQueuedAgentError(ErrInvalidParams, "hub delegation is unavailable in locked sessions")), nil
++	}
+ 	if t.modelPolicySource != nil && t.modelPolicySource().Restricted() {
+ 		return core.TextOutput(formatQueuedAgentError(ErrInvalidParams, "hub delegation is unavailable to agents restricted by allowed_models")), nil
+ 	}

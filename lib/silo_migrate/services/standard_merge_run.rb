@@ -25,7 +25,7 @@ module SiloMigrate
         end
       end
 
-      def build_merge_plan(source:, base_site:, settings: nil, ignore_global_pins: false, separate_same_named_groups: false, port: nil, allow_unqualified_runtime: false, runtime_selection:)
+      def build_merge_plan(source:, base_site:, settings: nil, ignore_global_pins: false, separate_same_named_groups: false, port: nil, allow_unqualified_runtime: false, preparation: nil, runtime_selection:)
         state = @store.load
         config = state.fetch("config")
         raise StandardWorkflowError, "STANDARD_SIZE_LIMIT" if state.fetch("plans").size >= self.class::MAX_PLANS
@@ -90,12 +90,19 @@ module SiloMigrate
           "not_included" => ["automatic count checks", "restore proof", "hosted restore", "DNS or cutover", "remote pushes"]
         }
         body["file_role_binding"] = role_binding if role_binding
+        if preparation
+          readiness = { "kind" => "merge_layer", "present" => layer["present"] == true }.merge(layer.slice("path", "revision", "sha256", "files"))
+          body["preparation"] = preparation_binding!(preparation, roles: roles, run_inputs: nil, code_readiness: readiness)
+          body["not_included"] += preparation_not_included(body["preparation"])
+        end
         @store.update do |current|
           verify_file_role_proposal!(body, @store.named_state)
           current.fetch("plans")[plan_id] = { "id" => plan_id, "digest" => Digest::SHA256.hexdigest(canonical_json(body)), "body" => body,
                                             "status" => "proposed", "created_at" => now, "approval" => nil, "run_id" => nil }
         end
-        show_plan(plan_id)
+        # The proposer (engineer, or the trusted private analyst session that wrote these documents)
+        # sees its own full plan; clean agent/operator surfaces use the default projection.
+        show_plan(plan_id, detail: true)
       end
 
       # Trusted analyst/engineer projection only; never used by public_run.

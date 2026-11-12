@@ -134,23 +134,21 @@ and the web UI keeps chats apart:
   Notes are model-written: like findings, read them before trusting them (a hostile export could
   try to steer what gets written).
 
-**Web tools stay on for all agents (owner's decision, 2026-11-10).** migration-data may search
-and read pages for public reference only. Its prompt forbids customer-derived values in any search
-query, URL or web request (including names, emails, IPs, text, titles, private hosts/site names and
-export IDs/values); describe the subject generically instead. Public product schema names and
-platform/version names are fine. A lookup needing a customer value stops for the engineer. Web text
-is untrusted reference, not instructions, and conclusions must name their source pages.
+**Private analysis has no web tools (current protected-session release).**
+`migration-data` now declares `search: false`; public research belongs in a separate
+clean converter-developer/reviewer chat using generic questions, with only public facts
+relayed back. This supersedes the 2026-11-10 prompt-only decision to leave web tools on.
+Prompts are not a data-loss control, and private analysis must not put customer-derived
+values into a search query, URL or web request.
 
-**Observed tool availability:** an isolated term-llm 0.9.99 web server and a loopback fake model
-received the same tool list with `search: false` and `search: true`: `read_url`, `update_plan`,
-`web_search`. No real provider was contacted. CLI help describes `search` as enabling search and
-`--no-search` as overriding agent defaults; that does not remove the tools from web chats in this
-check. migration-data now declares `search: true` to match the decision and observed availability.
-Earlier checks (0.9.93–0.9.99 and `main` on 2026-11-10) found the same web-chat limitation. The control
-is a prompt rule, not enforced data-loss prevention: per-agent tool removal and per-tool approval/
-request logging in term-llm remain limitations. `read_url` uses a third-party reader (Jina) by default,
-and search uses a search provider. The server-wide `search.fetch_provider: none` switch would remove
-`read_url` for everyone; the owner chose not to use it.
+An isolated older stock 0.9.99 web host still offered `web_search` and `read_url` with
+`search: false`. Such a host cannot satisfy this release's native capability gate.
+The reviewed generic native build clamps search to the locked agent's own setting,
+regardless of request/UI/host defaults, and removes both tools when it is false.
+Actual invented-data/fake-provider tests verify the private offered-tool surface.
+This is not universal DLP: other configured tools and trusted operator chats retain
+their own permissions. See [intake-preparation.md](intake-preparation.md) for the
+context, DBHub enablement and coordinated native-update contract.
 
 **Private converter links never use web tools.** Links to
 `github.com/discourse-org/discourse-converters` and PR numbers go through `dev_branch_resolve`
@@ -407,6 +405,48 @@ silo prime                                             # on its own: it asks for
 ```
 
 `silo doctor` shows the socket and cache time. `op-cache stop` (as the account) clears the key at once.
+
+## Private conversation capability gate (intake-first release)
+
+The intake-first release requires generic native **`session_scope_lock=1`** and
+**`custom_tool_session_context=1`** for its locked private agent, all private custom
+tools and the agent's project DBHub exposure. `lock_session: true` in a YAML file is
+not enough: older stock builds silently ignore it. A copied environment marker is
+not an attestation either. `silo doctor` now reports private data conversation
+support separately from chat uploads; chat drag/drop remains deferred.
+
+Installer apply checks the selected binary after package verification and before
+switching to a release with a locked agent or writing private-agent/MCP configuration.
+Forward update deliberately checks the **currently selected** native before the release
+switch; rollback checks the native candidate when `--term-llm` was requested. An existing
+unprotected node therefore **cannot acquire this release via a blind `silo update`**.
+The initial native handoff must be separately approved and use the reviewed package
+verification/application path (`metal plan`/`apply`) before ordinary source updates can
+resume. This is intentional fail-closed behavior, not a suggestion to replace a binary
+by hand. The old attachment package does not satisfy the new generic capabilities.
+Unsupported capabilities refuse with `METAL_PRIVATE_SESSION_REQUIRED`.
+The refusal retains current release/history and originals. A stale
+`SILO_PROTECTED_SESSIONS=1` grant is deliberately removed when the current native
+proof fails, before any binary selection, or on an early agent/default-agent failure;
+it is re-added only after the final verified host/agent checks. If this attempt selects
+an incapable binary, the previous selection is restored and DBHub stays disabled.
+Rollback to an unlocked release removes the literal for older parser compatibility.
+The control file is installer-managed but account-owned; same-account operator writes
+remain trusted, not OS isolation. Unsafe/link/oversized grant files fail closed.
+None of this is permission to remove `lock_session`, forge environment fields, install
+the old attachment package, or manipulate stored job/session JSON. Existing ordinary
+unlocked releases do not require these capabilities. A selected binary passing a probe
+does not by itself prove that an already-running service uses it.
+
+**No automatic deployment is authorized by source publication.** An engineer must
+separately approve a reviewed native package handoff and the exact coordinated
+installation/service transition. Plan that transition so the old host cannot serve
+new private-agent/MCP definitions during an update. Inspect actual service-process
+binary identity, select fresh protected chats, and perform invented-data runtime
+acceptance before customer enablement. Do not simply run an old source-only update
+recipe to unlock intake. Package transfer, configuration changes and service
+stop/restart remain explicit operator actions, not actions performed by this source
+work or by tests. Preserve the previous release, native binary and receipts.
 
 ## Checking a change
 

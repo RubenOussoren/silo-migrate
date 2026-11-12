@@ -1,8 +1,11 @@
 # File roles, source snapshots and correcting assignments
 
-This is part of the pending private-attachment change. It is not a deployment or a
-repair of any live project. Native chat references still require the paired
-term-llm build in [chat-attachments.md](chat-attachments.md).
+This release uses the intake-first workflow in [intake-preparation.md](intake-preparation.md)
+and the existing Project widget. Private analysis requires the separately reviewed
+**generic conversation-protection** native build, not chat upload support. Chat
+attachments/drag-drop are deferred; [chat-attachments.md](chat-attachments.md)
+retains historical compatibility evidence, not the installation path for this release.
+Source publication does not deploy or repair any live project.
 
 ## Choose a role, then an association
 

@@ -145,7 +145,34 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=
                         "full_head": head, "branch": proposal.get("branch"), "pushed_at": record.get("pushed_at"), "proposed_at": record.get("proposed_at"),
                         "findings": proposal.get("findings") or [], "used_by": used.get(head, [])})
     updates.sort(key=lambda update: _t(update.get("pushed_at") or update.get("proposed_at")), reverse=True)
-    return {"passes": ordered[::-1], "updates": updates, "banner": banner(ordered, updates, deliveries, active=active)}
+    return {"passes": ordered[::-1], "updates": updates, "banner": banner(ordered, updates, deliveries, active=active),
+            "preparations": preparations(plans, run_of_plan, bodies)}
+
+
+PREPARATION_OPERATIONS = {"standard_master_lists": "Master-list export"}
+
+
+def preparations(plans, run_of_plan, bodies):
+    """Preparation jobs (e.g. the converter's master-list export): not a pass, never numbered,
+    never a conversion or import, and not counted towards the "what's next" banner."""
+    items = []
+    for plan in plans:
+        body = bodies.get(plan.get("plan_id")) or {}
+        name = PREPARATION_OPERATIONS.get(body.get("operation"))
+        if not name:
+            continue
+        run = run_of_plan.get(plan.get("plan_id")) or {}
+        if not run and plan.get("status") not in WAITING + ("stale",):
+            continue
+        delivery = body.get("delivery") or {}
+        master = body.get("master_lists") if isinstance(body.get("master_lists"), dict) else {}
+        items.append({"kind": body["operation"], "name": name, "plan_id": plan.get("plan_id"), "plan_status": plan.get("status"),
+                      "run_id": run.get("run_id"), "run_status": run.get("status"), "stage": run.get("stage"),
+                      "list": master.get("list") if isinstance(master.get("list"), str) else None,
+                      "delivery": ("Launch" if delivery.get("kind") == "launch" else "Development v%s" % delivery.get("version")) if delivery else None,
+                      "at": run.get("started_at") or plan.get("created_at") or ""})
+    items.sort(key=lambda item: _t(item["at"]), reverse=True)
+    return items[:20]
 
 
 def merge_status(step):

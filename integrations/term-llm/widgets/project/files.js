@@ -1,5 +1,6 @@
 // Role-aware Files decisions. Server previews are the authority; commits never retry themselves.
 import { el, safe, api, explain, card, facts, details } from './ui.js';
+import { usageBlock, copyRequest } from './intake.js';
 
 const ROLES = [['source', 'Source export / backup'], ['uploads', 'Uploads / assets'], ['reference', 'Supporting reference'], ['base_site', 'Base-site backup']];
 const label = snapshot => safe(snapshot.label || `${snapshot.kind === 'launch' ? 'Launch' : snapshot.kind === 'base_site' ? 'Base site' : 'Development'} v${snapshot.version ?? snapshot.revision ?? '?'}`);
@@ -148,6 +149,9 @@ export function filesView(ctx) {
     role === 'uploads' ? el('p', { class: 'hint' }, 'Stored—not included by this workflow') : null,
     embedded ? el('p', { class: 'hint' }, 'Discourse full source backup: embedded uploads are consumed by native merge; external S3 assets are not fetched.') : null,
     role === 'reference' ? el('p', { class: 'hint' }, file.support_id ? `Private reference registered · ${safe(file.availability || file.status || 'availability checked by migration-data')}` : 'Private reference · availability not yet confirmed') : null,
+    role === 'reference' && file.sha256 ? el('p', { class: 'hint' }, 'Original retained in private custody · checksum recorded. Not executed; a plan says how it is used.') : null,
+    role === 'reference' && file.usage_status ? usageBlock(file) : null,
+    role === 'reference' && file.id && ctx.project ? el('div', { class: 'actions' }, ...copyRequest(ctx.project, file)) : null,
     details(facts([['Identity', file.id, true], ['Input', file.input_id, true], ['Support', file.support_id, true], ['Checksum', file.sha256, true]]))),
     file.id ? el('details', { class: 'file-manage' }, el('summary', {}, `Manage ${safe(file.path)}`), button('Correct assignment…', () => open('correct', [file]))) : null);
   }

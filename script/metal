@@ -483,6 +483,78 @@ def hub_secrets_state(entry):
     directory_authority([path.parent])
     return {"path": str(path), "uid": info.st_uid, "mode": oct(info.st_mode & 0o7777), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
 
+# Locked agents may expose private custom tools and project-scoped MCP servers.
+# A prompt or a recognized YAML key is not proof that the host enforces the lock.
+PRIVATE_SCOPE_CAPABILITIES = {"session_scope_lock": 1, "custom_tool_session_context": 1}
+
+
+def private_scope_required(release):
+    return any(re.search(r"(?m)^lock_session:[ \t]*true[ \t]*(?:#.*)?$", path.read_text())
+               for path in (Path(release)/"integrations/term-llm").glob("*/agent.yaml"))
+
+
+def private_scope_ready(as_account=True, binary=None):
+    raw = output([binary or P/"bin/term-llm", "capabilities", "--json"], account=as_account)
+    try:
+        capabilities = json.loads(raw) if raw and len(raw) <= 8192 else None
+        return isinstance(capabilities, dict) and all(type(capabilities.get(key)) is int and capabilities[key] == version
+                                                     for key, version in PRIVATE_SCOPE_CAPABILITIES.items())
+    except (ValueError, TypeError):
+        return False
+
+
+def require_private_scope(release, as_account=True, binary=None):
+    if private_scope_required(release) and not private_scope_ready(as_account, binary):
+        refuse("METAL_PRIVATE_SESSION_REQUIRED", "this release's locked private agent and database tools require native "
+               "session_scope_lock=1 and custom_tool_session_context=1; preserve the current release/configuration and "
+               "arrange a separately approved reviewed native package handoff; the old attachment package is not sufficient")
+
+
+def set_private_scope_flag(release, as_account=True):
+    """Only installer-verified native support may enable the DBHub host path.
+
+    Removing the literal on an unlocked rollback also keeps older control parsers
+    compatible. Never trust an inherited environment value as enablement.
+    """
+    enabled = private_scope_required(release)
+    if enabled:
+        try:
+            require_private_scope(release, as_account=as_account)
+        except Refusal:
+            clear_private_scope_flag()
+            raise
+    return _write_private_scope_flag(enabled)
+
+
+def clear_private_scope_flag():
+    return _write_private_scope_flag(False)
+
+
+def _write_private_scope_flag(enabled):
+    path = P/"etc/silo-control.env"
+    if not path.exists() and not path.is_symlink():
+        return False  # no installed control config means DBHub remains disabled
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > 65536):
+        refuse("METAL_CONTROL_CONFIG", "control config is not a bounded single-link account-owned regular file; left unchanged")
+    original = path.read_text()
+    lines = original.splitlines()
+    entries = [line for line in lines if line.startswith("SILO_PROTECTED_SESSIONS=")]
+    if len(entries) > 1:
+        refuse("METAL_CONTROL_CONFIG", "duplicate protected-session setting; left unchanged")
+    if not entries and not enabled:
+        return False
+    lines = [line for line in lines if not line.startswith("SILO_PROTECTED_SESSIONS=")]
+    if enabled:
+        lines.append("SILO_PROTECTED_SESSIONS=1")
+    text = "\n".join(lines) + "\n"
+    if text == original:
+        return False
+    atomic_write(path, text, stat.S_IMODE(info.st_mode))
+    return True
+
+
 MIGRATION_AGENTS = ("converter-developer", "converter-reviewer", "migration-data", "migration-operator", "server-support")
 # Earlier releases' agent names; their exact old ~/.config links are removed like the current ones.
 LEGACY_AGENTS = ("migration-analyst",)
@@ -706,7 +778,7 @@ def make_plan(allow=False):
     # ~/.config/term-llm/agents is a link to the release (link_agents checks it exactly), like skills.
     account_dirs = [home()/part for part in (".config", ".config/term-llm",
         ".config/term-llm/services/web", ".config/systemd/user", ".local/share/term-llm")]
-    authority = directory_authority(dirs + account_dirs + [P/"term-llm"/C["TERM_LLM_VERSION"]])
+    authority = directory_authority(dirs + account_dirs + [term_destination().parent])
     if C["ARTIFACT_PACKAGE"]:
         authority.update(directory_authority([Path(C["ARTIFACT_PACKAGE"])]))
     if C.get("TERM_LLM_PACKAGE"):
@@ -730,6 +802,7 @@ def make_plan(allow=False):
               "config_sha256": digest_bytes(canonical(C).encode()), "artifact_package": package}
     if native:
         target["term_llm_package"] = dict(native[2], manifest_sha256=sha(Path(C["TERM_LLM_PACKAGE"])/"manifest.json"))
+        target["term_llm_version"] = native[2]["version"]
         target["term_llm_sha256"] = native[2]["binary_sha256"]
     old = load(P/"state/install-manifest.json") if (P/"state/install-manifest.json").is_file() else {}
     image_steps = []
@@ -782,7 +855,7 @@ def make_plan(allow=False):
     if C["TERM_LLM_SERVICE"] != "skip" and (P/"bin/term-llm").exists() and (home()/".config/term-llm/config.yaml").exists() and entry \
             and (P/"current").exists() and not agents_ready(expected=shipped_agents(P/"current") or MIGRATION_AGENTS):
         refuse("METAL_AGENTS_CONFIG", "existing term-llm config preserved; " + AGENTS_HELP + " (" + agents_path() + "), then re-plan")
-    notes.append("term-llm " + C["TERM_LLM_VERSION"] + ": ~/.config/term-llm/agents links to the release's agents (the only ones an MCP rule can name; "
+    notes.append("term-llm " + term_destination().parent.name + ": ~/.config/term-llm/agents links to the release's agents (the only ones an MCP rule can name; "
                  "the release path leaves agents.search_paths), web.project_default_agent is set to migration-data if it isn't one of the node's agents, "
                  "and each project database's rule (mcp.servers.db-PROJECT.agents: [migration-data]) is written to config.yaml with term-llm's config set.")
     notes.append("Everyday node commands: <prefix>/current/bin/silo (doctor, update, use-github, restart, shell, prime, claude-login, intake, set-contact, remove-project); link it once as root: ln -sfn " + str(P/"current/bin/silo") + " /usr/local/bin/silo")
@@ -1238,11 +1311,21 @@ def account_apply(saved):
     print("METAL_TERM_VERIFIED", flush=True)
     STAGE = "RELEASE_CLONE"
     release = fetch_release(plan["target"]["commit"])
+    # Refuse before switching the release, linking private agents/MCP, or writing
+    # installed configuration. Missing protection must never partially enable it.
+    try:
+        require_private_scope(release, as_account=False)
+    except Refusal:
+        if before is not None and (P/"bin/term-llm").resolve() != before:
+            previous_term_llm_back()
+        raise
     print("METAL_RELEASE_READY", flush=True)
     STAGE = "ARTIFACT_LOAD"
     images, image_state, gems = extract_artifacts(release, plan["target"]["artifact_package"])
     env = {"SILO_MIGRATE_BASE_PATH": str(W), "SILO_CONTROL_GEMS": gems or str(P/"control/gems/unavailable"),
            "SILO_CONTROL_SITE_CACHE": str(P/"control/site-cache/site_settings.yml"), "SILO_RUNTIME_PROFILES_DIR": str(P/"state/runtime-profiles")}
+    # Start untrusted: agent/configuration failures must not leave a DBHub grant.
+    # The literal is added only after the final native/agent/default-agent checks.
     atomic_write(P/"etc/silo-control.env", "".join(k + "=" + v + "\n" for k,v in env.items()))
     shim = '#!/bin/sh\nset -eu\nexport SILO_CONTROL_CONFIG=' + shlex.quote(str(P/"etc/silo-control.env")) + '\nexec ' + shlex.quote(str(P/"current/bin/silo-migrate-control")) + ' "$@"\n'
     atomic_write(P/"bin/silo-migrate-control", shim, 0o750)
@@ -1287,6 +1370,12 @@ def account_apply(saved):
         if replaced:
             previous_term_llm_back()
         refuse("METAL_DEFAULT_AGENT", "web.project_default_agent must name one of the node's agents (term-llm config set web.project_default_agent migration-data); then re-plan")
+    try:
+        set_private_scope_flag(release, as_account=False)
+    except Refusal:
+        if replaced:
+            previous_term_llm_back()
+        raise
     mcp_rules()
     if C["TERM_LLM_SERVICE"] != "skip":
         unit = home()/".config/systemd/user/term-llm-web.service"
@@ -1410,7 +1499,7 @@ def term_llm_current():
         return False
     STAGE = "TERM_DOWNLOAD"
     install_term()
-    print("METAL_TERM_UPDATED: term-llm " + C["TERM_LLM_VERSION"], flush=True)
+    print("METAL_TERM_UPDATED: term-llm " + term_destination().parent.name, flush=True)
     return True
 
 def previous_term_llm_back():
@@ -1428,6 +1517,8 @@ def node_term_llm():
     term-llm, only once they are (0.9.99 won't start a search-path agent's chats); then the project
     default agent it needs (0.9.99 won't serve web UI projects without one), else the previous
     term-llm goes back; then the project databases' rules. True if term-llm changed (restart)."""
+    clear_private_scope_flag()
+    require_private_scope(P/"current")
     if not trust_agents():
         if (P/"bin/term-llm").resolve() != term_destination():
             print("METAL_TERM_NOT_UPDATED: term-llm stays at its current version until its agents are in ~/.config/term-llm/agents "
@@ -1438,6 +1529,12 @@ def node_term_llm():
             mcp_rules()
         return False
     changed = term_llm_current()
+    try:
+        require_private_scope(P/"current")
+    except Refusal:
+        if changed:
+            previous_term_llm_back()
+        raise  # flag is still absent; no MCP configuration or service refresh
     if not project_default_agent():
         if changed and previous_term_llm_back():
             print("METAL_TERM_KEPT_PREVIOUS: the new term-llm needs web.project_default_agent; the previous version is back in place", flush=True)
@@ -1447,6 +1544,7 @@ def node_term_llm():
         if (P/"bin/term-llm").resolve() == term_destination():
             mcp_rules()
         return False
+    set_private_scope_flag(P/"current")
     mcp_rules()
     return changed
 
@@ -1481,13 +1579,22 @@ def account_update(rollback=False, branch=None, term=False):
                 changed = node_term_llm()
                 if changed:
                     kept = {key: value for key, value in old.items() if key not in ("installed_at", "operation", "previous_commit")}
-                    record(dict(kept, term_llm_version=C["TERM_LLM_VERSION"]), "update", old.get("previous_commit"))
+                    record(dict(kept, term_llm_version=(P/"bin/term-llm").resolve().parent.name), "update", old.get("previous_commit"))
                 if refresh_service(force=changed):
                     print("METAL_SERVICE_UPDATED", flush=True)
                 print("METAL_UNCHANGED")
                 return
             release = fetch_release(commit)
             target = dict(old, commit=commit, branch=selected)
+        # Check the candidate host before any release switch, rollback link swap,
+        # private agent link or DBHub configuration. A refusal preserves history.
+        candidate = (P/"bin/term-llm.previous").resolve() if rollback and term else None
+        try:
+            require_private_scope(release, binary=candidate)
+        except Refusal:
+            if candidate is None:
+                clear_private_scope_flag()  # current host's old grant is no longer valid
+            raise
         bound = target.get("artifact_package")
         images, verification = verify_release_images(release, bound)
         target["images"] = images
@@ -1510,6 +1617,8 @@ def account_update(rollback=False, branch=None, term=False):
         if not rollback:
             changed = node_term_llm()
             target["term_llm_version"] = (P/"bin/term-llm").resolve().parent.name
+        else:
+            set_private_scope_flag(release)
         for key in ("installed_at", "operation", "previous_commit"):
             target.pop(key, None)
         record(target, "rollback" if rollback else "update", previous)

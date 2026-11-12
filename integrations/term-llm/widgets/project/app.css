@@ -164,3 +164,15 @@ textarea.note.tall { height: 110px; }
 .file-preview:not(:empty) { border-top: 1px solid var(--border); margin-top: 20px; padding-top: 16px; }
 .file-preview dd { white-space: pre-wrap; }
 @media (max-width: 600px) { .role-heading, .role-file { flex-direction: column; align-items: stretch; } }
+.usage { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.usage details.more { flex-basis: 100%; margin-top: 6px; }
+.copy-request textarea { margin-top: 8px; font-size: 12.5px; }
+.intake-list { margin: 4px 0 8px; padding-left: 18px; font-size: 14px; }
+.intake-list li { margin: 6px 0; overflow-wrap: anywhere; }
+.intake-list small { display: block; color: var(--text-muted); }
+.card-inner.needs { margin-top: 16px; padding: 12px 14px; border-radius: 10px; background: var(--launch-soft); border: 1px solid color-mix(in srgb, var(--launch) 40%, transparent); }
+.card-inner.needs h3 { font-size: 14px; margin: 0 0 6px; }
+.label-analyst { font-style: italic; }
+@media (max-width: 600px) { .card { padding: 16px; } .facts { grid-template-columns: 1fr; } .facts dd { margin-bottom: 6px; } .actions .btn { flex: 1 1 auto; } }
+.analyst-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.block .hint, .intake-list li { overflow-wrap: anywhere; }

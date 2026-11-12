@@ -34,7 +34,28 @@ def workbook():
 @unittest.skipUnless(BINARY and os.environ.get('SILO_SUPPORTING_LIVE') == '1', 'opt-in paired native node and cached Docker test')
 class PrivateAttachmentsNodeTest(unittest.TestCase):
     def test_ui_upload_reaches_only_own_private_project_tools(self):
-        with tempfile.TemporaryDirectory(prefix='private-attachments-node-') as directory:
+        # Chat upload plumbing is deliberately outside the new generic-core scope.
+        # Keep this compatibility check for the older attachment-capable binary.
+        probe = subprocess.run([str(Path(BINARY).resolve()), 'capabilities', '--json'],
+                               capture_output=True, timeout=10, check=True)
+        if json.loads(probe.stdout).get('private_upload_context') != 1:
+            self.skipTest('generic conversation protection build has no private chat-upload capability')
+        self.check_reference_route(via_intake=False)
+
+    def test_intake_reference_without_chat_upload_reaches_only_private_project(self):
+        self.check_reference_route(via_intake=True)
+
+    def test_intake_reference_prepares_converter_native_file_in_real_sandbox(self):
+        self.check_reference_route(via_intake=True, prepare_reference=True)
+
+    def check_reference_route(self, via_intake, prepare_reference=False):
+        previous_umask = os.umask(0o077)
+        self.addCleanup(os.umask, previous_umask)
+        # Preparation uses the real job disk-reserve admission. Use a private
+        # case under disk-backed /var/tmp (or an explicit test root), not a small
+        # /tmp tmpfs or a group-writable source checkout; never relax the gates.
+        scratch = os.environ.get('SILO_PRIVATE_TEST_TMPDIR', '/var/tmp') if prepare_reference else None
+        with tempfile.TemporaryDirectory(prefix='private-attachments-node-', dir=scratch) as directory:
             home = Path(directory)
             project = home / 'projects/invented'
             project.mkdir(parents=True)
@@ -42,12 +63,50 @@ class PrivateAttachmentsNodeTest(unittest.TestCase):
             named = home / 'workspaces/invented/.silo-migrate/named'
             (named / 'standard').mkdir(parents=True)
             named_state = named / 'state.json'
-            named_state.write_text(json.dumps({'inputs': {}, 'datasets': {}}))
+            named_document = {'inputs': {}, 'datasets': {}}
+            if prepare_reference:
+                # An invented, explicitly selected source is needed to associate
+                # preparation outputs; it is never mounted into the prepare job.
+                source_id, dataset_id, input_id = ['%s-%s' % (kind, char * 32)
+                                                  for kind, char in [('source', '1'), ('dataset', '2'), ('input', '3')]]
+                source = named.parent.parent / 'inputs/invented.sql'
+                source.parent.mkdir(mode=0o700)
+                source.write_bytes(b'CREATE TABLE invented (id int);\n')
+                source.chmod(0o400)
+                named_document['sources'] = {source_id: {'id': source_id, 'platform': base64.b64encode(b'mybb').decode()}}
+                named_document['datasets'][dataset_id] = {'id': dataset_id, 'source_id': source_id}
+                named_document['inputs'][input_id] = {'id': input_id, 'dataset_id': dataset_id, 'type': 'mysql-dump',
+                    'path': base64.b64encode(b'inputs/invented.sql').decode(), 'bytes': source.stat().st_size,
+                    'sha256': hashlib.sha256(source.read_bytes()).hexdigest()}
+                (named / 'deliveries.json').write_text(json.dumps({'version': 1, 'deliveries': {dataset_id: {
+                    'dataset_id': dataset_id, 'kind': 'development', 'version': 1, 'sequence': 1, 'files': []}}}))
+            named_state.write_text(json.dumps(named_document))
             profile = ROOT / 'runtime/profiles/discourse-2026.11.0-latest-3158c750.json'
             standard_state = named / 'standard/state.json'
             standard_state.write_text(json.dumps({'config': {'discourse_profile': profile.stem,
                                                             'discourse_profile_sha256': hashlib.sha256(profile.read_bytes()).hexdigest()}}))
             before = named_state.read_bytes(), standard_state.read_bytes()
+            intake_bytes = workbook()
+            if via_intake:
+                # Real engineer reference classification; no chat-upload context.
+                def load_local(name, relative):
+                    loader = importlib.machinery.SourceFileLoader(name, str(ROOT / relative))
+                    spec = importlib.util.spec_from_loader(name, loader)
+                    module = importlib.util.module_from_spec(spec)
+                    loader.exec_module(module)
+                    return module
+                helpers = load_local('intake_node_helpers', 'bin/data_tools.py')
+                host = load_local('intake_node_host', 'bin/silo-migrate-control')
+                workspace = helpers.Workspace(home / 'workspaces', 'invented', ROOT, host, {}, None)
+                (workspace.root / '.silo-migrate').chmod(0o700)
+                workspace.intake.mkdir(parents=True, mode=0o700)
+                original = workspace.intake / 'wishes.xlsx'
+                original.write_bytes(intake_bytes)
+                identity = helpers.supporting_module().source_identity(original.stat(), original.name)
+                change = {'action': 'classify', 'role': 'reference', 'files': [identity]}
+                preview = helpers.op_file_roles_preview(workspace, {'change': change, 'by': 'Invented Engineer'})
+                helpers.op_file_roles_commit(workspace, {'change': preview['change'], 'digest': preview['digest'],
+                                                         'by': 'Invented Engineer'})
             config = home / '.config/term-llm'
             config.mkdir(parents=True)
             (config / 'agents').symlink_to(ROOT / 'integrations/term-llm')
@@ -70,6 +129,7 @@ except helpers.Refusal as e:
             control.chmod(0o700)
             requests = []
             outputs = []
+            prepared_jobs = []
             failures = []
 
             def tool_json(text):
@@ -98,10 +158,29 @@ except helpers.Refusal as e:
                             name, args = 'data_supporting_list', {}
                         elif count == 1:
                             previous = tool_json(tools[-1]['content'])
-                            name, args = 'data_supporting_take', {'ref': previous['available_refs'][0]['id']}
-                        elif count == 2:
+                            if via_intake:
+                                assert previous['available_refs'] == [], 'intake test must have no chat uploads'
+                                name, args = 'data_supporting_read', {'id': previous['files'][0]['id'], 'mode': 'rows', 'columns': 2, 'limit': 1}
+                            else:
+                                name, args = 'data_supporting_take', {'ref': previous['available_refs'][0]['id']}
+                        elif count == 2 and not via_intake:
                             previous = tool_json(tools[-1]['content'])
                             name, args = 'data_supporting_read', {'id': previous['file']['id'], 'mode': 'rows', 'columns': 2, 'limit': 1}
+                        elif count == 2 and prepare_reference:
+                            outputs.append(tool_json(tools[-1]['content']))
+                            admitted = tool_json(tools[0]['content'])
+                            name, args = 'data_supporting_prepare', {
+                                'id': admitted['files'][0]['id'], 'sheet': 'Mappings', 'header_row': 0,
+                                'columns': [{'from': 'invented-reference-marker', 'to': 'khoros_source_id', 'required': True}],
+                                'format': 'csv', 'name': 'tag_mapping.csv', 'into': 'prepared-reference'}
+                        elif prepare_reference:
+                            previous = tool_json(tools[-1]['content'])
+                            if count == 3 or previous.get('status') == 'running':
+                                name, args = 'data_job', {'job_id': previous.get('job_id') or previous['id']}
+                            else:
+                                assert previous['status'] == 'succeeded', previous
+                                prepared_jobs.append(previous)
+                                name = None
                         else:
                             outputs.append(tool_json(tools[-1]['content']))
                             name = None
@@ -188,18 +267,32 @@ serve:
                 code, created = api('/v1/sessions', {'agent': 'migration-data', 'project_id': project_id})
                 self.assertEqual(201, code, created)
                 session_id = created['session']['id']
-                code, uploaded = api('/uploads', workbook(), **{'X-Term-LLM-Upload-Filename': quote('mapping.xlsx'),
-                                                               'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'})
-                self.assertEqual(201, code, uploaded)
-                code, response = api('/v1/responses', {'input': [{'type': 'message', 'role': 'user', 'content': [
-                    {'type': 'input_text', 'text': 'Inspect this invented reference, using the supporting tools.'},
-                    {'type': 'input_upload', 'upload_id': uploaded['upload_id']}]}], 'stream': False,
+                content = [{'type': 'input_text', 'text': 'Inspect this invented reference, using the supporting tools.'}]
+                if not via_intake:
+                    code, uploaded = api('/uploads', workbook(), **{'X-Term-LLM-Upload-Filename': quote('mapping.xlsx'),
+                                                                   'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'})
+                    self.assertEqual(201, code, uploaded)
+                    content.append({'type': 'input_upload', 'upload_id': uploaded['upload_id']})
+                code, response = api('/v1/responses', {'input': [{'type': 'message', 'role': 'user', 'content': content}], 'stream': False,
                     'client_message_id': 'fixture-upload-1'}, **{'X-Term-LLM-Session-ID': session_id})
                 self.assertEqual(200, code, response)
                 self.assertIn('SUPPORTING_UPLOAD_OK', json.dumps(response),
                               (failures, [m.get('content') for m in requests[-1].get('messages', []) if m.get('role') == 'tool']))
                 self.assertEqual([], failures)
-                self.assertEqual(4, len(requests))
+                offered = {tool.get('function', {}).get('name') for tool in requests[0].get('tools', [])}
+                self.assertTrue(offered, 'the real shipped private-agent tool surface must be offered')
+                self.assertFalse(offered & {'web_search', 'read_url', 'shell', 'read_file', 'write_file', 'edit_file', 'spawn_agent'},
+                                 'private analysis received unrestricted public-egress or host-file tools')
+                if prepare_reference:
+                    self.assertGreaterEqual(len(requests), 5)
+                    output = named.parent.parent / 'work/prepared-reference/tag_mapping.csv'
+                    self.assertEqual(b'khoros_source_id\n', output.read_bytes())
+                    self.assertEqual(1, len(prepared_jobs))
+                    self.assertEqual(hashlib.sha256(intake_bytes).hexdigest(), prepared_jobs[0]['references'][0]['sha256'])
+                    self.assertRegex(prepared_jobs[0]['preparation_sha256'], r'^[0-9a-f]{64}$')
+                    self.assertEqual([], list((named.parent / 'data/jobs').glob('refs-*')))
+                else:
+                    self.assertEqual(3 if via_intake else 4, len(requests))
                 self.assertEqual({'CDCK/MoM'}, {item['model'] for item in requests})
                 self.assertIn('rows', outputs[0], outputs)
                 self.assertEqual('invented-reference-marker', outputs[0]['rows'][0][0]['value'])
@@ -220,7 +313,11 @@ serve:
                 self.assertEqual({'CDCK/MoM'}, {item['model'] for item in requests},
                                  'locked history reached the forbidden fake provider')
                 self.assertEqual(before, (named_state.read_bytes(), standard_state.read_bytes()))
-                print(json.dumps({'result': 'native UI upload, own-project private import, real XLSX read and forbidden-provider non-dispatch passed',
+                if via_intake:
+                    self.assertEqual(intake_bytes, original.read_bytes())
+                print(json.dumps({'result': 'native reference, own-project private read and forbidden-provider non-dispatch passed',
+                                  'arrival': 'intake_without_chat_upload' if via_intake else 'chat_upload',
+                                  'prepared_in_real_sandbox': prepare_reference,
                                   'fake_frontier_requests': len(requests), 'migration_state_unchanged': True}))
             finally:
                 process.terminate()

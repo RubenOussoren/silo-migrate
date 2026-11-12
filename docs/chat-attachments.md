@@ -1,5 +1,14 @@
 # Private chat attachments and supporting reference files
 
+> **Historical attachment-fork contract, not the current installation path.** The
+> intake-first release uses [intake-preparation.md](intake-preparation.md), requires
+> the separately reviewed generic conversation-protection build, and does not need
+> native upload context for intake references. Chat drag/drop is deferred. Do **not**
+> install the older paired attachment package from the instructions below to unlock
+> private reading; its capabilities do not satisfy the new enablement gate. Original
+> attachment source/history and tests are retained for compatibility evidence.
+> Installation, package transfer and service changes always require separate approval.
+
 ## Intended workflow
 
 Use a **new migration-data chat in the correct Project**, on a node with the paired native support described below. Attach a small file with the normal term-llm attachment control and explain its purpose, for example: “Use this spreadsheet as reference for the category mapping.”
@@ -86,7 +95,7 @@ reference as source just to read it. Establish the capability first, then inspec
 project reference metadata through the protected tool path under the appropriate
 customer-data approval. Use invented data for node acceptance before customer reads.
 
-The reviewed native patch is `integrations/term-llm/patches/private-attachments.patch`, based on the exact commit in `runtime/private-node-source.json`. That source receipt binds the patch SHA-256. Native support can be checked without inference:
+The historical attachment patch is `integrations/term-llm/patches/private-attachments.patch`; its original base/hash are retained in Git history, not the current source receipt. `runtime/private-node-source.json` now binds the generic `conversation-scope.patch` described in [intake-preparation.md](intake-preparation.md). The following attachment capability/build instructions are historical and cannot be used with the current package helper. Native capability reporting itself can be checked without inference:
 
 ```sh
 term-llm capabilities --json

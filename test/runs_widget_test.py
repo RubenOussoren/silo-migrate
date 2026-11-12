@@ -180,6 +180,21 @@ else:
     def calls(self):
         return [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
 
+    def test_legacy_page_cannot_approve_or_start_a_private_preparation_plan(self):
+        state_path = self.base / 'arc/.silo-migrate/named/standard/state.json'
+        for key, value in [('preparation', {'version': 1}), ('run_inputs', {'version': 1, 'files': []})]:
+            state = json.loads(state_path.read_text())
+            state['plans'][pid(1)]['body'][key] = value
+            state_path.write_text(json.dumps(state))
+            for action in ('approve', 'start'):
+                status, body = self.post(action, plan_id=pid(1), digest='a' * 64,
+                                         project_reviewed=True)  # model/browser flags are not authority
+                self.assertEqual(409, status)
+                self.assertEqual('STANDARD_PROJECT_PLAN_REVIEW_REQUIRED', body['error'])
+            self.assertEqual([], self.calls())
+            del state['plans'][pid(1)]['body'][key]
+            state_path.write_text(json.dumps(state))
+
     def test_summary_counts_from_disk_without_any_text_or_control_call(self):
         status, data = self.get('/api/summary')
         self.assertEqual(200, status)

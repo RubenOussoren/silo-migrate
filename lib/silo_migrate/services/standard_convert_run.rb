@@ -20,6 +20,16 @@ module SiloMigrate
     module StandardConvertRun
       CONVERT_OPERATION = "standard_convert"
       CONVERT_STAGES = %w[preflight convert reconcile].freeze
+      # Explicit preparation job (Khoros contract): the converter's own master-list
+      # exporter on the run's disposable source copy. The exporter rebuilds source-side
+      # staging tables/indexes, so it is an approved mutation, not a read-only status.
+      MASTER_LISTS_OPERATION = "standard_master_lists"
+      MASTER_LISTS_STAGES = %w[preflight export].freeze
+      MASTER_LISTS_SCRIPT = "scripts/export_master_lists.rb"
+      MASTER_LIST = /\A[a-z][a-z_]{0,31}\z/
+      MAX_MASTER_FILES = 64
+      MAX_MASTER_FILE_BYTES = 8 * 1024**3
+      MAX_MASTER_TOTAL_BYTES = 16 * 1024**3
       CONVERT_IMAGE_ROLES = %w[converter source_db].freeze
       # Real dumps need far more than the synthetic profile's conversion limits: up to this
       # per container, at most a quarter of the host's memory each (see convert_limits).
@@ -81,7 +91,21 @@ module SiloMigrate
         end
       end
 
-      def propose_convert_plan(source:, settings:, reconciliation: nil, charset: "utf8mb4", allow_unqualified_runtime: false)
+      def propose_convert_plan(source:, settings:, reconciliation: nil, charset: "utf8mb4", allow_unqualified_runtime: false, run_inputs: nil, preparation: nil)
+        propose_source_db_plan(CONVERT_OPERATION, source: source, settings: settings, reconciliation: reconciliation, charset: charset,
+                               allow_unqualified_runtime: allow_unqualified_runtime, run_inputs: run_inputs, preparation: preparation)
+      end
+
+      # list: the exporter's own list name; its option parser decides validity.
+      def propose_master_lists_plan(source:, settings:, list: "all", charset: "utf8mb4", allow_unqualified_runtime: false, run_inputs: nil)
+        raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless list.is_a?(String) && list.match?(MASTER_LIST)
+
+        propose_source_db_plan(MASTER_LISTS_OPERATION, source: source, settings: settings, reconciliation: nil, charset: charset,
+                               allow_unqualified_runtime: allow_unqualified_runtime, run_inputs: run_inputs, preparation: nil, list: list)
+      end
+
+      def propose_source_db_plan(operation, source:, settings:, reconciliation:, charset:, allow_unqualified_runtime:, run_inputs:, preparation:, list: nil)
+        master = operation == MASTER_LISTS_OPERATION
         state = @store.load
         raise StandardWorkflowError, "STANDARD_SIZE_LIMIT" if state.fetch("plans").size >= self.class::MAX_PLANS
         raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless profile_current?(state.fetch("config"))
@@ -107,7 +131,7 @@ module SiloMigrate
           spec = read_registered_small(inputs["reconciliation"], MAX_SPEC_BYTES)
           reconciliation_spec(spec)
         end
-        settings_template!(read_registered_small(inputs.fetch("settings"), MAX_SPEC_BYTES))
+        settings_bytes = read_registered_small(inputs.fetch("settings"), MAX_SPEC_BYTES)
 
         delivery = delivery_binding!(inputs.fetch("source").fetch("dataset_id"))
         delivery_roles!(named, roles, delivery)
@@ -118,15 +142,21 @@ module SiloMigrate
         config = state.fetch("config")
         revision = config.fetch("converter_revision")
         converter_platform!(config.fetch("converter_worktree"), revision, platform)
+        master_lists_script!(config.fetch("converter_worktree"), revision, platform) if master
+        unless run_inputs.nil?
+          run_inputs = run_inputs_binding!(run_inputs, named: named, roles: roles, source: inputs.fetch("source"), platform: platform, delivery: delivery, config: config)
+          raise StandardWorkflowError, "STANDARD_INPUT_CHANGED" unless inputs_unchanged?(run_inputs.fetch("files").map { |file| named.fetch("inputs").fetch(file["input_id"]) })
+        end
+        settings_template!(settings_bytes, run_inputs)
         image = ImageIdentity.resolve(@runtime, lock.dig("images", "converter"))
         deps = converter_deps_binding(config.fetch("converter_worktree"), revision, image)
         deps_ready!(deps)
 
-        ids = roles.values.sort
+        ids = (roles.values + Array(run_inputs&.fetch("files")).map { |file| file["input_id"] }).sort
         plan_id = @store.new_id("plan")
         role_binding = file_role_binding(named, roles)
         body = {
-          "operation" => CONVERT_OPERATION,
+          "operation" => operation,
           "workspace_id" => named.fetch("workspace_id"),
           "dataset_id" => inputs.fetch("source").fetch("dataset_id"),
           "delivery" => delivery,
@@ -156,6 +186,30 @@ module SiloMigrate
           "not_included" => ["import into Discourse", "uploads", "hosted restore", "DNS or cutover", "remote pushes"]
         }
         body["file_role_binding"] = role_binding if role_binding
+        if master
+          body.delete("reconciliation_policy")
+          body["master_lists"] = { "script" => "converters/#{platform}/#{MASTER_LISTS_SCRIPT}", "list" => list }
+          body["mutations"] = [
+            "load the source dump into a disposable database for this run only (no network; deleted after the export)",
+            "run converters/#{platform}/#{MASTER_LISTS_SCRIPT} --list #{list} at the bound commit; it may create or rebuild source-side staging " \
+            "tables and indexes, only in that disposable copy",
+            "write the exported master CSVs to this run's private artifacts"
+          ]
+          body["not_included"] = ["conversion", "import into Discourse", "registering exports as run inputs", "external spreadsheet transfer", "remote pushes"]
+        end
+        if run_inputs
+          body["run_inputs"] = run_inputs
+          body["mutations"] << "copy #{run_inputs['files'].size} bound converter input file(s) into a fresh run-owned directory at #{run_inputs['consumer']['setting']} " \
+                               "(#{run_inputs['writable'] ? "writable only for #{run_inputs['generated'].size} declared generated file(s), kept privately as evidence and never reused as inputs" : 'read-only'}); " \
+                               "any other change fails the run"
+          reused = run_inputs["files"].count { |file| file["reuse"] }
+          body["mutations"] << "#{reused} run input file(s) explicitly reused from another delivery's data (bound by dataset and source digest)" if reused.positive?
+        end
+        if preparation
+          readiness = { "kind" => "converter", "present" => true, "platform" => platform, "path" => "converters/#{platform}/converter.rb", "revision" => revision }
+          body["preparation"] = preparation_binding!(preparation, roles: roles, run_inputs: run_inputs, code_readiness: readiness)
+          body["not_included"] += preparation_not_included(body["preparation"])
+        end
         digest = Digest::SHA256.hexdigest(canonical_json(body))
         @store.update do |current|
           verify_file_role_proposal!(body, @store.named_state)
@@ -163,7 +217,9 @@ module SiloMigrate
             "id" => plan_id, "digest" => digest, "body" => body, "status" => "proposed", "created_at" => now, "approval" => nil, "run_id" => nil
           }
         end
-        show_plan(plan_id)
+        # The proposer (engineer, or the trusted private analyst session that wrote these documents)
+        # sees its own full plan; clean agent/operator surfaces use the default projection.
+        show_plan(plan_id, detail: true)
       end
 
       private
@@ -172,8 +228,31 @@ module SiloMigrate
         plan.dig("body", "operation") == CONVERT_OPERATION
       end
 
+      def master_lists_plan?(plan)
+        plan.dig("body", "operation") == MASTER_LISTS_OPERATION
+      end
+
+      # Plans that load the source dump into a disposable database and run committed
+      # converter code on it.
+      def source_db_plan?(plan)
+        convert_plan?(plan) || master_lists_plan?(plan)
+      end
+
+      def master_lists_script!(worktree, revision, platform)
+        found = @runtime.run([*converter_git_argv(worktree), "cat-file", "-e", "#{revision}:converters/#{platform}/#{MASTER_LISTS_SCRIPT}"], capture: true, timeout: 30)
+        raise StandardWorkflowError.new("STANDARD_CONVERTER_PLATFORM_MISSING", "#{platform} master-list exporter") unless found.success?
+      end
+
+      def stage_export(run_id)
+        plan = plan_for(run_id)
+        raise StandardWorkflowError, "STANDARD_INTERNAL" unless master_lists_plan?(plan)
+
+        convert_real(run_id, plan)
+      end
+
       def stages_for(plan)
         return CONVERT_STAGES if convert_plan?(plan)
+        return MASTER_LISTS_STAGES if master_lists_plan?(plan)
         return StandardReviewRun::REVIEW_STAGES if review_plan?(plan)
 
         self.class::STAGES
@@ -280,18 +359,20 @@ module SiloMigrate
 
       # -- settings and the reconciliation spec ---------------------------------
 
-      def settings_template!(bytes)
+      def settings_template!(bytes, run_inputs = nil)
         text = bytes.dup.force_encoding("UTF-8")
         raise StandardWorkflowError.new("STANDARD_SETTINGS_INVALID", "not UTF-8") unless text.valid_encoding?
 
         names = text.scan(PLACEHOLDER).flatten.uniq
-        unknown = names - settings_values("x").keys
+        unknown = names - settings_values("x").keys - (run_inputs ? [StandardRunInputs::RUN_INPUTS_PLACEHOLDER] : [])
         raise StandardWorkflowError.new("STANDARD_SETTINGS_INVALID", "unknown placeholder #{unknown.first[0, 32]}") unless unknown.empty?
         raise StandardWorkflowError.new("STANDARD_SETTINGS_INVALID", "missing ${SILO_DB_PASSWORD}") unless names.include?("SILO_DB_PASSWORD")
 
-        filled = text.gsub(PLACEHOLDER) { |_match| settings_values("p0").fetch(Regexp.last_match(1)) }
+        filled = text.gsub(PLACEHOLDER) { |_match| settings_fill_values("p0", run_inputs).fetch(Regexp.last_match(1)) }
         parsed = YAML.safe_load(filled, aliases: false)
         raise StandardWorkflowError.new("STANDARD_SETTINGS_INVALID", "not a YAML mapping") unless parsed.is_a?(Hash)
+
+        run_inputs_settings!(parsed, names, run_inputs)
 
         text
       rescue Psych::Exception
@@ -300,6 +381,13 @@ module SiloMigrate
 
       def settings_values(password)
         { "SILO_DB_HOST" => "127.0.0.1", "SILO_DB_PORT" => "3306", "SILO_DB_USER" => "silo_convert", "SILO_DB_PASSWORD" => password, "SILO_DB_NAME" => "source" }
+      end
+
+      # Only a plan with bound run inputs may name their directory.
+      def settings_fill_values(password, run_inputs)
+        values = settings_values(password)
+        values[StandardRunInputs::RUN_INPUTS_PLACEHOLDER] = StandardRunInputs::RUN_INPUTS_MOUNT if run_inputs
+        values
       end
 
       def reconciliation_spec(bytes)
@@ -480,8 +568,9 @@ module SiloMigrate
         converter_password = "p#{SecureRandom.hex(31)}"
         count_password = SecureRandom.hex(32)
         template = File.read(input_path(run_id, role_input(inputs, "settings")))
-        settings_template!(template.b)
-        values = settings_values(converter_password)
+        settings_template!(template.b, body["run_inputs"])
+        values = settings_fill_values(converter_password, body["run_inputs"])
+        run_inputs_root = materialize_run_inputs(run_id, body, inputs)
         @store.write_private(File.join(secrets, "settings.yml"), template.gsub(PLACEHOLDER) { |_match| values.fetch(Regexp.last_match(1)) })
         @store.write_private(File.join(secrets, "root-password"), root_password)
         @store.write_private(File.join(secrets, "root.cnf"), "[client]\nuser=root\nsocket=/run/mysqld/mysqld.sock\npassword=#{root_password}\n")
@@ -549,26 +638,39 @@ module SiloMigrate
             "-v", "#{File.join(secrets, 'settings.yml')}:/run-fixture/settings.yml:ro",
             "--mount", "type=bind,src=#{File.join(deps, 'gems')},dst=/deps,readonly",
             "--mount", "type=bind,src=#{File.join(deps, 'emoji_cache')},dst=/app/tmp/emoji_cache,readonly",
+            *run_inputs_mount_args(run_inputs_root, body),
             "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8",
             *overlay_env(image_id(run_id, "converter")).flat_map { |item| ["-e", item] }, "-w", "/app",
             "--entrypoint", "/bin/sh", image_id(run_id, "converter"), "-c", "exec sleep infinity"]
           converter_id = checked(run_id, "conversion-container-start", converter_args, timeout: 60).stdout.strip
           created << converter_id
           # Output goes to a file, not memory: a real conversion can print for hours.
-          convert = @runtime.run(["docker", "exec", "-w", "/app", converter_id, "/bin/sh", "-c",
-                                  'exec env -u BUNDLE_PATH bundle _2.6.3_ exec ruby ./convert --from="$1" --settings=/run-fixture/settings.yml ' \
-                                  '--output-db=intermediate.sqlite --reset > /app/output/convert.log 2>&1', "convert", body.fetch("platform")],
-                                 capture: true, timeout: CONVERT_TIMEOUT)
+          command = if body["master_lists"]
+                      raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless body.dig("master_lists", "list").to_s.match?(MASTER_LIST)
+
+                      ["docker", "exec", "-w", "/app", converter_id, "/bin/sh", "-c",
+                       'exec env -u BUNDLE_PATH bundle _2.6.3_ exec ruby "converters/$1/scripts/export_master_lists.rb" --settings=/run-fixture/settings.yml ' \
+                       '--list="$2" --output-dir=/app/output/master_lists > /app/output/convert.log 2>&1', "export", body.fetch("platform"), body.dig("master_lists", "list")]
+                    else
+                      ["docker", "exec", "-w", "/app", converter_id, "/bin/sh", "-c",
+                       'exec env -u BUNDLE_PATH bundle _2.6.3_ exec ruby ./convert --from="$1" --settings=/run-fixture/settings.yml ' \
+                       '--output-db=intermediate.sqlite --reset > /app/output/convert.log 2>&1', "convert", body.fetch("platform")]
+                    end
+          convert = @runtime.run(command, capture: true, timeout: CONVERT_TIMEOUT)
         ensure
           # Anything that survives this is removed by the run's reset, via its label.
           created.reverse_each { |id| @runtime.run(["docker", "rm", "--force", "--volumes", id], capture: true, timeout: 120) }
         end
         tail = converter_log!(run_id, output, convert)
+        # Checked even when the converter failed: its effect on the inputs is evidence.
+        capture_run_inputs!(run_id, body, run_inputs_root) if convert
         raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "converter exit") unless convert.success?
 
         summary = tail.to_s.dup.force_encoding("UTF-8").scrub.split("== Run Summary ==", 2)[1]
         evidence(run_id, "conversion-summary.txt", summary[0, 8192]) if summary
         record_results(run_id, conversion_summary: summary ? "present" : "missing")
+        return master_lists_outputs!(run_id, File.join(output, "master_lists")) if body["master_lists"]
+
         produced = File.join(output, "intermediate.sqlite")
         raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "no output database") unless File.file?(produced) && !File.symlink?(produced)
 
@@ -579,6 +681,43 @@ module SiloMigrate
         File.chmod(0o400, intermediate)
         FileUtils.rm_f(produced)
         @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["intermediate"] = artifact_identity(intermediate) }
+      end
+
+      # The exporter's CSVs, moved (never followed through a link) into private artifacts.
+      # Bounded per file and in total; names are the exporter's own fixed file names.
+      def master_lists_outputs!(run_id, directory)
+        stat = File.lstat(directory)
+        raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "no master-list output") unless stat.directory?
+
+        names = Dir.children(directory).sort
+        raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "master-list output") if names.empty? || names.size > MAX_MASTER_FILES
+
+        target = @store.run_dir(run_id, "artifacts", "master-lists")
+        FileUtils.mkdir_p(target, mode: 0o700)
+        total = 0
+        files = names.map do |name|
+          path = File.join(directory, name)
+          entry = File.lstat(path)
+          unless entry.file? && entry.nlink == 1 && name.match?(/\A[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\.csv\z/)
+            raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "unexpected master-list output")
+          end
+          total += entry.size
+          if entry.size > MAX_MASTER_FILE_BYTES || total > MAX_MASTER_TOTAL_BYTES
+            raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "master-list output too large")
+          end
+
+          destination = File.join(target, name)
+          FileUtils.mv(path, destination)
+          File.chmod(0o400, destination)
+          { "name" => name, "sha256" => Digest::SHA256.file(destination).hexdigest, "bytes" => File.size(destination) }
+        end
+        identity = { "files" => files, "sha256" => Digest::SHA256.hexdigest(canonical_json(files)), "bytes" => files.sum { |file| file["bytes"] } }
+        evidence(run_id, "master-lists.json", identity)
+        @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["master_lists"] = identity }
+        # Public results: counts only; the names and digests stay in private evidence.
+        record_results(run_id, master_lists: { "files" => files.size, "bytes" => identity["bytes"] })
+      rescue Errno::ENOENT
+        raise StandardWorkflowError.new("STANDARD_CONVERSION_FAILED", "no master-list output")
       end
 
       # Read once the container is gone; never through a symlink. The whole output stays

@@ -33,6 +33,9 @@ findings = _load("silo_findings_widget", "findings")
 _board_spec = importlib.util.spec_from_file_location("silo_project_board", HERE / "board.py")
 board = importlib.util.module_from_spec(_board_spec)
 _board_spec.loader.exec_module(board)
+_intake_spec = importlib.util.spec_from_file_location("silo_project_intake", HERE / "intake.py")
+intake = importlib.util.module_from_spec(_intake_spec)
+_intake_spec.loader.exec_module(intake)
 RUN = re.compile(r"run-[0-9a-f]{32}\Z")
 FINDING = re.compile(r"finding-[0-9a-f]{32}\Z")
 
@@ -57,6 +60,7 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js",
           "/runs.js": ("runs.js", "text/javascript; charset=utf-8"),
           "/files.js": ("files.js", "text/javascript; charset=utf-8"),
           "/findings.js": ("findings.js", "text/javascript; charset=utf-8"),
+          "/intake.js": ("intake.js", "text/javascript; charset=utf-8"),
           "/app.css": ("app.css", "text/css; charset=utf-8"), "/tokens.css": ("tokens.css", "text/css; charset=utf-8")}
 # Varnish's own font files, so that the page matches without a second copy of them.
 FONTS = {"/fonts/Geist-Variable.woff2": "Geist-Variable.woff2", "/fonts/GeistMono-Variable.woff2": "GeistMono-Variable.woff2"}
@@ -221,8 +225,29 @@ def propose_again(base, control, body, import_next=False):
         raise Refused("STANDARD_ARGUMENTS_INVALID")
     if checks:
         request["reconciliation"] = checks
+    if not import_next and operation in ("standard_convert", "standard_merge"):
+        # The same bound converter inputs and the engineer's recorded answers/exclusions, as a NEW
+        # proposal for a new approval. Never silently dropped: refused if they can't be carried.
+        request.update(retained_choices(control, store, workspace, plan_body))
     # Proposing may prepare the converter's gems first: data_tools allows itself up to 290 s.
     return data(control, workspace, request, timeout=300)
+
+
+def retained_choices(control, store, workspace, plan_body):
+    try:
+        documents, references = intake.reproposal_documents(plan_body)
+    except intake.NotRetainable as error:
+        raise Refused(error.code + ": the earlier plan's inputs or choices cannot be carried over exactly; ask migration-data to propose again", 409)
+    if references:
+        # A cited reference must still be the same registered bytes.
+        current = {ref.get("id"): ref.get("sha256") for ref in ((data(control, workspace, {"op": "deliveries"}, timeout=30).get("roles") or {}).get("references") or [])
+                   if isinstance(ref, dict)}
+        inputs = store.named(workspace).get("inputs") or {}
+        for ref in references:
+            now = current.get(ref["file_id"]) if "file_id" in ref else (inputs.get(ref["input_id"]) or {}).get("sha256")
+            if now != ref["sha256"]:
+                raise Refused("STANDARD_PREPARATION_INVALID: a cited reference changed or is no longer a supporting reference; ask migration-data to propose again", 409)
+    return documents
 
 
 SUMMARY_SECONDS = 20
@@ -363,8 +388,48 @@ def release_backup(control, body):
     return runs.control_call(control, argv, timeout=3600)
 
 
+def files_view(base, control, workspace):
+    """The Files view, with each reference's "Used by" derived from plan/run provenance."""
+    view = data(control, workspace, {"op": "deliveries"}, timeout=30)
+    if not view.get("initialized"):
+        return view
+    store = runs.Store(base)
+    try:
+        store.root(workspace)
+    except REFUSALS:
+        standard = base / workspace / ".silo-migrate/named/standard"
+        # No workbench folder at all: no plan can cite anything. Anything odd: unknown, never "unused".
+        absent = not standard.exists() and not standard.is_symlink()
+        return _usage_without_store(view, "reference_only" if absent else "unknown")
+    return intake.annotate_references(store, workspace, view)
+
+
+def _usage_without_store(view, status):
+    roles = view.get("roles")
+    if not isinstance(roles, dict) or not isinstance(roles.get("references"), list):
+        return view
+    used = {"plans": [], "runs": []} if status == "reference_only" else None
+    return dict(view, roles=dict(roles, references=[dict(ref, usage_status=status, used_by=used)
+                                                    for ref in roles["references"] if isinstance(ref, dict)]))
+
+
+def guarded(store, control, action, body):
+    """The existing exact-digest approval and Start, refused while the plan's own preparation is
+    not ready (an unanswered material question, missing code, an unbound/changed/unreadable
+    selected input). Plans without preparation or run inputs pass through unchanged."""
+    workspace, plan_id = body.get("workspace"), body.get("plan_id")
+    if isinstance(plan_id, str) and runs.PLAN.fullmatch(plan_id):
+        store.root(workspace)
+        if intake.blockers_of(store, workspace, plan_id):
+            raise Refused("STANDARD_PLAN_NOT_READY", 409)
+    return runs.decide(store, control, action, body)
+
+
 def plan_detail(store, control, workspace, plan_id):
     result = runs.plan_detail(store, control, workspace, plan_id)
+    plan = (store.plans(workspace).get(plan_id) or {}) if store is not None else {}
+    body = plan.get("body") if isinstance(plan.get("body"), dict) else {}
+    result["intake"] = intake.plan_view(store, workspace, body) if store is not None else None
     # Base-site plans name the delivery/version, never the original backup file; nor does a merge
     # plan name its source site's backup (a Discourse backup's name starts with the site's name)
     # or its settings file (named by whoever wrote it). The settings' content is still shown.
@@ -437,8 +502,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"projects": project_names(base, intake_folder(control, base))})
             if url.path == "/api/summary":
                 return self.send(200, summary(base, control))
-            if url.path == "/api/files":  # quick: reads only files
-                return self.send(200, data(control, query.get("workspace"), {"op": "deliveries"}, timeout=30))
+            if url.path == "/api/files":  # quick: reads only files (and plan bodies for derived "Used by")
+                return self.send(200, files_view(base, control, query.get("workspace")))
             if url.path == "/api/guide":
                 return self.send(200, data(control, query.get("workspace"), {"op": "guide"}))
             if url.path == "/api/counts":
@@ -529,6 +594,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = data(self.server.control, body.get("workspace"), request)
             elif path == "/api/runs/release":
                 result = release_backup(self.server.control, body)
+            elif path in ("/api/runs/approve", "/api/runs/start"):
+                result = guarded(runs.Store(self.server.base), self.server.control, action, body)
             elif path in RUN_PATHS:
                 result = runs.decide(runs.Store(self.server.base), self.server.control, action, body)
             elif path in FINDING_PATHS:

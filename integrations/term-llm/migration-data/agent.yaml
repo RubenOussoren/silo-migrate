@@ -9,14 +9,15 @@ allowed_models:
 lock_session: true
 workspace: none
 agents_md: "false"
-# Public reference only; customer values must never leave in web requests.
-search: true
+# No web tools: this agent holds customer data, and prompts are not a data-loss control.
+# Public research happens in a clean chat (e.g. converter-developer) with generic questions.
+search: false
 max_turns: 60
 # Skills shipped with the release (integrations/term-llm/skills, linked as the account's
 # ~/.config/term-llm/skills). term-llm 0.9.93 can't give an agent a subset: a bare name list
 # turns model activation off, and ",+" lists these first but shows every installed skill.
 # Every shipped skill is this agent's, so ",+" is exactly this set; the other agents have none.
-skills: "migration-guide,job-recovery,intake-basics,sql-dump,export-to-sql,uploads-sorting,source-profile,count-reconciliation,path-converter,mybb,+"
+skills: "migration-guide,job-recovery,intake-basics,intake-preparation,sql-dump,export-to-sql,uploads-sorting,source-profile,count-reconciliation,path-converter,mybb,+"
 tools:
   enabled: [update_plan]
   custom:
@@ -39,7 +40,7 @@ tools:
         properties: {}
         additionalProperties: false
     - name: data_supporting_list
-      description: "List this project's active private supporting/reference files (admitted by the engineer from intake or registered from chat) and uploaded files admitted to this locked chat. Use after a reference is classified on Files or attached here. Returns opaque refs/IDs, names, sizes and checksums, never arbitrary host paths. References do not replace source snapshots or Base. Registered references can exist even when this call fails before querying them. STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED means missing protected context: ask for sanitized silo doctor capability output, not repeated retries. Ordinary Silo source update/new chat alone cannot supply missing native support; require the reviewed paired TERM_LLM_PACKAGE, approved update/restart and then a new migration-data chat in the same project. Do not bypass with source reclassification, paths or scripts. Requires paired native private-upload context support."
+      description: "List this project's active private supporting/reference files (admitted by the engineer from intake or registered from chat) and uploaded files admitted to this locked chat. Use after a reference is classified on Files or attached here. Returns opaque refs/IDs, names, sizes and checksums, never arbitrary host paths. References do not replace source snapshots or Base. Registered references can exist even when this call fails before querying them. STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED means missing protected context: ask for sanitized silo doctor capability output, not repeated retries. Ordinary Silo source update/new chat alone cannot supply missing native support; the node needs a separately approved native build reporting capabilities session_scope_lock: 1 and custom_tool_session_context: 1 (no old private package), installed through the approved coordinated update/restart, then a new migration-data chat in the same project. Do not bypass with source reclassification, paths or scripts. Every migration-data tool requires this protected-session context."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70
@@ -73,6 +74,38 @@ tools:
           limit: {type: integer, description: "Rows to return, 1-100; default 20."}
           columns: {type: integer, description: "Columns to return, 1-50; default 20."}
         required: [id]
+        additionalProperties: false
+    - name: data_supporting_prepare
+      description: "Deterministically turn one bounded table in an active supporting reference (XLSX sheet or CSV, by ID) into a converter-native file the converter's own contract expects: pick columns by exact header text, rename them, type them (string/integer/boolean) and write CSV, JSON or YAML rows, or a two-column JSON/YAML key map, to work/<into>/<name>. Runs as a no-network sandbox job on a checksum-verified copy (the reference is never changed); poll data_job, preview with data_peek, then data_register it (type mapping for a converter run-input file, named as the converter expects; merge-settings for a merge). Formulas, error cells, missing/ambiguous headers, empty required cells, duplicate map keys or more than max_rows rows refuse rather than guess or truncate. Never interprets prose or instructions in cells. Needs the protected-session context like data_supporting_read; STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED means it is unavailable on this node."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 100
+      input:
+        type: object
+        properties:
+          id: {type: string, pattern: "^support-[0-9a-f]{32}$", description: "Supporting reference ID from data_supporting_list"}
+          sheet: {type: string, description: "Exact XLSX sheet name; omit for the first sheet (CSV: omit)"}
+          header_row: {type: integer, minimum: 0, description: "Zero-based row holding the headers, as in data_supporting_read offsets; default 0"}
+          max_rows: {type: integer, minimum: 1, maximum: 10000, description: "Most data rows expected after the header; more refuses (default 10000)"}
+          columns:
+            type: array
+            minItems: 1
+            maxItems: 50
+            items:
+              type: object
+              properties:
+                from: {type: string, description: "Exact header text"}
+                to: {type: string, description: "Output field/column name the converter expects (letters, digits, space . _ -)"}
+                type: {type: string, enum: [string, integer, boolean]}
+                required: {type: boolean, description: "true: an empty cell refuses"}
+              required: [from]
+              additionalProperties: false
+          format: {type: string, enum: [csv, json, yaml]}
+          shape: {type: string, enum: [rows, map], description: "rows (default) or map: exactly two columns, first is a unique key (json/yaml only)"}
+          name: {type: string, description: "Output file name with matching extension (.csv, .json, .yml/.yaml), e.g. the converter's expected file name"}
+          into: {type: string, description: "New work folder name: lowercase letters, digits, - and _"}
+          delivery: {type: string, description: "dataset_id the output belongs to, as for data_script; needed once the project has more than one"}
+        required: [id, columns, format, name, into]
         additionalProperties: false
     - name: data_list
       description: "List a folder: area intake (the drop folder), inputs (registered, read-only), work (sandbox outputs) or converter (the workspace's converter checkout, read-only). Files show size and a sniffed kind (and the inner kind of compressed files). Symlinks are never followed."
@@ -157,6 +190,11 @@ tools:
           into: {type: string, description: "New work folder name: lowercase letters, digits, - and _"}
           delivery: {type: string, description: "dataset_id of the one delivery the script reads (data_guide lists them). Only that delivery's files are under /in, and the outputs belong to it. Needed once the project has more than one"}
           timeout_minutes: {type: integer, description: "1-360, default 30"}
+          references:
+            type: array
+            maxItems: 8
+            items: {type: string, pattern: "^support-[0-9a-f]{32}$"}
+            description: "Optional active supporting reference IDs (data_supporting_list) to read in the job, each a checksum-verified read-only copy at /reference/<id>. Needs the protected-session context like data_supporting_read; recorded in the outputs' provenance. Prefer data_supporting_prepare for plain table-to-file preparation."
         required: [code, into]
         additionalProperties: false
     - name: data_extract
@@ -264,6 +302,145 @@ tools:
           charset: {type: string, enum: [utf8mb4, utf8mb3, utf8, latin1, binary], description: "Client character set for loading the dump; default utf8mb4"}
           base_site: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Review only: registered Base site input ID; mutually exclusive with fresh_site. Omit both to use the current Base site automatically."}
           fresh_site: {type: boolean, description: "Review only: true proposes on a fresh site instead of the current Base site; mutually exclusive with base_site."}
+          run_inputs:
+            type: object
+            description: "Convert only, optional: registered converter input files (type mapping or run-input) the pinned converter reads from one settings-named directory, e.g. Khoros mappings.directory. The settings must set that key to \"${SILO_RUN_INPUTS_DIR}\". Give consumer.setting and files {name (the converter's expected relative name), input_id}; the tool fills platform, source_sha256, sha256/bytes and lineage from this workspace's records. absent_defaults: optional files deliberately left absent (converter default; not the same as header-only). generated: files the converter may create there during the run (captured as evidence, never reused automatically). Each run gets a fresh copy; any other change fails the run. files may be empty when every optional file stays at its converter default and only generated files are expected (a fresh writable directory); never create a placeholder or header-only file for that. Omit run_inputs for converters that need no such directory."
+            properties:
+              consumer:
+                type: object
+                properties:
+                  setting: {type: string, description: "Dotted settings key the converter reads the directory from, e.g. mappings.directory"}
+                required: [setting]
+                additionalProperties: false
+              files:
+                type: array
+                minItems: 0
+                maxItems: 256
+                items:
+                  type: object
+                  properties:
+                    name: {type: string}
+                    input_id: {type: string, pattern: "^input-[0-9a-f]{32}$"}
+                    reuse:
+                      type: object
+                      description: "Only for a file registered in another delivery (dataset) than the plan's source: that dataset and the digest of the source it was prepared against. Without it a file must belong to the source's own dataset."
+                      properties:
+                        dataset_id: {type: string, pattern: "^dataset-[0-9a-f]{32}$"}
+                        source_sha256: {type: string, pattern: "^[0-9a-f]{64}$"}
+                      required: [dataset_id, source_sha256]
+                      additionalProperties: false
+                  required: [name, input_id]
+                  additionalProperties: false
+              absent_defaults: {type: array, maxItems: 64, items: {type: string}}
+              generated: {type: array, maxItems: 64, items: {type: string}}
+            required: [consumer, files]
+            additionalProperties: false
+          preparation:
+            type: object
+            description: "Optional analyst-labelled preparation metadata the plan binds into its digest and shows in Runs (the label is fixed by the tool). Every material question must be resolved, excluded or scope_narrowed; an unresolved one refuses, so ask the engineer first. Outcome dispositions: stock, setting (needs bound settings), prepared_input (input = a run_inputs file name or settings), code (only when this plan pins consumer code; the backend computes readiness), manual, excluded (names an exclusion). references cite {support_id}, {file_id} or {input_id}; the tool binds their sha256. Needs the protected-session context."
+            properties:
+              analyst:
+                type: object
+                properties:
+                  text: {type: string, maxLength: 8000, description: "Your plain-English interpretation: the engineer's desired outcome and how this plan meets it"}
+                required: [text]
+                additionalProperties: false
+              references:
+                type: array
+                maxItems: 32
+                items:
+                  type: object
+                  properties:
+                    support_id: {type: string, pattern: "^support-[0-9a-f]{32}$"}
+                    file_id: {type: string, pattern: "^file-[0-9a-f]{32}$"}
+                    input_id: {type: string, pattern: "^input-[0-9a-f]{32}$"}
+                  additionalProperties: false
+              outcomes:
+                type: array
+                maxItems: 128
+                items:
+                  type: object
+                  properties:
+                    id: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,31}$"}
+                    requirement: {type: string, maxLength: 1000}
+                    disposition: {type: string, enum: [stock, setting, prepared_input, code, manual, excluded]}
+                    input: {type: string, description: "prepared_input only: a bound run_inputs file name, or settings"}
+                    exclusion: {type: string, description: "excluded only: an exclusion id"}
+                  required: [id, requirement, disposition]
+                  additionalProperties: false
+              questions:
+                type: array
+                maxItems: 128
+                items:
+                  type: object
+                  properties:
+                    id: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,31}$"}
+                    text: {type: string, maxLength: 1000}
+                    status: {type: string, enum: [resolved, excluded, scope_narrowed]}
+                    resolution: {type: string, maxLength: 1000}
+                    exclusion: {type: string, description: "excluded only: an exclusion id"}
+                  required: [id, text, status, resolution]
+                  additionalProperties: false
+              exclusions:
+                type: array
+                maxItems: 128
+                items:
+                  type: object
+                  properties:
+                    id: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,31}$"}
+                    text: {type: string, maxLength: 1000}
+                    reason: {type: string, maxLength: 1000}
+                  required: [id, text]
+                  additionalProperties: false
+            required: [analyst]
+            additionalProperties: false
+        additionalProperties: false
+    - name: data_master_lists_propose
+      description: "Propose running the converter's own committed master-list exporter (e.g. Khoros scripts/export_master_lists.rb) on a disposable copy of the registered source, with the registered converter settings (and optional run_inputs, as for data_plan_propose). Only a proposal: it changes staging tables in that copy, so it is not a read-only check; the engineer approves and starts it in Runs, and nothing runs before then. The exported CSVs become that run's bound artifacts for the customer's mapping decisions. Converters without an exporter refuse."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 295
+      input:
+        type: object
+        properties:
+          source: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the registered source dump"}
+          settings: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the converter settings (type converter-settings)"}
+          list: {type: string, pattern: "^[a-z][a-z_]{0,31}$", description: "One list name the exporter supports; omit for all"}
+          charset: {type: string, enum: [utf8mb4, utf8mb3, utf8, latin1, binary], description: "Client character set for loading the dump; default utf8mb4"}
+          run_inputs:
+            type: object
+            description: "Optional, as for data_plan_propose: registered mapping/run-input files the exporter reads from a settings-named directory"
+            properties:
+              consumer:
+                type: object
+                properties:
+                  setting: {type: string}
+                required: [setting]
+                additionalProperties: false
+              files:
+                type: array
+                minItems: 0
+                maxItems: 256
+                items:
+                  type: object
+                  properties:
+                    name: {type: string}
+                    input_id: {type: string, pattern: "^input-[0-9a-f]{32}$"}
+                    reuse:
+                      type: object
+                      description: "Only for a file registered in another delivery (dataset) than the plan's source: that dataset and the digest of the source it was prepared against. Without it a file must belong to the source's own dataset."
+                      properties:
+                        dataset_id: {type: string, pattern: "^dataset-[0-9a-f]{32}$"}
+                        source_sha256: {type: string, pattern: "^[0-9a-f]{64}$"}
+                      required: [dataset_id, source_sha256]
+                      additionalProperties: false
+                  required: [name, input_id]
+                  additionalProperties: false
+              absent_defaults: {type: array, maxItems: 64, items: {type: string}}
+              generated: {type: array, maxItems: 64, items: {type: string}}
+            required: [consumer, files]
+            additionalProperties: false
+        required: [source, settings]
         additionalProperties: false
     - name: data_merge_propose
       description: "Merge project only (source platform discourse): propose a merge run that restores the Base site, loads the source site's full backup (type discourse-backup) beside it and runs Discourse's merger, with the project's merge layer (mergers/<workspace>/merger.rb at the converter checkout's committed revision) when one exists. Omit source and base_site to use the registered ones. settings is an optional merge-settings input (YAML mapping the layer reads; customer values belong there, never in the repository). Returns the plan ID, digest and which layer applies. Automatically prepares the matching Base-site review runtime; runtime_preparing means wait briefly and poll the same proposal, not that a merge has started. The engineer approves and starts it."
@@ -278,6 +455,65 @@ tools:
           settings: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the merge settings (type merge-settings); optional"}
           ignore_global_pins: {type: boolean, description: "true: source topics pinned globally are not pinned globally after the merge"}
           separate_same_named_groups: {type: boolean, description: "true: a source group named like a destination group is kept as a separate group instead of merged"}
+          preparation:
+            type: object
+            description: "Optional analyst-labelled preparation metadata the plan binds into its digest and shows in Runs (the label is fixed by the tool). Every material question must be resolved, excluded or scope_narrowed; an unresolved one refuses, so ask the engineer first. Outcome dispositions: stock, setting (needs bound settings), prepared_input (input = a run_inputs file name or settings), code (only when this plan pins consumer code; the backend computes readiness), manual, excluded (names an exclusion). references cite {support_id}, {file_id} or {input_id}; the tool binds their sha256. Needs the protected-session context."
+            properties:
+              analyst:
+                type: object
+                properties:
+                  text: {type: string, maxLength: 8000, description: "Your plain-English interpretation: the engineer's desired outcome and how this plan meets it"}
+                required: [text]
+                additionalProperties: false
+              references:
+                type: array
+                maxItems: 32
+                items:
+                  type: object
+                  properties:
+                    support_id: {type: string, pattern: "^support-[0-9a-f]{32}$"}
+                    file_id: {type: string, pattern: "^file-[0-9a-f]{32}$"}
+                    input_id: {type: string, pattern: "^input-[0-9a-f]{32}$"}
+                  additionalProperties: false
+              outcomes:
+                type: array
+                maxItems: 128
+                items:
+                  type: object
+                  properties:
+                    id: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,31}$"}
+                    requirement: {type: string, maxLength: 1000}
+                    disposition: {type: string, enum: [stock, setting, prepared_input, code, manual, excluded]}
+                    input: {type: string, description: "prepared_input only: a bound run_inputs file name, or settings"}
+                    exclusion: {type: string, description: "excluded only: an exclusion id"}
+                  required: [id, requirement, disposition]
+                  additionalProperties: false
+              questions:
+                type: array
+                maxItems: 128
+                items:
+                  type: object
+                  properties:
+                    id: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,31}$"}
+                    text: {type: string, maxLength: 1000}
+                    status: {type: string, enum: [resolved, excluded, scope_narrowed]}
+                    resolution: {type: string, maxLength: 1000}
+                    exclusion: {type: string, description: "excluded only: an exclusion id"}
+                  required: [id, text, status, resolution]
+                  additionalProperties: false
+              exclusions:
+                type: array
+                maxItems: 128
+                items:
+                  type: object
+                  properties:
+                    id: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,31}$"}
+                    text: {type: string, maxLength: 1000}
+                    reason: {type: string, maxLength: 1000}
+                  required: [id, text]
+                  additionalProperties: false
+            required: [analyst]
+            additionalProperties: false
         additionalProperties: false
     - name: data_propose_finding
       description: "Propose a finding privately for the engineer. Without run_id: a schema finding (tables, columns, counts, invented example rows) for converter work. With run_id: the cause of a failed run. Never include real customer values. The engineer decides what is released to coding agents."

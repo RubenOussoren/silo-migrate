@@ -76,6 +76,56 @@ def trusted_context(request, api):
     return session, uploads
 
 
+def session_context(request, api):
+    """Protected-session proof without an upload manifest: reading, preparing or
+    citing an already-registered (e.g. intake-admitted) reference does not depend
+    on chat upload provenance, but still requires the host's protected session."""
+    session = request.get("_session_id")
+    if request.get("_private_session") is not True or not isinstance(session, str) or not SESSION_ID.fullmatch(session):
+        fail(api, "PRIVATE_SESSION_REQUIRED")
+    return session
+
+
+def resolve_references(ws, request, api, identities, snapshot_dir=None):
+    """Active registered references by ID, for job mounts or plan provenance.
+
+    Caller holds ws.lock() (it is not reentrant). Requires the protected session
+    context. With snapshot_dir, each file is copied to snapshot_dir/<id> (0400)
+    from the held custody inode and checksum-verified; originals are never
+    mounted or modified. Returns [{id, filename, size_bytes, sha256}] in request
+    order. Unknown/inactive IDs refuse without revealing other records.
+    """
+    session_context(request, api)
+    try:
+        if (not isinstance(identities, list) or not identities or len(identities) > 8
+                or len(set(map(str, identities))) != len(identities)
+                or not all(isinstance(value, str) and SUPPORT_ID.fullmatch(value) for value in identities)):
+            fail(api, "ID_INVALID")
+        ws.require(standard=False)
+        with store(ws, api) as (_, index, files):
+            items = {item["id"]: item for item in records(index, api)}
+            resolved = []
+            for identity in identities:
+                item = items.get(identity)
+                if item is None:
+                    fail(api, "NOT_FOUND")
+                if not reference_active(identity, api):
+                    fail(api, "INACTIVE")
+                if snapshot_dir is not None:
+                    fd, info = api.open_regular(files, [identity])
+                    try:
+                        check_file(info, api, 0o400)
+                        copy_checked(fd, Path(snapshot_dir) / identity, api, item)
+                    finally:
+                        os.close(fd)
+                resolved.append({key: item[key] for key in ("id", "filename", "size_bytes", "sha256")})
+            return resolved
+    except (OSError, ValueError, TypeError, UnicodeError) as error:
+        if isinstance(error, ValueError) and str(error).startswith("STANDARD_"):
+            raise
+        fail(api, "IO")
+
+
 def full_root(path, api, strict=False):
     """Unlike open_root alone, refuse symlinks in every absolute path component."""
     path = Path(path)
@@ -879,8 +929,12 @@ def handle(ws, request, api):
     never relaxes native context checks and is never taken from request JSON.
     """
     try:
-        session, uploads = trusted_context(request, api)
         op = request.get("op")
+        if op == "supporting_read":
+            # Reading a registered reference needs the protected session, not upload provenance.
+            session, uploads = session_context(request, api), []
+        else:
+            session, uploads = trusted_context(request, api)
         if op not in ("supporting_list", "supporting_take", "supporting_read"):
             fail(api, "OPERATION_INVALID")
         ws.require(standard=False)

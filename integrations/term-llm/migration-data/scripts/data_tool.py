@@ -2,7 +2,15 @@
 """Fixed mapping from migration-data's term-llm tools to `silo-migrate-control data WS`.
 
 Runs only in the Frontier-only migration-data agent: the one agent that handles customer
-data. Every tool is one operation of bin/data_tools.py, which confines paths to the
+data. Every tool requires the native host's protected-session context (see
+session_context); without it nothing reaches the backend.
+
+Boundary: this wrapper fixes "via": "chat", derives the workspace from the chat's
+project folder and forwards only each tool's listed keys, so model JSON cannot pick
+a workspace, a route or the context. The control backend trusts this JSON from the
+host (same service account). That is a host/process convention, not OS isolation:
+anything able to run commands as that account (e.g. an agent with a host shell)
+is outside this boundary. Every tool is one operation of bin/data_tools.py, which confines paths to the
 workspace's drop folder, inputs, work folders and converter checkout. Arguments never
 reach a shell; only the listed request keys are passed on.
 """
@@ -25,7 +33,7 @@ TOOLS = {
     "data_create": ("create", {"platform", "converter_branch"}, 290),
     "data_take": ("take", {"path", "type", "name"}, 290),
     "data_register": ("register", {"path", "type", "name"}, 290),
-    "data_script": ("script", {"language", "code", "into", "timeout_minutes", "delivery"}, 150),
+    "data_script": ("script", {"language", "code", "into", "timeout_minutes", "delivery", "references"}, 150),
     "data_extract": ("extract", {"path", "into", "timeout_minutes"}, 150),
     "data_job": ("job", {"job_id"}, 120),
     "data_db_up": ("db_up", {"engine"}, 200),
@@ -35,8 +43,11 @@ TOOLS = {
     "data_run_evidence": ("run_evidence", {"run_id"}, 60),
     "data_run_count": ("run_count", {"run_id", "side", "sql"}, 290),
     "data_propose_finding": ("propose_finding", {"text", "run_id"}, 60),
-    "data_plan_propose": ("plan_propose", {"source", "settings", "reconciliation", "charset", "from_run", "base_site", "fresh_site"}, 290),
-    "data_merge_propose": ("merge_propose", {"source", "base_site", "settings", "ignore_global_pins", "separate_same_named_groups"}, 290),
+    "data_plan_propose": ("plan_propose", {"source", "settings", "reconciliation", "charset", "from_run", "base_site", "fresh_site",
+                                           "run_inputs", "preparation"}, 290),
+    "data_master_lists_propose": ("master_lists_propose", {"source", "settings", "list", "charset", "run_inputs"}, 290),
+    "data_merge_propose": ("merge_propose", {"source", "base_site", "settings", "ignore_global_pins", "separate_same_named_groups",
+                                             "preparation"}, 290),
     "data_notes": ("notes", set(), 60),
     "data_notes_write": ("notes_write", {"text"}, 60),
     "data_decide": ("decide", {"topic", "decision", "basis"}, 60),
@@ -44,8 +55,19 @@ TOOLS = {
     "data_supporting_list": ("supporting_list", set(), 60),
     "data_supporting_take": ("supporting_take", {"ref"}, 60),
     "data_supporting_read": ("supporting_read", {"id", "mode", "sheet", "offset", "limit", "columns"}, 90),
+    "data_supporting_prepare": ("supporting_prepare", {"id", "sheet", "header_row", "max_rows", "columns", "format", "shape",
+                                                       "name", "into", "delivery"}, 90),
 }
-SUPPORTING_TOOLS = {"data_supporting_list", "data_supporting_take", "data_supporting_read"}
+# Native protected-session context, by need. Upload provenance (the admitted-upload
+# manifest) goes only to listing/taking chat uploads; reading, listing registered
+# references, preparing or citing an already-registered reference (including one the
+# engineer admitted from intake) needs the protected session alone. No marker, a bad
+# session ID or a malformed manifest fails closed before any backend call.
+UPLOAD_CONTEXT_TOOLS = {"data_supporting_list", "data_supporting_take"}
+SESSION_CONTEXT_TOOLS = {"data_supporting_read", "data_supporting_prepare"}
+# Only when these arguments are present: otherwise the tool is unchanged.
+SESSION_CONTEXT_ARGUMENTS = {"data_script": {"references"}, "data_plan_propose": {"preparation", "run_inputs"},
+                             "data_merge_propose": {"preparation"}, "data_master_lists_propose": {"run_inputs"}}
 SESSION = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
 
@@ -73,22 +95,52 @@ def control_env():
     return env
 
 
-def supporting_context():
-    """Only a locked native session can admit uploads. These protected variables
-    are set by the tool host, never accepted from a model's JSON arguments."""
+def session_context():
+    """The protected-session proof: TERM_LLM_PRIVATE_SESSION=1 and a valid session ID.
+
+    Set by a separately approved native host (capabilities session_scope_lock=1 and
+    custom_tool_session_context=1) only after durable scope admission, from its trusted
+    context, stripping inherited and per-tool values first. Stock 0.9.99 never sets the marker, so every caller
+    of this refuses there before any backend call. Never taken from model JSON."""
     session_id = os.environ.get("TERM_LLM_SESSION_ID", "")
-    raw = os.environ.get("TERM_LLM_UPLOADS_JSON", "")
     if os.environ.get("TERM_LLM_PRIVATE_SESSION") != "1" or not SESSION.fullmatch(session_id):
         return None
-    if not raw or len(raw.encode("utf-8")) > 64 * 1024:
+    return {"_private_session": True, "_session_id": session_id}
+
+
+MALFORMED = object()
+
+
+def upload_manifest():
+    """Admitted chat uploads: None when the host supplied no manifest, MALFORMED when
+    it supplied something unexpected (fail closed), else the bounded list."""
+    raw = os.environ.get("TERM_LLM_UPLOADS_JSON")
+    if raw is None:
         return None
+    if not raw or len(raw.encode("utf-8")) > 64 * 1024:
+        return MALFORMED
     try:
         uploads = json.loads(raw)
     except ValueError:
-        return None
+        return MALFORMED
     if not isinstance(uploads, list) or len(uploads) > 32:
+        return MALFORMED
+    return uploads
+
+
+def supporting_context(need_uploads=False):
+    """Session context, plus the upload manifest only where uploads are the subject.
+
+    Reading, listing registered references, preparing and citing need the protected
+    session, not upload provenance. A present-but-malformed manifest still refuses
+    (unexpected host format). Taking an upload requires a valid manifest."""
+    context = session_context()
+    uploads = upload_manifest()
+    if context is None or uploads is MALFORMED or (need_uploads and uploads is None):
         return None
-    return {"_private_session": True, "_session_id": session_id, "_uploads": uploads}
+    if need_uploads is not None:
+        context["_uploads"] = uploads or []
+    return context
 
 
 def fail(code):
@@ -142,10 +194,16 @@ def main():
     op, keys, timeout = TOOLS[tool]
     # "via": the host applies chat-only limits (a tool has 300 s); the agent can't set or drop it.
     request = {"op": op, **{key: value for key, value in args.items() if key in keys and value is not None}, "via": "chat"}
-    if tool in SUPPORTING_TOOLS:
-        context = supporting_context()
-        if context is None:
-            return fail("STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED")
+    # Uniform gate: every tool of this customer-data agent needs the host's protected
+    # session, checked here before any backend call. A host that cannot prove it
+    # (stock term-llm, an unlocked/foreign chat) gets no customer data at all.
+    # take needs the upload manifest; list shows it when present; nothing else receives it.
+    context = supporting_context(need_uploads=True if tool == "data_supporting_take" else
+                                 (False if tool == "data_supporting_list" else None))
+    if context is None:
+        return fail("STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED")
+    # The backend rechecks the context where references/preparation are involved.
+    if tool in UPLOAD_CONTEXT_TOOLS or tool in SESSION_CONTEXT_TOOLS or SESSION_CONTEXT_ARGUMENTS.get(tool, set()) & set(request):
         request.update(context)
     try:
         result = subprocess.run([control_path(), "data", project], input=json.dumps(request).encode("utf-8"),

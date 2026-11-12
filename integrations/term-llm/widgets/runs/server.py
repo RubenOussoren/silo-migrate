@@ -46,7 +46,7 @@ MAX_INPUT_TEXT = 256 * 1024     # settings and reconciliation inputs shown in a 
 MAX_EVIDENCE = 64 * 1024
 MAX_BODY = 4096                 # POST bodies are a few IDs
 STAGE_NAMES = ("preflight", "convert", "reconcile", "site_up", "site_setup", "verify", "baseline", "uploads", "import", "verify_site",
-               "final_backup", "review_url", "restore", "verify_restore")
+               "final_backup", "review_url", "restore", "verify_restore", "export")
 HERE = Path(__file__).resolve().parent
 INSTALLED = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/widgets/[a-z0-9-]+")
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -426,6 +426,21 @@ def decide(store, control, action, body):
     return control_call(control, argv, TIMEOUTS.get(action, DEFAULT_TIMEOUT))
 
 
+def legacy_decide(store, control, action, body):
+    """The legacy page cannot render the private intake review. Use Project instead.
+
+    The Project handler calls decide only after its own exact-input/readiness
+    projection; no request JSON flag can claim that review on this legacy route.
+    """
+    plan_id = body.get("plan_id")
+    if action in ("approve", "start") and isinstance(plan_id, str) and PLAN.fullmatch(plan_id):
+        plan = store.plans(body.get("workspace")).get(plan_id) or {}
+        document = plan.get("body") or {}
+        if "run_inputs" in document or "preparation" in document:
+            raise Refused("STANDARD_PROJECT_PLAN_REVIEW_REQUIRED", 409)
+    return decide(store, control, action, body)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "silo-runs"
     sys_version = ""
@@ -489,7 +504,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise Refused("STANDARD_ARGUMENTS_INVALID")
             action = urlsplit(self.path).path.removeprefix("/api/")
-            return self.send(200, decide(self.server.store, self.server.control, action, body))
+            return self.send(200, legacy_decide(self.server.store, self.server.control, action, body))
         except (ValueError, UnicodeDecodeError):
             return self.send(400, {"error": "STANDARD_ARGUMENTS_INVALID"})
         except Refused as refused:

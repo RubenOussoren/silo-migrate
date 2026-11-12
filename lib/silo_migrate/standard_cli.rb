@@ -26,19 +26,23 @@ module SiloMigrate
         status WORKSPACE
         plan propose WORKSPACE --dataset ID [--baseline seed|BASELINE_ID] [--ports A,B] [--allow-unqualified-runtime]
         plan propose WORKSPACE --operation convert --source INPUT_ID --settings INPUT_ID [--reconciliation INPUT_ID] [--charset NAME]
+                     [--run-inputs MANIFEST.json] [--preparation PREPARATION.json]   (docs/run-inputs.md)
+        plan propose WORKSPACE --operation master-lists --source INPUT_ID --settings INPUT_ID [--list NAME] [--charset NAME]
+                     [--run-inputs MANIFEST.json]   (the converter's own master-list exporter on a disposable source copy)
                                                        (real data: convert and reconcile counts only; no import)
         plan propose WORKSPACE --operation review --from-run RUN_ID [--reconciliation INPUT_ID] [--base-site INPUT_ID] [--port N]
                                                        (real data: import a completed convert run into a local review site)
         plan propose WORKSPACE --operation merge --source INPUT_ID --base-site INPUT_ID [--settings INPUT_ID]
                      [--ignore-global-pins] [--separate-same-named-groups] [--port N] [--allow-unqualified-runtime]
-        plan show WORKSPACE PLAN_ID
+                     [--preparation PREPARATION.json]
+        plan show WORKSPACE PLAN_ID [--detail]                (--detail: engineer-only preparation text, run-input names/lineage)
         plan approve WORKSPACE PLAN_ID --sha256 DIGEST --reviewer NAME
         plan discard WORKSPACE PLAN_ID --reviewer NAME          (a proposal nobody will approve)
         baseline accept WORKSPACE RUN_ID --reviewer NAME
         run start WORKSPACE PLAN_ID
         run claim WORKSPACE PLAN_ID
         run execute WORKSPACE RUN_ID
-        run show WORKSPACE RUN_ID
+        run show WORKSPACE RUN_ID [--detail]                  (--detail: engineer-only run-input/master-list evidence)
         run private-paths WORKSPACE RUN_ID
         run release WORKSPACE RUN_ID --reviewer NAME [--acknowledge-differences]
         run admin-password WORKSPACE RUN_ID                  (engineer: a review site's admin sign-in)
@@ -70,7 +74,8 @@ module SiloMigrate
     PARSE_ERROR = "STANDARD_ARGUMENTS_INVALID"
     DETAILED = %w[STANDARD_SETTINGS_INVALID STANDARD_RECONCILIATION_INVALID STANDARD_CONVERTER_DEPS_MISSING
                   STANDARD_CONVERTER_PLATFORM_MISSING STANDARD_INPUTS_INCOMPLETE STANDARD_DUMP_KIND_UNSUPPORTED
-                  STANDARD_REVIEW_SOURCE_INVALID].freeze
+                  STANDARD_REVIEW_SOURCE_INVALID STANDARD_RUN_INPUTS_INVALID STANDARD_PREPARATION_INVALID
+                  STANDARD_PREPARATION_UNRESOLVED].freeze
     OPERATION_ERROR = "STANDARD_OPERATION_FAILED"
     # Exit codes are per the contract: failed run returns its JSON and exits 1.
 
@@ -188,9 +193,18 @@ module SiloMigrate
         allow = args.delete("--allow-unqualified-runtime")
         if args[0, 2] == %w[--operation convert]
           args.shift(2)
-          opts = options!(args, "--source", "--settings", "--reconciliation", "--charset", optional: %w[--reconciliation --charset])
+          opts = options!(args, "--source", "--settings", "--reconciliation", "--charset", "--run-inputs", "--preparation",
+                          optional: %w[--reconciliation --charset --run-inputs --preparation])
           return service(workspace).propose_convert_plan(source: opts.fetch("--source"), settings: opts.fetch("--settings"), reconciliation: opts["--reconciliation"],
-                                                         charset: opts.fetch("--charset", "utf8mb4"), allow_unqualified_runtime: !allow.nil?)
+                                                         charset: opts.fetch("--charset", "utf8mb4"), allow_unqualified_runtime: !allow.nil?,
+                                                         **plan_documents(opts))
+        end
+        if args[0, 2] == %w[--operation master-lists]
+          args.shift(2)
+          opts = options!(args, "--source", "--settings", "--list", "--charset", "--run-inputs", optional: %w[--list --charset --run-inputs])
+          return service(workspace).propose_master_lists_plan(source: opts.fetch("--source"), settings: opts.fetch("--settings"), list: opts.fetch("--list", "all"),
+                                                              charset: opts.fetch("--charset", "utf8mb4"), allow_unqualified_runtime: !allow.nil?,
+                                                              **plan_documents(opts))
         end
         if args[0, 2] == %w[--operation merge]
           args.shift(2)
@@ -198,12 +212,12 @@ module SiloMigrate
             invalid! if args.count(flag) > 1
             [flag, !args.delete(flag).nil?]
           end
-          opts = options!(args, "--source", "--base-site", "--settings", "--port", optional: %w[--settings --port])
+          opts = options!(args, "--source", "--base-site", "--settings", "--port", "--preparation", optional: %w[--settings --port --preparation])
           port = opts["--port"]
           invalid! if port && !port.match?(/\A[1-9]\d{0,4}\z/)
           return service(workspace).propose_merge_plan(source: opts.fetch("--source"), base_site: opts.fetch("--base-site"), settings: opts["--settings"],
             ignore_global_pins: flags["--ignore-global-pins"], separate_same_named_groups: flags["--separate-same-named-groups"],
-            port: port&.to_i, allow_unqualified_runtime: !allow.nil?)
+            port: port&.to_i, allow_unqualified_runtime: !allow.nil?, **plan_documents(opts))
         end
         if args[0, 2] == %w[--operation review]
           args.shift(2)
@@ -218,8 +232,10 @@ module SiloMigrate
       when "show"
         workspace = positional!(args)
         plan_id = positional!(args)
-        no_more!(args)
-        service(workspace).show_plan(plan_id)
+        # --detail: engineer-only (preparation text, run-input names and lineage).
+        detail = args == ["--detail"]
+        invalid! unless args.empty? || detail
+        service(workspace).show_plan(plan_id, detail: detail)
       when "approve"
         workspace = positional!(args)
         plan_id = positional!(args)
@@ -250,7 +266,11 @@ module SiloMigrate
       when "start" then no_more!(args); service(workspace).run_plan(plan_id: identifier)
       when "claim" then no_more!(args); service(workspace).claim(plan_id: identifier)
       when "execute" then no_more!(args); service(workspace).execute(run_id: identifier)
-      when "show" then no_more!(args); service(workspace).show_run(identifier)
+      when "show"
+        # --detail: engineer-only private evidence (run-input names/digests, master-list files).
+        detail = args == ["--detail"]
+        invalid! unless args.empty? || detail
+        service(workspace).show_run(identifier, detail: detail)
       when "private-paths" then no_more!(args); service(workspace).private_paths(identifier)
       when "admin-password" then no_more!(args); service(workspace).admin_password(identifier)
       when "release"
@@ -398,6 +418,15 @@ module SiloMigrate
       end
       invalid! unless (allowed - optional - result.keys).empty?
       result
+    end
+
+    # Optional plan documents: bounded JSON files, validated by the service and embedded
+    # in the plan body. Absent options leave the call exactly as before.
+    def plan_documents(opts)
+      docs = {}
+      docs[:run_inputs] = Services::StandardRunInputs.read_document(opts["--run-inputs"], "STANDARD_RUN_INPUTS_INVALID") if opts["--run-inputs"]
+      docs[:preparation] = Services::StandardRunInputs.read_document(opts["--preparation"], "STANDARD_PREPARATION_INVALID") if opts["--preparation"]
+      docs
     end
 
     def positional!(args)

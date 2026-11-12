@@ -1573,7 +1573,8 @@ def op_register(ws, request):
             derived = os.open("derived", DIR_FLAGS, dir_fd=inputs)
             result = move_in(ws, meta, root, parts, derived, name, "inputs/derived/" + name, kind,
                              {"event": "derived", "from": "work/" + "/".join(parts),
-                              "job": producer and {key: producer.get(key) for key in ("id", "kind", "script_sha256", "inputs", "source")}})
+                              "job": producer and {key: producer.get(key) for key in ("id", "kind", "script_sha256", "inputs", "source", "references", "preparation_sha256")
+                                          if key in producer or key in ("id", "kind", "script_sha256", "inputs", "source")}})
         finally:
             for fd in (root, inputs, derived):
                 if fd is not None:
@@ -1677,7 +1678,12 @@ def op_script(ws, request):
     limit = minutes(request)
     with ws.lock():
         dataset, inputs = job_delivery(ws, request)
-        out = work_dir(ws, request.get("into"))
+        if not isinstance(request.get("into"), str) or not WORK_NAME.fullmatch(request["into"]):
+            refuse("STANDARD_ARGUMENTS_INVALID: into")
+        # References are checked (and snapshotted) before a work folder is made, so a refused
+        # reference leaves nothing behind; a refused folder removes the snapshots.
+        references, snapshots = job_references(ws, request)
+        out = start_with_references(ws, snapshots, lambda: work_dir(ws, request.get("into")))
         data = code.encode("utf-8")
         digest = hashlib.sha256(data).hexdigest()
         script = ws.data_dir("scripts") / (digest + (".rb" if language == "ruby" else ".py"))
@@ -1687,11 +1693,135 @@ def op_script(ws, request):
                 handle.write(data)
         target = "/job/script.rb" if language == "ruby" else "/job/script.py"
         interpreter = ["ruby", target] if language == "ruby" else ["python3", "-I", target]
-        record = start_job(ws, "script", out.name,
-                           lambda name: sandbox_argv(ws, name, out, [(script, target)], ["-s", "KILL", str(limit * 60), *interpreter], inputs),
-                           {"language": language, "script_sha256": digest, "inputs": input_digests(ws), "timeout_minutes": limit, "dataset_id": dataset})
-    return {"job_id": record["id"], "status": "running", "script_sha256": digest, "into": "work/" + out.name,
-            "next": "poll data_job until it finishes; outputs land in work/" + out.name}
+        mounts = [(script, target)] + [(snapshots / item["id"], "/reference/" + item["id"]) for item in references]
+        extra = {"language": language, "script_sha256": digest, "inputs": input_digests(ws), "timeout_minutes": limit, "dataset_id": dataset}
+        if references:
+            extra.update(references=reference_lineage(references), reference_dir=snapshots.name)
+        record = start_with_references(ws, snapshots, lambda: start_job(
+            ws, "script", out.name, lambda name: sandbox_argv(ws, name, out, mounts, ["-s", "KILL", str(limit * 60), *interpreter], inputs), extra))
+    result = {"job_id": record["id"], "status": "running", "script_sha256": digest, "into": "work/" + out.name,
+              "next": "poll data_job until it finishes; outputs land in work/" + out.name}
+    if references:
+        result["references"] = [{"id": item["id"], "mounted_at": "/reference/" + item["id"]} for item in references]
+    return result
+
+
+# -- supporting references in jobs -------------------------------------------------------
+# A job may read named, active project references through verified per-job snapshots
+# (never the custody originals). Only the protected-session context the fixed adapter
+# supplies admits them; the outputs' provenance records each reference's ID and digest.
+
+REFERENCE_DIR = re.compile(r"refs-[0-9a-f]{16}\Z")
+
+
+def reference_lineage(references):
+    return [{key: item[key] for key in ("id", "sha256", "size_bytes")} for item in references]
+
+
+def job_references(ws, request, identities=None):
+    """Caller holds ws.lock(). ([], None) when the request names no references."""
+    identities = request.get("references") if identities is None else identities
+    if identities is None:
+        return [], None
+    module, api = supporting_module(), supporting_api()
+    api.reference_active = lambda support_id: file_roles.reference_active(ws, support_id, roles_api())
+    module.session_context(request, api)
+    directory = ws.data_dir("jobs") / ("refs-" + secrets.token_hex(8))
+    directory.mkdir(mode=0o700)
+    try:
+        return module.resolve_references(ws, request, api, identities, directory), directory
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+def start_with_references(ws, snapshots, start):
+    try:
+        return start()
+    except BaseException:
+        if snapshots is not None:
+            shutil.rmtree(snapshots, ignore_errors=True)
+        raise
+
+
+def drop_reference_snapshots(ws, job):
+    name = job.get("reference_dir")
+    if isinstance(name, str) and REFERENCE_DIR.fullmatch(name):
+        path = ws.data / "jobs" / name
+        if path.is_dir() and not path.is_symlink():
+            for child in path.iterdir():
+                if not child.is_symlink():
+                    child.chmod(0o600)
+            shutil.rmtree(path, ignore_errors=True)
+
+
+PREPARE_MINUTES = 5
+
+
+def preparer_digest(ws):
+    digest = hashlib.sha256()
+    for name in ("supporting_prepare.py", "supporting_reader.py"):
+        data = (ws.repo / "bin" / name).read_bytes()
+        digest.update(name.encode() + b"\0" + hashlib.sha256(data).hexdigest().encode() + b"\n")
+    return digest.hexdigest()
+
+
+def preparer_module():
+    import sys
+    directory = str(Path(__file__).with_name("supporting_reader.py").parent)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    spec = importlib.util.spec_from_file_location("supporting_prepare", Path(__file__).with_name("supporting_prepare.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def op_supporting_prepare(ws, request):
+    """Deterministically project a bounded CSV/XLSX table region of one active reference
+    into a declared converter-native file (CSV, JSON or YAML) in work/<into>/, as a
+    confined no-network job. Register the result with data_register; its provenance
+    names the reference digest, spec digest and preparer code digest."""
+    ws.require()
+    identity = request.get("id")
+    preparer = preparer_module()
+    raw = {key: request[key] for key in ("sheet", "header_row", "max_rows", "columns") if key in request}
+    raw["output"] = {key: request[key] for key in ("format", "shape", "name") if key in request}
+    with ws.lock():
+        dataset, _mounts = job_delivery(ws, request)
+        references, snapshots = job_references(ws, request, [identity])
+        try:
+            suffix = Path(references[0]["filename"]).suffix.lower()
+            if suffix not in (".csv", ".tsv", ".xlsx"):
+                refuse("STANDARD_SUPPORTING_UNSUPPORTED")
+            raw["format"] = "xlsx" if suffix == ".xlsx" else "csv"
+            try:
+                spec = preparer.validate_spec(raw)
+            except preparer.Refusal as error:
+                refuse(error.code)
+            encoded = preparer.canonical(spec)
+            path = snapshots / "spec.json"
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(encoded)
+            out = work_dir(ws, request.get("into"))
+        except BaseException:
+            shutil.rmtree(snapshots, ignore_errors=True)
+            raise
+        command = ["-s", "KILL", str(PREPARE_MINUTES * 60), "python3", "-I", "-B", "/silo/bin/supporting_prepare.py",
+                   "/job/spec.json", "/reference/input", "/out"]
+        mounts = [(snapshots / identity, "/reference/input"), (path, "/job/spec.json")]
+        reader_ws = supporting_module().ReaderWorkspace(ws)
+        digest = preparer_digest(ws)
+        record = start_with_references(ws, snapshots, lambda: start_job(
+            ws, "prepare", out.name, lambda name: sandbox_argv(reader_ws, name, out, mounts, command, inputs=[]),
+            {"script_sha256": digest, "preparation": spec, "preparation_sha256": hashlib.sha256(encoded).hexdigest(),
+             "references": reference_lineage(references), "reference_dir": snapshots.name, "inputs": [],
+             "timeout_minutes": PREPARE_MINUTES, "dataset_id": dataset}))
+    return {"job_id": record["id"], "status": "running", "into": "work/" + out.name, "output": "work/%s/%s" % (out.name, spec["output"]["name"]),
+            "preparation_sha256": record["preparation_sha256"], "preparer_sha256": digest,
+            "next": ("poll data_job until it finishes; its log shows rows/skipped_blank/sha256. Preview the output with data_peek, "
+                     "then register it with data_register (type mapping or run-input for converter run inputs, merge-settings for a merge) so a plan can bind it.")}
 
 
 def op_extract(ws, request):
@@ -1771,6 +1901,7 @@ def finish(ws, job):
             return None
         docker(["rm", "-f", job["container"]], timeout=60)
         job.update(status="lost", finished_at=now())
+        drop_reference_snapshots(ws, job)
         ws.write_json(ws.data_dir("jobs") / (job["id"] + ".json"), job)
         return None
     state = json.loads(result.stdout)
@@ -1802,6 +1933,7 @@ def finish(ws, job):
         if db:
             db["ro_user"] = checked
             ws.write_json(ws.data_dir("db") / "state.json", db)
+    drop_reference_snapshots(ws, job)
     ws.write_json(log_dir / (job["id"] + ".json"), job)
     docker(["rm", "-f", job["container"]], timeout=60)
     return combined
@@ -1838,7 +1970,8 @@ def op_job(ws, request):
         with ws.lock():
             finish(ws, job)
     result = {key: job.get(key) for key in ("id", "kind", "status", "exit_code", "oom_killed", "started_at", "finished_at", "into",
-                                             "script_sha256", "timeout_minutes", "source", "error", "read_only_user_checked")}
+                                             "script_sha256", "timeout_minutes", "source", "error", "read_only_user_checked",
+                                             "references", "preparation_sha256") if key in job or key not in ("references", "preparation_sha256")}
     if job.get("status") == "running":
         logs = docker(["logs", "--tail", "200", job["container"]], timeout=60)
         result["log_tail"], result["log_truncated"] = tail_text(redact(ws, logs.stdout + logs.stderr))
@@ -2380,9 +2513,49 @@ def mcp_entry(ws):
     return {"command": str(control), "args": ["dbhub", ws.name]}
 
 
+PROTECTED_SESSIONS_KEY = "SILO_PROTECTED_SESSIONS"
+
+
+def protected_sessions_enabled(values):
+    """True only when the installer-managed control config literally says SILO_PROTECTED_SESSIONS=1.
+
+    The root-selected path is account-owned; same-account operator writes are trusted,
+    not an OS sandbox. Unsafe, linked, mutable or oversized flag files fail closed.
+    The installer writes it only after verifying a native host that keeps MCP results in a
+    protected migration-data session. Never read from the environment: values begin as
+    os.environ, which a tool host or service unit could carry. DBHub's MCP tools bypass
+    the custom-tool session gate, so without this they are neither registered nor started."""
+    path = values.get("SILO_CONTROL_CONFIG")
+    if not path:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid())
+                    or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > 64 * 1024):
+                return False
+            content = handle.read(64 * 1024 + 1)
+            after = os.fstat(handle.fileno())
+            if (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                return False
+        if len(content) > 64 * 1024 or "\x00" in content:
+            return False
+        lines = content.splitlines()
+    except (OSError, UnicodeError):
+        return False
+    return lines.count(PROTECTED_SESSIONS_KEY + "=1") == 1 and not any(
+        line.startswith(PROTECTED_SESSIONS_KEY + "=") and line != PROTECTED_SESSIONS_KEY + "=1" for line in lines)
+
+
 def mcp_register(ws, present=True):
     """Put this project's entry in mcp.json (or take it out), leaving everything else as it is.
-    Returns "added", "registered" (already right), "removed", "absent" or why nothing changed."""
+    Returns "added", "registered" (already right), "removed", "absent" or why nothing changed.
+    Without protected-session enablement an add instead removes any existing entry."""
+    if present and not protected_sessions_enabled(ws.values):
+        removed = mcp_register(ws, present=False)
+        return ("not changed: free SQL needs a node whose term-llm keeps database results in a protected migration-data chat"
+                + ("; the old entry was removed" if removed == "removed" else ""))
     path = mcp_config_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Serialises silo's own writers (term-llm's web UI can't be coordinated; status repairs it).
@@ -2474,6 +2647,9 @@ def dbhub_main(args, values, base, repo, host):
         refuse("STANDARD_ARGUMENTS_INVALID")
     ws = Workspace(base, args[1], repo, host, values, None)
     ws.require(standard=False)
+    # A stale mcp.json entry (older release, manual edit) must not open a bypass.
+    if not protected_sessions_enabled(values):
+        refuse("STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED: free SQL needs protected-session native support")
     state = db_state(ws)
     if not (state and state.get("ro_user") and state.get("engine") in DBHUB_DSN):
         refuse("STANDARD_DB_STATE_MISSING: start the project's source database with data_db_up first")
@@ -2605,6 +2781,218 @@ def runtime_preparing(plan):
     return {"status": "runtime_preparing", "next": "Preparing the matching public Discourse runtime. No customer data is used and no import has started. Poll this same proposal after a short wait; it will return a plan for the engineer to approve when ready."}
 
 
+# -- exact plan inputs and preparation metadata -------------------------------------
+# Optional; the Ruby plan backend (services/standard_run_inputs.rb) owns validation,
+# digest binding, materialization and display. Here: fill identities and lineage from
+# this workspace's own records (never from the agent), translate supporting reference
+# IDs to the file-roles registry entries the backend checks, and hand each document
+# over as a bounded private file. Without these keys proposals are exactly as before.
+RUN_INPUT_TYPES = ("run-input", "mapping")
+DATASET_ID = re.compile(r"dataset-[0-9a-f]{32}\Z")
+MAX_PLAN_DOCUMENT = 64 * 1024
+ANALYST_LABEL = "migration-data analyst (interpretation, not evidence)"
+SUPPORT_ID = re.compile(r"support-[0-9a-f]{32}\Z")
+FILE_ID = re.compile(r"file-[0-9a-f]{32}\Z")
+JOB_TOOLS = {"prepare": "data_supporting_prepare", "script": "data_script", "extract": "data_extract"}
+
+
+def reference_identity(ws, entry, roles, code):
+    """{file_id|input_id, sha256} for one cited reference, as the backend will recheck it.
+    An optional sha256 (e.g. a re-proposal of a plan's bound form) must still be current."""
+    if not isinstance(entry, dict) or not 1 <= len(entry) <= 2 or (len(entry) == 2 and "sha256" not in entry):
+        refuse(code + ": a reference is {support_id}, {file_id} or {input_id}")
+    entry = dict(entry)
+    expected = entry.pop("sha256", None)
+    if len(entry) != 1:
+        refuse(code + ": a reference is {support_id}, {file_id} or {input_id}")
+    resolved = _reference_identity(ws, entry, roles, code)
+    if expected is not None and expected != resolved["sha256"]:
+        refuse(code + ": a cited reference changed since it was bound; propose from the current reference")
+    return resolved
+
+
+def _reference_identity(ws, entry, roles, code):
+    (key, value), = entry.items()
+    if key == "support_id" and isinstance(value, str) and SUPPORT_ID.fullmatch(value):
+        found = [item for item in roles["files"].values() if item.get("support_id") == value and item.get("role") == "reference"]
+        if len(found) != 1:
+            refuse(code + ": reference %s is not yet recorded as a supporting reference on the Files tab (intake references are; a chat attachment is recorded by the engineer's next Files role change)" % value)
+        return {"file_id": found[0]["id"], "sha256": found[0]["sha256"]}
+    if key == "file_id" and isinstance(value, str) and FILE_ID.fullmatch(value):
+        item = roles["files"].get(value)
+        if not item or item.get("role") != "reference":
+            refuse(code + ": file_id is not a supporting reference")
+        return {"file_id": value, "sha256": item["sha256"]}
+    if key == "input_id" and isinstance(value, str) and INPUT_ID.fullmatch(value):
+        item = (ws.named_state().get("inputs") or {}).get(value)
+        if not item:
+            refuse(code + ": input_id is not registered")
+        return {"input_id": value, "sha256": item["sha256"]}
+    refuse(code + ": a reference is {support_id}, {file_id} or {input_id}")
+
+
+def derived_lineage(ws, input_id, roles):
+    """Lineage of a derived input from its provenance record and producing job, or None."""
+    path = ws.data / "provenance.jsonl"
+    record = None
+    if path.is_file() and not path.is_symlink():
+        for line in path.read_text().splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if item.get("input_id") == input_id and item.get("event") == "derived":
+                record = item
+    job = (record or {}).get("job")
+    if not isinstance(job, dict) or not isinstance(job.get("id"), str) or not JOB.fullmatch(job["id"]):
+        return None
+    preparation = {"job": job["id"], "tool": JOB_TOOLS.get(job.get("kind"), "data_job")}
+    if isinstance(job.get("script_sha256"), str) and DIGEST.fullmatch(job["script_sha256"]):
+        preparation["script_sha256"] = job["script_sha256"]
+    if job.get("kind") == "prepare":
+        # The deterministic preparer's exact normalized spec, as recorded when the job started.
+        if not (isinstance(job.get("preparation_sha256"), str) and DIGEST.fullmatch(job["preparation_sha256"])):
+            refuse("STANDARD_RUN_INPUTS_INVALID: a prepared file's job record has no spec digest")
+        preparation["preparation_sha256"] = job["preparation_sha256"]
+    lineage = {"preparation": preparation}
+    references = job.get("references") or []
+    if references:
+        bound = []
+        for item in references:
+            # The digest of the bytes the job actually read (its verified snapshot), which must
+            # still be the reference's current registered digest: never re-describe old output
+            # with a newer reference's hash.
+            used = item.get("sha256") if isinstance(item, dict) else None
+            if not (isinstance(used, str) and DIGEST.fullmatch(used)):
+                refuse("STANDARD_RUN_INPUTS_INVALID: a prepared file's job record has no reference digest")
+            bound.append(reference_identity(ws, {"support_id": item.get("id"), "sha256": used}, roles, "STANDARD_RUN_INPUTS_INVALID"))
+        lineage["references"] = bound
+    return lineage
+
+
+def chat_session_required(ws, request):
+    """Model-facing requests (via chat, fixed by the adapter) must carry the host's protected
+    session for private plan documents. The engineer's own proposal (Project page/shell,
+    ws.chat False) is the trusted signed-in path and needs no native chat context."""
+    if ws.chat:
+        supporting_module().session_context(request, supporting_api())
+
+
+# Keys a plan's stored (bound) run_inputs carries that the backend recomputes itself.
+BOUND_RUN_INPUT_KEYS = {"mount", "writable"}
+
+
+def run_inputs_document(ws, request, source):
+    if "run_inputs" not in request:
+        return None
+    code = "STANDARD_RUN_INPUTS_INVALID"
+    chat_session_required(ws, request)
+    manifest = request["run_inputs"]
+    # files may be empty: e.g. every optional map left at the converter's default, with a fresh
+    # writable directory for declared generated files. Never synthesize a placeholder file:
+    # header-only and absent files mean different things to converters.
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+        refuse(code + ": run_inputs needs consumer and files (a list, possibly empty)")
+    inputs = ws.named_state().get("inputs") or {}
+    roles = file_roles.load(ws, roles_api())
+    consumer = manifest.get("consumer")
+    if not isinstance(consumer, dict):
+        refuse(code + ": consumer")
+    consumer = dict(consumer)
+    consumer.setdefault("platform", ws.meta().get("platform"))
+    files = []
+    for index, entry in enumerate(manifest["files"], 1):
+        # Lineage comes from this workspace's records. Only the engineer's re-proposal of a
+        # bound plan may repeat it, and then it must equal what the records say now.
+        allowed = {"name", "input_id", "sha256", "bytes", "reuse"} | (set() if ws.chat else {"lineage"})
+        if not isinstance(entry, dict) or set(entry) - allowed:
+            refuse(code + ": file %d is {name, input_id}; lineage comes from the workspace's records" % index)
+        item = inputs.get(entry.get("input_id")) if isinstance(entry.get("input_id"), str) else None
+        if not item or item.get("type") not in RUN_INPUT_TYPES:
+            refuse(code + ": file %d must be a registered input of type run-input or mapping" % index)
+        for key, value in (("sha256", item.get("sha256")), ("bytes", item.get("bytes"))):
+            if key in entry and entry[key] != value:
+                refuse(code + ": file %d %s differs from the registered input" % (index, key))
+        bound = {"name": entry.get("name"), "input_id": entry["input_id"], "sha256": item.get("sha256"), "bytes": item.get("bytes")}
+        lineage = derived_lineage(ws, entry["input_id"], roles)
+        if "lineage" in entry and entry["lineage"] != lineage:
+            refuse(code + ": file %d lineage differs from the workspace's records" % index)
+        if lineage:
+            bound["lineage"] = lineage
+        if "reuse" in entry:
+            # Explicit cross-delivery reuse: the file's own dataset and the source digest it was
+            # prepared against. Shape only here; the plan backend owns its meaning and checks.
+            reuse = entry["reuse"]
+            if (not isinstance(reuse, dict) or set(reuse) != {"dataset_id", "source_sha256"}
+                    or not isinstance(reuse["dataset_id"], str) or not DATASET_ID.fullmatch(reuse["dataset_id"])
+                    or not isinstance(reuse["source_sha256"], str) or not DIGEST.fullmatch(reuse["source_sha256"])):
+                refuse(code + ": file %d reuse is {dataset_id, source_sha256}" % index)
+            bound["reuse"] = {"dataset_id": reuse["dataset_id"], "source_sha256": reuse["source_sha256"]}
+        files.append(bound)
+    refuse_base_roles(ws, [entry["input_id"] for entry in files])
+    document = {"version": manifest.get("version", 1), "consumer": consumer, "source_sha256": inputs.get(source, {}).get("sha256"), "files": files}
+    if "source_sha256" in manifest and manifest["source_sha256"] != document["source_sha256"]:
+        refuse(code + ": source_sha256 differs from the plan's source")
+    for key in ("absent_defaults", "generated"):
+        if key in manifest:
+            document[key] = manifest[key]
+    if set(manifest) - {"version", "consumer", "source_sha256", "files", "absent_defaults", "generated"} - (set() if ws.chat else BOUND_RUN_INPUT_KEYS):
+        refuse(code + ": unknown key")
+    return document
+
+
+def preparation_document(ws, request):
+    """Analyst-labelled preparation metadata. Needs the protected-session context."""
+    if "preparation" not in request:
+        return None
+    code = "STANDARD_PREPARATION_INVALID"
+    document = request["preparation"]
+    if not isinstance(document, dict) or not isinstance(document.get("analyst"), dict):
+        refuse(code + ": preparation needs analyst.text")
+    chat_session_required(ws, request)
+    document = dict(document)
+    document.setdefault("version", 1)
+    # The label is fixed: the agent cannot present its interpretation as anyone else's.
+    document["analyst"] = {"label": ANALYST_LABEL, "text": document["analyst"].get("text")}
+    if "references" in document:
+        if not isinstance(document["references"], list):
+            refuse(code + ": references")
+        roles = file_roles.load(ws, roles_api())
+        document["references"] = [reference_identity(ws, entry, roles, code) for entry in document["references"]]
+    return document
+
+
+class PlanDocuments:
+    """Bounded private JSON files for the backend's --run-inputs/--preparation; removed after the call."""
+
+    def __init__(self, ws, documents):
+        self.ws, self.documents, self.paths = ws, documents, []
+
+    def __enter__(self):
+        argv = []
+        directory = self.ws.data_dir("plan-documents")
+        for flag, (code, document) in self.documents.items():
+            if document is None:
+                continue
+            data = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            if len(data) > MAX_PLAN_DOCUMENT:
+                refuse(code + ": larger than 64 KiB")
+            path = directory / (secrets.token_hex(16) + ".json")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            self.paths.append(path)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            argv += [flag, str(path)]
+        return argv
+
+    def __exit__(self, *exc):
+        for path in self.paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def op_plan_propose(ws, request):
     """Propose conversion from inputs or review from a completed convert run.
     Only a proposal: the engineer approves and starts it."""
@@ -2612,7 +3000,7 @@ def op_plan_propose(ws, request):
     from_run = request.get("from_run")
     if "from_run" in request:
         if (not isinstance(from_run, str) or not RUN.fullmatch(from_run)
-                or any(key in request for key in ("source", "settings", "charset"))):
+                or any(key in request for key in ("source", "settings", "charset", "run_inputs", "preparation"))):
             refuse("STANDARD_ARGUMENTS_INVALID: from_run")
         reconciliation = request.get("reconciliation")
         if reconciliation is not None and (not isinstance(reconciliation, str) or not INPUT_ID.fullmatch(reconciliation)):
@@ -2647,12 +3035,18 @@ def op_plan_propose(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID: base_site and fresh_site are review options")
     argv = ["standard", "plan", "propose", ws.name, "--operation", "convert", "--charset", charset,
             *[flag for key, value in roles.items() for flag in ("--" + key, value)]]
+    documents = {"--run-inputs": ("STANDARD_RUN_INPUTS_INVALID", run_inputs_document(ws, request, roles["source"])),
+                 "--preparation": ("STANDARD_PREPARATION_INVALID", preparation_document(ws, request))}
+
+    def propose():
+        with PlanDocuments(ws, documents) as extra:
+            return json.loads(ws.control(argv + extra, timeout=30))
     prepared = None
     # Bind the workspace to the converter's committed branch head (a dirty checkout refuses:
     # commit first). The plan shows that commit and the engineer approves exactly it.
     converter = json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
     try:
-        plan = json.loads(ws.control(argv, timeout=30))
+        plan = propose()
     except Refusal as refusal:
         if not str(refusal).startswith("STANDARD_CONVERTER_DEPS_MISSING"):
             raise
@@ -2661,14 +3055,57 @@ def op_plan_propose(ws, request):
         # 150 s to build (+ up to ~35 s to remove a container that ran out of time) fits in
         # this call's 190, and 30 + 30 + 190 + 30 stays inside the tool's 290.
         prepared = json.loads(ws.control(["converter", "deps", ws.name, "--budget", "150"], timeout=190)).get("dependencies")
-        plan = json.loads(ws.control(argv, timeout=30))
+        plan = propose()
     return {"plan_id": plan.get("plan_id"), "digest": plan.get("digest"), "status": plan.get("status"), "operation": plan.get("operation"),
             "platform": plan.get("platform"), "roles": plan.get("roles"), "inputs": plan.get("inputs"), "source_charset": plan.get("source_charset"),
             "converter_revision": plan.get("converter_revision"), "converter_branch": converter.get("branch"),
             "converter_deps": plan.get("converter_deps"), "dependencies_prepared": prepared,
             "mutations": plan.get("mutations"), "not_included": plan.get("not_included"),
+            **{key: plan[key] for key in ("run_inputs", "preparation") if key in plan},
             "next": ("Tell the engineer the plan is waiting in the Project page's Runs tab, where they review, "
                      "approve and start it. When it has finished, read it with data_run_evidence.")}
+
+
+MASTER_LIST = re.compile(r"[a-z][a-z_]{0,31}\Z")
+
+
+def op_master_lists_propose(ws, request):
+    """Propose the converter's own master-list export (e.g. Khoros) on a disposable copy of
+    the registered source. Only a proposal: it mutates staging when run, so the engineer
+    approves and starts it in Runs; the exported CSVs become that run's bound artifacts."""
+    ws.require()
+    roles = {key: request.get(key) for key in ("source", "settings")}
+    charset, wanted = request.get("charset", "utf8mb4"), request.get("list", "all")
+    if (not all(isinstance(value, str) and INPUT_ID.fullmatch(value) for value in roles.values()) or charset not in CHARSETS
+            or not isinstance(wanted, str) or not MASTER_LIST.fullmatch(wanted)):
+        refuse("STANDARD_ARGUMENTS_INVALID: source, settings, list or charset")
+    refuse_base_roles(ws, roles.values())
+    file_roles.effective_input(ws, roles["source"], roles_api(), source=True)
+    argv = ["standard", "plan", "propose", ws.name, "--operation", "master-lists", "--source", roles["source"],
+            "--settings", roles["settings"], "--charset", charset]
+    if "list" in request:
+        argv += ["--list", wanted]
+    documents = {"--run-inputs": ("STANDARD_RUN_INPUTS_INVALID", run_inputs_document(ws, request, roles["source"]))}
+
+    def propose():
+        with PlanDocuments(ws, documents) as extra:
+            return json.loads(ws.control(argv + extra, timeout=30))
+    converter = json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
+    prepared = None
+    try:
+        plan = propose()
+    except Refusal as refusal:
+        if not str(refusal).startswith("STANDARD_CONVERTER_DEPS_MISSING"):
+            raise
+        prepared = json.loads(ws.control(["converter", "deps", ws.name, "--budget", "150"], timeout=190)).get("dependencies")
+        plan = propose()
+    return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "platform", "roles", "inputs", "source_charset",
+                                              "converter_revision", "converter_deps", "master_lists", "mutations", "not_included")},
+            **({"run_inputs": plan["run_inputs"]} if "run_inputs" in plan else {}),
+            "converter_branch": converter.get("branch"), "dependencies_prepared": prepared,
+            "next": ("Tell the engineer the master-list export is waiting in the Project page's Runs tab: it loads a disposable copy of "
+                     "the source and runs the converter's committed exporter, which rebuilds staging tables there (not a read-only check). "
+                     "They approve and start it; nothing runs until then. Its CSVs are kept as that run's artifacts.")}
 
 
 MERGE_OPTIONS = ("ignore_global_pins", "separate_same_named_groups")
@@ -2721,17 +3158,21 @@ def op_merge_propose(ws, request):
     argv = ["standard", "plan", "propose", ws.name, "--operation", "merge", "--source", source, "--base-site", base]
     if settings is not None:
         argv += ["--settings", settings]
+    preparation = preparation_document(ws, request)
     argv += ["--" + key.replace("_", "-") for key, value in options.items() if value]
     # Bind the workspace to the converter checkout's committed branch head: the merge layer, if the
     # project has one, is read from exactly that commit. A dirty checkout refuses: commit first.
     converter = json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
-    plan = json.loads(ws.control(argv, timeout=240))  # checks the registered inputs (a backup can be GBs)
+    # checks the registered inputs (a backup can be GBs)
+    with PlanDocuments(ws, {"--preparation": ("STANDARD_PREPARATION_INVALID", preparation)}) as extra:
+        plan = json.loads(ws.control(argv + extra, timeout=240))
     if pending := runtime_preparing(plan):
         return pending
     merge = plan.get("merge") or {}
     layer = merge.get("layer") or {}
     return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "roles", "inputs", "base_site", "merge", "review_runtime",
                                               "converter_revision", "limits", "mutations", "not_included")},
+            **({"preparation": plan["preparation"]} if "preparation" in plan else {}),
             "converter_branch": converter.get("branch"),
             "instances": {"review": {"port": ((plan.get("instances") or {}).get("review") or {}).get("port")}},
             "next": ("Tell the engineer the merge is waiting in the Project page's Runs tab, where they approve and start it. " +
@@ -3346,9 +3787,10 @@ def op_supporting(ws, request):
 OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
        "file_roles_preview": op_file_roles_preview, "file_roles_commit": op_file_roles_commit,
        "supporting_list": op_supporting, "supporting_take": op_supporting, "supporting_read": op_supporting,
+       "supporting_prepare": op_supporting_prepare,
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
        "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding,
-       "plan_propose": op_plan_propose, "merge_propose": op_merge_propose,
+       "plan_propose": op_plan_propose, "merge_propose": op_merge_propose, "master_lists_propose": op_master_lists_propose,
        "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions, "deliveries": op_deliveries, "delivery_label": op_delivery_label,
        "finding_done": op_finding_done, "site_process": op_site_process, "site_review": op_site_review}
 # Logged with their arguments (minus script code, finding text, count SQL and decisions, logged by hash).

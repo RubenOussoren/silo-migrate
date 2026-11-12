@@ -35,6 +35,7 @@ type label and checksum so every later step is traceable.
    classified **Supporting reference** use the same private registry as chat
    attachments: read them with `data_supporting_list`/`data_supporting_read`, not
    `data_take`. Never force a reference into Development/Launch/Base to read it.
+   To use a reference for a plan (wishes, mapping sheets), load `intake-preparation`.
 6. **Unpack archives** into a work folder with `data_extract`, check the job, and
    register the files you'll use with `data_register` (each gets its own type).
 7. **Report** to the engineer: what arrived (names, sizes, kinds, SHA-256 prefixes),

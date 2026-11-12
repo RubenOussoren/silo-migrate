@@ -31,8 +31,8 @@ class PrivateNodeTest(unittest.TestCase):
         (self.source / 'runtime').mkdir(parents=True)
         patch_dir = self.source / 'integrations/term-llm/patches'
         patch_dir.mkdir(parents=True)
-        (patch_dir / 'private-attachments.patch').write_bytes(b'invented-reviewed-patch\n')
-        self.expected = {'version': '0.9.99', 'base_commit': 'a' * 40,
+        (patch_dir / 'conversation-scope.patch').write_bytes(b'invented-reviewed-patch\n')
+        self.expected = {'version': '0.9.103', 'base_commit': 'a' * 40,
                          'patch_sha256': hashlib.sha256(b'invented-reviewed-patch\n').hexdigest()}
         (self.source / 'runtime/private-node-source.json').write_text(json.dumps(self.expected))
         self.binary = self.root / 'built-node'
@@ -42,8 +42,8 @@ class PrivateNodeTest(unittest.TestCase):
 #define SERVE_HELP_BYTES 10323
 int main(int argc, char **argv) {
  if (argc > 1 && !strcmp(argv[1], "capabilities"))
-  puts("{\"private_upload_context\": 1, \"session_scope_lock\": 1}");
- else if (argc > 1 && !strcmp(argv[1], "--version")) puts("term-llm version 0.9.99");
+  puts("{\"custom_tool_session_context\": 1, \"session_scope_lock\": 1}");
+ else if (argc > 1 && !strcmp(argv[1], "--version")) puts("term-llm version v0.9.103");
  else if (argc > 1 && !strcmp(argv[1], "serve")) {
   const char *flags = "--host --port --auth --approval --agent --projects --widgets-dir --extensions-dir --extensions";
   fputs(flags, stdout);
@@ -59,6 +59,20 @@ int main(int argc, char **argv) {
 
     def build_package(self):
         return node.package(self.binary, self.package, self.expected)
+
+    def test_generic_probe_refuses_legacy_or_boolean_capability_claims(self):
+        execute = node.subprocess.run
+        for capabilities in ({'private_upload_context': 1, 'session_scope_lock': 1},
+                             {'custom_tool_session_context': True, 'session_scope_lock': 1}):
+            def claim(argv, **kwargs):
+                result = execute(argv, **kwargs)
+                if argv[1:] == ['capabilities', '--json']:
+                    result.stdout = json.dumps(capabilities).encode()
+                return result
+            with self.subTest(capabilities=capabilities), patch.object(node.subprocess, 'run', side_effect=claim):
+                with self.assertRaises(node.Refusal):
+                    self.build_package()
+                self.assertFalse(self.package.exists())
 
     def test_real_sized_serve_help_packages_and_installs(self):
         result = subprocess.run([str(self.binary), 'serve', '--help'], check=True, capture_output=True)
@@ -109,7 +123,7 @@ int main(int argc, char **argv) {
 
     def test_source_patch_is_bound_to_release(self):
         self.assertEqual(self.expected, node.source(self.source))
-        (self.source / 'integrations/term-llm/patches/private-attachments.patch').write_bytes(b'different')
+        (self.source / 'integrations/term-llm/patches/conversation-scope.patch').write_bytes(b'different')
         with self.assertRaisesRegex(node.Refusal, 'METAL_PRIVATE_NODE_INVALID'):
             node.source(self.source)
 
