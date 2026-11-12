@@ -428,14 +428,18 @@ export CHROMIUM=/path/to/chromium
 export TERM_LLM_SOURCE=/path/to/term-llm-checkout  # contains local tag v0.9.99
 node test/launcher_extension_test.mjs
 node test/project_navigation_browser.mjs
+node test/file_roles_browser.mjs
+node test/file_decision_polling_browser.mjs
 node test/converter_rebase_browser.mjs
 ```
 
 The launcher test covers stock/Varnish headers, narrow screens, keyboard focus and Hub-relative
 links. Navigation checks cover immediate snapshots, deduplicated reads, stale response isolation,
-unsaved edits, decision invalidation and fresh site-acceptance state. These fixture checks are not
-proof of work-server latency: also check the real pinned host locally with invented data. Short
-engineer reads (`standard status`, `standard plan show`, `standard run show`) have a one-CPU control
+unsaved edits, decision invalidation and fresh site-acceptance state. Files checks cover explicit
+roles, exact-preview confirmation and stale/blocked decisions; the deterministic polling regression
+also holds reads and decisions in both orders to check their barrier and polling resumption.
+These fixture checks are not proof of work-server latency: also check the real pinned host locally
+with invented data. Short engineer reads (`standard status`, `standard plan show`, `standard run show`) have a one-CPU control
 ceiling to avoid throttling CLI startup; mutation/executor control commands retain 0.25 CPU, and
 migration containers' own profile limits and all other isolation settings are unchanged.
 

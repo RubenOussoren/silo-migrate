@@ -80,6 +80,15 @@ retrying. An affected active run blocks correction; unrelated reference work mus
 not stop an unrelated run. Only the engineer can confirm these actions; no agent
 mutation tool is provided.
 
+The page pauses its own background refreshes while checking or saving an
+assignment, and waits for refresh requests already sent to finish before sending
+the preview or confirmation. Polling resumes afterwards, including after a refused
+decision. This avoids the page competing with its own decision for the project
+lock; it does not bypass another tab, agent, run or operator holding that lock.
+A floating refresh error is not confirmation that an assignment failed or applied.
+A decision refusal is shown inside the form; a failed confirmation discards the
+preview and requires a fresh deliberate preview, never an automatic retry.
+
 Corrections are append-only audit events with actor, reason and before/after
 links. Original deliveries/named inputs are provenance, not mutable labels to
 erase. Historical plan bodies, consumed approvals, run bindings and released

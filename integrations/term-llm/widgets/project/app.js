@@ -91,7 +91,11 @@ function warmLists(project) {
   return lists.load(`api/boards?${new URLSearchParams({ workspace: project })}`).catch(() => {});
 }
 
-const fileView = filesView({ get project() { return state.project; }, get files() { return state.files; }, render, refresh });
+// Drain reads already sent before a Files decision; aborting fetch would not stop
+// their host-side work. New refreshes are paused only while the decision is busy.
+const refreshes = new Set();
+const fileView = filesView({ get project() { return state.project; }, get files() { return state.files; }, render, refresh,
+  settleReads: () => Promise.all([...refreshes]) });
 
 function newest(kind) { return currentSnapshot(state.files, kind); }
 
@@ -399,7 +403,13 @@ async function refreshCounts() {
 }
 
 async function refresh(full = true) {
-  if (state.removal) return;
+  if (state.removal || fileView.working) return;
+  const reading = refreshProject(full);
+  refreshes.add(reading);
+  try { await reading; } finally { refreshes.delete(reading); }
+}
+
+async function refreshProject(full) {
   if (!state.project) { render(); return; }
   const generation = ++state.generation;
   const project = state.project;

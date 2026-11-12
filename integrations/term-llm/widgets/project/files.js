@@ -96,6 +96,7 @@ export function filesView(ctx) {
       if (launchRequired) change.confirm = 'LAUNCH';
       e.working = true; e.preview = null; e.error = null; redraw();
       try {
+        await ctx.settleReads();
         const preview = await api('api/files/preview', { workspace: project, change });
         if (alive()) e.preview = preview;
       } catch (error) { if (alive()) e.error = explain(error); }
@@ -121,6 +122,7 @@ export function filesView(ctx) {
         if (!acknowledged || e.working || e.preview !== p || p.blocked?.length || !p.digest) return;
         e.working = true; redraw();
         try {
+          await ctx.settleReads();
           await api('api/files/commit', { workspace: project, change: p.change, digest: p.digest });
           if (alive()) { reset(); ctx.refresh(); }
         } catch (error) {
@@ -206,5 +208,5 @@ export function filesView(ctx) {
       el('p', { class: 'hint' }, 'Completed runs and releases retain their original snapshots, inputs and checksums. Corrections do not retroactively fix output.')));
     return out;
   }
-  return { render, reset, leaving, get editing() { return !!editor; } };
+  return { render, reset, leaving, get editing() { return !!editor; }, get working() { return !!editor?.working; } };
 }
