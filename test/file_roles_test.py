@@ -230,6 +230,52 @@ class FileRolesTest(unittest.TestCase):
         self.assertNotIn("plan-33333333333333333333333333333333", invalidated)
         self.assertNotIn("plan-22222222222222222222222222222222", invalidated)
 
+    def test_stale_job_requires_explicit_reconciliation_and_a_fresh_correction_preview(self):
+        first, second, wrong, _ = self.legacy(taken=True)
+        started = self.op("script", code="puts 1", into="analysis", delivery=second)
+        job_id = started["job_id"]
+        job_path = self.data / "jobs" / (job_id + ".json")
+        container = json.loads(job_path.read_text())["container"]
+        partial = self.root / "work/analysis/partial.txt"
+        partial.write_bytes(b"invented partial output")
+        originals = {path: path.read_bytes() for path in (
+            self.named / "state.json", self.named / "deliveries.json", self.standard / "state.json",
+            self.data / "file-roles.json", self.root / "inputs/mapping.xlsx", self.intake / "original.sql")}
+        change = self.correction(wrong, first)
+        blocked = self.preview(change)
+        self.assertEqual([{"job_id": job_id, "status": "running"}], blocked["impacts"]["active"])
+        # Polling genuinely live work does not turn it terminal or clear the guard.
+        self.assertEqual("running", self.op("job", job_id=job_id, via="chat")["status"])
+        self.assertTrue(self.preview(change)["blocked"])
+        self.assertIn(container, self.fixture.docker.state)
+        # The container has now exited, but GET/preview must not finalize jobs.
+        self.fixture.docker.state[container] = {"Running": False, "Status": "exited", "ExitCode": 137,
+                                                "OOMKilled": False, "FinishedAt": "2026-11-11T12:00:00Z"}
+        calls = len(self.fixture.docker.calls)
+        stale = self.preview(change)
+        self.assertTrue(stale["blocked"])
+        self.assertEqual("running", json.loads(job_path.read_text())["status"])
+        self.assertEqual(calls, len(self.fixture.docker.calls))
+        # This models the separately approved one-job reconciliation, not a new job.
+        with mock.patch.object(self.d, "now", return_value="2026-11-12T12:00:00Z"), \
+                mock.patch.object(self.d, "harden_ro_user") as harden:
+            result = self.op("job", job_id=job_id, via="chat")
+        harden.assert_not_called()  # script jobs do not do post-load DB hardening
+        self.assertEqual(("script", "timed_out", 137, False),
+                         tuple(result[key] for key in ("kind", "status", "exit_code", "oom_killed")))
+        self.assertEqual("2026-11-12T12:00:00Z", result["finished_at"])  # reconciliation time, not FinishedAt
+        self.assertNotIn(container, self.fixture.docker.state)
+        self.assertEqual(1, len(self.fixture.docker.argvs("run")))  # no rerun
+        self.assertEqual(b"invented partial output", partial.read_bytes())
+        self.assertEqual(originals, {path: path.read_bytes() for path in originals})
+        with self.assertRaisesRegex(self.d.Refusal, "STALE_PREVIEW"):
+            self.op("file_roles_commit", change=change, digest=stale["digest"], by="Engineer")
+        fresh = self.preview(change)
+        self.assertEqual([], fresh["blocked"])
+        self.assertEqual([], fresh["impacts"]["active"])
+        self.assertNotEqual(stale["digest"], fresh["digest"])
+        self.assertEqual(originals, {path: path.read_bytes() for path in originals})  # no auto-correction
+
     def test_activate_does_not_revise_or_invalidate_snapshot(self):
         one = self.source()
         two = self.source("next.sql")

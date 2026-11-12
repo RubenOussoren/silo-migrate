@@ -350,6 +350,52 @@ assert not any(key in os.environ for key in ('TERM_LLM_SESSION_ID', 'TERM_LLM_PR
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
         self.assertIn('lock_session: true', definition)
 
+    def test_job_recovery_guidance_keeps_status_and_reconciliation_authority_distinct(self):
+        agents = ROOT / 'integrations/term-llm'
+        prompt = (agents / 'migration-data/system.md').read_text()
+        guide = (agents / 'skills/job-recovery/SKILL.md').read_text()
+        self.assertIn('load `job-recovery`', (agents / 'skills/migration-guide/SKILL.md').read_text())
+        definition = (agents / 'migration-data/agent.yaml').read_text()
+        self.assertIn('migration-guide,job-recovery,', definition)
+        job = definition.split('    - name: data_job\n', 1)[1].split('    - name:', 1)[0]
+        # Text contract checks, not proof of provider/model behavior.
+        for text in (prompt, guide):
+            with self.subTest(kind='data recovery guidance', text=text[:40]):
+                self.assertIn('Blocked corrections and stale jobs', text)
+                self.assertIn('STANDARD_BUSY', text)
+                self.assertIn('not read-only', text)
+                self.assertIn('explicit approval', text)
+                self.assertIn('finished_at', text)
+                self.assertIn('reconciliation time', text)
+        for term in ('NOT read-only', 'low disk', 'after a load', 'explicit approval', 'timed_out'):
+            self.assertIn(term, job)
+        self.assertIn('required: [job_id]', job)
+        self.assertIn('additionalProperties: false', job)
+        for term in ('ten most recent jobs', 'one call on the exact job', 'once', 'low-disk',
+                     'fresh correction preview', 'does not prove', 'You cannot confirm', 'do not manufacture'):
+            self.assertIn(term, guide)
+        for agent in ('server-support', 'migration-operator'):
+            text = (agents / agent / 'system.md').read_text()
+            with self.subTest(agent=agent):
+                self.assertIn('migration-data in', text)
+                self.assertIn('exact job ID', text)
+                self.assertIn('approval', text)
+                self.assertNotIn('    - name: data_job\n', (agents / agent / 'agent.yaml').read_text())
+
+    def test_supporting_node_recovery_guidance_requires_paired_build_not_retries(self):
+        agents = ROOT / 'integrations/term-llm'
+        prompt = (agents / 'migration-data/system.md').read_text()
+        definition = (agents / 'migration-data/agent.yaml').read_text()
+        listing = definition.split('    - name: data_supporting_list\n', 1)[1].split('    - name:', 1)[0]
+        for text in (prompt, listing):
+            for term in ('STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED', 'silo doctor', 'TERM_LLM_PACKAGE',
+                         'new migration-data chat', 'before', 'scripts'):
+                with self.subTest(term=term):
+                    self.assertIn(term, text)
+        self.assertIn('pre-lock chats are not silently retrofitted', prompt)
+        self.assertIn('proves neither presence nor absence', prompt)
+        self.assertIn('new chat alone cannot supply missing native', prompt)
+
     def test_no_agent_declares_a_workspace_argument(self):
         import re
         for agent in ('migration-data', 'converter-developer', 'converter-reviewer', 'migration-operator'):

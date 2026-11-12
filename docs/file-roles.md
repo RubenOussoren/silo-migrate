@@ -80,6 +80,16 @@ retrying. An affected active run blocks correction; unrelated reference work mus
 not stop an unrelated run. Only the engineer can confirm these actions; no agent
 mutation tool is provided.
 
+If the preview lists an active `job-` dependency but nothing appears to be running,
+ask **migration-data in that project's private chat** about the exact job ID.
+The preview reads saved status, not container liveness. The agent's
+`job-recovery` skill includes a bounded stale-job recovery procedure: distinguish a
+real blocker from a floating lock-refusal toast, explain `data_job`'s finalization
+and cleanup effects, obtain explicit approval for old-job recovery, reconcile that
+job once, then ask for a fresh correction preview. This is not a failed-job rerun,
+automatic file correction or reset. Server-support/migration-operator must route
+this to migration-data rather than opening customer records themselves.
+
 The page pauses its own background refreshes while checking or saving an
 assignment, and waits for refresh requests already sent to finish before sending
 the preview or confirmation. Polling resumes afterwards, including after a refused

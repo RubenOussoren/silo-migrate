@@ -60,6 +60,32 @@ forum review; native Discourse merge uses uploads inside the original full backu
 
 Stock term-llm **0.9.99 does not implement these new interfaces**. A tools/YAML-only update is insufficient. Supporting tools fail closed with `STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED` when the protected context is absent; do not work around this with raw paths, generic filesystem tools or a coding provider.
 
+### Persistent `STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED`
+
+This refusal comes from the Python tool adapter before it calls the project
+supporting-file backend: the native tool host has not supplied a valid protected
+session marker, session ID and upload-context manifest. Successful unrelated tools
+or an up-to-date Silo release do not establish that native support is installed.
+There is no separate supporting-file service/package to restart independently:
+the paired term-llm host supplies context to its fixed tool subprocess.
+
+Ask the operator for sanitized `silo doctor` capability results and the selected
+service-account binary's `--version` and `capabilities --json` output. A warning
+about private attachments confirms the checked binary has not demonstrated the
+required capabilities; it does not provide its exact build stamp or establish
+whether project references exist. Fix/verify the paired package using the custody
+and approval procedure below, not another ordinary stock update or an environment
+variable forged into a tool call. Installation/update restarts the web service.
+After verified installation, use a **new migration-data chat in the same project**;
+a new chat alone cannot fix a missing binary, and pre-lock chats are not retrofitted.
+
+Files-tab admission/correction and protected chat reading have separate gates.
+A successful admission may already have preserved reference custody even while
+chat tools refuse. Do not infer absence, automatically re-admit, or relabel a
+reference as source just to read it. Establish the capability first, then inspect
+project reference metadata through the protected tool path under the appropriate
+customer-data approval. Use invented data for node acceptance before customer reads.
+
 The reviewed native patch is `integrations/term-llm/patches/private-attachments.patch`, based on the exact commit in `runtime/private-node-source.json`. That source receipt binds the patch SHA-256. Native support can be checked without inference:
 
 ```sh

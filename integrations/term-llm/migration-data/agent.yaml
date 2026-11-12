@@ -16,7 +16,7 @@ max_turns: 60
 # ~/.config/term-llm/skills). term-llm 0.9.93 can't give an agent a subset: a bare name list
 # turns model activation off, and ",+" lists these first but shows every installed skill.
 # Every shipped skill is this agent's, so ",+" is exactly this set; the other agents have none.
-skills: "migration-guide,intake-basics,sql-dump,export-to-sql,uploads-sorting,source-profile,count-reconciliation,path-converter,mybb,+"
+skills: "migration-guide,job-recovery,intake-basics,sql-dump,export-to-sql,uploads-sorting,source-profile,count-reconciliation,path-converter,mybb,+"
 tools:
   enabled: [update_plan]
   custom:
@@ -30,7 +30,7 @@ tools:
         properties: {}
         additionalProperties: false
     - name: data_status
-      description: "Overview of a workspace: drop folder contents, registered inputs (IDs, paths, types, sizes, SHA-256), work folders, recent jobs, the source database. Start here."
+      description: "Overview of a workspace: drop folder contents, registered inputs (IDs, paths, types, sizes, SHA-256), work folders, the ten most recent jobs, the source database. Job statuses are saved metadata, not a container-liveness check; absence from this recent list does not prove a job is gone. For stale-job recovery use job-recovery; data_job reconciliation has side effects and needs approval for old work."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70
@@ -39,7 +39,7 @@ tools:
         properties: {}
         additionalProperties: false
     - name: data_supporting_list
-      description: "List this project's active private supporting/reference files (admitted by the engineer from intake or registered from chat) and uploaded files admitted to this locked chat. Use after a reference is classified on Files or attached here. Returns opaque refs/IDs, names, sizes and checksums, never arbitrary host paths. References do not replace source snapshots or Base. Requires paired native private-upload context support."
+      description: "List this project's active private supporting/reference files (admitted by the engineer from intake or registered from chat) and uploaded files admitted to this locked chat. Use after a reference is classified on Files or attached here. Returns opaque refs/IDs, names, sizes and checksums, never arbitrary host paths. References do not replace source snapshots or Base. Registered references can exist even when this call fails before querying them. STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED means missing protected context: ask for sanitized silo doctor capability output, not repeated retries. Ordinary Silo source update/new chat alone cannot supply missing native support; require the reviewed paired TERM_LLM_PACKAGE, approved update/restart and then a new migration-data chat in the same project. Do not bypass with source reclassification, paths or scripts. Requires paired native private-upload context support."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70
@@ -173,7 +173,7 @@ tools:
         required: [path, into]
         additionalProperties: false
     - name: data_job
-      description: "Status of a job (script, extract or db_load): running, succeeded, failed, timed_out; exit code, log tail and the files it wrote."
+      description: "Poll/reconcile one job (script, extract or db_load); returns status, exit/OOM flags, private log tail and outputs. NOT read-only: may record completion, retain logs, remove the job container, and harden/check the DB read-only account after a load; low disk may stop a running non-load job. For recovery of an old job blocking Files, explain effects and get explicit approval first; a status question is not approval. Normal polling of already-authorized work remains its lifecycle. Exit 137/non-OOM is classified timed_out, not proven cause; finished_at may be reconciliation time. Never automatically rerun work or confirm assignments."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 130
