@@ -446,6 +446,34 @@ module SiloMigrate
         environment["updated_at"] = now
       end
 
+      # After a failed or interrupted run is recorded, under the op lock and outside the state
+      # lock (the order reset uses): inspection access opened by this run is closed, and so is
+      # the preparation's once its environment became dirty. A released, still-ready environment
+      # keeps its own access. The recorded failure, phase and generation are never changed; a
+      # fence that can't be proven is reported as a fixed fact, and reset retries it.
+      def merge_failure_fence(run_id)
+        state = @store.load
+        run = state.fetch("runs")[run_id]
+        # Released: claimed but never fenced or opened anything, and the environment stays ready.
+        return unless run && run["merge_environment"].is_a?(Hash) && run.dig("merge_environment", "phase") != "released" &&
+                      %w[failed interrupted].include?(run["status"])
+
+        environment = merge_environment_record(state, run)
+        ids = [run_id]
+        ids << environment["preparation_run_id"] if environment && environment["phase"] == "dirty" && environment["preparation_run_id"] != run_id
+        # Every owned access is attempted, whatever an earlier one did.
+        attempts = ids.uniq.map do |id|
+          merge_inspection_close(id)
+          true
+        rescue StandardWorkflowError
+          false
+        end
+        fenced = attempts.all?
+        @store.update do |current|
+          (current.fetch("runs").fetch(run_id).fetch("results")["merge"] ||= {})["inspection_fence"] = fenced ? "closed" : "unproven"
+        end
+      end
+
       # -- preparation stages -----------------------------------------------------------
 
       def prepare_preflight(run_id, plan)
@@ -751,7 +779,10 @@ module SiloMigrate
         manifest.each { |input| input["role"] = body.fetch("roles").key(input.fetch("id")) }
         @store.write_private(@store.run_dir(run_id, "work", "inputs.json"), JSON.pretty_generate(manifest) + "\n")
         snapshot_helpers(run_id)
-        if body["intent"] == "custom"
+        if body["intent"] == "custom" && merger_store_layer?(body.dig("merge", "layer"))
+          merger_extract!(run_id, body.dig("merge", "layer"))
+        elsif body["intent"] == "custom"
+          # An older prepared custom plan bound a converter-held layer: run exactly that one.
           config = @store.load.fetch("config")
           layer, files = merge_layer!(config.fetch("converter_worktree"), body.fetch("converter_revision"), @workspace)
           raise StandardWorkflowError, "STANDARD_MERGE_LAYER_INVALID" unless layer == body.dig("merge", "layer") && layer["present"] == true

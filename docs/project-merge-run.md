@@ -2,7 +2,7 @@
 
 A **merge run** brings one Discourse site (the **source site**) into another (the **target**, the customer's sandbox) with Discourse's own merger, `script/bulk_import/discourse_merger.rb`. Nothing is converted: there is no convert run, no intermediate database and no count checks. The run restores the target in a local review site, merges the source into it, takes a full backup and leaves the site up for the engineer to check.
 
-What is specific to one customer (which categories go where, what to skip) lives in a **merge layer**: a small Ruby file that converter-developer writes in the project's converter checkout. The tool supplies the frame; the node's agents write and review the layer.
+What is specific to one customer (which categories go where, what to skip) lives in a **merge layer**: Ruby code converter-developer writes in the project's standalone local `merger/` repository, with no remote (not Discourse core or discourse-converters). The tool supplies the frame; the node's agents write and review the layer.
 
 ## What the engineer does
 
@@ -25,12 +25,12 @@ The same automatic runtime selection and its limits as [Base-site review](projec
 
 Without a layer, the run is Discourse's merger exactly as shipped. To change what it does (route topics into other categories, skip some content, rename on collision), ask converter-developer in its own chat in the project. It calls `dev_merge_guide`, which states the contract and links the stock merger at the server's pinned Discourse revision.
 
-- The layer is `mergers/<project>/merger.rb` in the converter checkout, with any sibling `.rb` files it requires; tests go in `test/mergers/<project>/`.
+- New prepared custom merges use `merger.rb` at the root of `<workspace root>/merger/`, with optional `helpers/**/*.rb`; invented tests go under `test/`. The guide/status reports the actual Metal path for engineer review. Use `dev_merger_*` tools, not converter writes or push proposals. See [local merger development](merge-workflow-development.md).
 - It defines exactly **one subclass of `BulkImport::DiscourseMerger`** and overrides its methods, calling `super`. It does not reopen Discourse's classes.
-- A run applies the layer **as committed**: the plan names its path, commit, file count and checksum. A later commit makes the plan out of date; propose again.
-- Up to 32 regular `.rb` files, 512 KiB in total. Anything else under that folder is refused (`STANDARD_MERGE_LAYER_INVALID`).
+- A run applies the layer **as committed**: the plan names its path, commit, file count and checksum. A later commit does not replace the bound code; propose a new plan to use it.
+- Up to 32 regular `.rb` files, 512 KiB in total. Tests and README are not executed. Unsafe configuration, links, submodules or unexpected top-level files refuse (`STANDARD_MERGE_LAYER_INVALID` / `STANDARD_MERGER_CONFIG`). Legacy one-shot converter-held layers retain their previous folder-only contract only without a standalone store; otherwise propose a prepared merge with explicit stock/custom intent.
 
-**Customer values never go in the layer.** Category names, ids, user names and the like go in a **merge settings** file: migration-data writes a small YAML mapping with a data job, registers it as `merge-settings` and passes it to the proposal. The layer reads it from the path in `SILO_MERGE_SETTINGS`. migration-data tells converter-developer the key names and value shapes in a finding, with invented values; the engineer releases that finding as usual. The plan shows the settings file's text before approval.
+**Customer values never go in the layer.** Category names, ids, user names and the like go in a **merge settings** file: migration-data writes a safely loaded YAML root mapping (at most 256 KiB, aliases disabled) with a data job, registers it as `merge-settings` and passes it to the proposal. The layer reads it from the path in `SILO_MERGE_SETTINGS`. migration-data tells converter-developer the key names and value shapes in a finding, with invented values; the engineer releases that finding as usual. The plan shows the settings file's text before approval.
 
 The layer may report its own totals by printing lines of the form `SILO_MERGE_TOTAL: name=integer` (a lowercase name written out in the layer's code, up to 20 of them). The run keeps those and nothing else from the merger's output, and shows them to the engineer on the run and to migration-data. converter-developer is told only which commit ran, where a run stopped, the fixed site counts and how many totals were reported: a total's value reaches it when the engineer passes it on. The merge log stays private on the server; migration-data can read its end to explain a failure.
 
@@ -52,7 +52,7 @@ Refused before anything runs: a source site from a newer Discourse release than 
 
 - **No automatic count checks.** A merge joins users with the same email, categories and tags with the same name, and identical uploads, so the merged site rarely has the sum. The totals and the engineer's own check of the site are what there is; that is why release always asks.
 - **No accept or needs-changes verdict** on the pass yet, and no restore proof of the released backup.
-- **The layer's code is not shown on the page yet.** The plan names its path and commit: read it on the branch, and have converter-reviewer check it. The layer can write anything into the merged site (that is its job), and nothing checks afterwards that it wrote only what it should, so that review is the control.
+- **The layer's code is not shown on the page yet.** The plan names its path and commit: read the exact local path/commit the guide/status reports, and have converter-reviewer check it with the read-only merger tools. The layer can write anything into the merged site (that is its job), so code review and the required project-specific pre/postflight checks are the controls; they do not automatically establish every business requirement.
 - While the merged site is up it accepts uploads of any file type (the merger needs that). The setting is not in the backup.
 - **Uploads stored outside the backup** (S3) are not fetched: the source backup must contain its upload files. The target backup is SQL-only, so the local merged site does not show the target's own uploads.
 - **No hosted restore**, DNS or cutover. Those stay with the engineer.

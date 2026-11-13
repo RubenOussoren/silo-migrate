@@ -27,6 +27,141 @@ spawn:
 tools:
   enabled: [update_plan, spawn_agent, wait_agent]
   custom:
+    - name: dev_merger_init
+      description: "Create this project's standalone local merger repository with no remote. Does not prepare, reset or run a merge. Customer settings stay outside this checkout."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties: {}
+        additionalProperties: false
+    - name: dev_merger_list
+      description: "List a directory of the workspace's standalone local merger checkout: files tracked at HEAD (unchanged, or changed by the developer's tools) and files the developer created. Nothing else is ever shown."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          path: {type: string, description: "Directory relative to the checkout root; omit for the root"}
+        additionalProperties: false
+    - name: dev_merger_read
+      description: "Read a text file of the standalone local merger checkout from start_line, up to about 32 KB. Use next_line to continue."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          path: {type: string}
+          start_line: {type: integer, minimum: 1}
+        required: [path]
+        additionalProperties: false
+    - name: dev_merger_search
+      description: "Search the same files as dev_list (git grep). Fixed string by default; fixed=false for an extended regex."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          pattern: {type: string}
+          path: {type: string}
+          fixed: {type: boolean}
+          ignore_case: {type: boolean}
+        required: [pattern]
+        additionalProperties: false
+    - name: dev_merger_status
+      description: "Standalone local merger review path, committed identity and dirty state. No remote or push."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties: {}
+        additionalProperties: false
+    - name: dev_merger_diff
+      description: "Diff of visible uncommitted changes (scope working) or one local commit against its parent (scope commit; optional commit SHA). No remote operations."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          scope: {type: string, enum: [working, commit]}
+          path: {type: string}
+          commit: {type: string, pattern: "^[0-9a-f]{40}$"}
+        additionalProperties: false
+    - name: dev_merger_test
+      description: "Run invented test/..._test.rb tests in the pinned image with Ruby/minitest, no network, Bundler or Discourse, and only visible merger files. Stub the stock merger/models. Omit file for all tests."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 300
+      input:
+        type: object
+        properties:
+          suite: {type: string, enum: [test]}
+          file: {type: string}
+        additionalProperties: false
+    - name: dev_merger_write
+      description: "Create or replace a file in the standalone local merger checkout (not protected, ignored or Git-internal paths). Returns a diff."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          path: {type: string}
+          content: {type: string}
+        required: [path, content]
+        additionalProperties: false
+    - name: dev_merger_edit
+      description: "Replace exact text in a file of the standalone local merger checkout. old_text must match exactly once unless replace_all. Returns a diff."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          path: {type: string}
+          old_text: {type: string}
+          new_text: {type: string}
+          replace_all: {type: boolean}
+        required: [path, old_text, new_text]
+        additionalProperties: false
+    - name: dev_merger_delete
+      description: "Delete a file from the standalone local merger checkout."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          path: {type: string}
+        required: [path]
+        additionalProperties: false
+    - name: dev_merger_format
+      description: "Format visible Ruby files with syntax_tree in the no-network sandbox. No dependency installation. Use path for a Ruby file or folder; otherwise formats visible changed Ruby files."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 300
+      input:
+        type: object
+        properties:
+          path: {type: string, description: "A Ruby file or a folder, e.g. helpers"}
+        additionalProperties: false
+    - name: dev_merger_commit
+      description: "Commit visible merger code and invented tests locally as the engineer. No remote, push or PR. The engineer reviews the returned path/commit before any Merge plan."
+      script: scripts/dev_tool.py
+      call: json
+      timeout_seconds: 60
+      input:
+        type: object
+        properties:
+          message: {type: string, description: "Subject line (max 100 chars), blank line, body"}
+        required: [message]
+        additionalProperties: false
     - name: dev_list
       description: "List a directory of the workspace's converter checkout: files tracked at HEAD (unchanged, or changed by the developer's tools) and files the developer created. Nothing else is ever shown."
       script: scripts/dev_tool.py
@@ -104,7 +239,7 @@ tools:
         properties: {}
         additionalProperties: false
     - name: dev_merge_guide
-      description: "Merge projects (one Discourse site merged into another): how to write this project's merge layer, the Ruby file a merge run applies on top of Discourse's own merger. Returns the layer's path, the contract, the limits, the pinned Discourse revision with links to the stock merger's source, how to test it, what is committed so far, and the outcome of the latest merge runs (which layer commit ran, where it stopped, fixed site counts). Read it before writing or changing anything under mergers/."
+      description: "Standalone local merger contract, actual Metal review directory, committed layer and exact ready-Prepare Discourse revision with public source links. Works before local repository creation."
       script: scripts/dev_tool.py
       call: json
       timeout_seconds: 60

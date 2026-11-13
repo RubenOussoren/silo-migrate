@@ -24,6 +24,9 @@ module SiloMigrate
         unless options[:source].is_a?(String) && options[:base_site].is_a?(String) && ids.uniq.size == ids.size
           raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID"
         end
+        # Never silently ignore a standalone layer by taking the legacy converter path.
+        raise StandardWorkflowError, "STANDARD_MERGE_PREPARATION_REQUIRED" if merger_present?
+
         selection = select_review_runtime(options[:base_site], allow_unqualified: options.fetch(:allow_unqualified_runtime, false))
         with_review_runtime(selection.fetch("profile")) do
           build_merge_plan(**options, runtime_selection: selection)
@@ -37,7 +40,10 @@ module SiloMigrate
         raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless prepared ? StandardMergePreparation::MERGE_INTENTS.include?(intent) : intent.nil?
         # An explicit stock merge of a prepared environment uses no converter code at all.
         stock = prepared && intent == "stock"
-        raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless profile_current?(config) && (stock || check_converter!(config))
+        # A new prepared custom merge runs the project's standalone local merger store, and
+        # only it: never a converter checkout, so no converter identity is consulted either.
+        standalone = prepared && intent == "custom"
+        raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless profile_current?(config) && (stock || standalone || check_converter!(config))
         qualified = lock.dig("qualification", "status") == "qualified"
         review_ready = lock.dig("qualification", "status") == "review_ready"
         raise StandardWorkflowError, "STANDARD_RUNTIME_UNQUALIFIED" unless qualified || review_ready || allow_unqualified_runtime
@@ -59,7 +65,10 @@ module SiloMigrate
         # Settings are read by a merge layer only: a stock merge would silently ignore the mapping.
         raise StandardWorkflowError, "STANDARD_MERGE_INTENT_MISMATCH" if stock && settings
         merge_settings!(merge_settings_input!(inputs.fetch("settings"))) if settings
-        layer = stock ? { "present" => false } : merge_layer!(config.fetch("converter_worktree"), config.fetch("converter_revision"), @workspace).first
+        layer = if stock then { "present" => false }
+                elsif standalone then merger_proposal_layer!
+                else merge_layer!(config.fetch("converter_worktree"), config.fetch("converter_revision"), @workspace).first
+                end
         raise StandardWorkflowError, "STANDARD_MERGE_INTENT_MISMATCH" if prepared && intent == "custom" && layer["present"] != true
         plan_id = @store.new_id("plan")
         if prepared
@@ -91,8 +100,8 @@ module SiloMigrate
           "review_runtime" => runtime_selection.fetch("selection"), "base_site_generation" => review_base_generation,
           "image_content_ids" => lock.fetch("images").transform_values { |image| image.fetch("content_id") },
           "runtime_qualified" => qualified, "allow_unqualified_runtime" => allow_unqualified_runtime,
-          "converter" => stock ? nil : config["converter"], "converter_binding" => stock ? nil : config["converter_binding"],
-          "converter_revision" => stock ? nil : config["converter_revision"],
+          "converter" => stock || standalone ? nil : config["converter"], "converter_binding" => stock || standalone ? nil : config["converter_binding"],
+          "converter_revision" => stock || standalone ? nil : config["converter_revision"],
           "app_revision" => lock.dig("app", "revision"), "limits" => limits,
           "instances" => { "review" => instance },
           "outputs" => { "backup" => "validated full merged backup for #{plan_id}; engineer release to outbox" },
@@ -112,6 +121,8 @@ module SiloMigrate
           body["preparation"] = preparation_binding!(preparation, roles: roles, run_inputs: nil, code_readiness: readiness)
           body["not_included"] += preparation_not_included(body["preparation"])
         end
+        # Retained before the plan exists, so no stored plan names a collectable commit.
+        merger_retain!(plan_id, layer.fetch("revision")) if merger_store_layer?(layer)
         @store.update do |current|
           verify_file_role_proposal!(body, @store.named_state)
           current.fetch("plans")[plan_id] = { "id" => plan_id, "digest" => Digest::SHA256.hexdigest(canonical_json(body)), "body" => body,
@@ -209,7 +220,10 @@ module SiloMigrate
         return "delivery" unless base_record.slice("kind", "version") == body.dig("base_site", "delivery")
         return "code" unless body["code_identity"] == code_identity
         return "runtime" unless review_runtime_current?(body, state.fetch("config"))
-        unless body["prepared_from"] && body["intent"] == "stock"
+        if merger_store_layer?(body.dig("merge", "layer"))
+          # Exactly a prepared custom plan; its bound commit and manifest, never the converter.
+          return "merger" unless body["prepared_from"] && body["intent"] == "custom" && body["converter_revision"].nil? && merger_layer_current?(body.dig("merge", "layer"))
+        elsif !(body["prepared_from"] && body["intent"] == "stock")
           return "converter" unless check_converter!(state.fetch("config")) && state.dig("config", "converter_revision") == body["converter_revision"] && state.dig("config", "converter_binding") == body["converter_binding"]
         end
         return prepared_environment_stale_reason(plan, state) if body["prepared_from"]

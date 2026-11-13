@@ -20,6 +20,8 @@ module SiloMigrate
         init WORKSPACE [--converter-worktree PATH] [--discourse-profile NAME] [--site-settings PATH]
         runtime list
         runtime show NAME
+        merger init WORKSPACE                       (standalone local Git; no remote, no customer settings)
+        merger status WORKSPACE                     (actual local review path and committed layer)
         converter status WORKSPACE
         converter refresh WORKSPACE [--if-changed]    (--if-changed: keep plans valid when nothing changed)
         fixture register WORKSPACE --fixture-dir DIR --snapshot NAME [--label LABEL]
@@ -54,8 +56,8 @@ module SiloMigrate
         run recover WORKSPACE RUN_ID
         run reset WORKSPACE RUN_ID --yes
         finding review WORKSPACE FINDING_ID
-        finding release WORKSPACE FINDING_ID --file PATH --sha256 DIGEST --reviewer NAME [--reproduction PATH --reproduction-sha256 DIGEST]
-        finding reject WORKSPACE FINDING_ID --reviewer NAME
+        finding release WORKSPACE FINDING_ID --file PATH --sha256 DIGEST --expected-proposal-sha256 DIGEST --reviewer NAME [--reproduction PATH --reproduction-sha256 DIGEST]
+        finding reject WORKSPACE FINDING_ID --expected-proposal-sha256 DIGEST --reviewer NAME
         finding amend WORKSPACE FINDING_ID --file PATH|- --sha256 DIGEST --reviewer NAME   (replace a released finding)
         finding withdraw WORKSPACE FINDING_ID --reviewer NAME                            (take a released finding back)
 
@@ -64,6 +66,8 @@ module SiloMigrate
         analyst count WORKSPACE RUN_ID --side intermediate|destination --sql-file -   (SQL on stdin; one private count)
         finding propose WORKSPACE --run RUN_ID --file PATH|- [--kind finding|reproduction]
         finding propose WORKSPACE --kind schema --file PATH|-   (source schema; no run)
+        finding proposal WORKSPACE FINDING_ID                 (private proposed text and current revision digest)
+        finding revise WORKSPACE FINDING_ID --file PATH|- --expected-proposal-sha256 DIGEST
 
       Conversational adapter (safe projections only):
         agent status WORKSPACE
@@ -102,7 +106,7 @@ module SiloMigrate
         write_json(result)
         failed_run?(argv, result) ? 1 : 0
       rescue StandardWorkflowError => e
-        if %w[STANDARD_CONVERTER_DIRTY STANDARD_CONVERTER_CONFIG].include?(e.code)
+        if %w[STANDARD_CONVERTER_DIRTY STANDARD_CONVERTER_CONFIG STANDARD_MERGER_DIRTY STANDARD_MERGER_CONFIG STANDARD_MERGE_PREPARATION_REQUIRED].include?(e.code)
           @error.write("Error: #{e.code}. #{Services::StandardWorkflowService::RECOVERY.fetch(e.code)}\n")
           1
         elsif DETAILED.include?(e.code)
@@ -148,6 +152,15 @@ module SiloMigrate
           no_more!(args)
           service("runtime-catalog").profiles.show(name)
         else invalid!
+        end
+      when "merger"
+        action = args.shift
+        single_workspace(args) do |workspace|
+          case action
+          when "init" then service(workspace).merger_init
+          when "status" then service(workspace).merger_status
+          else invalid!
+          end
         end
       when "converter"
         action = args.shift
@@ -320,19 +333,23 @@ module SiloMigrate
         kind = opts.fetch("--kind", "finding")
         invalid! unless (kind == "schema") == opts["--run"].nil?
         findings(workspace).propose(run_id: opts["--run"], text: read_bounded(opts.fetch("--file")), kind: kind)
-      when "review"
+      when "review", "proposal"
         identifier = positional!(args)
         no_more!(args)
-        { version: 1, finding_id: identifier, status: "proposed", proposal: findings(workspace).review_text(identifier) }
+        findings(workspace).proposal(identifier)
+      when "revise"
+        identifier = positional!(args)
+        opts = options!(args, "--file", "--expected-proposal-sha256")
+        findings(workspace).revise(finding_id: identifier, text: read_bounded(opts.fetch("--file")), expected_proposal_sha256: opts.fetch("--expected-proposal-sha256"))
       when "release"
         identifier = positional!(args)
-        opts = options!(args, "--file", "--sha256", "--reviewer", "--reproduction", "--reproduction-sha256", optional: %w[--reproduction --reproduction-sha256])
+        opts = options!(args, "--file", "--sha256", "--reviewer", "--expected-proposal-sha256", "--reproduction", "--reproduction-sha256", optional: %w[--reproduction --reproduction-sha256])
         reproduction = opts["--reproduction"] && read_bounded(opts["--reproduction"])
-        findings(workspace).release(finding_id: identifier, released_text: read_bounded(opts.fetch("--file")), sha256: opts.fetch("--sha256"), reviewer: opts.fetch("--reviewer"), reproduction: reproduction, reproduction_sha256: opts["--reproduction-sha256"])
+        findings(workspace).release(finding_id: identifier, released_text: read_bounded(opts.fetch("--file")), sha256: opts.fetch("--sha256"), reviewer: opts.fetch("--reviewer"), expected_proposal_sha256: opts.fetch("--expected-proposal-sha256"), reproduction: reproduction, reproduction_sha256: opts["--reproduction-sha256"])
       when "reject"
         identifier = positional!(args)
-        opts = options!(args, "--reviewer")
-        findings(workspace).reject(finding_id: identifier, reviewer: opts.fetch("--reviewer"))
+        opts = options!(args, "--reviewer", "--expected-proposal-sha256")
+        findings(workspace).reject(finding_id: identifier, reviewer: opts.fetch("--reviewer"), expected_proposal_sha256: opts.fetch("--expected-proposal-sha256"))
       when "amend"
         identifier = positional!(args)
         opts = options!(args, "--file", "--sha256", "--reviewer")

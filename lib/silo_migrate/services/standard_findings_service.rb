@@ -18,6 +18,10 @@ module SiloMigrate
     # an OS sandbox; OS/container isolation of the analyst is a separate control.
     class StandardFindingsService
       MAX_BYTES = 256 * 1024
+      # A proposal and its revisions are kept, each immutable, so this bounds them per finding
+      # (at most MAX_REVISIONS * MAX_BYTES on disk). Past it, a new finding is proposed instead.
+      MAX_REVISIONS = 20
+      SHA256 = /\A[0-9a-f]{64}\z/
       # schema: tables, columns, counts and invented examples of a source, proposed by the
       # data agent from the project's source data. It belongs to no run.
       KINDS = %w[finding reproduction schema].freeze
@@ -55,26 +59,81 @@ module SiloMigrate
         @store = StandardStore.new(workspace, env: env)
       end
 
-      # Trusted analyst path. Returns only an ID: content is never echoed back.
+      # Trusted analyst path. Returns an ID, the revision and the proposal's digest: content
+      # is never echoed back.
       # A completed full run has nothing to diagnose, so it gets no finding. A completed
       # convert run does: its reconciliation differences are what converter work fixes.
       def propose(run_id:, text:, kind: "finding")
-        raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless KINDS.include?(kind) && text.is_a?(String) && text.bytesize.between?(1, MAX_BYTES) && text.valid_encoding?
+        raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless KINDS.include?(kind) && utf8_text?(text)
 
         id = @store.new_id("finding")
         raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless (kind == "schema") == run_id.nil?
 
+        digest = Digest::SHA256.hexdigest(text)
         @store.update do |state|
           unless kind == "schema"
             raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless state.fetch("runs").key?(run_id)
             raise StandardWorkflowError, "STANDARD_RUN_COMPLETED" if state.fetch("runs").fetch(run_id)["status"] == "completed" && !convert_run?(state, run_id)
           end
 
-          @store.write_private(@store.finding_dir(id, "private", "proposal.txt"), text)
+          @store.write_private(proposal_path(id, 1), text)
           state.fetch("findings")[id] = { "id" => id, "run_id" => run_id, "kind" => kind, "status" => "proposed", "proposed_at" => Time.now.utc.iso8601,
-                                          "proposal_sha256" => Digest::SHA256.hexdigest(text), "release" => nil }
+                                          "proposal_sha256" => digest, "proposal_revision" => 1, "release" => nil }
         end
-        { version: 1, finding_id: id, status: "proposed" }
+        { version: 1, finding_id: id, status: "proposed", proposal_revision: 1, proposal_sha256: digest }
+      end
+
+      # Trusted analyst path. Replaces the text of a finding of this workspace that is still
+      # proposed; its ID, kind and run stay as they are, and nothing is released by it. The
+      # caller names the proposal it is replacing (expected_proposal_sha256): if another
+      # revision or a decision came first, this refuses and nothing changes.
+      #
+      # Each revision is a new private file that is never rewritten (revision 1 stays in
+      # proposal.txt, so a finding proposed before revisions existed is simply at revision 1).
+      # The record lists every revision's digest, size and time; the list is private and
+      # bounded by MAX_REVISIONS. Returns metadata only: content is never echoed back.
+      def revise(finding_id:, text:, expected_proposal_sha256:)
+        raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless utf8_text?(text) && digest?(expected_proposal_sha256)
+
+        digest = Digest::SHA256.hexdigest(text)
+        @store.update do |state|
+          record = state.fetch("findings")[finding_id]
+          raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless record
+
+          current_proposal!(finding_id, record, expected_proposal_sha256)
+          raise StandardWorkflowError, "STANDARD_REVISION_UNCHANGED" if digest == record["proposal_sha256"]
+
+          history = proposal_history(finding_id, record)
+          revision = history.size + 1
+          raise StandardWorkflowError, "STANDARD_REVISION_LIMIT" if revision > MAX_REVISIONS
+
+          now = Time.now.utc.iso8601
+          # Written before the state that names it: if that write fails, this file is not a
+          # revision (nothing refers to it) and the next attempt replaces it.
+          @store.write_private(proposal_path(finding_id, revision), text)
+          record["proposal_revisions"] = history + [{ "revision" => revision, "sha256" => digest, "bytes" => text.bytesize, "at" => now }]
+          record["proposal_revision"] = revision
+          record["proposal_sha256"] = digest
+          record["proposal_revised_at"] = now
+          { version: 1, finding_id: finding_id, status: "proposed", proposal_revision: revision, proposal_sha256: digest, bytes: text.bytesize }
+        end
+      end
+
+      # Trusted analyst and engineer path: one finding's current private proposal, with the
+      # revision and digest a later revise, release or reject must name. Its status says
+      # whether it can still be revised. Never reachable from `standard agent`; do not
+      # expose it to a coding session. The state and the immutable revision file it names
+      # are read without the lock: a concurrent revision shows either the old or the new one.
+      def proposal(finding_id)
+        record = record!(finding_id)
+        # An amendment has no proposal of its own: it is the engineer's text.
+        raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless record["proposal_sha256"]
+
+        text = read_proposal!(finding_id, record)
+        # The digest is of the stored bytes; text that is not UTF-8 (older proposals were not
+        # checked) is shown with replacement characters so it can still be read and replaced.
+        { version: 1, finding_id: finding_id, status: record["status"], proposal: text.force_encoding(Encoding::UTF_8).scrub,
+          proposal_revision: proposal_revision(record), proposal_sha256: record["proposal_sha256"] }
       end
 
       # Trusted analyst path only. Bounded read of one run's private evidence. Never
@@ -122,16 +181,13 @@ module SiloMigrate
 
       # Engineer path: the private proposal, plus exact-digest gated release.
       def review_text(finding_id)
-        record!(finding_id)
-        path = @store.finding_dir(finding_id, "private", "proposal.txt")
-        # An amendment has no proposal of its own: it is the engineer's text.
-        raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless File.file?(path)
-
-        File.read(path)
+        proposal(finding_id).fetch(:proposal)
       end
 
-      def reject(finding_id:, reviewer:)
-        decide(finding_id, reviewer) do |record|
+      # Like release, a rejection names the proposal the engineer saw (expected_proposal_sha256):
+      # a revision they have not read is not rejected from a stale page.
+      def reject(finding_id:, reviewer:, expected_proposal_sha256:)
+        decide(finding_id, reviewer, proposal: expected_proposal_sha256) do |record|
           record["status"] = "rejected"
           record["rejected_by"] = reviewer
           record["rejected_at"] = Time.now.utc.iso8601
@@ -143,7 +199,7 @@ module SiloMigrate
       # that replaces it. Coding agents then see only the replacement; the old one is
       # kept, marked superseded, for the record.
       def amend(finding_id:, released_text:, sha256:, reviewer:)
-        raise StandardWorkflowError, "STANDARD_APPROVAL_MISMATCH" unless released_text.is_a?(String) && released_text.bytesize.between?(1, MAX_BYTES) && released_text.valid_encoding? && Digest::SHA256.hexdigest(released_text) == sha256
+        raise StandardWorkflowError, "STANDARD_APPROVAL_MISMATCH" unless utf8_text?(released_text) && Digest::SHA256.hexdigest(released_text) == sha256
 
         id = @store.new_id("finding")
         decide(finding_id, reviewer, from: "released") do |record, state|
@@ -179,13 +235,16 @@ module SiloMigrate
 
       # The released text is engineer-authored or engineer-reviewed and need not equal
       # the proposal. Stored separately; only that derivative is ever projected.
-      def release(finding_id:, released_text:, sha256:, reviewer:, reproduction: nil, reproduction_sha256: nil)
-        raise StandardWorkflowError, "STANDARD_APPROVAL_MISMATCH" unless released_text.is_a?(String) && released_text.bytesize.between?(1, MAX_BYTES) && released_text.valid_encoding? && Digest::SHA256.hexdigest(released_text) == sha256
+      # Two digests, two questions: sha256 is the text being released; expected_proposal_sha256
+      # is the proposal revision the engineer read before writing it. If the proposal was
+      # revised (or decided) since, this refuses: nothing is released on an unread revision.
+      def release(finding_id:, released_text:, sha256:, reviewer:, expected_proposal_sha256:, reproduction: nil, reproduction_sha256: nil)
+        raise StandardWorkflowError, "STANDARD_APPROVAL_MISMATCH" unless utf8_text?(released_text) && Digest::SHA256.hexdigest(released_text) == sha256
         unless reproduction.nil? == reproduction_sha256.nil? && (reproduction.nil? || (reproduction.bytesize <= MAX_BYTES && Digest::SHA256.hexdigest(reproduction) == reproduction_sha256))
           raise StandardWorkflowError, "STANDARD_APPROVAL_MISMATCH"
         end
 
-        decide(finding_id, reviewer) do |record|
+        decide(finding_id, reviewer, proposal: expected_proposal_sha256) do |record|
           @store.write_private(@store.finding_dir(finding_id, "released", "summary.txt"), released_text)
           @store.write_private(@store.finding_dir(finding_id, "released", "reproduction.txt"), reproduction) if reproduction
           record["status"] = "released"
@@ -333,16 +392,81 @@ module SiloMigrate
         @store.load.fetch("findings")[finding_id] || raise(StandardWorkflowError, "STANDARD_REFERENCE_INVALID")
       end
 
-      def decide(finding_id, reviewer, from: "proposed")
+      # A decision on a proposed finding always names the proposal it is about (`proposal`,
+      # a digest): there is no fallback for a missing one. Amend and withdraw act on a
+      # released finding and have no proposal to name.
+      def decide(finding_id, reviewer, from: "proposed", proposal: nil)
         raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless reviewer.is_a?(String) && reviewer.match?(/\A[[:print:]]{1,120}\z/)
+        raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless from != "proposed" || digest?(proposal)
 
         @store.update do |state|
           record = state.fetch("findings")[finding_id]
           raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless record
-          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless record["status"] == from
+
+          if from == "proposed"
+            current_proposal!(finding_id, record, proposal)
+          else
+            raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless record["status"] == from
+          end
 
           yield record, state
         end
+      end
+
+      def digest?(value)
+        value.is_a?(String) && value.match?(SHA256)
+      end
+
+      # Bounded UTF-8, whatever encoding the string is tagged with (stdin arrives as binary).
+      def utf8_text?(text)
+        text.is_a?(String) && text.bytesize.between?(1, MAX_BYTES) && text.dup.force_encoding(Encoding::UTF_8).valid_encoding?
+      end
+
+      def proposal_path(finding_id, revision)
+        @store.finding_dir(finding_id, "private", revision == 1 ? "proposal.txt" : "proposal-#{revision}.txt")
+      end
+
+      # A record written before revisions existed has no number: it is at revision 1.
+      def proposal_revision(record)
+        revision = record.fetch("proposal_revision", 1)
+        raise StandardWorkflowError, "STANDARD_PROPOSAL_TAMPERED" unless revision.is_a?(Integer) && revision.between?(1, MAX_REVISIONS)
+
+        revision
+      end
+
+      # The current proposal's bytes, only if they are still what the record says.
+      def read_proposal!(finding_id, record)
+        path = proposal_path(finding_id, proposal_revision(record))
+        raise StandardWorkflowError, "STANDARD_PROPOSAL_TAMPERED" unless File.file?(path) && !File.symlink?(path) && File.size(path) <= MAX_BYTES
+
+        text = File.binread(path)
+        raise StandardWorkflowError, "STANDARD_PROPOSAL_TAMPERED" unless Digest::SHA256.hexdigest(text) == record["proposal_sha256"]
+
+        text
+      end
+
+      # Call inside the store lock, so the answer and what the caller then writes are one
+      # step: the finding is still proposed, its current proposal is the one the caller
+      # saw, and the bytes on disk are that proposal.
+      def current_proposal!(finding_id, record, expected_sha256)
+        raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" unless record["status"] == "proposed"
+        raise StandardWorkflowError, "STANDARD_PROPOSAL_CHANGED" unless record["proposal_sha256"] == expected_sha256
+
+        read_proposal!(finding_id, record)
+      end
+
+      # Every revision so far, oldest first. A record that has never been revised has no
+      # list yet: its one revision is described from the record itself.
+      def proposal_history(finding_id, record)
+        revision = proposal_revision(record)
+        history = record["proposal_revisions"]
+        if history.nil? && revision == 1
+          return [{ "revision" => 1, "sha256" => record["proposal_sha256"], "bytes" => File.size(proposal_path(finding_id, 1)), "at" => record["proposed_at"] }]
+        end
+        valid = history.is_a?(Array) && history.size == revision && history.last.is_a?(Hash) && history.last["sha256"] == record["proposal_sha256"]
+        raise StandardWorkflowError, "STANDARD_PROPOSAL_TAMPERED" unless valid
+
+        history
       end
     end
   end

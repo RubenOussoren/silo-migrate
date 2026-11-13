@@ -53,10 +53,10 @@ try {
       assert.equal(body.run_id, runId); assert.equal(body.verdict, 'accepted');
       return json({ verdict: 'accepted' });
     }
-    if (path === 'api/findings/finding') return json({ id: findingId, kind: 'schema', status: released ? 'released' : 'proposed', versions: [], proposal: `${project} original proposal`, released: released ? releasedText : null });
+    if (path === 'api/findings/finding') return json({ id: findingId, kind: 'schema', status: released ? 'released' : 'proposed', versions: [], proposal: `${project} original proposal`, proposal_revision: 1, proposal_sha256: 'a'.repeat(64), released: released ? releasedText : null });
     if (path === 'api/findings/release') {
       const body = request.postDataJSON();
-      assert.equal(body.workspace, 'alpha'); assert.equal(body.id, findingId);
+      assert.equal(body.workspace, 'alpha'); assert.equal(body.id, findingId); assert.equal(body.proposal_sha256, 'a'.repeat(64));
       assert.equal(request.headers()['x-silo-project'], '1');
       releasedText = body.text; released = true; revision++;
       return json({ status: 'released', finding_id: findingId });

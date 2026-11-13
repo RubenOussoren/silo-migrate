@@ -32,6 +32,14 @@ class StandardPrivacyTest < SiloMigrateTest
     [code, out.string, err.string]
   end
 
+  def cli_stdin(text, *args)
+    original = $stdin
+    $stdin = StringIO.new(text.b)
+    cli(*args)
+  ensure
+    $stdin = original
+  end
+
   def test_status_show_run_show_plan_do_not_expose_private_material
     with_standard do
       add_standard_input('binary', MARKER, name: MARKER)
@@ -51,9 +59,9 @@ class StandardPrivacyTest < SiloMigrateTest
       run_id = claim(plan)
       plant_private_material(run_id)
       findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
-      finding_id = findings.propose(run_id: run_id, text: MARKER)[:finding_id]
+      finding_id, viewed = findings.propose(run_id: run_id, text: MARKER).values_at(:finding_id, :proposal_sha256)
       derivative = "Reviewed synthetic finding.\n"
-      findings.release(finding_id: finding_id, released_text: derivative, sha256: Digest::SHA256.hexdigest(derivative), reviewer: 'engineer')
+      findings.release(finding_id: finding_id, released_text: derivative, sha256: Digest::SHA256.hexdigest(derivative), reviewer: 'engineer', expected_proposal_sha256: viewed)
       # All supported agent commands, plus refusal of the removed run-request verb.
       [['status', 'synthetic'], ['plan-propose', 'synthetic', '--dataset', @dataset], ['plan-show', 'synthetic', plan[:plan_id]],
        ['run-request', 'synthetic', plan[:plan_id]], ['run-claim', 'synthetic', plan[:plan_id]], ['run-execute', 'synthetic', run_id], ['run-show', 'synthetic', run_id], ['findings', 'synthetic'], ['finding-show', 'synthetic', finding_id]].each do |args|
@@ -91,7 +99,7 @@ class StandardPrivacyTest < SiloMigrateTest
     with_standard do
       run_id = claim
       findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
-      id = findings.propose(run_id: run_id, text: "#{MARKER} #{PASSWORD} #{@root}")[:finding_id]
+      id, viewed = findings.propose(run_id: run_id, text: "#{MARKER} #{PASSWORD} #{@root}").values_at(:finding_id, :proposal_sha256)
       assert_empty findings.released_list[:findings]
       standard_error('STANDARD_NOT_RELEASED') { findings.released_show(id) }
       code, out, err = cli('agent', 'finding-show', 'synthetic', id)
@@ -100,10 +108,10 @@ class StandardPrivacyTest < SiloMigrateTest
       assert_includes err, 'STANDARD_NOT_RELEASED'
       released = "Reviewed derivative \u2603\n\n"
       reproduction = "Synthetic reproduction\n"
-      standard_error('STANDARD_APPROVAL_MISMATCH') { findings.release(finding_id: id, released_text: released, sha256: '0' * 64, reviewer: 'engineer') }
+      standard_error('STANDARD_APPROVAL_MISMATCH') { findings.release(finding_id: id, released_text: released, sha256: '0' * 64, reviewer: 'engineer', expected_proposal_sha256: viewed) }
       assert_empty findings.released_list[:findings]
       findings.release(finding_id: id, released_text: released, sha256: Digest::SHA256.hexdigest(released), reviewer: 'engineer',
-        reproduction: reproduction, reproduction_sha256: Digest::SHA256.hexdigest(reproduction))
+        expected_proposal_sha256: viewed, reproduction: reproduction, reproduction_sha256: Digest::SHA256.hexdigest(reproduction))
       assert_equal [id], findings.released_list[:findings].map { |entry| entry[:finding_id] }
       view = findings.released_show(id)
       assert_equal released.b, view[:summary].b
@@ -123,7 +131,7 @@ class StandardPrivacyTest < SiloMigrateTest
       findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
       standard_error('STANDARD_ARGUMENT_INVALID') { findings.propose(run_id: nil, text: 'x') }
       standard_error('STANDARD_ARGUMENT_INVALID') { findings.propose(run_id: claim, text: 'x', kind: 'schema') }
-      id = findings.propose(run_id: nil, text: "#{MARKER} users(uid int)", kind: 'schema')[:finding_id]
+      id, viewed = findings.propose(run_id: nil, text: "#{MARKER} users(uid int)", kind: 'schema').values_at(:finding_id, :proposal_sha256)
       assert_empty findings.released_list[:findings]
       code, out, err = cli('finding', 'propose', 'synthetic', '--file', '/dev/null')
       assert_equal [1, ''], [code, out]
@@ -132,7 +140,7 @@ class StandardPrivacyTest < SiloMigrateTest
       assert_equal 1, code
       assert_includes err, 'STANDARD_ARGUMENTS_INVALID'
       released = "users: uid int, username varchar(120); example user_1\n"
-      findings.release(finding_id: id, released_text: released, sha256: Digest::SHA256.hexdigest(released), reviewer: 'engineer')
+      findings.release(finding_id: id, released_text: released, sha256: Digest::SHA256.hexdigest(released), reviewer: 'engineer', expected_proposal_sha256: viewed)
       listed = findings.released_list[:findings]
       assert_equal [[id, 'schema', nil]], listed.map { |entry| entry.values_at(:finding_id, :kind, :run_id) }
       code, out, _err = cli('agent', 'finding-show', 'synthetic', id)
@@ -145,12 +153,12 @@ class StandardPrivacyTest < SiloMigrateTest
   def test_amend_replaces_a_release_and_withdraw_takes_one_back
     with_standard do
       findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
-      first = findings.propose(run_id: nil, text: 'schema v1', kind: 'schema')[:finding_id]
+      first, viewed = findings.propose(run_id: nil, text: 'schema v1', kind: 'schema').values_at(:finding_id, :proposal_sha256)
       digest = ->(text) { Digest::SHA256.hexdigest(text) }
       # Only a released finding can be amended or withdrawn.
       standard_error('STANDARD_TRANSITION_INVALID') { findings.amend(finding_id: first, released_text: 'x', sha256: digest.('x'), reviewer: 'engineer') }
       standard_error('STANDARD_TRANSITION_INVALID') { findings.withdraw(finding_id: first, reviewer: 'engineer') }
-      findings.release(finding_id: first, released_text: 'released v1', sha256: digest.('released v1'), reviewer: 'engineer')
+      findings.release(finding_id: first, released_text: 'released v1', sha256: digest.('released v1'), reviewer: 'engineer', expected_proposal_sha256: viewed)
       standard_error('STANDARD_APPROVAL_MISMATCH') { findings.amend(finding_id: first, released_text: 'v2', sha256: digest.('other'), reviewer: 'engineer') }
       amended = findings.amend(finding_id: first, released_text: 'released v2: -2 are drafts', sha256: digest.('released v2: -2 are drafts'), reviewer: 'engineer')
       second = amended[:finding_id]
@@ -170,8 +178,8 @@ class StandardPrivacyTest < SiloMigrateTest
       assert_empty findings.released_list[:findings]
       standard_error('STANDARD_NOT_RELEASED') { findings.released_show(second) }
       assert @service.store.load.fetch('findings').fetch(second)['withdrawn_at']
-      rejected = findings.propose(run_id: nil, text: 'other', kind: 'schema')[:finding_id]
-      findings.reject(finding_id: rejected, reviewer: 'engineer')
+      rejected, viewed = findings.propose(run_id: nil, text: 'other', kind: 'schema').values_at(:finding_id, :proposal_sha256)
+      findings.reject(finding_id: rejected, reviewer: 'engineer', expected_proposal_sha256: viewed)
       assert @service.store.load.fetch('findings').fetch(rejected)['rejected_at']
       # The CLI grammar for both.
       code, out, _err = cli('finding', 'withdraw', 'synthetic', rejected, '--reviewer', 'engineer')
@@ -186,9 +194,9 @@ class StandardPrivacyTest < SiloMigrateTest
   def test_amend_keeps_a_released_reproduction
     with_standard do
       findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
-      id = findings.propose(run_id: claim, text: 'cause')[:finding_id]
+      id, viewed = findings.propose(run_id: claim, text: 'cause').values_at(:finding_id, :proposal_sha256)
       findings.release(finding_id: id, released_text: 'v1', sha256: Digest::SHA256.hexdigest('v1'), reviewer: 'engineer',
-        reproduction: 'repro', reproduction_sha256: Digest::SHA256.hexdigest('repro'))
+        expected_proposal_sha256: viewed, reproduction: 'repro', reproduction_sha256: Digest::SHA256.hexdigest('repro'))
       second = findings.amend(finding_id: id, released_text: 'v2', sha256: Digest::SHA256.hexdigest('v2'), reviewer: 'engineer')[:finding_id]
       assert_equal 'repro', findings.released_show(second)[:reproduction]
       @service.store.write_private(@service.store.finding_dir(second, 'released', 'reproduction.txt'), MARKER)
@@ -199,18 +207,94 @@ class StandardPrivacyTest < SiloMigrateTest
 
   def test_tampered_reproduction_refused
     with_standard do
-      id = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env).propose(run_id: claim, text: MARKER)[:finding_id]
+      id, viewed = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env).propose(run_id: claim, text: MARKER).values_at(:finding_id, :proposal_sha256)
       findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
       findings.release(finding_id: id, released_text: 'safe', sha256: Digest::SHA256.hexdigest('safe'), reviewer: 'engineer',
-        reproduction: 'repro', reproduction_sha256: Digest::SHA256.hexdigest('repro'))
+        expected_proposal_sha256: viewed, reproduction: 'repro', reproduction_sha256: Digest::SHA256.hexdigest('repro'))
       @service.store.write_private(@service.store.finding_dir(id, 'released', 'reproduction.txt'), MARKER)
       standard_error('STANDARD_RELEASE_TAMPERED') { findings.released_show(id) }
     end
   end
 
+  def test_cli_reads_and_revises_a_proposal_and_refuses_a_stale_digest
+    with_standard do
+      findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
+      first = "#{MARKER} first draft \u2603\n"
+      id, viewed = findings.propose(run_id: nil, text: first, kind: 'schema').values_at(:finding_id, :proposal_sha256)
+      # The trusted read (engineer review and the analyst's resume are the same read).
+      %w[proposal review].each do |verb|
+        code, out, err = cli('finding', verb, 'synthetic', id)
+        assert_equal [0, ''], [code, err]
+        assert_equal({ 'version' => 1, 'finding_id' => id, 'status' => 'proposed', 'proposal' => first, 'proposal_revision' => 1, 'proposal_sha256' => viewed }, JSON.parse(out))
+      end
+      # Revise: text on stdin, the digest the analyst read as the precondition.
+      second = "#{MARKER} second draft\n"
+      code, out, err = cli_stdin(second, 'finding', 'revise', 'synthetic', id, '--file', '-', '--expected-proposal-sha256', viewed)
+      assert_equal [0, ''], [code, err]
+      revised = JSON.parse(out)
+      assert_equal [id, 'proposed', 2, Digest::SHA256.hexdigest(second), second.bytesize], revised.values_at('finding_id', 'status', 'proposal_revision', 'proposal_sha256', 'bytes')
+      refute_includes out, MARKER
+      current = revised.fetch('proposal_sha256')
+      # Every decision made on the first draft is refused; nothing changes and nothing private is echoed.
+      stale = [['revise', id, '--file', '-', '--expected-proposal-sha256', viewed],
+               ['release', id, '--file', '-', '--sha256', Digest::SHA256.hexdigest('third'), '--expected-proposal-sha256', viewed, '--reviewer', 'engineer'],
+               ['reject', id, '--expected-proposal-sha256', viewed, '--reviewer', 'engineer']]
+      stale.each do |verb, *rest|
+        code, out, err = cli_stdin('third', 'finding', verb, 'synthetic', *rest)
+        assert_equal [1, '', "Error: STANDARD_PROPOSAL_CHANGED\n"], [code, out, err], verb
+      end
+      # The digest is required and must be one: no flag, a short one, or a second one.
+      [['revise', id, '--file', '-'], ['revise', id, '--file', '-', '--expected-proposal-sha256', 'abc'],
+       ['release', id, '--file', '-', '--sha256', Digest::SHA256.hexdigest('third'), '--reviewer', 'engineer'],
+       ['reject', id, '--reviewer', 'engineer'],
+       ['reject', id, '--expected-proposal-sha256', current, '--expected-proposal-sha256', current, '--reviewer', 'engineer'],
+       ['proposal', id, 'extra']].each do |verb, *rest|
+        code, out, err = cli_stdin('third', 'finding', verb, 'synthetic', *rest)
+        assert_equal [1, ''], [code, out], [verb, rest].inspect
+        assert_match(/\AError: STANDARD_ARGUMENTS?_INVALID\n\z/, err)
+      end
+      assert_equal [second, 2, current], findings.proposal(id).values_at(:proposal, :proposal_revision, :proposal_sha256)
+      # The released text has its own digest; the viewed proposal digest is the separate precondition.
+      released = "users: uid int\n"
+      code, out, err = cli_stdin(released, 'finding', 'release', 'synthetic', id, '--file', '-', '--sha256', Digest::SHA256.hexdigest(released), '--expected-proposal-sha256', current, '--reviewer', 'engineer')
+      assert_equal [0, ''], [code, err]
+      assert_equal 'released', JSON.parse(out).fetch('status')
+      assert_equal released, findings.released_show(id)[:summary]
+      # Decided: the proposal stays readable to the engineer, and can no longer be revised or rejected.
+      code, out, _err = cli('finding', 'proposal', 'synthetic', id)
+      assert_equal [0, 'released', second], [code, *JSON.parse(out).values_at('status', 'proposal')]
+      code, _out, err = cli_stdin('late', 'finding', 'revise', 'synthetic', id, '--file', '-', '--expected-proposal-sha256', current)
+      assert_equal [1, "Error: STANDARD_TRANSITION_INVALID\n"], [code, err]
+      code, _out, err = cli('finding', 'reject', 'synthetic', id, '--expected-proposal-sha256', current, '--reviewer', 'engineer')
+      assert_equal [1, "Error: STANDARD_TRANSITION_INVALID\n"], [code, err]
+    end
+  end
+
+  # stdin is read as bytes: text that isn't UTF-8 is refused wherever it would be stored.
+  def test_cli_refuses_binary_text_and_stores_nothing
+    with_standard do
+      binary = "#{MARKER} \xFF\xFE\x00".b
+      code, out, err = cli_stdin(binary, 'finding', 'propose', 'synthetic', '--kind', 'schema', '--file', '-')
+      assert_equal [1, '', "Error: STANDARD_ARGUMENT_INVALID\n"], [code, out, err]
+      assert_empty @service.store.load.fetch('findings')
+      assert_empty Dir.glob(File.join(@service.store.root, 'findings', '*'))
+
+      findings = SiloMigrate::Services::StandardFindingsService.new('synthetic', env: @env)
+      id, viewed = findings.propose(run_id: nil, text: 'schema', kind: 'schema').values_at(:finding_id, :proposal_sha256)
+      before = File.binread(File.join(@service.store.root, 'state.json'))
+      code, out, err = cli_stdin(binary, 'finding', 'revise', 'synthetic', id, '--file', '-', '--expected-proposal-sha256', viewed)
+      assert_equal [1, '', "Error: STANDARD_ARGUMENT_INVALID\n"], [code, out, err]
+      code, out, err = cli_stdin(binary, 'finding', 'release', 'synthetic', id, '--file', '-', '--sha256', Digest::SHA256.hexdigest(binary),
+                                 '--expected-proposal-sha256', viewed, '--reviewer', 'engineer')
+      assert_equal [1, '', "Error: STANDARD_APPROVAL_MISMATCH\n"], [code, out, err]
+      assert_equal before, File.binread(File.join(@service.store.root, 'state.json'))
+      assert_equal ['private', 'private/proposal.txt'], Dir.glob('**/*', base: @service.store.finding_dir(id)).sort
+    end
+  end
+
   def test_agent_grammar_rejects_privileged_commands_and_every_extra_argument
     with_standard do
-      %w[approve reset release private-paths recover review run-request].each do |verb|
+      %w[approve reset release private-paths recover review proposal revise run-request].each do |verb|
         code, out, err = cli('agent', verb, 'synthetic')
         assert_equal 1, code, verb
         assert_empty out

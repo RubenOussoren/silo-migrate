@@ -95,6 +95,15 @@ def git_env(extra=None):
 class Checkout:
     """One workspace's converter checkout, gated before any Git command."""
 
+    # What a second kind of checkout (bin/merger_dev.py: the standalone local merger store)
+    # changes. Everything else below is shared, so there is one hardened content rule.
+    dev_lock = "converter-dev.lock"
+    manifest_name = "converter-dev-files.json"
+    busy_while_running = True      # commits/branch switches wait for a claimed or running run
+    sandbox_dependencies = True    # tests need the checkout's locked gems, emoji table, site settings
+    format_command = ("bundle", "_2.6.3_", "exec", "stree", "write")
+    write_refusal = "STANDARD_DEV_PATH_PROTECTED"
+
     def __init__(self, base, workspace, host):
         if not isinstance(workspace, str) or not WORKSPACE.fullmatch(workspace):
             refuse("STANDARD_ARGUMENTS_INVALID")
@@ -135,7 +144,7 @@ class Checkout:
     # checkout makes it invisible; untracked files nobody recorded never appear.
 
     def manifest_path(self):
-        return self.standard / "converter-dev-files.json"
+        return self.standard / self.manifest_name
 
     def manifest(self):
         path = self.manifest_path()
@@ -272,6 +281,14 @@ class Checkout:
 
     def migration_prefix(self):
         return "migration/" + self.workspace + "/"
+
+    def commit_gate(self):
+        if not self.branch().startswith(self.migration_prefix()):
+            refuse("STANDARD_DEV_NOT_MIGRATION_BRANCH")
+
+    def write_allowed(self, relative):
+        """The checkout's own layout rule for agent writes, beyond the protected paths."""
+        return True
 
 
 def relative_path(raw, allow_root=False):
@@ -538,34 +555,87 @@ def op_merge_guide(checkout, request, values, repo):
               "guide": MERGE_GUIDE.format(path=path, tests="test/" + folder, files=MERGE_LAYER_MAX_FILES, kib=MERGE_LAYER_MAX_BYTES // 1024)}
     if "discourse" not in platforms:
         result["note"] = "This project's source platform is not discourse, so it has no merge runs; a merge layer here would never be applied."
-    try:
-        app = runtime_profile(checkout, values, repo).get("app") or {}
-    except Refusal:
-        app = {}
-    # A review runtime is now pinned per merge plan, not in the converter's
-    # workspace profile. Quote the latest planned core without exposing inputs,
-    # settings, plugin metadata or any data-bearing evidence.
+    result.update(merge_discourse(checkout, values, repo))
+    # Prepared custom merges run the standalone local merger store, never this folder.
+    result["standalone_merger"] = {"path": str(checkout.root / "merger"), "initialized": os.path.lexists(checkout.root / "merger/.git"),
+                                   "note": "A prepared custom merge runs only the committed merger.rb (+ helpers/) of this local "
+                                           "repository; the converter folder above is the legacy one-shot layer."}
+    return result
+
+
+def ready_preparations(state):
+    """[(run id, generation, plan body)] of every completed Prepare whose environment is ready and unconsumed."""
+    plans = state.get("plans") if isinstance(state.get("plans"), dict) else {}
+    runs = state.get("runs") if isinstance(state.get("runs"), dict) else {}
+    found = []
+    for run_id, run in runs.items():
+        environment = run.get("merge_environment") if isinstance(run, dict) else None
+        if not (isinstance(run_id, str) and re.fullmatch(r"run-[0-9a-f]{32}", run_id) and isinstance(environment, dict)
+                and run.get("status") == "completed" and environment.get("phase") == "ready" and environment.get("consumed_by") is None
+                and environment.get("preparation_run_id") == run_id):
+            continue
+        generation = environment.get("generation")
+        plan = plans.get(run.get("plan_id")) if isinstance(run.get("plan_id"), str) else None
+        body = plan.get("body") if isinstance(plan, dict) and isinstance(plan.get("body"), dict) else {}
+        found.append((run_id, generation if isinstance(generation, str) and DIGEST.fullmatch(generation) else None,
+                      body if body.get("operation") == "standard_merge_prepare" else {}))
+    return found
+
+
+def merge_discourse(checkout, values, repo):
+    """Which Discourse revision the stock merger should be read at, and why that one. A ready
+    Prepare decides alone: when one exists but can't be read, no other revision is offered."""
+    spec = importlib.util.spec_from_file_location("merge_guide_discourse_version", Path(__file__).with_name("discourse_version.py"))
+    versions = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(versions)
+
+    def core(runtime, fallback=None):
+        runtime = runtime if isinstance(runtime, dict) else {}
+        parsed = versions.parse(runtime.get("actual_version"))
+        revision = runtime.get("app_revision") if isinstance(runtime.get("app_revision"), str) else fallback
+        if parsed and isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
+            return {"version": parsed["canonical"], "revision": revision}
+        return None
+
+    def answer(basis, app, **extra):
+        result = dict(discourse_basis=basis, **extra)
+        if app:
+            result["discourse"] = {"version": app.get("version"), "revision": app["revision"],
+                                   "merger_source": MERGE_STOCK % (app["revision"], "discourse_merger.rb"),
+                                   "base_source": MERGE_STOCK % (app["revision"], "base.rb")}
+        return result
+
+    ready = ready_preparations(checkout.state)
+    if len(ready) > 1:
+        return answer("ready_merge_preparation_ambiguous; more than one Prepare is ready, so no revision is given: ask the engineer", None)
+    if ready:
+        run_id, generation, body = ready[0]
+        app = core(body.get("review_runtime"), body.get("app_revision")) if generation else None
+        if not app:
+            return answer("ready_merge_preparation_unreadable; a Prepare is ready but its pinned core can't be read, so no revision "
+                          "is given (never the profile's or an older plan's): ask the engineer", None,
+                          discourse_basis_preparation={"run_id": run_id})
+        return answer("ready_merge_preparation; the core the ready Prepare restored and the next merge of it will run",
+                      app, discourse_basis_preparation={"run_id": run_id, "generation": generation})
+    # A review runtime is pinned per merge plan, not in the converter's workspace profile.
+    # Quote the latest planned core without exposing inputs, settings, plugin metadata or
+    # any data-bearing evidence.
     plans = checkout.state.get("plans") if isinstance(checkout.state.get("plans"), dict) else {}
     planned = [plan for plan in plans.values() if isinstance(plan, dict) and plan.get("status") != "discarded"
                and isinstance(plan.get("body"), dict) and plan["body"].get("operation") == "standard_merge"
                and isinstance(plan["body"].get("review_runtime"), dict)]
     planned.sort(key=lambda plan: str(plan.get("created_at", "")))
-    if planned:
-        runtime = planned[-1]["body"]["review_runtime"]
-        version, revision = runtime.get("actual_version"), runtime.get("app_revision")
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("merge_guide_discourse_version", Path(__file__).with_name("discourse_version.py"))
-        versions = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(versions)
-        parsed = versions.parse(version)
-        if parsed and isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
-            app = {"version": parsed["canonical"], "revision": revision}
-            result["discourse_basis"] = "latest_merge_plan; recheck after proposing against a replacement Base site"
+    app = core(planned[-1]["body"]["review_runtime"]) if planned else None
+    if app:
+        return answer("latest_merge_plan; recheck after proposing against a replacement Base site", app)
+    try:
+        app = runtime_profile(checkout, values, repo).get("app") or {}
+    except (Refusal, KeyError):
+        app = {}
     revision = app.get("revision")
     if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
-        result["discourse"] = {"version": app.get("version"), "revision": revision,
-                               "merger_source": MERGE_STOCK % (revision, "discourse_merger.rb"), "base_source": MERGE_STOCK % (revision, "base.rb")}
-    return result
+        return answer("workspace_profile; no merge Prepare is ready and no merge was planned, so recheck once a Prepare is ready", app)
+    return {}
 
 
 def converter_log(checkout, limit=30):
@@ -916,6 +986,8 @@ def writable(checkout, relative, must_exist):
     parts = relative.split("/")
     if any(part in PROTECTED_NAMES for part in parts) or relative.startswith((".github/workflows/", ".bundle/")) or relative in PROTECTED_PATHS:
         refuse("STANDARD_DEV_PATH_PROTECTED")
+    if not checkout.write_allowed(relative):
+        refuse(checkout.write_refusal)
     if not checkout.inside(relative):
         refuse("STANDARD_DEV_PATH_REFUSED")
     target = checkout.path / relative
@@ -1028,7 +1100,7 @@ class DevLock:
     def __enter__(self):
         import fcntl
         try:
-            self.fd = os.open(self.checkout.standard / "converter-dev.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            self.fd = os.open(self.checkout.standard / self.checkout.dev_lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         except OSError:
             refuse("STANDARD_PATH_INVALID")
         deadline = time.monotonic() + self.wait
@@ -1068,7 +1140,7 @@ class Locked:
             os.close(self.fd)
             refuse("STANDARD_BUSY")
         self.checkout.state = json.loads((self.checkout.standard / "state.json").read_text())
-        if self.checkout.running():
+        if self.checkout.busy_while_running and self.checkout.running():
             os.close(self.fd)
             refuse("STANDARD_BUSY")
         return self
@@ -1134,8 +1206,7 @@ def op_commit(checkout, request, home):
     if len(subject) > 100:
         refuse("STANDARD_DEV_SUBJECT_TOO_LONG")
     with Locked(checkout):
-        if not checkout.branch().startswith(checkout.migration_prefix()):
-            refuse("STANDARD_DEV_NOT_MIGRATION_BRANCH")
+        checkout.commit_gate()
         name_, email = identity(checkout, home)
         # The commit is built from exactly the verified bytes of visible changes (and
         # deletions of tracked files) in a temporary index: nothing else in the working
@@ -1143,10 +1214,11 @@ def op_commit(checkout, request, home):
         paths = [entry["path"] for entry in changes(checkout)[0]]
         if not paths:
             refuse("STANDARD_DEV_NOTHING_TO_COMMIT")
-        parent = checkout.head()
+        parent = checkout.head()  # None only where a checkout allows a first commit (the merger store)
         with tempfile.TemporaryDirectory(prefix="silo-dev-commit-") as scratch:
             index = {"GIT_INDEX_FILE": os.path.join(scratch, "index")}
-            checkout.git("read-tree", parent, env=index)
+            if parent:
+                checkout.git("read-tree", parent, env=index)
             for name in paths:
                 if not os.path.lexists(checkout.path / name):
                     checkout.git("--literal-pathspecs", "update-index", "--force-remove", "--", name, env=index)
@@ -1159,9 +1231,9 @@ def op_commit(checkout, request, home):
             text = checkout.git("stripspace", input=message.encode("utf-8")).stdout
             text = checkout.git("interpret-trailers", "--trailer", TRAILER["developer"], input=text).stdout
             env = {"GIT_AUTHOR_NAME": name_, "GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_NAME": name_, "GIT_COMMITTER_EMAIL": email}
-            commit = checkout.out("commit-tree", tree, "-p", parent, "-F", "-", input=text, env=env).strip()
-        # Compare-and-swap: refuses if HEAD moved meanwhile.
-        checkout.git("update-ref", "-m", "commit (converter-developer)", "HEAD", commit, parent)
+            commit = checkout.out("commit-tree", tree, *(["-p", parent] if parent else []), "-F", "-", input=text, env=env).strip()
+        # Compare-and-swap: refuses if HEAD moved (or, for a first commit, appeared) meanwhile.
+        checkout.git("update-ref", "-m", "commit (converter-developer)", "HEAD", commit, parent or "0" * 40)
         # Bring the real index in line for these paths only; other staged entries stay.
         warning = None
         try:
@@ -1497,6 +1569,9 @@ def image_gem_env(document, overlay):
     if not (match and safe.fullmatch(bundle) and safe.fullmatch(home) and all(safe.fullmatch(part) for part in path.split(":"))):
         refuse("STANDARD_RUNTIME_MISMATCH")
     gems = f"{bundle.rstrip('/')}/ruby/{match[1]}.{match[2]}.0"
+    if overlay is None:
+        # The image's own gems only (minitest, syntax_tree): no Bundler, no Gemfile, nothing installed.
+        return ["GEM_PATH=" + ":".join((gems, home)), "PATH=" + ":".join((gems + "/bin", path))]
     return [*BUNDLE_ENV, "GEM_HOME=" + overlay, "GEM_PATH=" + ":".join((overlay, gems, home)), "PATH=" + ":".join((overlay + "/bin", gems + "/bin", path))]
 
 
@@ -1647,8 +1722,11 @@ def run_in_sandbox(checkout, values, repo, command, collect=None, tool="dev_test
     started = time.monotonic()
     document = converter_image_document(checkout, values, repo)
     image = document["Id"]
-    deps, prepared = prepare_dependencies(checkout, document, started)
-    warning = emoji_warning(checkout)
+    # A checkout without a Gemfile of its own (the merger store) runs on the image's gems alone:
+    # no dependency step (the only one with network), no emoji table, no site settings.
+    bare = not checkout.sandbox_dependencies
+    deps, prepared = (False, {"status": "not_needed"}) if bare else prepare_dependencies(checkout, document, started)
+    warning = None if bare else emoji_warning(checkout)
     if warning:
         prepared = dict(prepared, emoji_warning=warning)
     if deps is None:
@@ -1666,10 +1744,11 @@ def run_in_sandbox(checkout, values, repo, command, collect=None, tool="dev_test
         os.chmod(export, 0o700)
         copied = export_visible(checkout, export)
         # Docker would create these mount points as root inside the export: make them ours first.
-        settings = site_settings_cache(checkout)
+        settings = None if bare else site_settings_cache(checkout)
         settings_target = Path(export) / "tmp/requires/discourse/config/site_settings.yml"
         try:
-            (Path(export) / "tmp/emoji_cache").mkdir(parents=True, exist_ok=True)
+            if not bare:
+                (Path(export) / "tmp/emoji_cache").mkdir(parents=True, exist_ok=True)
             if settings:
                 settings_target.parent.mkdir(parents=True, exist_ok=True)
                 settings_target.touch()
@@ -1686,12 +1765,13 @@ def run_in_sandbox(checkout, values, repo, command, collect=None, tool="dev_test
                 "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--cpus", "2", "--memory", "2g", "--memory-swap", "2g", "--pids-limit", "512", "--log-opt", "max-size=1m",
                 "--tmpfs", "/tmp:rw,exec,size=512m", "--mount", f"type=bind,src={export},dst=/app",
-                "--mount", f"type=bind,src={deps / 'gems'},dst=/deps,readonly",
-                "--mount", f"type=bind,src={deps / 'emoji_cache'},dst=/app/tmp/emoji_cache,readonly",
+                *([] if bare else ["--mount", f"type=bind,src={deps / 'gems'},dst=/deps,readonly",
+                                   "--mount", f"type=bind,src={deps / 'emoji_cache'},dst=/app/tmp/emoji_cache,readonly"]),
                 *(["--mount", f"type=bind,src={settings},dst=/app/tmp/requires/discourse/config/site_settings.yml,readonly"] if settings else []),
                 "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8",
-                *[arg for item in image_gem_env(document, "/deps") for arg in ("-e", item)], "-w", "/app",
-                "--entrypoint", "env", image, "-u", "BUNDLE_PATH", *command]
+                *[arg for item in image_gem_env(document, None if bare else "/deps") for arg in ("-e", item)], "-w", "/app",
+                "--entrypoint", "env", image, "-u", "BUNDLE_PATH",
+                *(["-u", "BUNDLE_GEMFILE", "-u", "BUNDLE_APP_CONFIG", "-u", "BUNDLE_FROZEN"] if bare else []), *command]
         code, stdout, stderr = docker(argv, budget)
         if code is None:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
@@ -1797,7 +1877,8 @@ def format_target_allowed(checkout, relative):
     """dev_write's own path rules, without re-hashing every visible file for each one."""
     parts = relative.split("/")
     return not (any(part in PROTECTED_NAMES for part in parts) or relative.startswith((".github/workflows/", ".bundle/"))
-                or relative in PROTECTED_PATHS or any(part.startswith("-") for part in parts)) and checkout.inside(relative)
+                or relative in PROTECTED_PATHS or any(part.startswith("-") for part in parts)) and checkout.write_allowed(relative) \
+        and checkout.inside(relative)
 
 
 def op_format(checkout, request, values, repo):
@@ -1827,7 +1908,7 @@ def op_format(checkout, request, values, repo):
 
     def collect(export):
         return {name: data for name in targets if (data := read_export(export, name)) is not None}
-    kind, ran = run_in_sandbox(checkout, values, repo, ["bundle", "_2.6.3_", "exec", "stree", "write", *targets], collect,
+    kind, ran = run_in_sandbox(checkout, values, repo, [*checkout.format_command, *targets], collect,
                                tool="dev_format", reserve=60, prepare=remember)
     if kind == "early":
         return dict(formatted=[], **ran)

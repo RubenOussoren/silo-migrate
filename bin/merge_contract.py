@@ -2,6 +2,7 @@
 
 MERGE_LAYER_MAX_FILES = 32
 MERGE_LAYER_MAX_BYTES = 512 * 1024
+MERGE_SETTINGS_MAX_BYTES = 256 * 1024  # as StandardMergeRun::MERGE_SETTINGS_BYTES; its only size rule, spelled out in the guide
 MERGE_GUIDE = """A merge run restores the site to merge into (the Base site), loads the source site's backup beside it and runs
 Discourse's own merger, script/bulk_import/discourse_merger.rb, unedited. A project that needs rules of its own (source
 categories into chosen destination categories, topics re-homed, groups mapped, ...) adds a merge layer. You write the layer;
@@ -20,6 +21,10 @@ The contract
   (YAML.safe_load_file). You decide the key names; migration-data fills in the values and registers the file (type
   merge-settings). Describe the keys and value shapes to the engineer, with invented values, so migration-data can write it.
   If the layer needs no values, don't read the variable (it is unset when the run has no settings).
+- The settings file's only limits: at most 256 KiB, and it must load safely as YAML with a mapping at its root. Loading safely
+  means mappings, lists, strings, numbers, true/false and null only, with aliases disabled: an alias (*name), a symbol
+  (:name), an unquoted date or time (quote them) or a tagged object refuses the plan with STANDARD_MERGE_SETTINGS_INVALID,
+  as does a list or nothing at the root. There is no limit on the number of lines or entries within that size.
 - Report what the layer did as totals: print lines `SILO_MERGE_TOTAL: name=integer` to standard output (name: lowercase
   letters, digits, _, spelled out in the layer's code; at most 20 names). A name built from a row (a slug, a user name) is
   dropped. The engineer and migration-data see those totals on the run; you don't. What you see back from a run, under
@@ -54,3 +59,39 @@ Testing without a Discourse app
   What it raised is in the private log: ask the engineer to have migration-data look and release a finding.
 - Format, lint and commit as for converter code. A run uses the checkout's committed head: commit before asking for a run.
 """
+
+
+def _swap(text, old, new):
+    # The standalone guide is the one contract above with only its repository-specific
+    # passages replaced; a passage that no longer matches must fail loudly, not be skipped.
+    if text.count(old) != 1:
+        raise ValueError("STANDARD_OPERATION_FAILED")
+    return text.replace(old, new)
+
+
+# The same contract for the project's standalone local merger repository (bin/merger_dev.py).
+# Placeholders: {path} (the repository's actual path), {files}, {kib}.
+STANDALONE_MERGE_GUIDE = MERGE_GUIDE
+for _old, _new in (
+    ("""- Entry file: {path}. Sibling .rb files in the same folder may be loaded with require_relative. The layer must not load or read anything else.
+- The folder may hold only regular .rb files: at most {files} files, {kib} KiB together. Anything else refuses the plan.
+""", """- The layer lives in this project's own local Git repository: {path}. It has no remote: nothing is pushed or fetched, and
+  the engineer reviews it right there. Entry file: merger.rb at its root. Ruby files under helpers/ may be loaded with
+  require_relative. The layer must not load or read anything else.
+- A merge runs merger.rb and helpers/**/*.rb only: regular .rb files, at most {files} files, {kib} KiB together. Tests and
+  invented fixtures go under test/ and notes in README.md: committed and reviewed, never run by a merge. Any other top-level
+  entry, a link or a submodule refuses the plan.
+"""),
+    ("anywhere in the folder's files.", "in merger.rb or helpers/."),
+    ("""- Put tests in {tests}/..._test.rb. They run with dev_test in the converter sandbox, which has no Discourse: define a small
+""", """- Put tests in test/..._test.rb. They run with dev_merger_test in a sealed container: the pinned converter image's Ruby and
+  minitest only, with no network, no Bundler, no gems of your own and no Discourse. Define a small
+"""),
+    ("""- Format, lint and commit as for converter code. A run uses the checkout's committed head: commit before asking for a run.
+""", """- Format (dev_merger_format) and commit (dev_merger_commit) here; the converter repository plays no part. A merge plan binds
+  the committed HEAD and the SHA-256 manifest of its executable files when migration-data proposes it, and is refused while
+  anything is uncommitted: commit, check that dev_merger_status shows dirty false and a layer, then ask for the plan. A later
+  commit never changes a proposed plan; it needs a new one.
+"""),
+):
+    STANDALONE_MERGE_GUIDE = _swap(STANDALONE_MERGE_GUIDE, _old, _new)

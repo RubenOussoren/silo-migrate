@@ -19,6 +19,18 @@ FINDING = re.compile(r"finding-[0-9a-f]{32}\Z")
 MAX_OUTPUT_BYTES = 48 * 1024
 # tool -> (converter dev op, allowed request keys)
 TOOLS = {
+    "dev_merger_list": ("list", {"path"}),
+    "dev_merger_read": ("read", {"path", "start_line"}),
+    "dev_merger_search": ("search", {"pattern", "path", "fixed", "ignore_case"}),
+    "dev_merger_status": ("status", set()),
+    "dev_merger_diff": ("diff", {"scope", "path", "commit"}),
+    "dev_merger_test": ("test", {"suite", "file"}),
+    "dev_merger_write": ("write", {"path", "content"}),
+    "dev_merger_edit": ("edit", {"path", "old_text", "new_text", "replace_all"}),
+    "dev_merger_delete": ("delete", {"path"}),
+    "dev_merger_format": ("format", {"path"}),
+    "dev_merger_commit": ("commit", {"message"}),
+    "dev_merger_init": ("init", set()),
     "dev_list": ("list", {"path"}),
     "dev_read": ("read", {"path", "start_line"}),
     "dev_search": ("search", {"pattern", "path", "fixed", "ignore_case"}),
@@ -42,6 +54,7 @@ TOOLS = {
 }
 READ_ONLY = {"dev_list", "dev_read", "dev_search", "dev_status", "dev_diff", "dev_test", "dev_push_show", "dev_merge_guide", "dev_findings",
              "dev_finding_show"}
+READ_ONLY |= {"dev_merger_list", "dev_merger_read", "dev_merger_search", "dev_merger_status", "dev_merger_diff", "dev_merger_test"}
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
 
 
@@ -125,7 +138,7 @@ def main():
     workspace = chat_project()
     if workspace is None or not WORKSPACE.match(workspace):
         return fail("STANDARD_CHAT_NOT_IN_PROJECT")
-    timeout = 285 if tool == "dev_rebase_main" else 290 if tool in ("dev_test", "dev_format") else 85 if tool in ("dev_branches", "dev_branch_resolve") else 55
+    timeout = 285 if tool == "dev_rebase_main" else 290 if tool in ("dev_test", "dev_format", "dev_merger_test", "dev_merger_format") else 85 if tool in ("dev_branches", "dev_branch_resolve") else 55
     try:
         if tool == "dev_findings":
             result = subprocess.run([control_path(), "standard", "agent", "findings", workspace], capture_output=True, timeout=timeout, env=control_env())
@@ -137,7 +150,8 @@ def main():
         else:
             op, keys = TOOLS[tool]
             request = {"op": op, **{key: value for key, value in args.items() if key in keys and value is not None}}
-            result = subprocess.run([control_path(), "converter", "dev", workspace, "--role", role()], input=json.dumps(request).encode("utf-8"),
+            backend = "merger" if tool.startswith("dev_merger_") or tool == "dev_merge_guide" else "converter"
+            result = subprocess.run([control_path(), backend, "dev", workspace, "--role", role()], input=json.dumps(request).encode("utf-8"),
                                     capture_output=True, timeout=timeout, env=control_env())
     except subprocess.TimeoutExpired:
         return fail("STANDARD_OPERATION_TIMEOUT")

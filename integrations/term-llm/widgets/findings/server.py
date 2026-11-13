@@ -5,7 +5,9 @@ of its own any more. It lists each workspace's findings from the
 standard store (read-only, straight from disk, so lists stay fast however many there are)
 and runs every decision through `silo-migrate-control standard finding …`, which locks,
 validates and records it. Release and amend take the exact text the engineer sees in the
-editor; its SHA-256 is computed here from those bytes.
+editor; its SHA-256 is computed here from those bytes. Release and reject also name the
+proposal the engineer was shown (its SHA-256, as `detail` reported it): migration-data can
+revise a proposal until it is decided, and a decision on a revision nobody read is refused.
 
 Models never reach this: agents have no web UI sign-in, and the socket isn't a TCP port.
 """
@@ -25,6 +27,8 @@ from urllib.parse import parse_qs, urlsplit
 
 WORKSPACE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 FINDING = re.compile(r"finding-[0-9a-f]{32}\Z")
+DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+MAX_REVISIONS = 20             # the store's limit for a proposal's revisions
 STATUSES = ("proposed", "released", "rejected", "superseded", "withdrawn")
 MAX_TEXT = 256 * 1024          # the store's limit for a finding's text
 MAX_STATE = 4 * 1024 * 1024    # the store's limit for state.json
@@ -129,7 +133,14 @@ class Store:
             record = dict(record, proposed_at=text(record.get("proposed_at")), supersedes=text(record.get("supersedes")),
                           superseded_by=text(record.get("superseded_by")))
             decided = decided if isinstance(decided, str) else None
+            # A proposal from before revisions existed has no number: it is revision 1.
+            revision = record.get("proposal_revision", 1)
+            revision = revision if type(revision) is int and 1 <= revision <= MAX_REVISIONS else None
+            digest = record.get("proposal_sha256")
+            digest = digest if isinstance(digest, str) and DIGEST.fullmatch(digest) else None
             out.append({"workspace": workspace, "id": key, "kind": str(record.get("kind") or ""), "status": record["status"],
+                        "proposal_revision": revision if digest else None, "proposal_sha256": digest,
+                        "proposal_revised_at": text(record.get("proposal_revised_at")),
                         "run_id": record.get("run_id"), "proposed_at": record.get("proposed_at"), "decided_at": decided,
                         "updated_at": decided or record.get("proposed_at") or "",
                         "reviewer": release.get("reviewer") or record.get("rejected_by") or record.get("withdrawn_by"),
@@ -137,8 +148,10 @@ class Store:
                         "supersedes": record.get("supersedes"), "superseded_by": record.get("superseded_by")})
         return out
 
-    def text(self, workspace, finding_id, kind, limit=MAX_TEXT):
-        part = {"proposal": ("private", "proposal.txt"), "released": ("released", "summary.txt")}[kind]
+    def raw(self, workspace, finding_id, kind, limit=MAX_TEXT, revision=1):
+        # Revision 1 of a proposal is proposal.txt; each later one is its own file, never rewritten.
+        proposal = "proposal.txt" if revision == 1 else "proposal-%d.txt" % revision
+        part = {"proposal": ("private", proposal), "released": ("released", "summary.txt")}[kind]
         standard = self.root(workspace)
         path = standard / "findings" / finding_id / part[0] / part[1]
         # Nothing reached through a link: the folders must resolve inside this store,
@@ -146,12 +159,30 @@ class Store:
         if os.path.realpath(path.parent) != os.path.join(os.path.realpath(standard), "findings", finding_id, part[0]):
             return None
         try:
-            return read_file(path, MAX_TEXT, head=limit).decode("utf-8", "replace")
+            return read_file(path, MAX_TEXT, head=limit)
         except (OSError, Refused):
             return None
 
+    def text(self, workspace, finding_id, kind, limit=MAX_TEXT, revision=1):
+        data = self.raw(workspace, finding_id, kind, limit, revision)
+        return None if data is None else data.decode("utf-8", "replace")
+
+    def proposal(self, record):
+        """(text, sha256) of a record's current proposal. The digest is what a release or a rejection
+        must name, so it is given only when the bytes read are the recorded revision's: the state and
+        an immutable revision file are read without a lock, and both describe the same revision."""
+        revision = record.get("proposal_revision")  # None when the record names no usable revision or digest
+        data = self.raw(record["workspace"], record["id"], "proposal", revision=revision or 1)
+        if data is None:
+            return None, None
+        digest = hashlib.sha256(data).hexdigest()
+        return data.decode("utf-8", "replace"), digest if revision and digest == record.get("proposal_sha256") else None
+
     def title(self, record):
-        text = (self.text(record["workspace"], record["id"], "proposal", 4096) or self.text(record["workspace"], record["id"], "released", 4096) or "")
+        # A line of the proposal only when its bytes are the recorded revision's (the whole file is
+        # read to check that); otherwise the released text, or nothing.
+        text, digest = self.proposal(record)
+        text = (text[:4096] if digest else None) or self.text(record["workspace"], record["id"], "released", 4096) or ""
         line = next((line.strip() for line in text.splitlines() if line.strip()), "")
         return line[:120]
 
@@ -215,7 +246,8 @@ def detail(store, workspace, finding_id):
         seen.add(cursor["superseded_by"])
         cursor = records[cursor["superseded_by"]]
         chain.append(cursor)
-    return dict(record, proposal=store.text(workspace, finding_id, "proposal"), released=store.text(workspace, finding_id, "released"),
+    proposal, digest = store.proposal(record)
+    return dict(record, proposal=proposal, proposal_sha256=digest, released=store.text(workspace, finding_id, "released"),
                 versions=[{k: r[k] for k in ("id", "status", "updated_at")} for r in chain])
 
 
@@ -233,10 +265,13 @@ def reviewer_name():
     return name + " (web UI)"
 
 
-def decide(control, action, workspace, finding_id, text=None):
+def decide(control, action, workspace, finding_id, text=None, proposal_sha256=None):
     if action not in ("release", "amend", "reject", "withdraw"):
         raise Refused("STANDARD_ARGUMENTS_INVALID")
     if not (isinstance(workspace, str) and WORKSPACE.fullmatch(workspace) and isinstance(finding_id, str) and FINDING.fullmatch(finding_id)):
+        raise Refused("STANDARD_ARGUMENTS_INVALID")
+    # A decision on a proposal names the revision the engineer was shown; there is no default.
+    if action in ("release", "reject") and not (isinstance(proposal_sha256, str) and DIGEST.fullmatch(proposal_sha256)):
         raise Refused("STANDARD_ARGUMENTS_INVALID")
     argv = [control, "standard", "finding", action, workspace, finding_id]
     data = None
@@ -247,6 +282,8 @@ def decide(control, action, workspace, finding_id, text=None):
         if len(data) > MAX_TEXT:
             raise Refused("STANDARD_TEXT_TOO_LARGE")
         argv += ["--file", "-", "--sha256", hashlib.sha256(data).hexdigest()]
+    if action in ("release", "reject"):
+        argv += ["--expected-proposal-sha256", proposal_sha256]
     argv += ["--reviewer", reviewer_name()]
     try:
         result = subprocess.run(argv, input=data, capture_output=True, timeout=120, stdin=None if data is not None else subprocess.DEVNULL)
@@ -317,7 +354,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise Refused("STANDARD_ARGUMENTS_INVALID")
             action = urlsplit(self.path).path.removeprefix("/api/")
-            outcome = decide(self.server.control, action, body.get("workspace"), body.get("id"), body.get("text"))
+            outcome = decide(self.server.control, action, body.get("workspace"), body.get("id"), body.get("text"), body.get("proposal_sha256"))
             return self.send(200, outcome)
         except (ValueError, UnicodeDecodeError):
             return self.send(400, {"error": "STANDARD_ARGUMENTS_INVALID"})

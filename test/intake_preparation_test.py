@@ -285,7 +285,7 @@ class AdapterContextTest(unittest.TestCase):
         skill = (ROOT / 'integrations/term-llm/skills/intake-preparation/SKILL.md').read_text()
         # Guidance never names the old private package.
         for path in (ROOT / 'integrations/term-llm/migration-data').rglob('*'):
-            if path.is_file():
+            if path.is_file() and '__pycache__' not in path.parts:
                 text = path.read_text()
                 for stale in ('TERM_LLM_PACKAGE', 'private_upload_context', 'paired'):
                     self.assertNotIn(stale, text, path.name)
@@ -308,8 +308,9 @@ class CodingAgentBoundaryTest(unittest.TestCase):
                 self.assertFalse(any(tool['name'].startswith('data_') for tool in definition['tools']['custom']))
                 self.assertNotIn('mcp', definition)
                 source = (directory / 'scripts/dev_tool.py').read_text()
-                # Its only control route is `converter dev WS --role <fixed role>`.
-                self.assertIn('[control_path(), "converter", "dev", workspace, "--role", role()]', source)
+                # Both code-only routes derive from the fixed tool name, never model JSON.
+                self.assertIn('[control_path(), backend, "dev", workspace, "--role", role()]', source)
+                self.assertIn('backend = "merger" if tool.startswith("dev_merger_") or tool == "dev_merge_guide" else "converter"', source)
                 self.assertNotIn('"data"', source)
                 self.assertNotIn('shell=True', source)
                 self.assertEqual(['scripts'], sorted(p.name for p in directory.iterdir() if p.is_dir() and p.name != '__pycache__'))

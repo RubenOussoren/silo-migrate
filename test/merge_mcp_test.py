@@ -121,7 +121,7 @@ class MergeMcpTest(unittest.TestCase):
         self.write_secret("base.key", KEY)
         self.write_secret("source.env", f"SILO_MI_ROLE=silo_mi_0a1b2c3d\nSILO_MI_PASSWORD={PASSWORD}\n")
         self.manifest = {
-            "version": 1, "run_id": RUN, "preparation_run_id": PREP, "generation": GEN, "phase": "base", "state": "open",
+            "version": 1, "run_id": RUN, "preparation_run_id": RUN, "generation": GEN, "phase": "base", "state": "open",
             "owner": {"workspace": "arc", "instance": INSTANCE}, "containers": {"web": WEB, "db": DB},
             "network": INSTANCE + "-int", "port": 41000,
             "endpoints": {
@@ -133,6 +133,15 @@ class MergeMcpTest(unittest.TestCase):
                            "credential_sha256": hashlib.sha256(f"SILO_MI_ROLE=silo_mi_0a1b2c3d\nSILO_MI_PASSWORD={PASSWORD}\n".encode()).hexdigest(),
                            "policy": {"version": "merge-source-read-v1", "granted_tables": 3, "unreviewed_tables": 1}}}}
         self.save()
+        self.state_path = root / ".silo-migrate/named/standard/state.json"
+        self.state = {"runs": {RUN: {"status": "completed", "merge_environment": {
+            "preparation_run_id": RUN, "generation": GEN, "phase": "ready", "instance": "instance-fixture"}}},
+            "instances": {"instance-fixture": {"name": INSTANCE, "state": "prepared"}}, "plans": {}}
+        self.save_state()
+
+    def save_state(self):
+        self.state_path.write_text(json.dumps(self.state))
+        self.state_path.chmod(0o600)
 
     def write_secret(self, name, content):
         path = self.private / "merge-inspection" / name
@@ -145,7 +154,15 @@ class MergeMcpTest(unittest.TestCase):
         path.chmod(0o600)
 
     def ws(self):
-        return self.d.Workspace(self.base, "arc", ROOT, None, {}, None)
+        def control(argv, **kwargs):
+            self.assertEqual(["standard", "run", "show", "arc", RUN], argv)
+            run = self.state["runs"][RUN]
+            if "merge_environment" in run:
+                environment = run["merge_environment"]
+            else:
+                environment = self.state["runs"][PREP]["merge_environment"]
+            return json.dumps({"status": run["status"], "merge_environment": environment})
+        return self.d.Workspace(self.base, "arc", ROOT, None, {}, control)
 
     def info(self, **request):
         return self.m.inspection_info(self.ws(), {"run_id": RUN, "generation": GEN, "side": "base", **request}, self.api)
@@ -164,7 +181,7 @@ class MergeMcpTest(unittest.TestCase):
         (self.config_home / "term-llm/mcp.json").write_text(json.dumps({"servers": {"mine": {"command": "x", "args": ["y"]}}}))
         with mock.patch.object(self.m, "connector_ready", return_value=("/x", "sha256:" + "9" * 64, "e.js")):
             result = self.info()
-        self.assertEqual({"run_id", "generation", "side", "mcp_server", "registration", "ready", "next"}, set(result))
+        self.assertEqual({"run_id", "generation", "side", "mcp_server", "registration", "ready", "next", "access_model", "category_budget"}, set(result))
         self.assertEqual(("merge-base-arc", "added", True), (result["mcp_server"], result["registration"], result["ready"]))
         text = json.dumps(result)
         for secret in (KEY, PASSWORD, str(self.base), "silo_inspect_", "41000", "merge_source_inspect"):
@@ -181,6 +198,75 @@ class MergeMcpTest(unittest.TestCase):
         self.assertEqual("merge-source-arc", source["mcp_server"])
         self.assertEqual(["merge-dbhub", "arc", RUN, GEN, "source"], self.mcp()["servers"]["merge-source-arc"]["args"])
         self.assertIn("merge-base-arc", self.mcp()["servers"])  # both sides of the open base phase stay
+
+    def test_open_manifest_refuses_failed_dirty_consumed_reset_or_wrong_generation(self):
+        import copy
+        original = copy.deepcopy(self.state)
+        for change in ("failed", "running", "dirty", "reset", "consumed", "generation", "owner", "removed"):
+            with self.subTest(change=change):
+                self.state = copy.deepcopy(original)
+                run = self.state["runs"][RUN]
+                env = run["merge_environment"]
+                if change in ("failed", "running"):
+                    run["status"] = change
+                elif change in ("dirty", "reset", "consumed"):
+                    env["phase"] = change
+                elif change == "generation":
+                    env["generation"] = "0" * 64
+                elif change == "owner":
+                    env["preparation_run_id"] = PREP
+                else:
+                    self.state["instances"]["instance-fixture"]["state"] = "removed"
+                self.save_state()
+                self.refused("STANDARD_MERGE_INSPECTION_STALE", self.info)
+                self.assertFalse(self.m._still_open(self.ws(), RUN, GEN, "base", self.api))
+                with mock.patch("subprocess.run") as created:
+                    self.refused("STANDARD_MERGE_INSPECTION_STALE", lambda: self.launch("source", "merge-dbhub"))
+                    created.assert_not_called()
+        self.assertFalse((self.config_home / "term-llm/mcp.json").exists())
+
+    def test_malformed_manifest_and_state_fail_with_fixed_codes(self):
+        import copy
+        for endpoints in ([], "not-an-object", None):
+            manifest = copy.deepcopy(self.manifest)
+            manifest["endpoints"] = endpoints
+            self.save(manifest)
+            self.refused("STANDARD_MERGE_INSPECTION_INVALID", self.info)
+        self.save()
+        for policy in ([], "not-an-object", None):
+            manifest = copy.deepcopy(self.manifest)
+            manifest["endpoints"]["source"]["policy"] = policy
+            self.save(manifest)
+            self.refused("STANDARD_MERGE_INSPECTION_INVALID", lambda: self.info(side="source"))
+        self.save()
+        original = copy.deepcopy(self.state)
+        for value in (None, [], "not-an-object"):
+            self.state = copy.deepcopy(original)
+            self.state["runs"][RUN]["merge_environment"] = value
+            self.save_state()
+            self.refused("STANDARD_MERGE_INSPECTION_STALE", self.info)
+        self.state_path.write_text("[" * 20000 + "]" * 20000)
+        self.refused("STANDARD_MERGE_INSPECTION_STALE", self.info)
+        self.state = original
+        self.save_state()
+
+    def test_result_requires_matching_completed_consumer_and_recorded_backup(self):
+        import copy
+        self.state["runs"][PREP] = self.state["runs"].pop(RUN)
+        env = self.state["runs"][PREP]["merge_environment"]
+        env.update(preparation_run_id=PREP, phase="result", consumed_by=RUN)
+        self.state["runs"][RUN] = {"status": "completed", "plan_id": "plan-fixture", "artifacts": {"backup": {
+            "merge_generation": GEN, "preparation_run_id": PREP}}}
+        self.state["plans"] = {"plan-fixture": {"body": {"prepared_from": {"run_id": PREP, "generation": GEN}}}}
+        self.manifest.update(preparation_run_id=PREP, phase="result")
+        self.manifest["endpoints"] = {"result": dict(self.manifest["endpoints"]["base"], credential="result.key")}
+        self.write_secret("result.key", KEY)
+        self.save()
+        self.save_state()
+        self.assertEqual("result", self.info(side="result")["side"])
+        self.state["runs"][RUN]["artifacts"]["backup"]["merge_generation"] = "0" * 64
+        self.save_state()
+        self.refused("STANDARD_MERGE_INSPECTION_STALE", lambda: self.info(side="result"))
 
     def test_missing_connector_or_image_is_a_clear_not_ready_not_a_download(self):
         with mock.patch.object(self.m, "connector_ready", return_value=None):
@@ -725,12 +811,14 @@ class MergeMcpTest(unittest.TestCase):
                     {"jsonrpc": "2.0", "method": "notifications/initialized"},
                     {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
                     {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "discourse_list_categories", "arguments": {}}},
-                    {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "discourse_manage_user_activation", "arguments": {}}}]
+                    {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "discourse_manage_user_activation", "arguments": {}}},
+                    {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "discourse_list_categories", "arguments": {"max_pages": 1, "max_requests": 1, "max_results": 3}}},
+                    {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "discourse_list_categories", "arguments": {"max_pages": 1, "max_requests": 4, "max_results": 3}}}]
         process.stdin.write("".join(json.dumps(message) + "\n" for message in messages).encode())
         process.stdin.flush()
         replies, buffer = {}, b""
         deadline = __import__("time").monotonic() + 60
-        while len(replies) < 4 and __import__("time").monotonic() < deadline:
+        while len(replies) < 6 and __import__("time").monotonic() < deadline:
             ready, _, _ = select.select([process.stdout], [], [], 1)
             if not ready:
                 if process.poll() is not None:
@@ -743,14 +831,14 @@ class MergeMcpTest(unittest.TestCase):
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
                 message = json.loads(line)
-                if message.get("id") in (1, 2, 3, 4):
+                if message.get("id") in (1, 2, 3, 4, 5, 6):
                     replies[message["id"]] = message
         process.stdin.close()
         process.wait(timeout=10)
         stderr = process.stderr.read()
         process.stdout.close()
         process.stderr.close()
-        self.assertEqual({1, 2, 3, 4}, set(replies), stderr.decode("utf-8", "replace")[-500:])
+        self.assertEqual({1, 2, 3, 4, 5, 6}, set(replies), stderr.decode("utf-8", "replace")[-500:])
         self.assertEqual(b"", stderr)  # log_level silent: no site title/URL on stderr
         names = {tool["name"] for tool in replies[2]["result"]["tools"]}
         self.assertEqual(set(self.m.EXPECTED_TOOLS), names)
@@ -761,6 +849,16 @@ class MergeMcpTest(unittest.TestCase):
         self.assertFalse(call.get("isError"), call)
         listed = {c["slug"]: c["read_restricted"] for c in call["structuredContent"]["categories"]}
         self.assertEqual({"invented-public": False, "invented-staff": True}, listed)
+        # A one-request budget is exhausted by the GET-only key refusing category
+        # search POST. It is explicitly incomplete, NOT a complete empty site. A
+        # budget of four can reach the GET fallback without broadening key scopes.
+        limited = replies[5]["result"]["structuredContent"]
+        self.assertEqual([], limited["categories"])
+        self.assertEqual((False, True, 0, "page_limit"), (limited["meta"]["complete"], limited["meta"]["has_more"],
+                         limited["meta"]["pages_fetched"], limited["meta"]["truncated_reason"]))
+        fallback = replies[6]["result"]["structuredContent"]
+        self.assertEqual(2, len(fallback["categories"]))
+        self.assertEqual(1, fallback["meta"]["pages_fetched"])
         # An unregistered write tool is refused by the connector before any request.
         self.assertTrue("error" in replies[4] or replies[4]["result"].get("isError"))
         # Every request carried the scoped key for the tethered identity; the only non-GET was the
@@ -885,6 +983,12 @@ class SourceReadPolicyLiveTest(unittest.TestCase):
 
         allowed = self.as_role("SELECT id, username FROM users")
         self.assertEqual((0, b"1|alice\n"), (allowed.returncode, allowed.stdout), allowed.stderr)
+        privileges = self.as_role("SELECT has_table_privilege('public.users', 'SELECT'), "
+                                  "has_any_column_privilege('public.users', 'SELECT'), "
+                                  "has_column_privilege('public.users', 'id', 'SELECT'), "
+                                  "has_column_privilege('public.users', 'password_hash', 'SELECT'), "
+                                  "(SELECT count(*) FROM public.users)")
+        self.assertEqual((0, b"f|t|t|f|1\n"), (privileges.returncode, privileges.stdout), privileges.stderr)
         denied = {
             "unreviewed column": "SELECT password_hash FROM users",
             "PUBLIC-granted secret table": "SELECT token FROM plugin_secret_tokens",

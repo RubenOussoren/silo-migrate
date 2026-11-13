@@ -376,13 +376,18 @@ def validate_manifest(manifest, ws_name, run_id, generation, side, data_module):
     phase = manifest.get("phase")
     if phase not in ("base", "result") or (side in ("base", "result") and side != phase) or (side == "source" and phase != "base"):
         _refuse(data_module, "STANDARD_MERGE_INSPECTION_STALE")
-    endpoint = (manifest.get("endpoints") or {}).get(side)
+    endpoints = manifest.get("endpoints")
+    if not isinstance(endpoints, dict):
+        bad()
+    endpoint = endpoints.get(side)
     if not isinstance(endpoint, dict) or endpoint.get("state") != "open" or endpoint.get("credential") != CREDENTIALS[side]:
         _refuse(data_module, "STANDARD_MERGE_INSPECTION_STALE")
     if not (isinstance(endpoint.get("credential_sha256"), str) and GENERATION.fullmatch(endpoint["credential_sha256"])):
         bad()
     if side == "source":
-        policy = endpoint.get("policy") or {}
+        policy = endpoint.get("policy")
+        if not isinstance(policy, dict):
+            bad()
         if not (endpoint.get("kind") == "dbhub" and isinstance(endpoint.get("role"), str) and ROLE.fullmatch(endpoint["role"])
                 and isinstance(endpoint.get("database"), str) and DB_NAME.fullmatch(endpoint["database"])
                 and endpoint["database"] not in ("discourse", "postgres", "template0", "template1")
@@ -468,9 +473,55 @@ def _checked_request(request, data_module):
     return run_id, generation, side
 
 
+def validate_run_environment(ws, manifest, side, data_module):
+    """An open credential manifest is necessary, not sufficient: failure/recovery can
+    invalidate the owning generation after opening. Read current atomic state under
+    the shared endpoint fence before handing any credential to a new launcher."""
+    root = data_module.open_root(str(ws.root))
+    standard = None
+    try:
+        standard = data_module.walk_dirs(root, [".silo-migrate", "named", "standard"])
+        raw = _read_private(standard, "state.json", 64 * 1024 * 1024, data_module)
+        state = json.loads(raw)
+    except (OSError, ValueError, TypeError, RecursionError):
+        _refuse(data_module, "STANDARD_MERGE_INSPECTION_STALE")
+    finally:
+        if standard is not None:
+            os.close(standard)
+        os.close(root)
+    try:
+        run_id, preparation = manifest["run_id"], manifest["preparation_run_id"]
+        runs = state["runs"]
+        run, prepared = runs[run_id], runs[preparation]
+        environment = prepared["merge_environment"]
+        instance = state["instances"][environment["instance"]]
+        if not all(isinstance(item, dict) for item in (state, runs, run, prepared, environment, instance)):
+            _refuse(data_module, "STANDARD_MERGE_INSPECTION_STALE")
+        valid = (run["status"] == "completed" and prepared["status"] == "completed"
+                 and environment["preparation_run_id"] == preparation
+                 and environment["generation"] == manifest["generation"]
+                 and instance["name"] == manifest["owner"]["instance"]
+                 and instance["state"] != "removed")
+        if side == "result":
+            binding = state["plans"][run["plan_id"]]["body"]["prepared_from"]
+            backup = run["artifacts"]["backup"]
+            valid = (valid and environment["phase"] == "result" and environment["consumed_by"] == run_id
+                     and binding == {"run_id": preparation, "generation": manifest["generation"]}
+                     and backup["merge_generation"] == manifest["generation"]
+                     and backup["preparation_run_id"] == preparation)
+        else:
+            valid = (valid and run_id == preparation and environment["phase"] == "ready"
+                     and environment.get("consumed_by") is None and instance["state"] == "prepared")
+        if not valid:
+            _refuse(data_module, "STANDARD_MERGE_INSPECTION_STALE")
+    except (KeyError, TypeError, AttributeError):
+        _refuse(data_module, "STANDARD_MERGE_INSPECTION_STALE")
+
+
 def checked_endpoint(ws, run_id, generation, side, data_module, dir_fd):
     manifest = load_manifest(ws, run_id, data_module, dir_fd)
     endpoint = validate_manifest(manifest, ws.name, run_id, generation, side, data_module)
+    validate_run_environment(ws, manifest, side, data_module)
     verify_environment(manifest, data_module)
     return manifest, endpoint
 
@@ -654,7 +705,10 @@ def inspection_info(ws, request, data_module):
     what = ("read-only SQL on the prepared source inspection copy (reviewed core columns only; at most 50 rows per query)" if side == "source"
             else "read-only Discourse API tools on the local " + side + " inspection site (writes disabled, emails hidden)")
     return {"run_id": run_id, "generation": generation, "side": side, "mcp_server": name, "registration": registration, "ready": ready,
-            "next": ("The engineer turns on MCP server " + name + " in this chat (MCP button): " + what + ". Use only this project's server; "
+            "access_model": ("reviewed column-level SELECT grants, not table-level SELECT; use has_any_column_privilege/has_column_privilege to inspect grants" if side == "source"
+                             else "admin visibility for restricted-content inspection; read-only global:read API key, GET only; no mutation tools"),
+            "category_budget": None if side == "source" else "Use default request budgets or max_requests >= 4 for category discovery. The GET-only key rejects the initial category-search POST; its GET fallback consumes another request. An incomplete empty response is not evidence of an empty site.",
+            "next": ("Bound to run " + run_id + " generation " + generation + ". The engineer turns on MCP server " + name + " in this chat (MCP button): " + what + ". Use only this project's server; "
                      "it stops working when the environment is fenced for the merge or reset.") if ready else missing}
 
 
@@ -666,6 +720,7 @@ def _still_open(ws, run_id, generation, side, data_module):
     try:
         manifest = load_manifest(ws, run_id, data_module, dir_fd)
         validate_manifest(manifest, ws.name, run_id, generation, side, data_module)
+        validate_run_environment(ws, manifest, side, data_module)
         return True
     except Exception:
         return False

@@ -12,6 +12,8 @@ AGENTS = ROOT / 'integrations/term-llm'
 # The retired fork's context variables: stock term-llm never sets them and they are spoofable,
 # so migration-data's adapters ignore them and never forward them to the control backend.
 FORGED = {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'session-fixture', 'TERM_LLM_UPLOADS_JSON': '[{"path": "/etc/passwd"}]'}
+MERGER_WRITE_TOOLS = {'dev_merger_init', 'dev_merger_write', 'dev_merger_edit', 'dev_merger_delete', 'dev_merger_format', 'dev_merger_commit'}
+MERGER_READ_TOOLS = {'dev_merger_list', 'dev_merger_read', 'dev_merger_search', 'dev_merger_status', 'dev_merger_diff', 'dev_merger_test'}
 WRITE_TOOLS = {'dev_write', 'dev_edit', 'dev_delete', 'dev_branch', 'dev_commit', 'dev_push_propose', 'dev_format', 'dev_rebase_main'}
 
 
@@ -91,11 +93,42 @@ print(json.dumps({'version': 1, 'ok': True}))
             'dev_branch_diff': ({'branch': 'migration/arc/x', 'base': 'main', 'path': 'lib', 'content': 'dropped'}, {'op': 'branch-diff', 'branch': 'migration/arc/x', 'base': 'main', 'path': 'lib'}),
             'dev_branch_read': ({'branch': 'main', 'path': 'README.md', 'start_line': 2}, {'op': 'branch-read', 'branch': 'main', 'path': 'README.md', 'start_line': 2}),
         }
-        self.assertEqual(set(cases) | {'dev_findings', 'dev_finding_show'}, set(self.tools('converter-developer')))
+        self.assertEqual(set(cases) | {'dev_findings', 'dev_finding_show'} | MERGER_WRITE_TOOLS | MERGER_READ_TOOLS, set(self.tools('converter-developer')))
         for tool, (args, request) in cases.items():
             with self.subTest(tool=tool):
                 self.assertEqual(True, self.call('converter-developer', tool, dict(op='push', sha256='0' * 64, **args))['ok'])
-                self.assertEqual([[['converter', 'dev', 'example-forum', '--role', 'developer'], json.dumps(request)]], self.calls())
+                backend = 'merger' if tool == 'dev_merge_guide' else 'converter'
+                self.assertEqual([[[backend, 'dev', 'example-forum', '--role', 'developer'], json.dumps(request)]], self.calls())
+
+    def test_merger_tools_route_only_to_local_store_and_reviewer_cannot_mutate(self):
+        cases = {
+            'dev_merger_init': ({}, {'op': 'init'}),
+            'dev_merger_read': ({'path': 'merger.rb', 'start_line': 1}, {'op': 'read', 'path': 'merger.rb', 'start_line': 1}),
+            'dev_merger_list': ({'path': 'helpers'}, {'op': 'list', 'path': 'helpers'}),
+            'dev_merger_search': ({'pattern': 'super'}, {'op': 'search', 'pattern': 'super'}),
+            'dev_merger_status': ({}, {'op': 'status'}),
+            'dev_merger_diff': ({'scope': 'commit', 'commit': 'a' * 40}, {'op': 'diff', 'scope': 'commit', 'commit': 'a' * 40}),
+            'dev_merger_test': ({'suite': 'test'}, {'op': 'test', 'suite': 'test'}),
+            'dev_merger_write': ({'path': 'merger.rb', 'content': 'invented'}, {'op': 'write', 'path': 'merger.rb', 'content': 'invented'}),
+            'dev_merger_edit': ({'path': 'merger.rb', 'old_text': 'x', 'new_text': 'y'}, {'op': 'edit', 'path': 'merger.rb', 'old_text': 'x', 'new_text': 'y'}),
+            'dev_merger_delete': ({'path': 'helpers/x.rb'}, {'op': 'delete', 'path': 'helpers/x.rb'}),
+            'dev_merger_format': ({'path': 'merger.rb'}, {'op': 'format', 'path': 'merger.rb'}),
+            'dev_merger_commit': ({'message': 'Invented layer'}, {'op': 'commit', 'message': 'Invented layer'}),
+        }
+        for tool, (args, request) in cases.items():
+            with self.subTest(tool=tool):
+                self.assertTrue(self.call('converter-developer', tool, dict(workspace='other', backend='converter', op='push', **args))['ok'])
+                self.assertEqual([[['merger', 'dev', 'example-forum', '--role', 'developer'], json.dumps(request)]], self.calls())
+                result = self.call('converter-reviewer', tool, args)
+                if tool in MERGER_WRITE_TOOLS:
+                    self.assertIn(result['error'], ('STANDARD_TOOL_UNKNOWN', 'STANDARD_DEV_OPERATION_REFUSED'))
+                    self.assertEqual([], self.calls())
+                else:
+                    self.assertTrue(result['ok'])
+                    self.assertEqual([[['merger', 'dev', 'example-forum', '--role', 'reviewer'], json.dumps(request)]], self.calls())
+        for forbidden in ('dev_merger_push', 'dev_merger_fetch', 'dev_merger_branch', 'dev_merger_rebase_main'):
+            self.assertEqual('STANDARD_TOOL_UNKNOWN', self.call('converter-developer', forbidden, {})['error'])
+            self.assertEqual([], self.calls())
 
     def test_data_branch_tools_derive_project_and_always_use_reader(self):
         cases = {
@@ -171,7 +204,7 @@ print(json.dumps({'version': 1, 'ok': True}))
         self.assertEqual([[['converter', 'dev', 'example-forum', '--role', 'reviewer'], json.dumps({'op': 'test'})]], self.calls())
         self.assertIn('dev_merge_guide', self.tools('converter-reviewer'))
         self.call('converter-reviewer', 'dev_merge_guide', {})
-        self.assertEqual([['converter', 'dev', 'example-forum', '--role', 'reviewer'], json.dumps({'op': 'merge-guide'})], self.calls()[-1])
+        self.assertEqual([['merger', 'dev', 'example-forum', '--role', 'reviewer'], json.dumps({'op': 'merge-guide'})], self.calls()[-1])
 
     def test_the_reviewer_has_no_branch_tools(self):
         for tool in ('dev_branches', 'dev_branch_diff', 'dev_branch_read'):

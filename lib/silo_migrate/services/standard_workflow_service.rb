@@ -26,6 +26,7 @@ require_relative "standard_run_inputs"
 require_relative "standard_convert_run"
 require_relative "standard_review_run"
 require_relative "standard_merge_run"
+require_relative "standard_merge_code"
 require_relative "standard_merge_preparation"
 require_relative "standard_merge_inspection"
 
@@ -44,6 +45,7 @@ module SiloMigrate
       include StandardConvertRun
       include StandardReviewRun
       include StandardMergeRun
+      include StandardMergeCode
       include StandardMergePreparation
       include StandardMergeInspection
 
@@ -103,14 +105,17 @@ module SiloMigrate
         "STANDARD_RELEASE_CHECKS" => "Review reconciliation differences or missing checks and explicitly acknowledge them before release.",
         "STANDARD_MERGE_SOURCE_INVALID" => "Register a valid full Discourse source backup and re-plan.",
         "STANDARD_MERGE_SOURCE_NEWER" => "The source backup needs a newer application than the Base-selected runtime. Supply a compatible current Base backup or align the hosted target's version/track; resetting alone will not fix it.",
-        "STANDARD_MERGE_LAYER_INVALID" => "Correct and commit the merge layer, refresh the converter and re-plan.",
+        "STANDARD_MERGE_LAYER_INVALID" => "Correct and commit the merge layer (a prepared custom merge: merger.rb plus optional helpers/*.rb in the project's local merger repository, at most 32 Ruby files and 512 KiB; tests and README outside them), then re-plan. An older converter-layer plan: refresh the converter and re-plan.",
+        "STANDARD_MERGER_CONFIG" => "The project's local merger repository has a remote, include, filter, URL rewrite, helper, alternate object store, link or other setting or layout that is not allowed. Inspect it as the service account, remove it (the store is local-only, with no remote), then re-plan.",
+        "STANDARD_MERGER_DIRTY" => "The local merger repository has uncommitted changes. Commit (or discard) them so the plan binds exactly what was reviewed, then re-plan.",
         "STANDARD_MERGE_SETTINGS_INVALID" => "Register a valid merge settings mapping and re-plan.",
         "STANDARD_MERGE_SCHEMA" => "Inspect private schema evidence, correct the layer or runtime and re-plan.",
         "STANDARD_MERGE_FAILED" => "Inspect private merge evidence, reset the dirty run and re-plan.",
         "STANDARD_MERGE_INCOMPATIBLE" => "The source and Base schemas or migrations are not ones the pinned merger supports together; nothing was merged and no migration marker was edited. Inspect the private compatibility evidence, align the Base/runtime or supply a compatible source, reset this run, then re-plan.",
         "STANDARD_MERGE_ENVIRONMENT_STALE" => "The prepared merge environment is not this ready, unused generation any more (used, reset, or its inputs or runtime changed). Check the preparation run's merge_environment, prepare again if needed, then propose a merge of the current generation.",
         "STANDARD_MERGE_ENVIRONMENT_DIRTY" => "The prepared merge environment could not be checkpointed or returned to its sealed state, so its state is uncertain. Reset this run (that removes the environment), then prepare again.",
-        "STANDARD_MERGE_INTENT_MISMATCH" => "A custom merge needs a committed merge layer for this workspace. Commit the layer and refresh the converter, or propose a stock merge.",
+        "STANDARD_MERGE_PREPARATION_REQUIRED" => "This project has a standalone local merger repository. Use its ready preparation run/generation and explicit custom or stock intent; do not use the legacy one-shot merge, which cannot run that layer.",
+        "STANDARD_MERGE_INTENT_MISMATCH" => "A custom merge needs a committed merger.rb in the project's local merger repository. Initialize it, commit the layer, or propose a stock merge.",
         "STANDARD_MERGE_INSPECTION_INVALID" => "The merge inspection request is not valid for this run.",
         "STANDARD_MERGE_INSPECTION_ORDER" => "Merge inspection access can open only on a running prepared copy, or on a result after its backup is recorded.",
         "STANDARD_MERGE_INSPECTION_UNAVAILABLE" => "Local merge inspection access could not be opened. Inspect private evidence, reset this run, then prepare again.",
@@ -535,8 +540,9 @@ module SiloMigrate
             run["finished_at"] = now
             mark_instances_dirty(state, run)
             merge_environment_failed(state, run)
-            public_run(run, held: true)
           end
+          merge_failure_fence(run_id)
+          public_run(@store.load.fetch("runs").fetch(run_id), held: true)
         end
       end
 
@@ -990,6 +996,9 @@ module SiloMigrate
         @store.update do |state|
           apply_failure(state, state.fetch("runs").fetch(run_id), stage, code, detail)
         end
+        # The failure is recorded first; then (still under the executor's op lock, outside the
+        # state lock) no inspection access may outlive it.
+        merge_failure_fence(run_id)
       end
 
       def apply_failure(state, run, stage, code, detail)

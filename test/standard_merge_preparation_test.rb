@@ -26,6 +26,11 @@ class PrepareScriptedRuntime < MergeScriptedRuntime
   end
 
   def run(cmd, **options)
+    # The standalone merger store is a real local repository: its Git calls really run.
+    if (index = cmd.index('-C')) && cmd[index + 1].to_s.end_with?('/merger') && cmd.include?('git')
+      commands << cmd.join(' ')
+      return SiloMigrate::Runtime::Docker.new.run(cmd, **options)
+    end
     if cmd[0, 2] == %w[docker exec] && cmd.include?('psql') && cmd.include?('-Atc') && (result = prepare_sql(cmd, cmd.last))
       commands << cmd.join(' ')
       sql << cmd.last
@@ -158,11 +163,40 @@ class StandardMergePreparationTest < StandardMergeRunTest
     nil
   end
 
-  def use_layer
+  LAYER_SOURCE = "require_relative 'helpers/routes'\nclass InventedMerger < BulkImport::DiscourseMerger; def self.silo_merge_preflight! = true; def self.silo_merge_postflight! = true; end\n"
+
+  # A converter-held layer, as older (pre-standalone) plans bound.
+  def use_converter_layer
     sha = 'c' * 40
-    source = "class InventedMerger < BulkImport::DiscourseMerger; def self.silo_merge_preflight! = true; def self.silo_merge_postflight! = true; end\n"
     @runtime.layer_entries = "100644 blob #{sha}\tmergers/synthetic/merger.rb\0"
-    @runtime.layer_blobs = { sha => source, 'mergers/synthetic/merger.rb' => source }
+    @runtime.layer_blobs = { sha => LAYER_SOURCE, 'mergers/synthetic/merger.rb' => LAYER_SOURCE }
+  end
+
+  def merger_dir = File.join(@service.store.workspace_root, 'merger')
+
+  # The engineer's own Git, outside the service: command-scoped identity, no global config.
+  def git(*args, dir: merger_dir)
+    out, status = Open3.capture2e({ 'GIT_CONFIG_NOSYSTEM' => '1', 'GIT_CONFIG_GLOBAL' => '/dev/null' }, 'git', '-c', 'user.name=Invented Engineer',
+                                  '-c', 'user.email=invented@example.invalid', '-c', 'commit.gpgsign=false', '-C', dir, *args)
+    assert status.success?, out
+    out
+  end
+
+  def commit_merger(files, message = 'invented layer')
+    files.each do |name, content|
+      path = File.join(merger_dir, name)
+      FileUtils.mkdir_p(File.dirname(path))
+      content.nil? ? FileUtils.rm_f(path) : File.write(path, content)
+    end
+    git('add', '-A')
+    git('commit', '-q', '--allow-empty', '-m', message)
+    git('rev-parse', 'HEAD').strip
+  end
+
+  def use_layer
+    @service.merger_init
+    commit_merger('merger.rb' => LAYER_SOURCE, 'helpers/routes.rb' => "module InventedRoutes; end\n",
+                  'test/merger_test.rb' => "raise 'invented tests are never executed by a merge'\n", 'README.md' => "Invented contract notes.\n")
   end
 
   # -- the production quiesce script against real processes (no scripted runtime) ----------
@@ -599,7 +633,8 @@ class StandardMergePreparationTest < StandardMergeRunTest
       refute index_of(/TEMPLATE|RENAME TO/)
       refute index_of(%r{ruby /tmp/merge_run\.rb})
       refute merge_lines.any? { |line| line.match?(/schema_migrations/i) && line.match?(/DELETE|INSERT|UPDATE/i) }
-      assert_equal [], @inspection
+      # Never opened; the failed run's own access is fenced all the same.
+      assert_equal [{ op: 'close', run_id: run[:run_id] }], @inspection.map { |call| call.slice(:op, :run_id) }
       refute_includes JSON.generate(run), '20270101000000'
       standard_error('STANDARD_ARGUMENT_INVALID') { @service.propose_merge_plan(prepared_from: run[:run_id], generation: nil, intent: 'stock') }
       standard_error('STANDARD_MERGE_ENVIRONMENT_STALE') { @service.propose_merge_plan(prepared_from: run[:run_id], generation: 'a' * 64, intent: 'stock') }
@@ -698,26 +733,40 @@ class StandardMergePreparationTest < StandardMergeRunTest
       prep = prepared
       error = standard_error('STANDARD_MERGE_INTENT_MISMATCH') { prepared_plan(prep, intent: 'custom') }
       assert_equal 'STANDARD_MERGE_INTENT_MISMATCH', error.code
+      # Even a committed converter-held layer is never a fallback for a new custom plan.
+      use_converter_layer
+      standard_error('STANDARD_MERGE_INTENT_MISMATCH') { prepared_plan(prep, intent: 'custom') }
+      @service.merger_init
+      standard_error('STANDARD_MERGE_INTENT_MISMATCH') { prepared_plan(prep, intent: 'custom') }
       use_layer
-      # A layer that disappears after approval is a changed plan, not a silent stock merge.
+      # A store that turns unsafe after approval is a changed plan, not a silent stock merge.
       plan = prepared_plan(prep, intent: 'custom')
-      @runtime.layer_entries = ''
-      failed = @service.run_plan(plan_id: approve(plan))
-      assert_equal 'STANDARD_MERGE_LAYER_INVALID', failed.dig(:failure, 'code')
-      assert_equal 'failed', failed.dig(:stages, 'preflight')
-      assert_equal 'released', failed.dig(:merge_environment, 'phase')
+      approved = approve(plan)
+      git('remote', 'add', 'origin', 'https://example.invalid/merger.git')
+      assert_equal 'stale', @service.show_plan(plan[:plan_id])[:status]
+      standard_error('STANDARD_STALE_PLAN') { @service.run_plan(plan_id: approved) }
+      standard_error('STANDARD_MERGER_CONFIG') { prepared_plan(prep, intent: 'custom') }
       assert_equal 'ready', environment(prep[:run_id])['phase']
       assert_equal SEALED, @runtime.databases
       # Nothing was consumed: the same generation serves the next exact plan.
-      use_layer
+      git('remote', 'remove', 'origin')
+      # No converter identity is consulted for a standalone custom plan.
+      @runtime.converter_dirty = true
       plan = prepared_plan(prep, intent: 'custom', settings: @merge_settings)
       assert_equal 'custom', plan[:intent]
       assert_equal true, plan.dig(:merge, 'layer', 'present')
+      assert_equal 'merger', plan.dig(:merge, 'layer', 'store')
+      assert_equal 2, plan.dig(:merge, 'layer', 'files')
+      assert_equal git('rev-parse', 'HEAD').strip, plan.dig(:merge, 'layer', 'revision')
       assert_equal true, plan.dig(:merge, 'settings')
-      assert_equal 'a' * 40, plan[:converter_revision]
+      assert_nil plan[:converter_revision]
+      assert_nil plan[:converter]
       before = merge_lines.size
       run = @service.run_plan(plan_id: approve(plan))
       assert_equal 'completed', run[:status], run[:failure].inspect + failure_detail(run)
+      # Exactly the executable committed files; tests and README are never extracted.
+      extracted = Dir.glob('**/*', base: @service.store.run_dir(run[:run_id], 'private', 'merge', 'layer')).sort
+      assert_equal %w[helpers helpers/routes.rb merger.rb], extracted
       # The command line is shell-escaped; compare the plain form.
       merger = merge_lines[index_of(%r{ruby /tmp/merge_run\.rb}, from: before)].delete('\\')
       assert_includes merger, 'SILO_MERGE_REQUIRE_CHECKS=1'
@@ -852,7 +901,7 @@ class StandardMergePreparationTest < StandardMergeRunTest
       # Ownership was durable before the first fallible action.
       assert_equal @instance, record(run[:run_id])['instance']
       assert_equal 'dirty', instance_state
-      assert_equal [], @inspection
+      assert_equal [{ op: 'close', run_id: run[:run_id] }], @inspection.map { |call| call.slice(:op, :run_id) }
       standard_error('STANDARD_DIRTY_INSTANCE') { @service.claim(plan_id: approve(prepare_plan)) }
       @runtime.fail_sql = nil
       assert_equal [@instance], @service.reset_run(run_id: run[:run_id], yes: true)[:removed]
@@ -911,7 +960,11 @@ class StandardMergePreparationTest < StandardMergeRunTest
       run = @service.run_plan(plan_id: approve(prepared_plan(prep)))
       assert_equal 'STANDARD_MERGE_ENVIRONMENT_DIRTY', run.dig(:failure, 'code')
       assert_equal SEALED, @runtime.databases
-      refute @inspection.any? { |call| call[:op] == 'close' }
+      # Nothing was fenced by activation; once the failure made the environment dirty, the
+      # recorded failure is followed by closing every access of it (the preparation's included).
+      assert_equal 'dirty', environment(prep[:run_id])['phase']
+      assert_equal [prep[:run_id], run[:run_id]].sort, @inspection.select { |call| call[:op] == 'close' }.map { |call| call[:run_id] }.sort
+      assert_equal 'closed', run.dig(:results, 'merge', 'inspection_fence')
     end
     with_prepare do
       prep = prepared

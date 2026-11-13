@@ -268,11 +268,13 @@ It can read safe status, propose plans and read released findings. It can't appr
 
 ## Investigation and release
 
+Proposed findings can be revised privately with compare-and-swap; Release/Reject name the proposal digest the engineer reviewed, separately from the edited release text digest. See [proposal revisions and local merger development](merge-workflow-development.md).
+
 1. A migration-data session (restricted to the `cdck_frontier` route) reads one run's private evidence and proposes a finding:
    `term-llm ask --agent ./integrations/term-llm/migration-data "Investigate run RUN_ID in workspace WS"`. It can also propose a **schema finding** with no run (`standard finding propose WS --kind schema --file -`): a source's tables, columns, counts and invented examples for converter work.
    `standard analyst evidence WS RUN_ID` returns the run's stages, assertions, results and failure record first, then every evidence file and log with its size and stage, then the ends of the most relevant files: failed assertion groups, then the failed stage's logs (the step named in the failure first, then latest first), then earlier stages. The whole document stays under 40 KiB, because term-llm 0.9.93 cuts tool output at 50 KiB. An entry whose `tail_bytes` is below its `bytes` wasn't read in full; `tails_omitted` counts files with no tail. A completed run gets no finding: `finding propose` refuses it with `STANDARD_RUN_COMPLETED`.
 2. The engineer reads it, checks it against the evidence, and writes the text to release. It doesn't have to match the proposal, and often shouldn't. On a node this happens in the web UI's **Findings** widget (see `docs/node-operations.md`); from a shell, `standard finding review`.
-3. The engineer releases that exact text: in the widget with **Release**, or `standard finding release WS FINDING_ID --file PATH|- --sha256 DIGEST --reviewer NAME`. A synthetic reproduction can be attached the same way (CLI only).
+3. The engineer releases that exact text: in the widget with **Release**, or `standard finding release WS FINDING_ID --file PATH|- --sha256 DIGEST --expected-proposal-sha256 VIEWED_PROPOSAL_DIGEST --reviewer NAME`. A synthetic reproduction can be attached the same way (CLI only).
 4. Coding work reads it with `standard agent finding-show`. Unreleased findings aren't listed and can't be read through this surface.
 5. To correct a released finding, `standard finding amend WS FINDING_ID --file -|PATH --sha256 DIGEST --reviewer NAME` (widget: **Amend**) releases the new text as a new finding that replaces it: the old one becomes `superseded` and coding agents see only the replacement, whose `supersedes` names the old ID. `standard finding withdraw WS FINDING_ID --reviewer NAME` (widget: **Withdraw**) takes one back without a replacement. Rejected, superseded and withdrawn findings stay on record.
 5. Fixing the code invalidates earlier plans, so a new plan and run validate the fix.

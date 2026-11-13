@@ -3171,8 +3171,8 @@ def merge_layer_contract(ws):
     spec = importlib.util.spec_from_file_location("merge_contract_source", Path(__file__).with_name("merge_contract.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.MERGE_GUIDE.format(path="mergers/%s/merger.rb" % ws.name, files=module.MERGE_LAYER_MAX_FILES,
-                                     kib=module.MERGE_LAYER_MAX_BYTES // 1024, tests="test/mergers/%s" % ws.name)
+    return module.STANDALONE_MERGE_GUIDE.format(path="the standalone local merger checkout", files=module.MERGE_LAYER_MAX_FILES,
+                                                kib=module.MERGE_LAYER_MAX_BYTES // 1024)
 
 
 def op_merge_prepare(ws, request):
@@ -3214,6 +3214,16 @@ def op_merge_inspection(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID: generation")
     if request.get("side") not in ("source", "base", "result"):
         refuse("STANDARD_ARGUMENTS_INVALID: side is source, base or result")
+    # The Ruby projection computes input/delivery/runtime staleness; don't register a
+    # connector for an environment that cannot be consumed. This is process guidance,
+    # not revocation: the manifest + atomic-state fence gates every new launcher.
+    run = json.loads(ws.control(["standard", "run", "show", ws.name, request["run_id"]], timeout=60))
+    environment = run.get("merge_environment") if isinstance(run, dict) else None
+    wanted = "result" if request["side"] == "result" else "ready"
+    if not (isinstance(environment, dict) and run.get("status") == "completed"
+            and environment.get("generation") == request["generation"] and environment.get("phase") == wanted
+            and (request["side"] == "result" or environment.get("preparation_run_id") == request["run_id"])):
+        refuse("STANDARD_MERGE_ENVIRONMENT_STALE: this run is not the current ready/result generation; check data_guide and its exact binding")
     spec = importlib.util.spec_from_file_location("merge_mcp", Path(__file__).with_name("merge_mcp.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -3248,6 +3258,8 @@ def op_merge_propose(ws, request):
     else:
         if generation is not None or intent is not None:
             refuse("STANDARD_ARGUMENTS_INVALID: generation and intent require prepared_from")
+        if os.path.lexists(ws.root / "merger/.git") or (ws.root / "merger").is_symlink():
+            refuse("STANDARD_MERGE_PREPARATION_REQUIRED: use the ready preparation run/generation and explicit custom or stock intent")
         source = merge_source(ws, request, inputs, read_deliveries(ws))
         base = merge_base(ws, request)
         argv = ["standard", "plan", "propose", ws.name, "--operation", "merge", "--source", source, "--base-site", base]
@@ -3261,9 +3273,9 @@ def op_merge_propose(ws, request):
         argv += ["--settings", settings]
     preparation = preparation_document(ws, request)
     argv += ["--" + key.replace("_", "-") for key, value in options.items() if value]
-    # Bind the workspace to the converter checkout's committed branch head: the merge layer, if the
-    # project has one, is read from exactly that commit. A dirty checkout refuses: commit first.
-    converter = {} if prepared and intent == "stock" else json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
+    # Legacy one-shot merges retain their converter binding. Prepared custom merges
+    # use the independent local merger store; the backend binds its committed bytes.
+    converter = {} if prepared else json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
     # checks the registered inputs (a backup can be GBs)
     with PlanDocuments(ws, {"--preparation": ("STANDARD_PREPARATION_INVALID", preparation)}) as extra:
         plan = json.loads(ws.control(argv + extra, timeout=240))
@@ -3300,7 +3312,48 @@ def op_propose_finding(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID: run_id")
     result = json.loads(ws.control(argv, input=text))
     return {"finding_id": result.get("finding_id"), "status": result.get("status"), "kind": "schema" if run_id is None else "finding",
+            "proposal_revision": result.get("proposal_revision"), "proposal_sha256": result.get("proposal_sha256"),
             "note": "private proposal; the engineer reviews and decides what is released to coding agents"}
+
+
+def finding_reference(request):
+    identifier = request.get("finding_id")
+    if not isinstance(identifier, str) or not re.fullmatch(r"finding-[0-9a-f]{32}", identifier):
+        refuse("STANDARD_ARGUMENTS_INVALID: finding_id")
+    return identifier
+
+
+def op_finding_proposal(ws, request):
+    """Trusted paginated proposal read; never routed through the coding projection."""
+    ws.require()
+    identifier = finding_reference(request)
+    offset = request.get("offset", 0)
+    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= MAX_FINDING:
+        refuse("STANDARD_ARGUMENTS_INVALID: offset")
+    result = json.loads(ws.control(["standard", "finding", "proposal", ws.name, identifier]))
+    text = result.get("proposal")
+    if not isinstance(text, str):
+        refuse("STANDARD_OPERATION_FAILED")
+    # At most 24 KiB even if JSON escapes every character as \uXXXX.
+    page = text[offset:offset + 4096]
+    next_offset = offset + len(page)
+    return {"finding_id": identifier, "status": result.get("status"), "proposal": page,
+            "proposal_revision": result.get("proposal_revision"), "proposal_sha256": result.get("proposal_sha256"),
+            "offset": offset, "next_offset": next_offset if next_offset < len(text) else None,
+            "total_chars": len(text), "complete": next_offset >= len(text)}
+
+
+def op_revise_finding(ws, request):
+    ws.require()
+    identifier = finding_reference(request)
+    text, expected = request.get("text"), request.get("expected_proposal_sha256")
+    if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > MAX_FINDING:
+        refuse("STANDARD_ARGUMENTS_INVALID: text")
+    if not isinstance(expected, str) or not DIGEST.fullmatch(expected):
+        refuse("STANDARD_ARGUMENTS_INVALID: expected_proposal_sha256")
+    result = json.loads(ws.control(["standard", "finding", "revise", ws.name, identifier,
+                                   "--file", "-", "--expected-proposal-sha256", expected], input=text))
+    return {key: result[key] for key in ("version", "finding_id", "status", "proposal_revision", "proposal_sha256", "bytes") if key in result}
 
 
 # -- dispatch ------------------------------------------------------------------------------
@@ -3512,7 +3565,9 @@ def guide_findings(state):
     for key, record in found.items():
         if isinstance(record, dict):
             release = record.get("release") if isinstance(record.get("release"), dict) else {}
-            out.append({"id": key, "status": record.get("status"), "at": release.get("released_at") or record.get("proposed_at") or ""})
+            out.append({"id": key, "status": record.get("status"), "at": release.get("released_at") or record.get("proposed_at") or "",
+                        **({"proposal_revision": record.get("proposal_revision", 1), "proposal_sha256": record.get("proposal_sha256")}
+                           if record.get("status") == "proposed" else {})})
     return sorted(out, key=lambda item: str(item["at"]))
 
 
@@ -3917,13 +3972,13 @@ OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_creat
        "supporting_list": op_supporting, "supporting_take": op_supporting, "supporting_read": op_supporting,
        "supporting_prepare": op_supporting_prepare,
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
-       "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding,
+       "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding, "finding_proposal": op_finding_proposal, "revise_finding": op_revise_finding,
        "plan_propose": op_plan_propose, "merge_prepare": op_merge_prepare, "merge_inspection": op_merge_inspection,
        "merge_propose": op_merge_propose, "master_lists_propose": op_master_lists_propose,
        "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions, "deliveries": op_deliveries, "delivery_label": op_delivery_label,
        "finding_done": op_finding_done, "site_process": op_site_process, "site_review": op_site_review}
 # Logged with their arguments (minus script code, finding text, count SQL and decisions, logged by hash).
-QUIET = {"status", "list", "job", "db_status", "notes", "guide", "decisions", "deliveries", "site_process"}
+QUIET = {"status", "list", "job", "db_status", "notes", "guide", "decisions", "deliveries", "site_process", "finding_proposal"}
 
 
 def fit(result):

@@ -266,6 +266,27 @@ def host_data(args, values, base, self):
     return 0
 
 
+def merger_dev():
+    # As converter_dev(): by path from beside this file.
+    import importlib.util
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("merger_dev", Path(__file__).resolve().parent / "merger_dev.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def host_merger(args, values, base, self):
+    """`merger dev WS --role ROLE`: the coding agents' bounded tools for the project's standalone
+    local merger repository (bin/merger_dev.py), one JSON request on stdin. Host-only: no remote,
+    no credentials. Its init runs the service's own explicit `standard merger init WS`."""
+    def init(workspace):
+        capture([str(self), "standard", "merger", "init", workspace], passthrough=True)
+    result = merger_dev().main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin, init)
+    sys.stdout.buffer.write((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
+    return 0
+
+
 def host_converter(args, values, base, self):
     if len(args) >= 2 and args[1] in ("dev", "push", "push-show", "push-discard", "deps", "log"):
         result = converter_dev().main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin)
@@ -584,6 +605,8 @@ def main(args):
     gems = Path(values.get("SILO_CONTROL_GEMS", str(project / ".runtime-cache/gems")))
     if args[:1] == ["converter"]:
         return host_converter(args, values, base, self)
+    if args[:1] == ["merger"]:
+        return host_merger(args, values, base, self)
     if args[:1] in (["merge-mcp"], ["merge-dbhub"]):
         return host_merge_inspection(args, values, base)
     if args[:1] in (["data"], ["dbhub"]):

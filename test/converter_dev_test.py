@@ -231,6 +231,81 @@ class ConverterDevTest(unittest.TestCase):
         self.assertNotIn(MARKER, json.dumps(guide))
         self.assertNotIn('private-base', json.dumps(guide))
 
+    def test_merge_guide_reads_the_ready_prepare_core_and_never_falls_back_past_it(self):
+        profiles = Path(self.temp.name) / 'profiles'
+        raw = json.dumps({'images': {}, 'app': {'revision': 'a' * 40, 'version': '2026.11.0-latest'}}).encode()
+        self.write(profiles / 'profile-a.json', raw.decode())
+        self.state['config']['discourse_profile_sha256'] = hashlib.sha256(raw).hexdigest()
+        values = {'SILO_RUNTIME_PROFILES_DIR': str(profiles)}
+
+        def guide():
+            (self.root / '.silo-migrate/named/standard/state.json').write_text(json.dumps(self.state))
+            result = self.dev.op_merge_guide(self.dev.Checkout(self.base, self.ws, self.host), {}, values, Path(self.temp.name) / 'no-release')
+            for leak in (MARKER, 'private-base', 'image_ref', 'base_site'):
+                self.assertNotIn(leak, json.dumps(result))
+            return result
+
+        def prepare(run, runtime, **environment):
+            run_id, plan_id = 'run-' + run * 32, 'plan-' + run * 32
+            self.state['plans'][plan_id] = {'status': 'completed', 'created_at': '2026-11-01T00:00:00Z', 'body': {
+                'operation': 'standard_merge_prepare', 'roles': {'base_site': 'private-base'}, 'review_runtime': runtime}}
+            self.state['runs'][run_id] = {'plan_id': plan_id, 'status': 'completed', 'merge_environment': dict(
+                {'phase': 'ready', 'consumed_by': None, 'preparation_run_id': run_id, 'generation': 'e' * 64}, **environment)}
+            return run_id
+
+        self.state['plans'], self.state['runs'] = {}, {}
+        # Nothing prepared or planned: the workspace profile, labelled as such.
+        first = guide()
+        self.assertTrue(first['discourse_basis'].startswith('workspace_profile;'))
+        self.assertEqual('a' * 40, first['discourse']['revision'])
+        self.assertNotIn('discourse_basis_preparation', first)
+        # Prepared custom merges run the standalone local repository: the guide says where, never a file of it.
+        self.assertEqual((str(self.root / 'merger'), False), (first['standalone_merger']['path'], first['standalone_merger']['initialized']))
+        # A later merge plan is newer than the Prepare, yet the ready Prepare decides.
+        self.state['plans']['plan-' + 'b' * 32] = {'status': 'proposed', 'created_at': '2026-11-12T00:00:00Z', 'body': {
+            'operation': 'standard_merge', 'review_runtime': {'actual_version': '2026.6.1', 'app_revision': 'd' * 40}}}
+        self.assertTrue(guide()['discourse_basis'].startswith('latest_merge_plan;'))
+        run_id = prepare('1', {'actual_version': '2026.7.5', 'app_revision': 'c' * 40, 'image_ref': 'private-base/' + MARKER})
+        ready = guide()
+        self.assertTrue(ready['discourse_basis'].startswith('ready_merge_preparation;'))
+        self.assertEqual({'run_id': run_id, 'generation': 'e' * 64}, ready['discourse_basis_preparation'])
+        self.assertEqual(('2026.7.5', 'c' * 40), (ready['discourse']['version'], ready['discourse']['revision']))
+        self.assertIn('c' * 40 + '/script/bulk_import/discourse_merger.rb', ready['discourse']['merger_source'])
+        # Ready but unreadable, or more than one ready: no revision at all rather than the plan's or the profile's.
+        for runtime, environment in (({'actual_version': 'main', 'app_revision': 'c' * 40}, {}), ({'actual_version': '2026.7.5', 'app_revision': 'main'}, {}),
+                                     ({'actual_version': '2026.7.5', 'app_revision': 'c' * 40}, {'generation': 'unset'})):
+            prepare('1', runtime, **environment)
+            unreadable = guide()
+            self.assertTrue(unreadable['discourse_basis'].startswith('ready_merge_preparation_unreadable;'), runtime)
+            self.assertEqual({'run_id': run_id}, unreadable['discourse_basis_preparation'])
+            self.assertNotIn('discourse', unreadable)
+        prepare('1', {'actual_version': '2026.7.5', 'app_revision': 'c' * 40})
+        prepare('2', {'actual_version': '2026.7.5', 'app_revision': 'f' * 40})
+        ambiguous = guide()
+        self.assertTrue(ambiguous['discourse_basis'].startswith('ready_merge_preparation_ambiguous;'))
+        self.assertNotIn('discourse', ambiguous)
+        self.assertNotIn('discourse_basis_preparation', ambiguous)
+        # A consumed, unfinished or foreign environment is not a ready Prepare.
+        del self.state['runs']['run-' + '2' * 32]
+        for change in ({'phase': 'consumed', 'consumed_by': 'run-' + '3' * 32}, {'phase': 'inspection'}, {'preparation_run_id': 'run-' + '3' * 32}):
+            prepare('1', {'actual_version': '2026.7.5', 'app_revision': 'c' * 40}, **change)
+            self.assertTrue(guide()['discourse_basis'].startswith('latest_merge_plan;'), change)
+
+    def test_merge_guide_states_the_settings_file_limits_the_service_enforces(self):
+        contract = self.dev._merge_contract
+        service = (ROOT / 'lib/silo_migrate/services/standard_merge_run.rb').read_text()
+        self.assertEqual(256 * 1024, contract.MERGE_SETTINGS_MAX_BYTES)
+        self.assertIn('MERGE_SETTINGS_BYTES = 256 * 1024', service)
+        self.assertIn('YAML.safe_load(bytes, permitted_classes: [], permitted_symbols: [], aliases: false)', service)
+        self.assertIn('unless value.is_a?(Hash)', service)
+        for text in (contract.MERGE_GUIDE, contract.STANDALONE_MERGE_GUIDE):
+            for phrase in ('at most %d KiB' % (contract.MERGE_SETTINGS_MAX_BYTES // 1024), 'a mapping at its root', 'aliases disabled',
+                           'STANDARD_MERGE_SETTINGS_INVALID', 'no limit on the number of lines or entries'):
+                self.assertIn(phrase, text)
+            # Never a cap the service does not have.
+            for wrong in ('200 lines', '200-line', '100 entries', '100-entry'):
+                self.assertNotIn(wrong, text)
+
     def resolver_fixture(self):
         self.fetch_local_origin()
         patcher = mock.patch.object(self.dev, 'origin_repository', return_value=('discourse-org', 'discourse-converters'))

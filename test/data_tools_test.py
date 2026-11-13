@@ -1722,7 +1722,7 @@ class DataToolsTest(unittest.TestCase):
         self.assertIn('SILO_MERGE_SETTINGS', result['layer_contract'])
         self.assertIn('call super first', result['layer_contract'])
         self.assertIn('Do not write files', result['layer_contract'])
-        self.assertIn('mergers/arc/merger.rb', result['layer_contract'])
+        self.assertIn('Entry file: merger.rb at its root', result['layer_contract'])
         self.assertNotIn('private', json.dumps({key: value for key, value in result.items() if key != 'layer_contract'}))
         self.assertNotIn('converter_branch', result)
         self.assertNotIn(MARKER, json.dumps(result))
@@ -1763,7 +1763,8 @@ class DataToolsTest(unittest.TestCase):
         source = next(key for key, value in named['inputs'].items() if value.get('type') == 'discourse-backup')
         base = next(key for key, value in named['inputs'].items() if value.get('type') == 'base_site')
         self.op('merge_propose', prepared_from=run, generation=generation, intent='custom', source=source, base_site=base)
-        self.assertEqual(['standard', 'converter', 'refresh'], calls[0][:3])
+        self.assertEqual(1, len(calls))  # local custom store does not refresh the converter
+        self.assertEqual(['standard', 'plan', 'propose'], calls[0][:3])
         self.assertIn('--source', calls[-1])
         self.assertIn('--base-site', calls[-1])
         self.refused('STANDARD_MERGE_INTENT_MISMATCH', 'merge_propose', prepared_from=run, generation=generation,
@@ -1783,6 +1784,20 @@ class DataToolsTest(unittest.TestCase):
                         {'run_id': 'run-' + 'b' * 32, 'generation': 'a' * 64, 'side': 'production'}):
             with self.subTest(request=request):
                 self.refused('STANDARD_ARGUMENTS_INVALID', 'merge_inspection', **request)
+
+    def test_merge_inspection_refuses_stale_or_missing_projection_before_registration(self):
+        self.merge_project()
+        run, generation = 'run-' + 'b' * 32, 'a' * 64
+        original = self.control
+        for environment in (None, {'phase': 'stale', 'generation': generation, 'preparation_run_id': run},
+                            {'phase': 'ready', 'generation': 'c' * 64, 'preparation_run_id': run}):
+            def control(argv, input=None, timeout=120):
+                if argv[:3] == ['standard', 'run', 'show']:
+                    return json.dumps({'status': 'completed', 'merge_environment': environment})
+                return original(argv, input=input, timeout=timeout)
+            self.control = control
+            self.refused('STANDARD_MERGE_ENVIRONMENT_STALE', 'merge_inspection', run_id=run, generation=generation, side='base')
+        self.assertFalse((self.config_home / 'term-llm/mcp.json').exists())
 
     def test_merge_guide_distinguishes_preparation_lifecycle_and_drops_nested_secrets(self):
         self.merge_project()
@@ -1842,6 +1857,13 @@ class DataToolsTest(unittest.TestCase):
         doc['inputs'][input_id] = {'id': input_id, 'type': 'merge-settings', 'dataset_id': 'dataset-' + 'b' * 32}
         state.write_text(json.dumps(doc))
         return input_id
+
+    def test_one_shot_does_not_silently_ignore_a_local_merger_store(self):
+        self.merge_project()
+        (self.base / 'arc/merger/.git').mkdir(parents=True)
+        before = len(self.control.calls)
+        self.refused('STANDARD_MERGE_PREPARATION_REQUIRED', 'merge_propose')
+        self.assertEqual(before, len(self.control.calls))
 
     def test_merge_propose_refuses_what_is_not_a_source_base_site_or_settings(self):
         source, base = self.merge_project()
@@ -2210,6 +2232,42 @@ class DataToolsTest(unittest.TestCase):
         audit = (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text()
         self.assertNotIn('example user_1', audit)
         self.assertIn('text_sha256', audit)
+
+    def test_proposal_read_and_revision_are_private_bounded_and_digest_bound(self):
+        self.create()
+        finding = 'finding-' + 'a' * 32
+        text = 'Invented ' + '\u2603' * 5000
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        original, calls = self.control, []
+        def control(argv, input=None, timeout=120):
+            calls.append((argv, input))
+            if argv[:3] == ['standard', 'finding', 'proposal']:
+                return json.dumps({'finding_id': finding, 'status': 'proposed', 'proposal': text,
+                                   'proposal_sha256': digest, 'proposal_revision': 1})
+            if argv[:3] == ['standard', 'finding', 'revise']:
+                return json.dumps({'finding_id': finding, 'status': 'proposed', 'proposal_revision': 2,
+                                   'proposal_sha256': hashlib.sha256(input.encode()).hexdigest(), 'private_extra': MARKER})
+            return original(argv, input=input, timeout=timeout)
+        self.control = control
+        first = self.op('finding_proposal', finding_id=finding)
+        second = self.op('finding_proposal', finding_id=finding, offset=first['next_offset'])
+        self.assertFalse(first['complete'])
+        self.assertTrue(second['complete'])
+        self.assertEqual(text, first['proposal'] + second['proposal'])
+        self.assertEqual(digest, second['proposal_sha256'])
+        self.assertLess(len(json.dumps(first, ensure_ascii=False).encode()), self.d.OUTPUT_LIMIT)
+        result = self.op('revise_finding', finding_id=finding, text='Corrected invented requirement', expected_proposal_sha256=digest)
+        self.assertEqual(2, result['proposal_revision'])
+        self.assertNotIn(MARKER, json.dumps(result))
+        self.assertEqual((['standard', 'finding', 'revise', 'arc', finding, '--file', '-', '--expected-proposal-sha256', digest],
+                          'Corrected invented requirement'), calls[-1])
+        audit = (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text()
+        self.assertNotIn('Corrected invented requirement', audit)
+        for args in ({'finding_id': '../elsewhere', 'text': 'safe', 'expected_proposal_sha256': digest},
+                     {'finding_id': finding, 'text': 'safe', 'expected_proposal_sha256': 'bad'},
+                     {'finding_id': finding, 'text': ' ', 'expected_proposal_sha256': digest}):
+            self.refused('STANDARD_ARGUMENTS_INVALID', 'revise_finding', **args)
+        self.refused('STANDARD_ARGUMENTS_INVALID', 'finding_proposal', finding_id=finding, offset=True)
 
     def test_plan_propose_passes_input_ids_and_prepares_dependencies_once(self):
         self.create()

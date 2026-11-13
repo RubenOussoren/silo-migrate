@@ -47,6 +47,8 @@ TOOLS = {
     "data_run_evidence": ("run_evidence", {"run_id"}, 60),
     "data_run_count": ("run_count", {"run_id", "side", "sql"}, 290),
     "data_propose_finding": ("propose_finding", {"text", "run_id"}, 60),
+    "data_finding_proposal": ("finding_proposal", {"finding_id", "offset"}, 60),
+    "data_revise_finding": ("revise_finding", {"finding_id", "text", "expected_proposal_sha256"}, 60),
     "data_plan_propose": ("plan_propose", {"source", "settings", "reconciliation", "charset", "from_run", "base_site", "fresh_site",
                                            "run_inputs", "preparation"}, 290),
     "data_master_lists_propose": ("master_lists_propose", {"source", "settings", "list", "charset", "run_inputs"}, 290),

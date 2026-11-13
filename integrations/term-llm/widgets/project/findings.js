@@ -1,8 +1,14 @@
 // The Findings tab: what migration-data proposes, and the only way text reaches the coding agents.
-// The decisions are those of widgets/findings/server.py, unchanged: the exact text and its checksum are sent.
+// The decisions are those of widgets/findings/server.py: the exact text and its checksum are sent, and a
+// release or a rejection also names the proposal this page showed (migration-data can revise one until then).
 import { el, safe, ago, toast, api, lists, explain, facts, details, card, back, item } from './ui.js';
 
 const STATUS_LABEL = { proposed: 'to review', released: 'released', rejected: 'rejected', superseded: 'replaced', withdrawn: 'withdrawn' };
+// Refusals only a decision on a proposal gets; ui.js explains the rest.
+const REFUSED = {
+  STANDARD_PROPOSAL_CHANGED: 'migration-data revised this proposal after this page loaded it. Nothing was released or rejected.',
+  STANDARD_PROPOSAL_TAMPERED: 'The stored proposal no longer matches its record. Nothing was released or rejected. Ask your node admin to investigate.',
+};
 
 // A small Markdown subset rendered as DOM nodes (never as HTML): headings (also ALL-CAPS section
 // lines), bullet and numbered lists, pipe tables, fenced code, `code` and **bold**. Links stay text.
@@ -108,7 +114,7 @@ export function findingsView(ctx) {
     return { area, node: el('div', { class: 'editor' }, area, counter) };
   }
 
-  async function act(action, record, text) {
+  async function act(action, record, text, onRevised) {
     const words = {
       release: `Release this exact text (${new TextEncoder().encode(text || '').length} bytes) to the coding agents of ${ctx.project}?`,
       amend: `Release this corrected text for ${ctx.project}? It replaces the current one; the coding agents will see only the new version.`,
@@ -118,11 +124,13 @@ export function findingsView(ctx) {
     if (!confirm(words[action])) return;
     const project = ctx.project;
     const mine = ++ticket;  // an older list refresh must not replace the disabled action controls
-    // One decision at a time.
-    const buttons = [...document.querySelectorAll('#content .actions button')];
+    // One decision at a time. Only what was enabled: a refusal re-enables these, never a control that was off already.
+    const buttons = [...document.querySelectorAll('#content .actions button')].filter((button) => !button.disabled);
     for (const button of buttons) button.disabled = true;
     try {
-      const outcome = await api(`api/findings/${action}`, { workspace: project, id: record.id, text });
+      // The proposal this page showed: the server refuses if it has been revised (or decided) since.
+      const viewed = action === 'release' || action === 'reject' ? { proposal_sha256: record.proposal_sha256 } : {};
+      const outcome = await api(`api/findings/${action}`, { workspace: project, id: record.id, text, ...viewed });
       if (project !== ctx.project || mine !== ticket) return;
       toast(action === 'amend' ? 'Released the correction.' : `Done: ${outcome.status}.`);
       editing = null;
@@ -131,7 +139,9 @@ export function findingsView(ctx) {
     } catch (error) {
       if (project !== ctx.project || mine !== ticket) return;
       for (const button of buttons) button.disabled = false;
-      toast(explain(error), true);  // nothing changed: the page, edits included, stays as it is
+      const code = String(error.message).split(':')[0];
+      toast(REFUSED[code] || explain(error), true);  // nothing changed: the page, edits included, stays as it is
+      if (code === 'STANDARD_PROPOSAL_CHANGED' && onRevised) onRevised();
     }
   }
 
@@ -197,16 +207,23 @@ export function findingsView(ctx) {
     ctx.mount(nodes);
   }
 
-  async function detail(id) {
+  // keepEdits: reading a revised proposal after a refused decision. The page, and the editor on it, stays
+  // until the revision has arrived; the engineer's own text then goes into the new editor.
+  async function detail(id, keepEdits = false) {
     const mine = ++ticket;
     const leave = () => { if (!unsaved() || confirm('Discard your edits to this finding?')) { editing = null; ctx.close(); } };
-    ctx.mount([back('Findings', leave), el('p', { class: 'quiet' }, 'Loading…')]);
+    if (!keepEdits) ctx.mount([back('Findings', leave), el('p', { class: 'quiet' }, 'Loading…')]);
     let record;
     try { record = await api(`api/findings/finding?${new URLSearchParams({ workspace: ctx.project, id })}`); } catch (error) {
-      if (mine === ticket) ctx.mount([back('Findings', leave), el('p', { class: 'quiet' }, explain(error))]);
+      if (mine !== ticket) return;
+      if (keepEdits) toast(explain(error), true); else ctx.mount([back('Findings', leave), el('p', { class: 'quiet' }, explain(error))]);
       return;
     }
     if (mine !== ticket) return;
+    if (keepEdits && record.status !== 'proposed' && unsaved()) {
+      toast('This finding was decided in the meantime. Your text is still here; go back to Findings to see the decision.', true);
+      return;
+    }
     board = lists.peek(listPath())?.findings || null;
     if (!find(record.id)) {
       try {
@@ -223,20 +240,33 @@ export function findingsView(ctx) {
       try { await api('api/findings/done', { workspace: ctx.project, id: undo && entry.marked_id ? entry.marked_id : record.id, undo }); if (mine !== ticket) return; toast(undo ? 'Reopened.' : 'Marked done.'); board = null; ctx.refresh(); } catch (error) { toast(explain(error), true); }
     } }, undo ? 'Reopen' : 'Mark done');
     const more = details(facts([['Finding', record.id, true], ['Kind', record.kind + (record.run_id ? ` (run ${record.run_id})` : '')], ['Proposed', record.proposed_at],
+      ['Proposal revision', record.proposal_revision > 1 ? `${record.proposal_revision}${record.proposal_revised_at ? `, revised ${record.proposal_revised_at}` : ''}` : null],
       ['Decided', record.decided_at ? `${record.decided_at}${record.reviewer ? ` by ${record.reviewer}` : ''}` : null], ['SHA-256', record.sha256, true]]),
     record.versions.length > 1 ? el('ol', {}, record.versions.map((version) => el('li', {}, el('button', { type: 'button', class: version.id === record.id ? 'link current' : 'link', onclick: () => {
       if (!unsaved() || confirm('Discard your edits to this finding?')) { editing = null; ctx.open('finding', version.id); }
     } }, version.id), ` · ${STATUS_LABEL[version.status]} · ${ago(version.updated_at)}`))) : null);
     let parts;
     if (record.status === 'proposed') {
+      const kept = keepEdits && unsaved() ? editing.area.value : null;  // text written against the proposal shown before
       const [view, toggle] = textView(record.proposal);
       const edit = editor(record.proposal);
+      if (kept !== null) { edit.area.value = kept; edit.area.dispatchEvent(new Event('input')); }
+      const revised = el('div', { class: 'block', role: 'alert', hidden: true });
+      const onRevised = () => {
+        revised.replaceChildren(el('p', { class: 'note' }, 'migration-data revised this proposal after this page loaded it, so nothing was decided. Load the revision to read it'
+          + (unsaved() ? '; your text to release is kept.' : '.')),
+        el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn q', onclick: () => detail(record.id, true) }, 'Load the revised proposal')));
+        revised.hidden = false;
+      };
       parts = [card('FOR YOU TO REVIEW', 'What the coding agents would see',
         el('p', { class: 'note' }, 'Nothing reaches the coding agents until you release it. Edit it first: invented examples only, no real names, emails, IPs or messages.'),
-        el('div', { class: 'block' }, el('h3', {}, 'Proposal from migration-data ', toggle), view),
-        el('div', { class: 'block' }, el('h3', {}, 'Text to release'), edit.node),
-        el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', onclick: () => act('release', record, edit.area.value) }, 'Release'),
-          el('button', { type: 'button', class: 'btn q', onclick: () => act('reject', record) }, 'Reject')), more)];
+        record.proposal_sha256 ? null : el('p', { class: 'note', role: 'alert' }, 'The stored proposal doesn\'t match its record, so it can\'t be released or rejected. Ask your node admin to investigate.'),
+        kept !== null ? el('p', { class: 'note', role: 'status' }, 'The proposal below is the revision. Your text to release was written before it and is kept as you left it: compare the two before you release.') : null,
+        el('div', { class: 'block' }, el('h3', {}, `Proposal from migration-data${record.proposal_revision > 1 ? ` (revision ${record.proposal_revision})` : ''} `, toggle), view),
+        el('div', { class: 'block' }, el('h3', {}, 'Text to release'), edit.node), revised,
+        // No digest to name, no decision to offer.
+        el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn', disabled: !record.proposal_sha256, onclick: () => act('release', record, edit.area.value, onRevised) }, 'Release'),
+          el('button', { type: 'button', class: 'btn q', disabled: !record.proposal_sha256, onclick: () => act('reject', record, undefined, onRevised) }, 'Reject')), more)];
     } else if (record.status === 'released') {
       const [view, toggle] = textView(record.released);
       const edit = editor(record.released);

@@ -17,12 +17,12 @@ You review converter changes for a migration engineer before they are pushed. Yo
 
 ## Merge layers
 
-A change under `mergers/<workspace>/` is a merge layer: Ruby that a merge run loads inside the Discourse app, next to two sites' customer data. Read `dev_merge_guide` for the contract, then check, as must-fix when broken:
+A prepared custom merge uses the standalone local repository reported by `dev_merge_guide` (entry `merger.rb`, optional `helpers/`, invented `test/`), not discourse-converters or Discourse core. Use `dev_merger_status`, `dev_merger_diff` scope `commit` (optional commit SHA), `dev_merger_read`/`dev_merger_search`, and `dev_merger_test`; no push/PR or converter lint is involved. A merge layer is: Ruby that a merge run loads inside the Discourse app, next to two sites' customer data. Read `dev_merge_guide` for the contract, then check, as must-fix when broken:
 
 - Exactly one subclass of `BulkImport::DiscourseMerger`; overrides call `super` where the stock behaviour must still happen; the stock classes are not reopened or copied. Compare each override with the stock source at the pinned revision the guide links: same arguments, same return meaning (an id or nil, a row hash or nil).
 - No customer values anywhere in the checkout (names, IDs, URLs, emails): they come from the settings file. Tests use invented values and a stub base class.
 - Nothing that moves data out or sideways: no network, no file writes, no shelling out, no reads other than the settings file, no SQL or model calls beyond what the stated rule needs, and no data put into `SILO_MERGE_TOTAL` names, exception messages or output. Totals are counts.
-- Only regular `.rb` files in the folder, within the limits the guide states.
+- Only regular executable `.rb` files (`merger.rb`, `helpers/`) within the guide limits. Tests and README stay outside the executable selection. Both class-level preflight/postflight hooks must validate the intended policy and return exactly true.
 
 ## How to report
 

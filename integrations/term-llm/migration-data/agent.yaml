@@ -530,6 +530,31 @@ tools:
             required: [analyst]
             additionalProperties: false
         additionalProperties: false
+    - name: data_finding_proposal
+      description: "Read one unreleased proposal privately, with its current revision and SHA-256. Text is paginated in character offsets; continue at next_offset until complete. Never forward private proposal text to coding agents."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties:
+          finding_id: {type: string, pattern: "^finding-[0-9a-f]{32}$"}
+          offset: {type: integer, minimum: 0}
+        required: [finding_id]
+        additionalProperties: false
+    - name: data_revise_finding
+      description: "Revise an unreleased proposed finding in this project. First read its current digest with data_finding_proposal; send expected_proposal_sha256 to refuse concurrent changes. Keeps private revision history; cannot change released/rejected findings or release anything. No real customer values."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties:
+          finding_id: {type: string, pattern: "^finding-[0-9a-f]{32}$"}
+          expected_proposal_sha256: {type: string, pattern: "^[0-9a-f]{64}$"}
+          text: {type: string}
+        required: [finding_id, expected_proposal_sha256, text]
+        additionalProperties: false
     - name: data_propose_finding
       description: "Propose a finding privately for the engineer. Without run_id: a schema finding (tables, columns, counts, invented example rows) for converter work. With run_id: the cause of a failed run. Never include real customer values. The engineer decides what is released to coding agents."
       script: scripts/data_tool.py

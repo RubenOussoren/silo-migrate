@@ -183,7 +183,7 @@ DATA_TOOLS = ('data_guide', 'data_status', 'data_supporting_list', 'data_support
               'data_supporting_prepare', 'data_list', 'data_peek', 'data_create', 'data_take', 'data_register', 'data_script',
               'data_extract', 'data_job', 'data_db_up', 'data_db_load', 'data_db_status', 'data_db_reset', 'data_run_evidence',
               'data_run_count', 'data_plan_propose', 'data_master_lists_propose', 'data_merge_prepare', 'data_merge_inspection',
-              'data_merge_propose', 'data_propose_finding',
+              'data_merge_propose', 'data_finding_proposal', 'data_revise_finding', 'data_propose_finding',
               'data_notes', 'data_decide', 'data_decisions', 'data_notes_write')
 BRANCH_TOOLS = ('data_branch_resolve', 'data_branches', 'data_branch_diff', 'data_branch_read')
 
@@ -249,9 +249,9 @@ else:
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
         blocks = re.split(r'(?m)^    - name: ', definition)[1:]
         # The four branch tools use a separate reader-role adapter, tested in converter_dev_adapter_test.
-        self.assertEqual(33, len(blocks))
+        self.assertEqual(35, len(blocks))
         declared = [block.splitlines()[0] for block in blocks if 'script: scripts/data_tool.py' in block]
-        self.assertEqual(29, len(declared))
+        self.assertEqual(31, len(declared))
         self.assertEqual(list(DATA_TOOLS), declared)
         self.assertEqual(list(BRANCH_TOOLS), [block.splitlines()[0] for block in blocks if 'script: scripts/dev_tool.py' in block])
         import importlib.util
@@ -280,6 +280,8 @@ else:
             'data_decisions': ({}, {'op': 'decisions'}),
             'data_notes_write': ({'text': '# arc', 'path': 'x'}, {'op': 'notes_write', 'text': '# arc'}),
             'data_propose_finding': ({'text': 'schema', 'run_id': None}, {'op': 'propose_finding', 'text': 'schema'}),
+            'data_finding_proposal': ({'finding_id': 'finding-' + 'c' * 32, 'offset': 8192, 'workspace': 'other'}, {'op': 'finding_proposal', 'finding_id': 'finding-' + 'c' * 32, 'offset': 8192}),
+            'data_revise_finding': ({'finding_id': 'finding-' + 'c' * 32, 'expected_proposal_sha256': 'd' * 64, 'text': 'invented'}, {'op': 'revise_finding', 'finding_id': 'finding-' + 'c' * 32, 'expected_proposal_sha256': 'd' * 64, 'text': 'invented'}),
             'data_run_evidence': ({'run_id': self.run_id}, {'op': 'run_evidence', 'run_id': self.run_id}),
             'data_run_count': ({'run_id': self.run_id, 'side': 'destination', 'sql': 'SELECT COUNT(*) FROM posts', 'confirm': True},
                                {'op': 'run_count', 'run_id': self.run_id, 'side': 'destination', 'sql': 'SELECT COUNT(*) FROM posts'}),

@@ -688,7 +688,7 @@ class Handler(BaseHTTPRequestHandler):
                     no_prepared_sign_in(runs.Store(self.server.base), body)
                 result = runs.decide(runs.Store(self.server.base), self.server.control, action, body)
             elif path in FINDING_PATHS:
-                result = findings.decide(self.server.control, action, body.get("workspace"), body.get("id"), body.get("text"))
+                result = findings.decide(self.server.control, action, body.get("workspace"), body.get("id"), body.get("text"), body.get("proposal_sha256"))
             else:
                 raise Refused("STANDARD_ARGUMENTS_INVALID")
             _summary["value"] = None  # the tab's count may have changed

@@ -332,15 +332,16 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
     def test_runs_and_findings_decisions_go_to_their_own_unchanged_logic(self):
         calls = []
         self.m.runs.decide = lambda store, control, action, body: calls.append(('runs', action, body)) or {'status': 'ok'}
-        self.m.findings.decide = lambda control, action, workspace, finding_id, text: calls.append(('findings', action, workspace, finding_id, text)) or {'status': 'ok'}
+        self.m.findings.decide = lambda control, action, workspace, finding_id, text, proposal_sha256: calls.append(('findings', action, workspace, finding_id, text, proposal_sha256)) or {'status': 'ok'}
         headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
         for action in self.m.RUN_ACTIONS:
             self.assertEqual(200, self.request('POST', '/api/runs/' + action, {'workspace': 'arc', 'plan_id': 'p'}, headers)[0])
         for action in self.m.FINDING_ACTIONS:
-            self.assertEqual(200, self.request('POST', '/api/findings/' + action, {'workspace': 'arc', 'id': 'f', 'text': 't'}, headers)[0])
+            self.assertEqual(200, self.request('POST', '/api/findings/' + action, {'workspace': 'arc', 'id': 'f', 'text': 't', 'proposal_sha256': 'a' * 64}, headers)[0])
         self.assertEqual(len(self.m.RUN_ACTIONS) + len(self.m.FINDING_ACTIONS), len(calls))
         self.assertEqual(('runs', 'approve', {'workspace': 'arc', 'plan_id': 'p'}), calls[0])
-        self.assertEqual(('findings', 'release', 'arc', 'f', 't'), calls[len(self.m.RUN_ACTIONS)])
+        # The proposal the page showed is passed on as sent; findings.decide requires it for release and reject.
+        self.assertEqual(('findings', 'release', 'arc', 'f', 't', 'a' * 64), calls[len(self.m.RUN_ACTIONS)])
         for path in ('/api/runs/approve-all', '/api/findings/delete', '/api/runs/../label', '/api/other/approve'):
             self.assertEqual(400, self.request('POST', path, {'workspace': 'arc'}, headers)[0])
         self.assertEqual(403, self.request('POST', '/api/runs/approve', {'workspace': 'arc'}, {'Content-Type': 'application/json', 'X-Silo-Runs': '1'})[0])

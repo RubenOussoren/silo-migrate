@@ -32,6 +32,15 @@ account is root-equivalent through Docker anyway, but keep the release sealed (`
 | `silo intake PROJECT` | Creates the project's drop folder `<prefix>/intake/PROJECT/` (private to the account), its chat folder `~/projects/PROJECT` and its web UI project. Copy export files into the drop folder; run it again as root afterwards so the files belong to the account. |
 | `silo set-contact NAME` | (root) Sets who the agents tell engineers to ask when they can't help. Stored in `<prefix>/etc/support-contact`, on this server only. |
 
+## Local merge tooling updates
+
+See [local merger development, finding revisions and inspection semantics](merge-workflow-development.md).
+After updating, open new chats to select the new custom tool definitions; keep stock
+term-llm and the current ready Prepare. Do not reset/re-Prepare merely to initialize
+local merger code. `dev_merge_guide` reports the actual review directory and ready
+core pin; `dev_merger_*` tools never push or fetch. Use current run/generation, not
+an older failed run's evidence, when registering inspection connectors.
+
 ## Intake
 
 Copy whatever the customer sent into one folder per project, in any shape (SQL dumps, XML or
@@ -87,7 +96,7 @@ each is a fixed operation of `silo-migrate-control data WS`) can:
   with a read-only user `silo_ro`; load dumps as jobs, show tables and sizes, reset;
 - read a failed run's evidence, and propose findings: a **schema finding** (no run: tables,
   columns, counts, invented examples) or a run's cause. You review and release them
-  (`standard finding review/release`); only released text reaches converter-developer;
+  (`standard finding review/release`); only released text reaches converter-developer. Still-proposed findings can be revised privately with `data_revise_finding`; stale engineer review refuses without losing edits;
 - for a merge project (platform `discourse`): take the source site's full backup, write and
   register a merge settings file, propose the merge run, and read a merge run's totals and the
   end of its private log. See `docs/project-merge-run.md`.
@@ -282,7 +291,7 @@ errors. It does not validate real Claude authentication, backend fallback behavi
 server's effective model.
 
 On a merge project the same two agents write and review the **merge layer**
-(`mergers/<project>/merger.rb`), the code that changes what Discourse's merger does for this
+(`merger.rb` in a standalone local repository with no remote), the code that changes what Discourse's merger does for this
 customer. Their `dev_merge_guide` tool gives the contract and, for the last three merge runs, the
 status, the layer's commit, where a run stopped, the fixed site counts and how many totals the
 layer reported. The layer's own totals go to you (the run on the Project page) and migration-data,
