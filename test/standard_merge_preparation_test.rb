@@ -44,7 +44,11 @@ class PrepareScriptedRuntime < MergeScriptedRuntime
     when /COUNT\(\*\) FROM pg_stat_activity/ then review_ok("#{sessions_left || 0}\n")
     when /pg_database_size/ then review_ok("1000,2000\n")
     when /\ASELECT oid::text FROM pg_database WHERE datname = 'discourse'\z/ then review_ok("#{inspection_oid}\n")
-    when /FROM pg_database WHERE/ then review_ok(databases.sort.map { |name, open| "#{name}:#{open ? 't' : 'f'}\n" }.join)
+    when /FROM pg_database WHERE/
+      # PostgreSQL boolean concatenation uses true/false, unlike a standalone
+      # boolean column's t/f output. Do not let the fake hide this SQL contract.
+      canonical = text.include?("CASE WHEN datallowconn THEN 't' ELSE 'f' END")
+      review_ok(databases.sort.map { |name, open| "#{name}:#{canonical ? (open ? 't' : 'f') : open.to_s}\n" }.join)
     when /\ACREATE DATABASE merge_source OWNER/
       databases['merge_source'] = true
       review_ok
@@ -393,6 +397,44 @@ class StandardMergePreparationTest < StandardMergeRunTest
       merge = prepared_plan(run)
       assert_equal run[:run_id], merge.dig(:prepared_from, 'run_id')
       assert_equal plan[:limits], merge[:limits]
+    end
+  end
+
+  def test_prepare_database_inventory_checks_the_fresh_stack_before_restore
+    with_prepare do
+      run = prepared
+      initial = index_of(/CASE WHEN datallowconn/)
+      assert_operator initial, :<, index_of(%r{script/discourse restore})
+      assert @runtime.sql.grep(/SELECT datname \|\|/).all? { |sql| sql.include?("CASE WHEN datallowconn THEN 't' ELSE 'f' END") }
+      assert_equal 'completed', run[:status]
+    end
+  end
+
+  def test_prepare_initial_database_probe_command_failure_is_stack_failure
+    with_prepare do
+      @runtime.fail_sql = 'CASE WHEN datallowconn'
+      run = run_prepare
+      assert_equal 'failed', run.dig(:stages, 'site_up')
+      assert_equal 'pending', run.dig(:stages, 'base_restore')
+      assert_equal 'STANDARD_STACK_FAILED', run.dig(:failure, 'code')
+      assert_includes failure_detail(run), 'initial-databases'
+      refute index_of(%r{script/discourse restore})
+    end
+  end
+
+  def test_prepare_unexpected_initial_databases_refuse_before_restore
+    [{'discourse' => false}, {'discourse' => true, 'silo_clean_base' => true},
+     {'discourse' => true, 'merge_source' => true}].each do |databases|
+      with_prepare do
+        @runtime.databases.replace(databases)
+        run = run_prepare
+        assert_equal 'failed', run[:status]
+        assert_equal 'failed', run.dig(:stages, 'site_up')
+        assert_equal 'pending', run.dig(:stages, 'base_restore')
+        assert_equal 'STANDARD_MERGE_ENVIRONMENT_DIRTY', run.dig(:failure, 'code')
+        assert_includes failure_detail(run), 'unexpected initial databases'
+        refute index_of(%r{script/discourse restore})
+      end
     end
   end
 

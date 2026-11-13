@@ -572,7 +572,7 @@ class StandardMasterListsTest < StandardRunInputsTest
   end
 end
 
-class StandardMergePreparationTest < StandardMergeRunTest
+class StandardMergePreparationInputsTest < StandardMergeRunTest
   def self.runnable_methods
     public_instance_methods.grep(/^test_merge_preparation/).map(&:to_s)
   end

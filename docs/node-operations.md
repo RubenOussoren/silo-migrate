@@ -457,6 +457,21 @@ python3 -I -B -m unittest discover -s test/metal -p 'test_*.py'
 
 `test/varnish_bundle_test.py` is what proves the bundled theme is exactly what `update-varnish` recorded.
 
+For Prepare checkpoint protocol changes, the opt-in invented-data test invokes the
+production checkpoint/activation SQL on cached PostgreSQL. It requires explicit
+operator approval for uniquely owned local Docker resources; it never uses a
+customer instance, published ports or downloaded images. Web/Redis/control-store
+seams are documented in the test, so this is not full Prepare/MCP acceptance:
+
+```sh
+SILO_CHECKPOINT_PROTOCOL_LIVE=1 python3 -I -B test/checkpoint_protocol_live_test.py
+```
+
+`test/benchmark_base_inventory.rb` is a separate, invented-data profiling tool,
+not part of `test/**/*_test.rb` and not a CI timing threshold. Its header documents
+how to compare the original scanner and current scanner on the same generated
+archive; results depend on row shape, compression and storage cache conditions.
+
 For the Project launcher and navigation, also run the invented-data browser checks (Node,
 Playwright Core and Chromium must already be available; this does not install anything):
 

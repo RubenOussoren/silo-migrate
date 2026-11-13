@@ -78,6 +78,18 @@ and graceful worker drain are bounded; an already-down app is valid. Unknown sta
 only a fixed reason and counts (no process arguments or customer values). Do not
 interpret an exit-2 worker-drain failure as proof Unicorn was already down/crashed.
 
+Before Base restore, Prepare also checks the fresh stack's reserved database names
+and connection flags using the same explicit `t`/`f` protocol as checkpoint and
+activation. A failed probe command is a stack failure; an unexpected database set
+fails closed. This early check does not replace any later sealing/copy/state check.
+
+Base migration inventory still drains and validates the complete gzip stream.
+Outside its migration COPY block, it skips per-row Ruby parsing only for chunks
+that cannot contain the migration header, preserving bounded partial-line state.
+Candidate headers, migration rows, line/version limits, CRC/trailer and trailing-data
+refusals are unchanged. Invented warm-cache fixtures demonstrate lower parser CPU
+and allocations, not a guaranteed speedup for a particular backup or storage device.
+
 The run page and `data_run_evidence` show `step_timings_ms`: fixed operation labels
 with elapsed milliseconds, including failed steps. These separate inventory,
 hashing/copying, restore, health checks, source SQL load and migrations. They are

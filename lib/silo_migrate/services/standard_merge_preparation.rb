@@ -503,9 +503,11 @@ module SiloMigrate
         seal
       end
 
-      def merge_databases(run_id)
+      def merge_databases(run_id, label: "databases", code: "STANDARD_MERGE_ENVIRONMENT_DIRTY")
         names = [MERGE_CLEAN_BASE_DB, MERGE_BASE_DB, MERGE_CLEAN_SOURCE_DB, MERGE_INSPECT_SOURCE_DB]
-        merge_environment_sql(run_id, "databases", "SELECT datname || ':' || datallowconn FROM pg_database WHERE datname IN (#{names.map { |name| "'#{name}'" }.join(', ')}) ORDER BY datname").lines.map(&:strip).reject(&:empty?).sort
+        # Boolean concatenation renders true/false, not psql's standalone t/f.
+        # Make the wire format explicit for every strict lifecycle state check.
+        merge_environment_sql(run_id, label, "SELECT datname || ':' || CASE WHEN datallowconn THEN 't' ELSE 'f' END FROM pg_database WHERE datname IN (#{names.map { |name| "'#{name}'" }.join(', ')}) ORDER BY datname", code: code).lines.map(&:strip).reject(&:empty?).sort
       end
 
       # Quiesce, seal and copy. The clean databases keep every byte restored/migrated by this

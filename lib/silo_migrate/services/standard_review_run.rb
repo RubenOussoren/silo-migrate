@@ -411,6 +411,24 @@ module SiloMigrate
         complete = false
         Zlib::GzipReader.open(path) do |gzip|
           while (chunk = gzip.read(64 * 1024)) && !chunk.empty?
+            # No header can occur without this marker, even across a chunk boundary.
+            # Keep the marker aligned with the COPY-header matcher below.
+            # Skip irrelevant rows in C, retaining exactly the bounded pending-line
+            # state the parser below would leave. Still drain and validate the gzip.
+            unless inside || (buffer.empty? ? chunk : buffer + chunk).include?("schema_migrations")
+              if (newline = chunk.rindex("\n"))
+                tail_size = chunk.bytesize - newline - 1
+                oversized = tail_size > 1024
+                buffer = oversized ? +"".b : chunk.byteslice(newline + 1, tail_size)
+              elsif oversized || buffer.bytesize + chunk.bytesize > 1024
+                oversized = true
+                buffer.clear
+              else
+                buffer << chunk
+              end
+              next
+            end
+
             chunk.each_line do |part|
               if buffer.bytesize + part.bytesize > 1024
                 oversized = true

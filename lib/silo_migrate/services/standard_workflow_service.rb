@@ -1371,8 +1371,15 @@ module SiloMigrate
         stack = create_stack(run_id, "review", body.dig("instances", "review"), limits: [REVIEW_OPERATION, MERGE_OPERATION, PREPARE_OPERATION].include?(body["operation"]) ? body.fetch("limits") : nil,
                              extra_env: body["base_site"] ? review_environment(body.dig("instances", "review", "port")).merge([MERGE_OPERATION, PREPARE_OPERATION].include?(body["operation"]) ? { "DISCOURSE_AUTHORIZED_EXTENSIONS" => "*", "DISCOURSE_DISABLE_SYSTEM_EDIT_NOTIFICATIONS" => "true" } : {}) : {})
         assert_runtime_identity!(run_id, stack, "review")
-        # Fail on this image's stop protocol before spending time restoring a large Base.
-        measure_run_step(run_id, "workers.pre_restore") { merge_quiesce_web!(run_id, stack, code: "STANDARD_STACK_FAILED") } if prepare_plan?(plan_for(run_id))
+        if prepare_plan?(plan_for(run_id))
+          # Exercise the same database-state protocol as checkpoint/activation before
+          # paying for a restore. Keep the later checks: this only proves fresh state.
+          unless merge_databases(run_id, label: "initial-databases", code: "STANDARD_STACK_FAILED") == ["#{MERGE_BASE_DB}:t"]
+            raise StandardWorkflowError.new("STANDARD_MERGE_ENVIRONMENT_DIRTY", "unexpected initial databases")
+          end
+          # Fail on this image's stop protocol before spending time restoring a large Base.
+          measure_run_step(run_id, "workers.pre_restore") { merge_quiesce_web!(run_id, stack, code: "STANDARD_STACK_FAILED") }
+        end
       end
 
       def create_stack(run_id, role, target, limits: nil, extra_env: {})
