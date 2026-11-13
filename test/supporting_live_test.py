@@ -38,7 +38,9 @@ def workbook():
         archive.writestr('xl/workbook.xml', '''<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Mappings" sheetId="1" r:id="rId1"/></sheets></workbook>''')
         archive.writestr('xl/_rels/workbook.xml.rels', '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>''')
-        archive.writestr('xl/worksheets/sheet1.xml', '''<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>invented-reference-marker</t></is></c><c r="B1"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>''')
+        archive.writestr('xl/worksheets/sheet1.xml', '''<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>invented-reference-marker</t></is></c><c r="B1"><f>1+1</f><v>2</v></c></row></sheetData><hyperlinks><hyperlink ref="A1" r:id="rLink"/></hyperlinks></worksheet>''')
+        # Common export shape: clickable metadata, not an external data source.
+        archive.writestr('xl/worksheets/_rels/sheet1.xml.rels', '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.invalid/LINK_TARGET_NEVER_FETCH_OR_RETURN" TargetMode="External"/></Relationships>''')
     return stream.getvalue()
 
 
@@ -99,7 +101,11 @@ class SupportingLiveTest(unittest.TestCase):
                     if filename.endswith('.xlsx'):
                         sheets = request('supporting_read', id=taken['id'], mode='sheets')
                         self.assertEqual(['Mappings'], sheets['sheets'])
-                        rows = request('supporting_read', id=taken['id'], mode='rows', columns=2, limit=1)['rows']
+                        self.assertEqual(1, sheets['ignored_external_hyperlinks'])
+                        values = request('supporting_read', id=taken['id'], mode='rows', columns=2, limit=1)
+                        self.assertEqual(1, values['ignored_external_hyperlinks'])
+                        self.assertNotIn('LINK_TARGET_NEVER_FETCH_OR_RETURN', json.dumps([sheets, values]))
+                        rows = values['rows']
                         self.assertEqual('invented-reference-marker', rows[0][0]['value'])
                         self.assertEqual({'type': 'formula', 'formula': True, 'value': None}, rows[0][1])
                     else:
@@ -111,7 +117,7 @@ class SupportingLiveTest(unittest.TestCase):
             for name in names:
                 left = subprocess.check_output(['docker', 'ps', '-aq', '--filter', 'name=^/' + name + '$'], timeout=10)
                 self.assertEqual(b'', left.strip())
-            print(json.dumps({'result': 'intake reference custody, no-context chat XLSX/TSV sandbox reads, take refused USE_INTAKE, formula non-evaluation and exact cleanup passed',
+            print(json.dumps({'result': 'intake reference custody, no-context chat XLSX/TSV sandbox reads with external hyperlink metadata ignored, take refused USE_INTAKE, formula non-evaluation and exact cleanup passed',
                               'read_containers': len(names), 'migration_state_unchanged': True}))
 
 

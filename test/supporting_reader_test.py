@@ -223,6 +223,149 @@ class SupportingReaderTest(unittest.TestCase):
                     relationship('bad', target, extra='TargetMode="%s"' % mode))
                 self.refused(self.read(entries=entries), 'UNSAFE_RELATIONSHIP')
 
+    def google_sheets_book(self, links=None, sheet_rels=None):
+        # Invented, Google-Sheets-shaped: cell hyperlinks via sheet .rels plus <hyperlinks>.
+        links = [('rId1', 'https://example.invalid/' + CANARY), ('rId2', 'mailto:' + CANARY + '@example.invalid'),
+                 ('rId3', 'file:///' + CANARY)] if links is None else links
+        body = ('<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t>mail</t></is></c>'
+                '<c r="C1" t="str"><v>local</v></c></row>'
+                '<row r="2"><c r="A2"><f>HYPERLINK(&quot;https://example.invalid/%s&quot;,&quot;x&quot;)</f>'
+                '<v>%s</v></c><c r="B2"><v>7</v></c><c r="C2" t="e"><v>#N/A</v></c></row>' % (CANARY, CANARY))
+        entries = members([('Linked', body)], '<si><t>site</t></si>')
+        entries['xl/worksheets/sheet1.xml'] = (
+            '<worksheet xmlns="%s" xmlns:r="%s"><sheetData>%s</sheetData><hyperlinks>%s</hyperlinks></worksheet>' % (
+                NS, REL, body, ''.join('<hyperlink ref="%s1" r:id=%s/>' % ('ABC'[i % 3], quoteattr(identity))
+                                       for i, (identity, _) in enumerate(links))))
+        entries['xl/worksheets/_rels/sheet1.xml.rels'] = sheet_rels if sheet_rels is not None else relationships(
+            ''.join(relationship(identity, target, 'hyperlink', 'TargetMode="External"') for identity, target in links))
+        return entries
+
+    def test_external_hyperlinks_ignored_cells_unchanged_and_never_opened_or_output(self):
+        entries = self.google_sheets_book()
+        real_open = open
+        opened = []
+
+        def guarded_open(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_open(path, *args, **kwargs)
+        data = zip_bytes(entries)
+        self.path.write_bytes(data)
+        with mock.patch('builtins.open', side_effect=guarded_open), \
+                mock.patch('socket.socket', side_effect=AssertionError('network')), \
+                mock.patch('urllib.request.urlopen', side_effect=AssertionError('network')):
+            sheets = reader.read_document(self.path, format='xlsx')
+            rows = reader.read_document(self.path, format='xlsx', mode='rows', columns=3)
+        self.assertEqual(opened, [str(self.path)] * 2)
+        self.assertEqual(sheets, {'status': 'ok', 'format': 'xlsx', 'mode': 'sheets', 'sheets': ['Linked'],
+                                  'ignored_external_hyperlinks': 3})
+        self.assertEqual(rows['status'], 'ok', rows)
+        self.assertEqual(rows['ignored_external_hyperlinks'], 3)
+        self.assertEqual(rows['rows'], [
+            [reader.cell('string', 'site'), reader.cell('string', 'mail'), reader.cell('string', 'local')],
+            [{'type': 'formula', 'formula': True, 'value': None}, reader.cell('number', '7'), reader.cell('error', '#N/A')]])
+        for result in (sheets, rows):
+            output = json.dumps(result)
+            for leaked in (CANARY, 'example.invalid', 'https', 'mailto', 'file:', 'rId', 'hyperlink"'):
+                self.assertNotIn(leaked, output)
+        # Without external hyperlinks the field is absent (unchanged schema).
+        self.assertNotIn('ignored_external_hyperlinks', self.read(entries=members()))
+        self.assertNotIn('ignored_external_hyperlinks', self.read(entries=self.google_sheets_book(links=[])))
+        # CLI: same success, nothing on stderr, no link content on stdout.
+        self.path.write_bytes(data)
+        result = subprocess.run([sys.executable, '-I', '-B', str(SCRIPT), '--format', 'xlsx', '--mode', 'rows',
+                                 str(self.path)], capture_output=True, timeout=10)
+        self.assertEqual((result.returncode, result.stderr), (0, b''))
+        self.assertEqual(json.loads(result.stdout)['ignored_external_hyperlinks'], 3)
+        self.assertNotIn(b'example.invalid', result.stdout.replace(str(self.path).encode(), b''))
+
+    def test_ignored_hyperlink_metadata_still_validated_and_duplicates_refused(self):
+        link = lambda identity, target='https://example.invalid/' + CANARY, extra='TargetMode="External"': \
+            relationship(identity, target, 'hyperlink', extra)
+        variants = [
+            link('rId1') * 2,                                             # duplicate ignored IDs
+            link('rId1') + relationship('rId1', 'sheet1.xml', 'worksheet'),  # ignored then internal
+            relationship('rId1', 'sheet1.xml', 'worksheet') + link('rId1'),  # internal then ignored
+            link(''),                                                     # empty Id
+            '<Relationship Target="https://example.invalid/" Type="%s/hyperlink" TargetMode="External"/>' % REL,
+            link('rId1', ''),                                             # empty target
+            '<Relationship Id="rId1" Type="%s/hyperlink" TargetMode="External"/>' % REL,  # missing target
+            link('rId1', 'https://example.invalid/' + 'x' * 4097),        # oversized target
+            '<Other Id="rId1" Target="https://example.invalid/" Type="%s/hyperlink" TargetMode="External"/>' % REL,
+        ]
+        for rels in variants:
+            with self.subTest(rels=rels[:100]):
+                self.refused(self.read(entries=self.google_sheets_book(sheet_rels=relationships(rels))),
+                             'INVALID_DOCUMENT')
+        # Positive controls for the same helper path.
+        for rels in (link('rId1'), link('rId1') + relationship('rId2', 'sheet1.xml', 'worksheet')):
+            result = self.read(entries=self.google_sheets_book(sheet_rels=relationships(rels)))
+            self.assertEqual(result['ignored_external_hyperlinks'], 1, result)
+        # Duplicates across different .rels parts are independent, as before.
+        entries = self.google_sheets_book(links=[('r1', 'https://example.invalid/')])
+        self.assertIn('Id="r1"', entries['xl/_rels/workbook.xml.rels'])
+        self.assertEqual(self.read(entries=entries)['ignored_external_hyperlinks'], 1)
+
+    def test_external_non_hyperlink_types_and_unknown_modes_still_unsafe(self):
+        url = 'https://example.invalid/' + CANARY
+        cases = [(kind, 'External') for kind in ('worksheet', 'sharedStrings', 'externalLink', 'oleObject',
+                                                  'package', 'image', 'Hyperlink', 'hyperlink/', 'unknown')]
+        cases += [('hyperlink', mode) for mode in ('external', 'EXTERNAL', ' External', 'External ', '',
+                                                   'Internal ', 'Other')]
+        for kind, mode in cases:
+            for part in ('xl/worksheets/_rels/sheet1.xml.rels', 'xl/_rels/workbook.xml.rels', 'xl/_rels/unused.xml.rels'):
+                with self.subTest(kind=kind, mode=mode, part=part):
+                    entries = self.google_sheets_book()
+                    extra = relationship('bad', url, kind, 'TargetMode=%s' % quoteattr(mode))
+                    entries[part] = entries.get(part, relationships('')).replace(
+                        '</Relationships>', extra + '</Relationships>')
+                    self.refused(self.read(entries=entries), 'UNSAFE_RELATIONSHIP')
+        # Exact type URI only: other namespaces using a hyperlink suffix refuse.
+        for uri in ('http://purl.oclc.org/ooxml/officeDocument/relationships/hyperlink', 'hyperlink', ''):
+            with self.subTest(uri=uri):
+                rels = relationships('<Relationship Id="x" Target=%s Type=%s TargetMode="External"/>' % (
+                    quoteattr(url), quoteattr(uri)))
+                self.refused(self.read(entries=self.google_sheets_book(sheet_rels=rels)), 'UNSAFE_RELATIONSHIP')
+        # Workbook-level external worksheet/sharedStrings never become sheets or strings.
+        for kind in ('worksheet', 'sharedStrings'):
+            entries = self.google_sheets_book()
+            entries['xl/_rels/workbook.xml.rels'] = relationships(
+                relationship('r1', url, kind, 'TargetMode="External"'))
+            self.refused(self.read(entries=entries), 'UNSAFE_RELATIONSHIP')
+
+        # Ignored metadata may not stand in for the worksheet named by the workbook.
+        entries = self.google_sheets_book()
+        entries['xl/_rels/workbook.xml.rels'] = relationships(
+            relationship('r1', url, 'hyperlink', 'TargetMode="External"'))
+        self.refused(self.read(entries=entries), 'INVALID_DOCUMENT')
+
+    def test_valid_hyperlinks_do_not_relax_other_archive_protections(self):
+        def book(**updates):
+            entries = self.google_sheets_book()
+            entries.update(updates)
+            return entries
+        self.refused(self.read(entries=book(**{'xl/unused.xml': '<!DOCTYPE x [<!ENTITY a "b">]><x>&a;</x>'})),
+                     'UNSAFE_XML')
+        self.refused(self.read(entries=book(**{'xl/vbaProject.bin': CANARY})), 'UNSUPPORTED')
+        self.refused(self.read(entries=book(**{'xl/unused.xml': '<broken>' + CANARY})))
+        self.refused(self.read(entries=book(**{'xl/unused.xml': '<a>' * 129 + '</a>' * 129})), 'LIMIT')
+        self.refused(self.read(zip_bytes(list(book().items()) + [('../' + CANARY, 'x')])))
+        with mock.patch.object(reader, 'MAX_XML_NODES', 10):
+            self.refused(self.read(entries=book()), 'LIMIT')
+        data = zip_bytes(book(), zipfile.ZIP_STORED).replace(b'<v>7</v>', b'<v>8</v>', 1)
+        self.refused(self.read(data))
+        self.refused(self.read(zip_bytes(book(), zipfile.ZIP_BZIP2)), 'UNSUPPORTED')
+        # Internal relationships beside ignored hyperlinks keep full target validation.
+        for target in ('../../' + CANARY, 'missing.xml', 'https://example.invalid/x'):
+            with self.subTest(target=target):
+                rels = relationships(relationship('rId1', 'https://example.invalid/', 'hyperlink', 'TargetMode="External"') +
+                                     relationship('rId9', target, 'hyperlink'))
+                self.refused(self.read(entries=book(**{'xl/worksheets/_rels/sheet1.xml.rels': rels})))
+        # Formula caches and cell limits are still checked in hyperlink-bearing sheets.
+        entries = book()
+        entries['xl/worksheets/sheet1.xml'] = entries['xl/worksheets/sheet1.xml'].replace(
+            '<v>7</v>', '<v>' + 'x' * 4097 + '</v>')
+        self.refused(self.read(entries=entries, mode='rows'), 'LIMIT')
+
     def test_relationship_target_path_attacks_and_missing_targets(self):
         targets = ['../outside.xml', 'worksheets/../worksheets/sheet1.xml', '//xl/worksheets/sheet1.xml',
                    'worksheets\\sheet1.xml', 'https://example.invalid/x', 'file:///etc/passwd',

@@ -8,7 +8,10 @@ rows are arrays of exactly `columns` typed cell dictionaries. Empty cells are
 {type: 'empty', value: None}. Numbers and ISO dates retain their raw strings;
 no formatting, date serial conversion, or formula evaluation is attempted.
 Formula cells are {type: 'formula', formula: True, value: None}; neither formula
-text nor cached results are returned. CSV fields are always strings.
+text nor cached results are returned. CSV fields are always strings. XLSX successes may add
+ignored_external_hyperlinks (a count, only when > 0): ordinary
+TargetMode="External" hyperlink relationships are validated and discarded,
+never resolved, fetched or returned. Any other external relationship refuses.
 
 All refusals return {status: 'error', error: 'STANDARD_SUPPORTING_*'} with no
 input-derived diagnostics. The UTF-8 JSON representation, including newline,
@@ -110,6 +113,7 @@ class Workbook:
         self.archive = zipfile.ZipFile(io.BytesIO(data))
         self.members = {}
         self.relationships = {}
+        self.ignored_external_hyperlinks = 0
         total = 0
         normalized = set()
         entries = self.archive.infolist()
@@ -189,17 +193,31 @@ class Workbook:
             directory, filename = posixpath.split(name)
             require(posixpath.basename(directory) == '_rels' and filename.endswith('.rels'))
             base = posixpath.dirname(directory)
-        result = {}
+        result, seen = {}, set()
         for entry in root:
             require(entry.tag == '{' + PKG_REL_NS + '}Relationship')
-            require(entry.get('TargetMode', 'Internal') == 'Internal', 'UNSAFE_RELATIONSHIP')
+            identity, kind = entry.get('Id'), entry.get('Type')
+            mode = entry.get('TargetMode', 'Internal')
+            if mode != 'Internal':
+                # Only ordinary external cell hyperlinks are tolerated. Their
+                # metadata is validated, counted and DISCARDED: never resolved,
+                # fetched, opened or returned. Every other external relationship
+                # (worksheet, sharedStrings, externalLink, OLE, data, unknown
+                # types) and every unknown TargetMode still refuses.
+                require(mode == 'External' and kind == DOC_REL_NS + '/hyperlink', 'UNSAFE_RELATIONSHIP')
+                target = entry.get('Target', '')
+                require(0 < len(target) <= MAX_CELL_CHARS)
+                require(identity and identity not in seen)
+                seen.add(identity)
+                self.ignored_external_hyperlinks += 1
+                continue
             target = entry.get('Target', '')
             # OPC package-absolute targets are allowed, filesystem paths are not.
             safe_name(target[1:] if target.startswith('/') else target)
             target = target.lstrip('/') if target.startswith('/') else posixpath.join(base, target)
             require(target in self.members and not target.endswith('/'))
-            identity, kind = entry.get('Id'), entry.get('Type')
-            require(identity and identity not in result and kind)
+            require(identity and identity not in seen and kind)
+            seen.add(identity)
             result[identity] = (target, kind)
         return result
 
@@ -369,6 +387,8 @@ def read_document(path, *, format, mode='sheets', sheet=None, offset=0, limit=20
                     require(sheet in book.sheets, 'SHEET_NOT_FOUND')
                     rows, more = book.rows(sheet, offset, limit, columns)
                     result.update(sheet=sheet, rows=rows, has_more=more)
+                if book.ignored_external_hyperlinks:
+                    result['ignored_external_hyperlinks'] = book.ignored_external_hyperlinks
             finally:
                 book.archive.close()
         if mode == 'rows':

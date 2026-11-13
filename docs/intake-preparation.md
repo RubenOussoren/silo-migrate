@@ -23,6 +23,28 @@ Every migration-data tool uses the fixed adapter's project routing and argument
 whitelist. No experimental native context is required. Native chat-upload import
 is deliberately not advertised: use the same intake-first flow for all references.
 
+### XLSX hyperlinks are inert metadata
+
+Ordinary external hyperlink relationships are ignored, never followed or resolved.
+Their presence alone does not block reading sheet names or literal cell values.
+A successful XLSX read includes `ignored_external_hyperlinks` only when nonzero;
+it is a whole-workbook count (including other sheets/parts), not a list of targets,
+hosts or URLs. No relationship target metadata
+is returned. URLs written as literal cell text remain ordinary untrusted cell data.
+
+This is not permission to import external data: external worksheet/shared-string/
+workbook-data relationships and unknown external relationship types still refuse.
+Archive target/path validation, XML/DTD/entity and expansion limits, macro/binary
+refusals, formula non-evaluation and no-network sandboxing remain unchanged.
+Ignored links neither prove that linked content is in the file nor resolve a
+migration ambiguity. The parser has not visited those links.
+
+If a registered reference is visible but refused, do not move it between source
+deliveries, Make-current a different dataset, re-export or mutate its bytes merely
+to bypass the reader. Diagnose the supported parser path; report the fixed error
+code if an unsupported relationship remains. Existing references need not be
+re-admitted just to use a newer reader.
+
 ### Deterministic preparation (`data_supporting_prepare`)
 
 Projects one bounded table region of an XLSX sheet or CSV/TSV reference into the

@@ -280,6 +280,8 @@ serve:
                     self.assertEqual(3, len(requests))
                 self.assertEqual({'CDCK/MoM'}, {item['model'] for item in requests})
                 self.assertIn('rows', outputs[0], outputs)
+                self.assertEqual(1, outputs[0]['ignored_external_hyperlinks'])
+                self.assertNotIn('LINK_TARGET_NEVER_FETCH_OR_RETURN', json.dumps(requests))
                 self.assertEqual('invented-reference-marker', outputs[0]['rows'][0][0]['value'])
                 self.assertEqual({'type': 'formula', 'formula': True, 'value': None}, outputs[0]['rows'][0][1])
                 before_denial = len(requests)
@@ -300,7 +302,8 @@ serve:
                 self.assertEqual(before, (named_state.read_bytes(), standard_state.read_bytes()))
                 self.assertEqual(intake_bytes, original.read_bytes())
                 print(json.dumps({'result': 'official stock intake/read/preparation and same-agent model-policy control passed',
-                                  'arrival': 'intake_without_chat_upload', 'stock_web_tools_offered': stock_web_tools,
+                                  'arrival': 'intake_without_chat_upload', 'ignored_external_hyperlinks': 1,
+                                  'stock_web_tools_offered': stock_web_tools,
                                   'durable_conversation_privacy': 'deferred_not_attested',
                                   'prepared_in_real_sandbox': prepare_reference,
                                   'fake_frontier_requests': len(requests), 'migration_state_unchanged': True}))
