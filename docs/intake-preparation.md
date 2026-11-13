@@ -10,26 +10,18 @@ the `intake-preparation` skill; this page documents the tool/backend contract.
 
 | Tool / argument | Effect | Needs |
 | --- | --- | --- |
-| `data_supporting_list` | Active project references (incl. intake-admitted) + this chat's admitted upload refs when the host supplies a manifest | protected session; manifest optional, malformed refuses |
-| `data_supporting_take(ref)` | Copy a chat upload into the private registry | protected session + valid upload manifest |
-| `data_supporting_read(id, …)` | Bounded sheets/rows/text of a registered reference | protected session only (manifest never forwarded) |
-| `data_supporting_prepare(id, …)` | Deterministic table → converter-native file job (below) | protected session only |
-| `data_script(…, references=[support-…])` | Existing sandbox job; each reference is a verified read-only copy at `/reference/<id>` | protected session; references optional |
-| `data_register` | Unchanged; provenance now also keeps `references` and `preparation_sha256` when the producing job had them | protected session |
-| `data_plan_propose(…, run_inputs={…}, preparation={…})` | Convert plan binds a run-input manifest and analyst-labelled preparation metadata | protected session |
-| `data_merge_propose(…, preparation={…})` | Native merge binds preparation metadata beside source/Base/merge-settings/layer | protected session |
-| `data_master_lists_propose(source, settings, list?, charset?, run_inputs?)` | One `standard_master_lists` plan: the converter's committed exporter on a disposable source copy (mutates staging there); the engineer approves and starts it; CSVs become that run's bound artifacts | protected session |
+| `data_supporting_list` | Active references from this project's intake registry | current project registry; no native context |
+| `data_supporting_read(id, …)` | Bounded sheets/rows/text of a registered reference | current project registry |
+| `data_supporting_prepare(id, …)` | Deterministic table → converter-native file job (below) | current project registry |
+| `data_script(…, references=[support-…])` | Existing sandbox job; each reference is a verified read-only copy at `/reference/<id>` | references optional |
+| `data_register` | Unchanged; provenance now also keeps `references` and `preparation_sha256` when the producing job had them | current project/workspace |
+| `data_plan_propose(…, run_inputs={…}, preparation={…})` | Convert plan binds a run-input manifest and analyst-labelled preparation metadata | current project/workspace |
+| `data_merge_propose(…, preparation={…})` | Native merge binds preparation metadata beside source/Base/merge-settings/layer | current project/workspace |
+| `data_master_lists_propose(source, settings, list?, charset?, run_inputs?)` | One `standard_master_lists` plan: the converter's committed exporter on a disposable source copy (mutates staging there); the engineer approves and starts it; CSVs become that run's bound artifacts | current project/workspace |
 
-**Every** migration-data tool (all `data_*` tools above and the four `data_branch_*`
-tools) requires the protected session; the "Needs" column lists what each needs in
-addition. Without it the adapter refuses before any backend call.
-
-Without the new arguments existing operations retain their request/flag/document
-shape **after** the mandatory protected-session check. Unsupported stock hosts now
-refuse every migration-data tool before dispatch. Source publication is not native
-enablement: coordinate the separately approved generic-native update before using
-the release with private data. Chat uploads remain an optional legacy capability,
-not required or implemented by the new generic protection build; use intake.
+Every migration-data tool uses the fixed adapter's project routing and argument
+whitelist. No experimental native context is required. Native chat-upload import
+is deliberately not advertised: use the same intake-first flow for all references.
 
 ### Deterministic preparation (`data_supporting_prepare`)
 
@@ -112,127 +104,92 @@ rechecks: intake-admitted references always do; a chat-only attachment does afte
 the engineer's next Files role change. Code readiness is computed by the backend.
 
 **Who may submit them.** Model-facing calls (the fixed adapter always sets
-`via: chat`; the model cannot choose or drop it) need the protected session for
-`run_inputs` and `preparation`, and may not supply lineage. The engineer's own
+`via: chat`; the model cannot choose or drop it) use the chat's project and may not
+supply lineage. The engineer's own
 proposal from the Project page or a shell (no `via`, e.g. **Run again**) is the
-trusted signed-in path and needs no native chat context; it may resubmit a plan's
+trusted signed-in path; it may resubmit a plan's
 bound form (`sha256` on references, `lineage`, `mount`, `writable`), but every
 reference digest must still be current and every lineage must equal what the
 workspace records say now, otherwise it refuses. Reader/preparer/script tools keep
-requiring the session on every path.
+using the same workspace/path and digest validation on every path.
 
 Plans without these keys keep exactly their previous arguments, body and digest;
 review (`from_run`) plans refuse both keys.
 
-## Protected-session context (generic core contract)
+## Stock term-llm support
 
-The separately reviewed generic native build (`term-llm capabilities --json` →
-`session_scope_lock: 1`, `custom_tool_session_context: 1`) strips inherited reserved
-values and rejects per-tool configuration of them. Only an admitted locked run gets
-`TERM_LLM_PRIVATE_SESSION=1` and `TERM_LLM_SESSION_ID` (its own native session ID).
-`TERM_LLM_UPLOADS_JSON` is reserved but **never emitted** by this generic build;
-chat upload plumbing is outside scope. Intake references do not need a manifest.
-The adapter has two parsers:
+The supported host is the official, unmodified **term-llm 0.9.103** release, pinned
+by version and archive checksum in `script/metal`. No fork, capability command,
+`lock_session` key or custom native package is required for intake references,
+preparation, script references, plan citations or the ordinary migration-data tools.
 
-- **session proof** — marker `1` and a valid session ID, required by every gated call.
-  Unsupported stock hosts refuse with `STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED`
-  before any backend call. The installer refuses their private-tool enablement.
-- **legacy upload manifest** — needed only to take an upload; shown by list when
-  present. A present-but-malformed manifest refuses every gated call. Readers,
-  preparation and plan citations never receive it. The old attachment package is
-  historical, not a way to satisfy the new capability gate.
+The fixed adapters derive the workspace from the web project's working directory,
+fix `via: chat` and forward only listed arguments. They do not accept a model-supplied
+workspace, route or native session proof. Historical `TERM_LLM_PRIVATE_SESSION`,
+`TERM_LLM_SESSION_ID` and `TERM_LLM_UPLOADS_JSON` values are ignored and removed from
+child environments, not treated as credentials or fabricated on stock hosts.
 
-Actual local tests against the reviewed generic binary use an isolated temporary
-HOME, invented data and loopback fake providers: normal engineer intake → new locked
-migration-data chat → own-project list/read and real sandbox preparation, with zero
-forbidden-provider dispatch. The old chat-upload test deliberately skips when the
-host lacks that separate legacy capability. These are not deployed-node tests.
+References enter through **Project → Files → Supporting reference**. Listing and
+reading use that workspace's private registry; preparation gets checksum-verified
+copies in its existing confined sandbox. Chat-upload taking is not supported:
+`STANDARD_SUPPORTING_USE_INTAKE` means use Files, not install a fork or set a marker.
+Historical reference custody/provenance is retained; missing native chat IDs are
+not invented.
 
-The host and same-account operator remain trusted. This is not OS isolation or
-universal data-loss prevention; tool permissions must independently constrain egress.
+## Retained boundaries and explicitly deferred protections
 
-## Uniform gate, search and DBHub
+- `migration-data` retains its Frontier-only `allowed_models`. Stock term-llm's
+  ordinary agent/model checks apply; they are **not a permanent conversation lock**.
+  Restart/retarget/config-widening privacy guarantees are deferred.
+- Both adapters retain fixed project/workspace routing, argument whitelists and
+  scoped branch-reader operations. Broad analyst host-shell/file tools are not added.
+- Custody, digest rechecks, source/Base roles, run-input lineage, no-network/read-only
+  sandboxing, parser/formula/size/disk limits, exact plan review, approval and separate
+  Start remain enforced. Deferring conversation locking does not relax these gates.
+- `search: false` remains a preference. Stock web-tool availability must not be
+  described as enforced DLP. The real 0.9.103 acceptance run still offered
+  `web_search` and `read_url`; no external requests were made. Do not put
+  customer-derived values in web requests;
+  keep public research in a clean chat. Initial acceptance uses invented data.
+- DBHub no longer requires the experimental `SILO_PROTECTED_SESSIONS` grant. It still
+  requires the stock-supported `mcp.servers.NAME.agents: [migration-data]` rule and
+  trusted installed agents; query sessions remain read-only. This is agent-scoped,
+  not a customer/project authorization boundary: enable only the current project's
+  server. Doctor reports misconfigured rules without editing them.
+- The service account/operator and server-support's root-equivalent Docker authority
+  remain trusted. This is not OS isolation or universal data-loss prevention.
 
-- **Uniform tool gate.** Both fixed adapters (`scripts/data_tool.py`,
-  `scripts/dev_tool.py`) refuse every tool unless the host supplied the private
-  marker and a valid session ID (and, if present, a well-formed legacy upload
-  manifest). Context reaches the backend only for references/preparation, where it
-  is rechecked. Model JSON look-alike keys are dropped. The gate is in the adapters,
-  the only chat entry; trusted engineer/shell paths (`via` absent) are unchanged.
-- **No web search.** `migration-data` has `search: false`. Public research belongs
-  in a separate clean chat with generic questions; the engineer relays public facts
-  only. The generic native build clamps the locked agent's setting so request/UI/
-  host defaults cannot re-enable it. Actual offered-tool tests show neither
-  `web_search` nor `read_url`. Older unsupported stock hosts did not enforce this
-  and are blocked by the native gate. This cannot stop an engineer pasting customer
-  values into a different chat.
-- **DBHub (free SQL over MCP).** MCP servers don't receive custom-tool session
-  context. DBHub is enabled only when the installer-managed, account-owned control
-  config (`SILO_CONTROL_CONFIG`) literally contains `SILO_PROTECTED_SESSIONS=1`;
-  inherited values are never consulted. Same-account operator writes remain trusted.
-  The file must be regular, single-link, non-group/world-writable, bounded and
-  unchanged while read. Without the grant `data_db_up` does not register the server
-  and removes an existing entry, and `silo-migrate-control dbhub WS` refuses to start
-  (including stale `mcp.json` entries). The installer verifies native capabilities
-  before project wiring, clears the grant before native selection/early failure,
-  restores the previous binary after an incapable replacement and grants only after
-  final host/agent checks. An unlocked rollback removes the literal for older control
-  parser compatibility. A capability failure refuses before release selection;
-  an invalid old grant is revoked, not left true. Doctor reports project-server
-  **counts** as FAIL without native protection; diagnostics never change configuration.
-- **Auxiliary calls.** Auto titles stay disabled in fresh node config. The generic
-  native lock keeps titles/classification within its saved model policy, skips
-  locked memory mining/freshening and suppresses transcript debug logging. Side
-  questions, manual compaction, summarized branch notes, cross-model handovers,
-  Hub delegation and MCP sampling refuse locked conversations. Automatic compaction
-  uses the admitted model. Direct ask/loop/chat TUI and progressive runs refuse
-  locks because they do not use the protected per-turn runner.
+The stronger generic native lock/context work is parked for later. Its branch,
+patch and historical tests remain in Git history; they are not prerequisites for
+this stock workflow and no equivalent privacy attestation is claimed.
 
-## Host boundary
+## Updating an existing stock node
 
-The wrappers fix `via: chat`, derive the workspace from the chat's project folder
-and forward only each tool's listed keys; the control backend trusts that JSON from
-its host. This is a host/process convention on one service account, **not OS
-isolation**. Coding agents (converter-developer/-reviewer) have no shell/file tools
-and only the `converter dev WS --role <fixed>` route (source-tested). The
-`server-support` agent does have `shell`, `edit_file` and `write_file` on that
-account: it is a trusted operator agent outside this boundary and could reach
-workspace files directly.
+Use the normal `sudo silo update` on an installer already tracking
+`mvp/metal-installer`, during an approved idle maintenance window. The release pins
+and checks the official binary; existing 0.9.93/0.9.99 version settings are recognized
+as older pins. Keep `TERM_LLM_PACKAGE` empty/unset; it is not needed. If a previous
+experiment explicitly configured a package, review that configuration before
+returning to stock rather than silently ignoring it.
 
-## Deployment compatibility (coordinate core and Silo installs)
+Existing control-runtime artifacts, provider configuration and workspaces are
+preserved and verified; the native helper package is not the runtime artifact
+package. No host Go/Node compiler install or fork-package transfer is needed.
+The ordinary update restarts the web service and interrupts chats. Use a **new
+migration-data chat** after updating so the current tool definitions are selected;
+do not edit old session rows, fabricate context or delete locks to retrofit them.
 
-This Silo source **requires** the protected-session native host for every
-migration-data tool. Unsupported hosts refuse the release update before enabling
-private tools; there is no stock fallback. Files/Runs in the Project page remain
-engineer-controlled. The separately approved deployment must verify the reviewed
-native build, this Silo release and the final DBHub grant, then start a **new**
-migration-data chat per project. No installed binary/configuration/service was
-changed by this source implementation.
+## Acceptance and remaining gates
 
-The current source receipt, `runtime/private-node-source.json`, binds
-`integrations/term-llm/patches/conversation-scope.patch` to upstream base
-`70523473fa89952f8312be6136a92c51ffae1f4c` (version `0.9.103`). Build/test that exact
-source and preserve provenance, then use `script/private-node package` / `verify`
-from a private custody-safe source/artifact directory outside customer storage.
-The package helper checks ELF structure, exact source/hash receipts, capability,
-version and CLI support using sealed bytes and disposable HOME/XDG probes. It does
-not install anything. Transfer, service-account custody handoff, installed config,
-selection and service restart remain subject to separate deployment approval.
-The custody rules in the historical [attachment documentation](chat-attachments.md)
-still apply, but its old patch/version/capability instructions do not.
+Run stock-host acceptance with `STOCK_TERM_LLM_BINARY` pointing to the verified
+unmodified official release and `SILO_SUPPORTING_LIVE=1`: normal Files intake →
+list/read → real sandbox preparation, with no native context and forged legacy
+variables ignored. These tests measure the ordinary model-policy control and
+report web-tool availability; they do not attest durable conversation privacy.
+Backend/contract and browser tests cover registration, exact plan review and the
+separate Approve/Start workflow. Chat drag/drop import remains deferred.
 
-## Compatibility verification and remaining gates
-
-Local fake-provider tests cover protected intake/preparation, own-project IDs,
-forbidden-provider non-dispatch, restart/config widening refusal, allowed continuation
-and branching, child native identity and ordinary unlocked provider routing. The
-core suite also covers reserved-environment impersonation, auxiliary refusals,
-stored policy/database invariants, search clamping and debug suppression. Repeat
-these checks on any future candidate upstream build before claiming equivalence.
-
-Project Files/Runs rendering, exact preparation review and scoped Khoros master-list
-export are implemented; they are not pending worker tasks. Uniform gating and the
-search change are implemented under the approved source scope, not proposals.
-Remaining gates are separately approved package transfer/installation/restart,
-invented-data acceptance on the actual node, then separately approved real
-provider/customer-data work. No deployed-node or customer acceptance is implied.
+Source verification/publication does not authorize a server update/restart or
+customer-data access. After deployment approval, start with invented data on the
+actual node. Revisit durable conversation isolation separately once the full flow
+is accepted; do not describe it as implemented by stock configuration.

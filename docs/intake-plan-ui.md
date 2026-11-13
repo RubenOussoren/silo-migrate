@@ -134,9 +134,10 @@ Plans without these fields propose exactly the same request as before. **Import 
 site** is unchanged (review plans carry neither field).
 
 **Engineer path:** this signed-in Project page call is the engineer's own trusted proposal.
-The data adapter accepts it (`ws.chat` false) without any protected chat-session context. The
-page never makes up a session marker. Chat (model-facing) proposals still need the protected
-session. On this engineer path the adapter also accepts the repeated bound `lineage` and
+The data adapter accepts it (`ws.chat` false) through the trusted signed-in engineer path.
+Neither this page nor stock chat adapters manufacture native session markers. Chat proposals
+retain fixed project routing and argument whitelists. On the engineer path the adapter also
+accepts the repeated bound `lineage` and
 refuses if it differs from what the workspace's records derive now.
 
 ### Preparation jobs (master-list export)
@@ -250,7 +251,7 @@ then explicit Start.
 ## Known gaps
 
 - No engineer-side bounded reference **preview** yet. `supporting_read` is the
-  agent's protected-session reader, and this page does not bypass that gate.
+  agent's project-scoped reader; this page does not expose reference contents.
 - Copy request is the safe MVP. Opening a draft in the correct chat needs a verified
   generic term-llm mechanism.
 - Answers are given in the migration-data chat and produce a new plan. The page doesn't

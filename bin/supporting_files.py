@@ -1,6 +1,8 @@
-"""Private project reference files. Only trusted wrappers may supply underscore keys.
+"""Private project reference files, admitted by the engineer (intake/inputs/assets).
 
 handle(ws, request, api) uses the parent's confinement, Docker and refusal helpers.
+Chat requests carry no session or upload context: chat upload admission is not
+offered (supporting_take refuses USE_INTAKE); request underscore keys are ignored.
 admit_reference(ws, request, api) and admit_asset_reference(ws, request, api)
 are engineer-only and require the caller's lock.
 Nothing here registers an input, delivery, output, job, or named-state record.
@@ -11,7 +13,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import pwd
 import re
 import secrets
 import stat
@@ -30,6 +31,7 @@ PARSER_ERRORS = frozenset("STANDARD_SUPPORTING_" + code for code in (
     "INVALID_ARGUMENT", "INVALID_DOCUMENT", "IO", "LIMIT", "OUTPUT_LIMIT",
     "SHEET_NOT_FOUND", "UNSAFE_RELATIONSHIP", "UNSAFE_XML", "UNSUPPORTED",
 ))
+# These identifiers validate retained historical upload records, not current host proof.
 SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -48,54 +50,16 @@ def safe_name(value):
             and not any(c in "/\\" or ord(c) < 32 or 127 <= ord(c) < 160 for c in value))
 
 
-def trusted_context(request, api):
-    session = request.get("_session_id")
-    if request.get("_private_session") is not True or not isinstance(session, str) or not SESSION_ID.fullmatch(session):
-        fail(api, "PRIVATE_SESSION_REQUIRED")
-    uploads = request.get("_uploads", [])
-    if not isinstance(uploads, list) or len(uploads) > 32:
-        fail(api, "UPLOADS_INVALID")
-    try:
-        if len(encoded(uploads)) > MAX_RECORD:
-            fail(api, "UPLOADS_INVALID")
-    except (TypeError, ValueError, UnicodeError):
-        fail(api, "UPLOADS_INVALID")
-    seen = set()
-    for item in uploads:
-        if not isinstance(item, dict):
-            fail(api, "UPLOADS_INVALID")
-        ref = item.get("id")
-        if not isinstance(ref, str) or not REF_ID.fullmatch(ref) or ref in seen:
-            fail(api, "UPLOADS_INVALID")
-        seen.add(ref)
-        if (not safe_name(item.get("filename")) or not isinstance(item.get("path"), str)
-                or not isinstance(item.get("media_type"), str) or len(item["media_type"]) > 128
-                or any(ord(c) < 32 or ord(c) == 127 for c in item["media_type"])
-                or type(item.get("size_bytes")) is not int or not 0 <= item["size_bytes"] <= MAX_FILE):
-            fail(api, "UPLOADS_INVALID")
-    return session, uploads
-
-
-def session_context(request, api):
-    """Protected-session proof without an upload manifest: reading, preparing or
-    citing an already-registered (e.g. intake-admitted) reference does not depend
-    on chat upload provenance, but still requires the host's protected session."""
-    session = request.get("_session_id")
-    if request.get("_private_session") is not True or not isinstance(session, str) or not SESSION_ID.fullmatch(session):
-        fail(api, "PRIVATE_SESSION_REQUIRED")
-    return session
-
-
 def resolve_references(ws, request, api, identities, snapshot_dir=None):
     """Active registered references by ID, for job mounts or plan provenance.
 
-    Caller holds ws.lock() (it is not reentrant). Requires the protected session
-    context. With snapshot_dir, each file is copied to snapshot_dir/<id> (0400)
-    from the held custody inode and checksum-verified; originals are never
-    mounted or modified. Returns [{id, filename, size_bytes, sha256}] in request
+    Caller holds ws.lock() (it is not reentrant). Registered references are
+    project custody: no chat session or upload manifest is consulted (request is
+    accepted for call compatibility and unused). With snapshot_dir, each file is
+    copied to snapshot_dir/<id> (0400) from the held custody inode and
+    checksum-verified; originals are never mounted or modified. Returns [{id, filename, size_bytes, sha256}] in request
     order. Unknown/inactive IDs refuse without revealing other records.
     """
-    session_context(request, api)
     try:
         if (not isinstance(identities, list) or not identities or len(identities) > 8
                 or len(set(map(str, identities))) != len(identities)
@@ -151,13 +115,6 @@ def full_root(path, api, strict=False):
         return os.dup(fd)
     finally:
         os.close(fd)
-
-
-def upload_root():
-    if os.environ.get("SILO_TESTING") == "1" and os.environ.get("SILO_SUPPORT_UPLOADS_ROOT"):
-        return Path(os.environ["SILO_SUPPORT_UPLOADS_ROOT"])
-    base = os.environ.get("XDG_DATA_HOME")
-    return (Path(base) if base else Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/share") / "term-llm/uploads"
 
 
 def check_file(info, api, mode=None):
@@ -473,53 +430,6 @@ def bounded(value, api):
     if len(encoded(value)) > MAX_OUTPUT:
         fail(api, "OUTPUT_LIMIT")
     return value
-
-
-def take(ws, request, api, root, index, files, items, session, uploads):
-    ref = request.get("ref")
-    if not isinstance(ref, str) or not REF_ID.fullmatch(ref):
-        fail(api, "REF_INVALID")
-    upload = next((item for item in uploads if item["id"] == ref), None)
-    if upload is None:
-        fail(api, "REF_NOT_AVAILABLE")
-    old = next((item for item in items if item.get("provenance") == "private-session-upload"
-                and item["session_id"] == session and item["refid"] == ref), None)
-    if old:
-        if not reference_active(old["id"], api):
-            fail(api, "INACTIVE")
-        return {"status": "ok", "file": public(old), "already_registered": True}
-    capacity(index, files, items, api, upload["size_bytes"], 1)
-    source_root = upload_root()
-    source = Path(upload["path"])
-    # No resolution/normalization that could silently accept ../ or nested paths.
-    if (not source.is_absolute() or source.parent != source_root or ".." in source.parts
-            or upload["path"] != str(source) or not safe_name(source.name)):
-        fail(api, "PATH_INVALID")
-    source_dir = full_root(source_root, api)
-    try:
-        fd, info = api.open_regular(source_dir, [source.name])
-    finally:
-        os.close(source_dir)
-    identity = "support-" + secrets.token_hex(16)
-    try:
-        check_file(info, api)
-        if info.st_size != upload["size_bytes"]:
-            fail(api, "FILE_CHANGED")
-        count, digest = copy_checked(fd, identity, api, dir_fd=files)
-        try:
-            if stamp(info) != stamp(os.fstat(fd)) or count != info.st_size:
-                fail(api, "FILE_CHANGED")
-            capacity(index, files, items, api)
-        except BaseException:
-            os.unlink(identity, dir_fd=files)
-            raise
-    finally:
-        os.close(fd)
-    item = {"id": identity, "filename": upload["filename"], "size_bytes": count,
-            "sha256": digest, "session_id": session, "refid": ref,
-            "media_type": upload["media_type"], "imported_at": int(time.time()),
-            "provenance": "private-session-upload"}
-    return publish(item, index, files, api)
 
 
 def publish(item, index, files, api):
@@ -923,37 +833,32 @@ def read(ws, request, api, files, items):
 def handle(ws, request, api):
     """Dispatch supporting_list/take/read; errors are fixed parent refusal codes.
 
-    request.op is the operation. take uses ref; read uses id. List returns
-    files (active project references), available_refs (current chat only), and
-    has_more. Optional api.reference_active(id) is internal role authority; it
-    never relaxes native context checks and is never taken from request JSON.
+    request.op is the operation; read uses id. List returns files (active project
+    references, e.g. intake-admitted ones), available_refs (always empty: chat
+    upload intake is not offered) and has_more. take always refuses USE_INTAKE:
+    no request key, environment value or manifest is upload provenance, so a
+    forged session/manifest can never register a file. Optional
+    api.reference_active(id) is internal role authority, never request JSON.
+    Historical private-session-upload records stay valid, listable and readable.
     """
     try:
         op = request.get("op")
-        if op == "supporting_read":
-            # Reading a registered reference needs the protected session, not upload provenance.
-            session, uploads = session_context(request, api), []
-        else:
-            session, uploads = trusted_context(request, api)
-        if op not in ("supporting_list", "supporting_take", "supporting_read"):
+        if op == "supporting_take":
+            fail(api, "USE_INTAKE")
+        if op not in ("supporting_list", "supporting_read"):
             fail(api, "OPERATION_INVALID")
         ws.require(standard=False)
-        with ws.lock(), store(ws, api) as (root, index, files):
+        with ws.lock(), store(ws, api) as (_, index, files):
             items = records(index, api)
-            if op == "supporting_take":
-                return bounded(take(ws, request, api, root, index, files, items, session, uploads), api)
             if op == "supporting_read":
                 return read(ws, request, api, files, items)
             result = {"status": "ok", "files": [], "available_refs": [], "has_more": False}
-            refs = [{"id": item["id"], "filename": item["filename"], "size_bytes": item["size_bytes"]} for item in uploads]
-            active = [public(item) for item in items if reference_active(item["id"], api)]
-            for key, entries in (("available_refs", refs), ("files", active)):
-                for item in entries:
-                    result[key].append(item)
-                    if len(encoded(result)) > MAX_OUTPUT:
-                        result[key].pop()
-                        result["has_more"] = True
-                        break
+            for item in (public(item) for item in items if reference_active(item["id"], api)):
+                result["files"].append(item)
+                if len(encoded(result)) > MAX_OUTPUT:
+                    result["files"].pop()
+                    result["has_more"] = True
+                    break
             return bounded(result, api)
     except (OSError, ValueError, TypeError, UnicodeError) as error:
         # Preserve parent's fixed refusals, but never leak filesystem/parser errors.

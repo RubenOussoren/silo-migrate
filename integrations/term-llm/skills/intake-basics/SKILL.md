@@ -32,9 +32,9 @@ type label and checksum so every later step is traceable.
    `postgres-dump`, `discourse-backup`, `archive`, `xml-export`, `json-export`,
    `csv-export`, `uploads`. Files become read-only in `inputs/`; provenance records
    where they came from. A workbook is not a Discourse source backup. Intake files
-   classified **Supporting reference** use the same private registry as chat
-   attachments: read them with `data_supporting_list`/`data_supporting_read`, not
-   `data_take`. Never force a reference into Development/Launch/Base to read it.
+   classified **Supporting reference** go to a private registry: read them with
+   `data_supporting_list`/`data_supporting_read`, not `data_take`. Chat drops are
+   not read; ask for an intake upload instead. Never force a reference into Development/Launch/Base to read it.
    To use a reference for a plan (wishes, mapping sheets), load `intake-preparation`.
 6. **Unpack archives** into a work folder with `data_extract`, check the job, and
    register the files you'll use with `data_register` (each gets its own type).

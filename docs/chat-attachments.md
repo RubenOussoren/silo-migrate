@@ -1,13 +1,12 @@
 # Private chat attachments and supporting reference files
 
-> **Historical attachment-fork contract, not the current installation path.** The
-> intake-first release uses [intake-preparation.md](intake-preparation.md), requires
-> the separately reviewed generic conversation-protection build, and does not need
-> native upload context for intake references. Chat drag/drop is deferred. Do **not**
-> install the older paired attachment package from the instructions below to unlock
-> private reading; its capabilities do not satisfy the new enablement gate. Original
-> attachment source/history and tests are retained for compatibility evidence.
-> Installation, package transfer and service changes always require separate approval.
+> **Historical attachment-fork contract only.** The current supported workflow uses
+> official, unmodified term-llm and [Files intake](intake-preparation.md), with no
+> custom native package or session marker. Chat drag/drop import and stronger
+> conversation protection are deferred. Do not use the package/version/capability
+> installation instructions below for the stock release. Original source and test
+> history are retained in Git; no equivalent stock privacy guarantee is claimed.
+> Server changes and customer-data work remain separately approved operations.
 
 ## Intended workflow
 

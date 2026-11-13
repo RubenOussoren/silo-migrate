@@ -2,8 +2,12 @@
 """Fixed mapping from migration-data's term-llm tools to `silo-migrate-control data WS`.
 
 Runs only in the Frontier-only migration-data agent: the one agent that handles customer
-data. Every tool requires the native host's protected-session context (see
-session_context); without it nothing reaches the backend.
+data. It works on stock, unmodified term-llm: no tool needs a native session marker,
+and any TERM_LLM_PRIVATE_SESSION / TERM_LLM_SESSION_ID / TERM_LLM_UPLOADS_JSON in the
+environment is ignored and stripped (stock hosts let anything that sets the
+environment spoof them). Chat-attached uploads are not taken: supporting references
+arrive through Files intake only (data_supporting_take always refuses with
+STANDARD_SUPPORTING_USE_INTAKE, before any backend call).
 
 Boundary: this wrapper fixes "via": "chat", derives the workspace from the chat's
 project folder and forwards only each tool's listed keys, so model JSON cannot pick
@@ -53,22 +57,16 @@ TOOLS = {
     "data_decide": ("decide", {"topic", "decision", "basis"}, 60),
     "data_decisions": ("decisions", set(), 60),
     "data_supporting_list": ("supporting_list", set(), 60),
-    "data_supporting_take": ("supporting_take", {"ref"}, 60),
     "data_supporting_read": ("supporting_read", {"id", "mode", "sheet", "offset", "limit", "columns"}, 90),
     "data_supporting_prepare": ("supporting_prepare", {"id", "sheet", "header_row", "max_rows", "columns", "format", "shape",
                                                        "name", "into", "delivery"}, 90),
 }
-# Native protected-session context, by need. Upload provenance (the admitted-upload
-# manifest) goes only to listing/taking chat uploads; reading, listing registered
-# references, preparing or citing an already-registered reference (including one the
-# engineer admitted from intake) needs the protected session alone. No marker, a bad
-# session ID or a malformed manifest fails closed before any backend call.
-UPLOAD_CONTEXT_TOOLS = {"data_supporting_list", "data_supporting_take"}
-SESSION_CONTEXT_TOOLS = {"data_supporting_read", "data_supporting_prepare"}
-# Only when these arguments are present: otherwise the tool is unchanged.
-SESSION_CONTEXT_ARGUMENTS = {"data_script": {"references"}, "data_plan_propose": {"preparation", "run_inputs"},
-                             "data_merge_propose": {"preparation"}, "data_master_lists_propose": {"run_inputs"}}
-SESSION = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+# Taking a chat upload needs host-proved upload provenance that stock term-llm cannot give.
+# Kept as a fixed refusal (not a backend call) so an old prompt or a spoofed environment
+# cannot copy arbitrary host files into the registry.
+USE_INTAKE_TOOLS = {"data_supporting_take"}
+# Legacy fork context variables: never trusted, never forwarded (stock env is spoofable).
+LEGACY_CONTEXT_ENV = ("TERM_LLM_UPLOADS_JSON", "TERM_LLM_PRIVATE_SESSION", "TERM_LLM_SESSION_ID")
 INSTALLED_AGENT = re.compile(r"(/.+)/releases/[0-9a-f]{40}/integrations/term-llm/[a-z][a-z-]*")
 
 
@@ -87,60 +85,11 @@ def control_path():
 
 def control_env():
     env = dict(os.environ)
-    # Native upload capabilities go only in the fixed supporting operation's
-    # stdin, not the environment of unrelated control/Git/Docker subprocesses.
-    for key in ("TERM_LLM_UPLOADS_JSON", "TERM_LLM_PRIVATE_SESSION", "TERM_LLM_SESSION_ID"):
+    # Legacy context variables never reach control/Git/Docker subprocesses.
+    for key in LEGACY_CONTEXT_ENV:
         env.pop(key, None)
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     return env
-
-
-def session_context():
-    """The protected-session proof: TERM_LLM_PRIVATE_SESSION=1 and a valid session ID.
-
-    Set by a separately approved native host (capabilities session_scope_lock=1 and
-    custom_tool_session_context=1) only after durable scope admission, from its trusted
-    context, stripping inherited and per-tool values first. Stock 0.9.99 never sets the marker, so every caller
-    of this refuses there before any backend call. Never taken from model JSON."""
-    session_id = os.environ.get("TERM_LLM_SESSION_ID", "")
-    if os.environ.get("TERM_LLM_PRIVATE_SESSION") != "1" or not SESSION.fullmatch(session_id):
-        return None
-    return {"_private_session": True, "_session_id": session_id}
-
-
-MALFORMED = object()
-
-
-def upload_manifest():
-    """Admitted chat uploads: None when the host supplied no manifest, MALFORMED when
-    it supplied something unexpected (fail closed), else the bounded list."""
-    raw = os.environ.get("TERM_LLM_UPLOADS_JSON")
-    if raw is None:
-        return None
-    if not raw or len(raw.encode("utf-8")) > 64 * 1024:
-        return MALFORMED
-    try:
-        uploads = json.loads(raw)
-    except ValueError:
-        return MALFORMED
-    if not isinstance(uploads, list) or len(uploads) > 32:
-        return MALFORMED
-    return uploads
-
-
-def supporting_context(need_uploads=False):
-    """Session context, plus the upload manifest only where uploads are the subject.
-
-    Reading, listing registered references, preparing and citing need the protected
-    session, not upload provenance. A present-but-malformed manifest still refuses
-    (unexpected host format). Taking an upload requires a valid manifest."""
-    context = session_context()
-    uploads = upload_manifest()
-    if context is None or uploads is MALFORMED or (need_uploads and uploads is None):
-        return None
-    if need_uploads is not None:
-        context["_uploads"] = uploads or []
-    return context
 
 
 def fail(code):
@@ -179,6 +128,8 @@ def emit(result):
 
 def main():
     tool = os.environ.get("TERM_LLM_TOOL_NAME", "")
+    if tool in USE_INTAKE_TOOLS:
+        return fail("STANDARD_SUPPORTING_USE_INTAKE")
     if tool not in TOOLS:
         return fail("STANDARD_TOOL_UNKNOWN")
     try:
@@ -193,18 +144,9 @@ def main():
         return fail("STANDARD_CHAT_NOT_IN_PROJECT")
     op, keys, timeout = TOOLS[tool]
     # "via": the host applies chat-only limits (a tool has 300 s); the agent can't set or drop it.
+    # Only listed keys pass: model JSON can't add context keys (_private_session, _session_id,
+    # _uploads), a workspace or a route.
     request = {"op": op, **{key: value for key, value in args.items() if key in keys and value is not None}, "via": "chat"}
-    # Uniform gate: every tool of this customer-data agent needs the host's protected
-    # session, checked here before any backend call. A host that cannot prove it
-    # (stock term-llm, an unlocked/foreign chat) gets no customer data at all.
-    # take needs the upload manifest; list shows it when present; nothing else receives it.
-    context = supporting_context(need_uploads=True if tool == "data_supporting_take" else
-                                 (False if tool == "data_supporting_list" else None))
-    if context is None:
-        return fail("STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED")
-    # The backend rechecks the context where references/preparation are involved.
-    if tool in UPLOAD_CONTEXT_TOOLS or tool in SESSION_CONTEXT_TOOLS or SESSION_CONTEXT_ARGUMENTS.get(tool, set()) & set(request):
-        request.update(context)
     try:
         result = subprocess.run([control_path(), "data", project], input=json.dumps(request).encode("utf-8"),
                                 capture_output=True, timeout=timeout, env=control_env())

@@ -1,5 +1,14 @@
 # Debian metal installer (single account; synthetic MVP)
 
+**Current native default:** official, unmodified term-llm **0.9.103**, verified against
+both the reviewed archive SHA and official release checksums. Existing 0.9.93/0.9.99
+configuration pins are recognized as older release pins. `TERM_LLM_PACKAGE` is not
+required; leave it empty for stock operation. Ordinary `silo update` delivers the
+Silo release and pinned native update, then restarts the service. Experimental
+conversation locking/trusted upload context are deferred, not hidden prerequisites.
+See [intake-preparation.md](intake-preparation.md). Older version-specific observations
+below retain their original scope; they are not claims about the current binary.
+
 Day-to-day operation after installing (updates, checks, sign-ins, intake): see `docs/node-operations.md` and the `silo` command.
 
 `script/metal` installs the containerised control runtime, not host Ruby, Node or

@@ -35,11 +35,11 @@ ROOT = SELF.parent.parent
 # Reviewed term-llm release: version, and the SHA-256 of term-llm_VERSION_linux_amd64.tar.gz
 # (it must also match the release's checksums.txt). 0.9.96+ enforces config.yaml's
 # mcp.servers.NAME.agents for agents in ~/.config/term-llm/agents (SamSaffron/term-llm#1341).
-TERM_LLM_PINNED = "0.9.99"
-PIN = "1c2004cf869e9470e605197f386347ff938ab88e431edb3637ee65b95c24cc8f"
-# Versions earlier releases pinned. metal.example.conf used to name one, so a config that still
-# does gets this release's version instead of a refusal.
-TERM_LLM_SUPERSEDED = ("0.9.93",)
+TERM_LLM_PINNED = "0.9.103"
+PIN = "ad6120221d9c34975c0c6ce25f00d9d3b68d0b174c8bf0bcca20e6e04240d9ed"
+# Versions earlier releases pinned. Existing configs naming either receive this
+# release's reviewed version instead of a refusal.
+TERM_LLM_SUPERSEDED = ("0.9.93", "0.9.99")
 TERM_NOTE = ""
 PACKAGES = ("git", "curl", "ca-certificates", "python3", "util-linux", "gzip", "tar", "gnupg")
 DEFAULTS = dict(SILO_ACCOUNT="silomig", SILO_PREFIX="/srv/silo-migrate", SILO_WORKSPACES="",
@@ -489,6 +489,11 @@ PRIVATE_SCOPE_CAPABILITIES = {"session_scope_lock": 1, "custom_tool_session_cont
 
 
 def private_scope_required(release):
+    # Stock operation must not depend on unsupported keys in an older release's
+    # agent YAML, including during rollback. Only explicit experimental packages
+    # use this retained capability contract.
+    if not C.get("TERM_LLM_PACKAGE"):
+        return False
     return any(re.search(r"(?m)^lock_session:[ \t]*true[ \t]*(?:#.*)?$", path.read_text())
                for path in (Path(release)/"integrations/term-llm").glob("*/agent.yaml"))
 

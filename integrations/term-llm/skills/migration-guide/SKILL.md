@@ -47,7 +47,7 @@ A **merge project** (source platform `discourse`) brings another Discourse site 
 
 ## File roles and corrections
 
-`data` reports explicit current source snapshots, not the newest arrival. Development/Launch are snapshot purposes; assets attach to one, and references from intake/chat share the private registry without replacing source or Base. Only an explicit new source creates a source version.
+`data` reports explicit current source snapshots, not the newest arrival. Development/Launch are snapshot purposes; assets attach to one, and references from Files intake share the private registry without replacing source or Base. Only an explicit new source creates a source version.
 Only the engineer can use Files → Manage to correct/reactivate with a reason and digest-bound dependency preview. Preserve bytes, input IDs and completed run/release bindings; correction is not output repair. Affected pending approvals stale; affected active work blocks it. Unrelated references do not stale source plans. Never suggest Start over, deletion, manual JSON edits or fake re-uploaded versions as an undo.
 For active job blockers, load `job-recovery` before acting; saved status is not liveness and reconciliation needs approval. Loose uploads are stored/not included by normal forum review. Native merge consumes uploads inside the original full source backup only.
 

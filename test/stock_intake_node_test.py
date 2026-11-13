@@ -1,7 +1,7 @@
-"""Opt-in native UI-upload -> Frontier tool -> private registry/real reader check.
+"""Opt-in official-stock host -> project intake -> real confined reader/preparer.
 
-Set PRIVATE_TERM_LLM_BINARY to the paired binary and SILO_SUPPORTING_LIVE=1.
-Only isolated configuration, invented data and loopback fake providers are used.
+Set STOCK_TERM_LLM_BINARY to the verified official release and SILO_SUPPORTING_LIVE=1.
+No fork capability/context is supplied. Durable privacy is explicitly not attested.
 """
 import base64
 import hashlib
@@ -17,11 +17,10 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = os.environ.get('PRIVATE_TERM_LLM_BINARY')
+BINARY = os.environ.get('STOCK_TERM_LLM_BINARY')
 
 
 def workbook():
@@ -31,24 +30,15 @@ def workbook():
     return module.workbook()
 
 
-@unittest.skipUnless(BINARY and os.environ.get('SILO_SUPPORTING_LIVE') == '1', 'opt-in paired native node and cached Docker test')
-class PrivateAttachmentsNodeTest(unittest.TestCase):
-    def test_ui_upload_reaches_only_own_private_project_tools(self):
-        # Chat upload plumbing is deliberately outside the new generic-core scope.
-        # Keep this compatibility check for the older attachment-capable binary.
-        probe = subprocess.run([str(Path(BINARY).resolve()), 'capabilities', '--json'],
-                               capture_output=True, timeout=10, check=True)
-        if json.loads(probe.stdout).get('private_upload_context') != 1:
-            self.skipTest('generic conversation protection build has no private chat-upload capability')
-        self.check_reference_route(via_intake=False)
-
-    def test_intake_reference_without_chat_upload_reaches_only_private_project(self):
-        self.check_reference_route(via_intake=True)
+@unittest.skipUnless(BINARY and os.environ.get('SILO_SUPPORTING_LIVE') == '1', 'opt-in official stock binary and cached Docker test')
+class StockIntakeNodeTest(unittest.TestCase):
+    def test_intake_reference_without_native_context(self):
+        self.check_reference_route()
 
     def test_intake_reference_prepares_converter_native_file_in_real_sandbox(self):
-        self.check_reference_route(via_intake=True, prepare_reference=True)
+        self.check_reference_route(prepare_reference=True)
 
-    def check_reference_route(self, via_intake, prepare_reference=False):
+    def check_reference_route(self, prepare_reference=False):
         previous_umask = os.umask(0o077)
         self.addCleanup(os.umask, previous_umask)
         # Preparation uses the real job disk-reserve admission. Use a private
@@ -87,32 +77,31 @@ class PrivateAttachmentsNodeTest(unittest.TestCase):
                                                             'discourse_profile_sha256': hashlib.sha256(profile.read_bytes()).hexdigest()}}))
             before = named_state.read_bytes(), standard_state.read_bytes()
             intake_bytes = workbook()
-            if via_intake:
-                # Real engineer reference classification; no chat-upload context.
-                def load_local(name, relative):
-                    loader = importlib.machinery.SourceFileLoader(name, str(ROOT / relative))
-                    spec = importlib.util.spec_from_loader(name, loader)
-                    module = importlib.util.module_from_spec(spec)
-                    loader.exec_module(module)
-                    return module
-                helpers = load_local('intake_node_helpers', 'bin/data_tools.py')
-                host = load_local('intake_node_host', 'bin/silo-migrate-control')
-                workspace = helpers.Workspace(home / 'workspaces', 'invented', ROOT, host, {}, None)
-                (workspace.root / '.silo-migrate').chmod(0o700)
-                workspace.intake.mkdir(parents=True, mode=0o700)
-                original = workspace.intake / 'wishes.xlsx'
-                original.write_bytes(intake_bytes)
-                identity = helpers.supporting_module().source_identity(original.stat(), original.name)
-                change = {'action': 'classify', 'role': 'reference', 'files': [identity]}
-                preview = helpers.op_file_roles_preview(workspace, {'change': change, 'by': 'Invented Engineer'})
-                helpers.op_file_roles_commit(workspace, {'change': preview['change'], 'digest': preview['digest'],
-                                                         'by': 'Invented Engineer'})
+            # Real engineer reference classification; no chat-upload context.
+            def load_local(name, relative):
+                loader = importlib.machinery.SourceFileLoader(name, str(ROOT / relative))
+                spec = importlib.util.spec_from_loader(name, loader)
+                module = importlib.util.module_from_spec(spec)
+                loader.exec_module(module)
+                return module
+            helpers = load_local('intake_node_helpers', 'bin/data_tools.py')
+            host = load_local('intake_node_host', 'bin/silo-migrate-control')
+            workspace = helpers.Workspace(home / 'workspaces', 'invented', ROOT, host, {}, None)
+            (workspace.root / '.silo-migrate').chmod(0o700)
+            workspace.intake.mkdir(parents=True, mode=0o700)
+            original = workspace.intake / 'wishes.xlsx'
+            original.write_bytes(intake_bytes)
+            identity = helpers.supporting_module().source_identity(original.stat(), original.name)
+            change = {'action': 'classify', 'role': 'reference', 'files': [identity]}
+            preview = helpers.op_file_roles_preview(workspace, {'change': change, 'by': 'Invented Engineer'})
+            helpers.op_file_roles_commit(workspace, {'change': preview['change'], 'digest': preview['digest'],
+                                                     'by': 'Invented Engineer'})
             config = home / '.config/term-llm'
             config.mkdir(parents=True)
             (config / 'agents').symlink_to(ROOT / 'integrations/term-llm')
             control = home / 'test-control'
             control.write_text(f'''#!/usr/bin/env python3
-import importlib.machinery, importlib.util, json, os, sys
+import importlib.machinery, importlib.util, io, json, os, sys
 from pathlib import Path
 root = Path({str(ROOT)!r})
 def load(name, rel):
@@ -121,7 +110,10 @@ def load(name, rel):
     m = importlib.util.module_from_spec(spec); loader.exec_module(m); return m
 helpers, host = load('data_helpers', 'bin/data_tools.py'), load('control_helpers', 'bin/silo-migrate-control')
 try:
-    result = helpers.main(sys.argv[1:], {{}}, Path({str(home / 'workspaces')!r}), root, host, sys.stdin, None)
+    payload = json.load(sys.stdin)
+    assert not (set(payload) & {{'_private_session', '_session_id', '_uploads'}}), 'synthetic native context forwarded'
+    assert not any(k in os.environ for k in ('TERM_LLM_PRIVATE_SESSION', 'TERM_LLM_SESSION_ID', 'TERM_LLM_UPLOADS_JSON')), 'legacy native environment forwarded'
+    result = helpers.main(sys.argv[1:], {{}}, Path({str(home / 'workspaces')!r}), root, host, io.StringIO(json.dumps(payload)), None)
     print(json.dumps(result))
 except helpers.Refusal as e:
     print('Error: ' + str(e), file=sys.stderr); sys.exit(1)
@@ -158,14 +150,8 @@ except helpers.Refusal as e:
                             name, args = 'data_supporting_list', {}
                         elif count == 1:
                             previous = tool_json(tools[-1]['content'])
-                            if via_intake:
-                                assert previous['available_refs'] == [], 'intake test must have no chat uploads'
-                                name, args = 'data_supporting_read', {'id': previous['files'][0]['id'], 'mode': 'rows', 'columns': 2, 'limit': 1}
-                            else:
-                                name, args = 'data_supporting_take', {'ref': previous['available_refs'][0]['id']}
-                        elif count == 2 and not via_intake:
-                            previous = tool_json(tools[-1]['content'])
-                            name, args = 'data_supporting_read', {'id': previous['file']['id'], 'mode': 'rows', 'columns': 2, 'limit': 1}
+                            assert previous['available_refs'] == [], 'stock intake has no trusted chat uploads'
+                            name, args = 'data_supporting_read', {'id': previous['files'][0]['id'], 'mode': 'rows', 'columns': 2, 'limit': 1}
                         elif count == 2 and prepare_reference:
                             outputs.append(tool_json(tools[-1]['content']))
                             admitted = tool_json(tools[0]['content'])
@@ -232,7 +218,9 @@ serve:
 ''')
             env = {'PATH': os.defpath, 'HOME': str(home), 'XDG_CONFIG_HOME': str(home / '.config'),
                    'XDG_DATA_HOME': str(data), 'XDG_CACHE_HOME': str(home / 'cache'),
-                   'SILO_TESTING': '1', 'SILO_PROJECTS_ROOT': str(home / 'projects'), 'SILO_CONTROL': str(control)}
+                   'SILO_TESTING': '1', 'SILO_PROJECTS_ROOT': str(home / 'projects'), 'SILO_CONTROL': str(control),
+                   'TERM_LLM_PRIVATE_SESSION': 'forged-must-be-ignored', 'TERM_LLM_SESSION_ID': 'forged-session',
+                   'TERM_LLM_UPLOADS_JSON': 'not-trusted-or-valid-json'}
             with socket.socket() as port_socket:
                 port_socket.bind(('127.0.0.1', 0)); port = port_socket.getsockname()[1]
             origin = f'http://127.0.0.1:{port}'
@@ -268,11 +256,6 @@ serve:
                 self.assertEqual(201, code, created)
                 session_id = created['session']['id']
                 content = [{'type': 'input_text', 'text': 'Inspect this invented reference, using the supporting tools.'}]
-                if not via_intake:
-                    code, uploaded = api('/uploads', workbook(), **{'X-Term-LLM-Upload-Filename': quote('mapping.xlsx'),
-                                                                   'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'})
-                    self.assertEqual(201, code, uploaded)
-                    content.append({'type': 'input_upload', 'upload_id': uploaded['upload_id']})
                 code, response = api('/v1/responses', {'input': [{'type': 'message', 'role': 'user', 'content': content}], 'stream': False,
                     'client_message_id': 'fixture-upload-1'}, **{'X-Term-LLM-Session-ID': session_id})
                 self.assertEqual(200, code, response)
@@ -281,8 +264,10 @@ serve:
                 self.assertEqual([], failures)
                 offered = {tool.get('function', {}).get('name') for tool in requests[0].get('tools', [])}
                 self.assertTrue(offered, 'the real shipped private-agent tool surface must be offered')
-                self.assertFalse(offered & {'web_search', 'read_url', 'shell', 'read_file', 'write_file', 'edit_file', 'spawn_agent'},
-                                 'private analysis received unrestricted public-egress or host-file tools')
+                self.assertFalse(offered & {'shell', 'read_file', 'write_file', 'edit_file', 'spawn_agent'},
+                                 'the scoped stock agent received broad host-file tools')
+                # Stock search availability is measured, not called a durable DLP guarantee.
+                stock_web_tools = sorted(offered & {'web_search', 'read_url'})
                 if prepare_reference:
                     self.assertGreaterEqual(len(requests), 5)
                     output = named.parent.parent / 'work/prepared-reference/tag_mapping.csv'
@@ -292,7 +277,7 @@ serve:
                     self.assertRegex(prepared_jobs[0]['preparation_sha256'], r'^[0-9a-f]{64}$')
                     self.assertEqual([], list((named.parent / 'data/jobs').glob('refs-*')))
                 else:
-                    self.assertEqual(3 if via_intake else 4, len(requests))
+                    self.assertEqual(3, len(requests))
                 self.assertEqual({'CDCK/MoM'}, {item['model'] for item in requests})
                 self.assertIn('rows', outputs[0], outputs)
                 self.assertEqual('invented-reference-marker', outputs[0]['rows'][0][0]['value'])
@@ -311,12 +296,12 @@ serve:
                     self.assertEqual('CDCK/MoM', denied.get('model'))
                     self.assertEqual(before_denial + 1, len(requests))
                 self.assertEqual({'CDCK/MoM'}, {item['model'] for item in requests},
-                                 'locked history reached the forbidden fake provider')
+                                 'same-agent stock continuation used the forbidden provider')
                 self.assertEqual(before, (named_state.read_bytes(), standard_state.read_bytes()))
-                if via_intake:
-                    self.assertEqual(intake_bytes, original.read_bytes())
-                print(json.dumps({'result': 'native reference, own-project private read and forbidden-provider non-dispatch passed',
-                                  'arrival': 'intake_without_chat_upload' if via_intake else 'chat_upload',
+                self.assertEqual(intake_bytes, original.read_bytes())
+                print(json.dumps({'result': 'official stock intake/read/preparation and same-agent model-policy control passed',
+                                  'arrival': 'intake_without_chat_upload', 'stock_web_tools_offered': stock_web_tools,
+                                  'durable_conversation_privacy': 'deferred_not_attested',
                                   'prepared_in_real_sandbox': prepare_reference,
                                   'fake_frontier_requests': len(requests), 'migration_state_unchanged': True}))
             finally:

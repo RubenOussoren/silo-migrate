@@ -222,10 +222,10 @@ class DataToolsTest(unittest.TestCase):
         self.addCleanup(disk.stop)
         self.host = types.SimpleNamespace(inspect=lambda ref: {'Id': 'sha256:' + '1' * 64, 'ref': ref},
                                           identity=lambda document: self.content_id(document['ref']))
-        # The installer-managed, account-owned control config after native verification:
-        # the only thing that lets free SQL (DBHub over MCP) be offered at all.
+        # The installer-managed, account-owned control config. Free SQL (DBHub over MCP)
+        # needs no native-session flag in it: stock term-llm is the supported host.
         self.control_config = top / 'control.conf'
-        self.control_config.write_text('SILO_PROTECTED_SESSIONS=1\n')
+        self.control_config.write_text('SILO_MIGRATE_BASE_PATH=/invented\n')
         self.control_config.chmod(0o600)
         self.values = {'SILO_CONTROL_GEMS': str(top / 'gems'), 'SILO_CONTROL_CONFIG': str(self.control_config)}
         (top / 'gems').mkdir()
@@ -788,46 +788,26 @@ class DataToolsTest(unittest.TestCase):
             with self.subTest(args=bad), self.assertRaises(self.d.Refusal):
                 self.d.dbhub_main(bad, self.values, self.base, ROOT, self.host)
 
-    def test_free_sql_enablement_rejects_unsafe_or_oversized_config_files(self):
-        self.assertTrue(self.d.protected_sessions_enabled(self.values))
-        self.control_config.chmod(0o660)
-        self.assertFalse(self.d.protected_sessions_enabled(self.values))
-        self.control_config.chmod(0o600)
-        link = self.control_config.with_name('linked.conf')
-        link.symlink_to(self.control_config)
-        self.assertFalse(self.d.protected_sessions_enabled(dict(self.values, SILO_CONTROL_CONFIG=str(link))))
-        link.unlink()
-        os.link(self.control_config, link)
-        self.assertFalse(self.d.protected_sessions_enabled(self.values))
-        link.unlink()
-        self.control_config.write_text('SILO_PROTECTED_SESSIONS=1\n' + '#' * (64 * 1024))
-        self.assertFalse(self.d.protected_sessions_enabled(self.values))
-
-    def test_free_sql_needs_protected_session_enablement_from_the_root_config(self):
-        """DBHub's MCP tools bypass the custom-tool session gate, so a node that hasn't verified
-        protected-session native support neither registers nor starts it, whatever the environment says."""
+    def test_free_sql_needs_no_native_session_flag_on_stock_term_llm(self):
+        """DBHub is registered and started on a stock host: its limits are the migration-data
+        MCP rule, the read-only user and the internal network, not a protected-session flag."""
+        self.assertFalse(hasattr(self.d, 'protected_sessions_enabled'))
         self.create()
         self.op('db_up', engine='postgres')
         mcp = self.config_home / 'term-llm/mcp.json'
-        self.assertIn('db-arc', json.loads(mcp.read_text())['servers'])
-        for text, env in (('', {}), ('SILO_PROTECTED_SESSIONS=0\n', {}), ('SILO_PROTECTED_SESSIONS=1\nSILO_PROTECTED_SESSIONS=yes\n', {}),
-                          ('# SILO_PROTECTED_SESSIONS=1\n', {'SILO_PROTECTED_SESSIONS': '1'})):
+        for text in ('', 'SILO_PROTECTED_SESSIONS=0\n', 'SILO_PROTECTED_SESSIONS=1\n'):
             with self.subTest(config=text):
-                self.control_config.write_text(text)
-                values = dict(self.values, **env)  # an inherited environment variable is not the root config
-                ws = self.d.Workspace(self.base, 'arc', ROOT, self.host, values, self.control)
-                self.assertFalse(self.d.protected_sessions_enabled(values))
-                result = self.d.mcp_register(ws)
-                self.assertTrue(result.startswith('not changed: free SQL needs'), result)
-                self.assertNotIn('db-arc', json.loads(mcp.read_text())['servers'])  # a stale entry is taken out
-                with mock.patch.object(self.d.os, 'execvpe') as execvpe, self.assertRaises(self.d.Refusal) as refused:
-                    self.d.dbhub_main(['dbhub', 'arc'], values, self.base, ROOT, self.host)
-                self.assertTrue(str(refused.exception).startswith('STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED'))
-                execvpe.assert_not_called()
-        for values in ({'SILO_CONTROL_GEMS': 'x'}, dict(self.values, SILO_CONTROL_CONFIG=str(self.control_config) + '.missing')):
-            self.assertFalse(self.d.protected_sessions_enabled(values))
-        self.control_config.write_text('SILO_PROTECTED_SESSIONS=1\n')
-        self.assertEqual('added', self.d.mcp_register(self.d.Workspace(self.base, 'arc', ROOT, self.host, self.values, self.control)))
+                self.control_config.write_text(text)  # the legacy flag neither grants nor denies anything
+                ws = self.d.Workspace(self.base, 'arc', ROOT, self.host, self.values, self.control)
+                self.assertEqual('registered', self.d.mcp_register(ws))
+                self.assertIn('db-arc', json.loads(mcp.read_text())['servers'])
+                with mock.patch.object(self.d.os, 'execvpe') as execvpe:
+                    self.d.dbhub_main(['dbhub', 'arc'], self.values, self.base, ROOT, self.host)
+                argv = execvpe.call_args[0][1]
+                self.assertEqual(['docker', 'run', '-i', '--rm', '--pull=never'], argv[:5])
+                self.assertIn('silo-src-arc', argv)
+        self.assertEqual('removed', self.d.mcp_register(ws, present=False))
+        self.assertEqual('added', self.d.mcp_register(ws))
 
     def test_a_database_is_never_listed_without_its_rule(self):
         self.create()

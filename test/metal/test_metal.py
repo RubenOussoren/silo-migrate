@@ -500,8 +500,10 @@ class InstallerTests(unittest.TestCase):
         # metal.example.conf used to name 0.9.93: such a config gets this release's version, with a note.
         self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("TERM_LLM_VERSION=0.9.93")["TERM_LLM_VERSION"])
         self.assertIn("TERM_LLM_VERSION=0.9.93 is an older pin", self.m.TERM_NOTE)
+        self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("TERM_LLM_VERSION=0.9.99")["TERM_LLM_VERSION"])
+        self.assertIn("TERM_LLM_VERSION=0.9.99 is an older pin", self.m.TERM_NOTE)
         self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("TERM_LLM_VERSION=" + self.m.TERM_LLM_PINNED)["TERM_LLM_VERSION"])
-        for other in ("0.9.95", "0.9.100"):
+        for other in ("0.9.95", "0.9.100", "0.9.102", "0.9.104"):
             with self.subTest(other=other), self.assertRaisesRegex(self.m.Refusal, "METAL_VERSION_UNPINNED"):
                 self.configured("TERM_LLM_VERSION=" + other)
 

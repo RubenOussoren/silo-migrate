@@ -20,6 +20,8 @@ class NativePolicyEnablementTest(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.m = self.fixture.m
+        # Historical opt-in native packaging, not the default stock release.
+        self.m.C["TERM_LLM_PACKAGE"] = "/invented/reviewed-native-package"
         self.release = self.m.P / 'releases' / ('b' * 40)
         agent = self.release / 'integrations/term-llm/migration-data'
         agent.mkdir(parents=True)

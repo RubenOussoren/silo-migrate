@@ -390,35 +390,46 @@ class FileRolesTest(unittest.TestCase):
         self.commit({"action": "classify", "role": "source", "kind": "development", "files": [item]})
 
     def test_native_chat_reference_inventory_and_soft_unassignment_use_same_custody(self):
-        uploads = self.root / "native-uploads"
-        uploads.mkdir(mode=0o700)
-        ref = "a" * 32
-        original = uploads / ref
-        original.write_bytes(b"invented chat notes")
-        context = {"via": "chat", "_private_session": True, "_session_id": "chat-1",
-                   "_uploads": [{"id": ref, "path": str(original), "filename": "chat-notes.txt", "media_type": "text/plain", "size_bytes": original.stat().st_size}]}
-        with mock.patch.dict(os.environ, {"SILO_TESTING": "1", "SILO_SUPPORT_UPLOADS_ROOT": str(uploads)}):
-            registered = self.op("supporting_take", ref=ref, **context)["file"]
-            reference = self.op("deliveries")["roles"]["references"][0]
-            self.assertEqual(registered["id"], reference["support_id"])
-            self.assertIsNone(reference["identity"])
-            self.assertEqual("supporting", reference["origin"])
-            with self.assertRaisesRegex(self.d.Refusal, "REINTAKE_REQUIRED"):
-                self.preview({"action": "correct", "file_ids": [reference["id"]], "role": "uploads", "reason": "promotion"})
-            blob = self.data / "supporting/files" / registered["id"]
-            original_blob = blob.read_bytes()
-            self.commit({"action": "correct", "file_ids": [reference["id"]], "role": "unassigned", "reason": "Not relevant"})
-            self.assertEqual([], self.op("supporting_list", **context)["files"])
-            with self.assertRaisesRegex(self.d.Refusal, "STANDARD_SUPPORTING_INACTIVE"):
-                self.op("supporting_read", id=registered["id"], **context)
-            with self.assertRaisesRegex(self.d.Refusal, "STANDARD_SUPPORTING_INACTIVE"):
-                self.op("supporting_take", ref=ref, **context)
-            with self.assertRaisesRegex(self.d.Refusal, "PRIVATE_SESSION_REQUIRED"):
-                self.op("supporting_list", via="chat")
-            self.assertEqual(original_blob, blob.read_bytes())
-            self.commit({"action": "correct", "file_ids": [reference["id"]], "role": "reference", "reason": "Restore archived reference"})
-            self.assertEqual(registered["id"], self.op("supporting_list", **context)["files"][0]["id"])
-            self.assertEqual(registered["id"], self.op("supporting_take", ref=ref, **context)["file"]["id"])
+        # A record an earlier native-upload release admitted. Stock term-llm admits no
+        # new chat uploads (supporting_take refuses USE_INTAKE); history stays usable.
+        data = b"invented chat notes"
+        self.op("supporting_list")  # benign private store initialization
+        support = self.data / "supporting"
+        support_id = "support-" + "a" * 32
+        blob = support / "files" / support_id
+        blob.write_bytes(data)
+        blob.chmod(0o400)
+        record = {"id": support_id, "filename": "chat-notes.txt", "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                  "session_id": "chat-1", "refid": "b" * 32, "media_type": "text/plain", "imported_at": 1700000000,
+                  "provenance": "private-session-upload"}
+        meta = support / "index" / (support_id + ".json")
+        meta.write_text(json.dumps(record))
+        meta.chmod(0o600)
+        context = {"via": "chat"}
+        forged = {"via": "chat", "_private_session": True, "_session_id": "chat-1",
+                  "_uploads": [{"id": "b" * 32, "path": str(blob), "filename": "chat-notes.txt", "media_type": "text/plain", "size_bytes": len(data)}]}
+        reference = self.op("deliveries")["roles"]["references"][0]
+        self.assertEqual(support_id, reference["support_id"])
+        self.assertIsNone(reference["identity"])
+        self.assertEqual("supporting", reference["origin"])
+        with self.assertRaisesRegex(self.d.Refusal, "REINTAKE_REQUIRED"):
+            self.preview({"action": "correct", "file_ids": [reference["id"]], "role": "uploads", "reason": "promotion"})
+        self.commit({"action": "correct", "file_ids": [reference["id"]], "role": "unassigned", "reason": "Not relevant"})
+        self.assertEqual([], self.op("supporting_list", **context)["files"])
+        with self.assertRaisesRegex(self.d.Refusal, "STANDARD_SUPPORTING_INACTIVE"):
+            self.op("supporting_read", id=support_id, **context)
+        for request in (context, forged):
+            with self.assertRaisesRegex(self.d.Refusal, "^STANDARD_SUPPORTING_USE_INTAKE$"):
+                self.op("supporting_take", ref="b" * 32, **request)
+        self.assertEqual(data, blob.read_bytes())
+        self.commit({"action": "correct", "file_ids": [reference["id"]], "role": "reference", "reason": "Restore archived reference"})
+        self.assertEqual(support_id, self.op("supporting_list", **context)["files"][0]["id"])
+        self.assertEqual(self.op("supporting_list", **context), self.op("supporting_list", **forged))
+        self.assertEqual("invented chat notes", self.op("supporting_read", id=support_id, **context)["text"])
+        with self.assertRaisesRegex(self.d.Refusal, "^STANDARD_SUPPORTING_USE_INTAKE$"):
+            self.op("supporting_take", ref="b" * 32, **forged)  # a replayed session/refid is not "already registered"
+        self.assertEqual(json.dumps(record), meta.read_text())  # history (incl. session ID) untouched
+        self.assertEqual(1, len(list((support / "index").iterdir())))
 
     def test_private_mode_hardlink_and_invalid_json_registry_rejected(self):
         self.source()

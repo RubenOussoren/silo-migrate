@@ -1,10 +1,10 @@
 # File roles, source snapshots and correcting assignments
 
 This release uses the intake-first workflow in [intake-preparation.md](intake-preparation.md)
-and the existing Project widget. Private analysis requires the separately reviewed
-**generic conversation-protection** native build, not chat upload support. Chat
-attachments/drag-drop are deferred; [chat-attachments.md](chat-attachments.md)
-retains historical compatibility evidence, not the installation path for this release.
+and the existing Project widget on official, unmodified term-llm. A custom native
+package or session marker is not required. Stronger durable conversation protection
+and chat-upload import/drag-drop are deferred; [chat-attachments.md](chat-attachments.md)
+retains historical compatibility evidence, not the current installation path.
 Source publication does not deploy or repair any live project.
 
 ## Choose a role, then an association
@@ -30,14 +30,14 @@ arrival. Selecting an earlier valid snapshot as current does not copy the backup
 or manufacture another Development version. Plans explicitly selecting an older
 valid source retain that selection even if another snapshot later becomes current.
 
-### Supporting references from intake and chat
+### Supporting references from intake
 
 For an intake XLSX, CSV/TSV or document, select **Supporting reference**, inspect the
-preview, then confirm. It is copied into the same project-private registry used by
-protected chat attachments. Original intake/registered bytes and provenance are
+preview, then confirm. It is copied into the project-private reference registry.
+Original intake/registered bytes and any historical attachment provenance are
 preserved. There is no migration dataset/version merely because a reference was
 registered. `data_supporting_list` and `data_supporting_read` make it available to
-migration-data in this project's protected chat; the engineer does not grant the
+migration-data in this project's chat; the engineer does not grant the
 agent arbitrary host-path access.
 
 References remain untrusted data, not instructions. Formulas are not executed,

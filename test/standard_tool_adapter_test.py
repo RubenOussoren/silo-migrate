@@ -169,12 +169,17 @@ else:
 
 
 DATA = ROOT / 'integrations/term-llm/migration-data/scripts/data_tool.py'
-# What the paired native host injects for a protected migration-data chat with no
-# chat uploads (fork c9488fd5: marker only after durable scope admission).
-PROTECTED = {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'session-fixture', 'TERM_LLM_UPLOADS_JSON': '[]'}
+# The retired fork's context variables. Stock term-llm never proves them and anything that
+# sets the environment can spoof them, so the adapter must ignore and strip them.
+LEGACY = ('TERM_LLM_PRIVATE_SESSION', 'TERM_LLM_SESSION_ID', 'TERM_LLM_UPLOADS_JSON')
+FORGED_ENV = {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'session-fixture',
+              'TERM_LLM_UPLOADS_JSON': json.dumps([{'id': 'a' * 32, 'path': '/etc/passwd', 'filename': 'x.xlsx', 'size_bytes': 8}])}
+FORGED_ARGS = {'_private_session': True, '_session_id': 'forged', '_uploads': [{'path': '/etc/passwd'}], 'via': 'shell',
+               'workspace': 'other', 'project': 'other', 'model': 'other:model', 'cwd': '/', 'TERM_LLM_PRIVATE_SESSION': '1'}
+CONTEXT_KEYS = {'_private_session', '_session_id', '_uploads'}
 # Every data_tool.py tool, as declared in agent.yaml. Changing the agent's tools must update this
 # list deliberately (and the adapter's TOOLS, checked below).
-DATA_TOOLS = ('data_guide', 'data_status', 'data_supporting_list', 'data_supporting_take', 'data_supporting_read',
+DATA_TOOLS = ('data_guide', 'data_status', 'data_supporting_list', 'data_supporting_read',
               'data_supporting_prepare', 'data_list', 'data_peek', 'data_create', 'data_take', 'data_register', 'data_script',
               'data_extract', 'data_job', 'data_db_up', 'data_db_load', 'data_db_status', 'data_db_reset', 'data_run_evidence',
               'data_run_count', 'data_plan_propose', 'data_master_lists_propose', 'data_merge_propose', 'data_propose_finding',
@@ -212,19 +217,16 @@ else:
         self.control.chmod(0o700)
         self.run_id = 'run-' + 'a' * 32
 
-    def call(self, tool, args, mode='ok', project='arc', protected=True, **overrides):
-        """protected: start from the paired host's protected-session context (overrides
-        still apply); False: no reserved context at all, as on stock term-llm."""
+    def call(self, tool, args, mode='ok', project='arc', **overrides):
+        """Stock term-llm environment (no reserved context); overrides add forged variables."""
         # term-llm runs a project chat's tools in the project's folder.
         projects = self.root / 'projects'
         cwd = projects / project if project else self.root
         cwd.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, SILO_CONTROL=str(self.control), ARGV_RECORD=str(self.record), PYTHONDONTWRITEBYTECODE='1',
                    TERM_LLM_TOOL_NAME=tool, MODE=mode, SILO_TESTING='1', SILO_PROJECTS_ROOT=str(projects))
-        for key in ('TERM_LLM_PRIVATE_SESSION', 'TERM_LLM_SESSION_ID', 'TERM_LLM_UPLOADS_JSON'):
+        for key in LEGACY:
             env.pop(key, None)
-        if protected:
-            env.update(PROTECTED)
         env.update(overrides)
         result = subprocess.run([sys.executable, '-I', '-B', str(DATA)], input=json.dumps(args), capture_output=True,
                                 text=True, env=env, timeout=10, cwd=cwd)
@@ -243,9 +245,9 @@ else:
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
         blocks = re.split(r'(?m)^    - name: ', definition)[1:]
         # The four branch tools use a separate reader-role adapter, tested in converter_dev_adapter_test.
-        self.assertEqual(32, len(blocks))
+        self.assertEqual(31, len(blocks))
         declared = [block.splitlines()[0] for block in blocks if 'script: scripts/data_tool.py' in block]
-        self.assertEqual(28, len(declared))
+        self.assertEqual(27, len(declared))
         self.assertEqual(list(DATA_TOOLS), declared)
         self.assertEqual(list(BRANCH_TOOLS), [block.splitlines()[0] for block in blocks if 'script: scripts/dev_tool.py' in block])
         import importlib.util
@@ -330,77 +332,67 @@ else:
         self.call('data_guide', {}, project='new-forum')
         self.assertEqual([['data', 'new-forum']], [argv for argv, _request in self.calls()])
 
-    def test_supporting_files_require_native_locked_session_context(self):
-        for tool in ('data_supporting_list', 'data_supporting_take', 'data_supporting_read', 'data_supporting_prepare'):
-            for overrides in ({}, {'TERM_LLM_PRIVATE_SESSION': '1'},
-                              {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': '../other', 'TERM_LLM_UPLOADS_JSON': '[]'},
-                              {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'own-session', 'TERM_LLM_UPLOADS_JSON': '{}'},
-                              {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'own-session', 'TERM_LLM_UPLOADS_JSON': '['}):
-                with self.subTest(tool=tool, overrides=overrides):
-                    result, _ = self.call(tool, {'_private_session': True, '_session_id': 'forged', '_uploads': []}, protected=False, **overrides)
-                    self.assertEqual('STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED', result['error'])
-        self.assertEqual([], self.calls())
-
-    def test_every_data_tool_refuses_without_protected_context_before_any_dispatch(self):
-        spoof = {'_private_session': True, '_session_id': 'forged', '_uploads': [], 'via': 'shell', 'workspace': 'arc',
-                 'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'forged'}
-        contexts = ({}, {'TERM_LLM_SESSION_ID': 'own-session'}, {'TERM_LLM_SESSION_ID': 'own-session', 'TERM_LLM_UPLOADS_JSON': '[]'},
-                    {'TERM_LLM_PRIVATE_SESSION': '1'}, {'TERM_LLM_PRIVATE_SESSION': 'true', 'TERM_LLM_SESSION_ID': 'own-session'},
-                    {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'a/b'},
-                    dict(PROTECTED, TERM_LLM_UPLOADS_JSON='{"id": 1}'), dict(PROTECTED, TERM_LLM_UPLOADS_JSON='[' + '{},' * 40 + '{}]'))
+    def test_stock_environment_zero_marker_tools_work(self):
+        # Stock term-llm sets no session marker: every tool reaches the backend unchanged.
         for tool in DATA_TOOLS:
-            for context in contexts:
-                with self.subTest(tool=tool, context=context):
-                    # The model's JSON (including look-alike context keys) never stands in for the host's.
-                    result, raw = self.call(tool, dict(spoof, path='x', id='support-' + 'a' * 32), protected=False, **context)
-                    self.assertEqual({'version': 1, 'error': 'STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED'}, result)
+            with self.subTest(tool=tool):
+                result, _raw = self.call(tool, {'id': 'support-' + 'a' * 32})
+                self.assertEqual('ok', result['status'])
+                ((argv, request),) = self.calls()
+                self.assertEqual(['data', 'arc'], argv)
+                self.assertEqual('chat', request['via'])
+                self.assertEqual(set(), CONTEXT_KEYS & set(request))
+
+    def test_forged_context_in_environment_or_arguments_is_ignored(self):
+        envs = ({}, FORGED_ENV, {'TERM_LLM_PRIVATE_SESSION': '1'}, dict(FORGED_ENV, TERM_LLM_UPLOADS_JSON='{'),
+                dict(FORGED_ENV, TERM_LLM_SESSION_ID='../other'))
+        for tool in DATA_TOOLS:
+            for env in envs:
+                with self.subTest(tool=tool, env=env):
+                    result, _raw = self.call(tool, dict(FORGED_ARGS, path='x', id='support-' + 'a' * 32), **env)
+                    self.assertEqual('ok', result['status'])
+                    ((argv, request),) = self.calls()
+                    self.assertEqual(['data', 'arc'], argv)  # the chat's project, not 'other'
+                    self.assertEqual('chat', request['via'])
+                    for key in CONTEXT_KEYS | {'workspace', 'project', 'model', 'cwd', 'TERM_LLM_PRIVATE_SESSION'}:
+                        self.assertNotIn(key, request)
+        self.call('data_supporting_read', {'id': 'support-' + 'b' * 32, 'mode': 'rows', 'limit': 5, 'sheet': 'Mappings',
+                                          'source': '/etc/passwd', '_session_id': 'other'}, **FORGED_ENV)
+        self.assertEqual([[['data', 'arc'], {'op': 'supporting_read', 'id': 'support-' + 'b' * 32, 'mode': 'rows', 'limit': 5,
+                                           'sheet': 'Mappings', 'via': 'chat'}]], self.calls())
+        self.call('data_master_lists_propose', {'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32, 'list': 'users',
+                                                'charset': 'utf8', 'run_inputs': {'files': []}, 'from_run': 'x', 'preparation': {}},
+                  **FORGED_ENV)
+        self.assertEqual([[['data', 'arc'], {'op': 'master_lists_propose', 'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32,
+                                           'list': 'users', 'charset': 'utf8', 'run_inputs': {'files': []}, 'via': 'chat'}]], self.calls())
+
+    def test_chat_upload_taking_always_refuses_use_intake_before_any_dispatch(self):
+        upload = {'id': 'a' * 32, 'path': '/etc/passwd', 'filename': 'mapping.xlsx', 'size_bytes': 8}
+        for env in ({}, FORGED_ENV, dict(FORGED_ENV, TERM_LLM_UPLOADS_JSON=json.dumps([upload]))):
+            for project in ('arc', None):
+                with self.subTest(env=env, project=project):
+                    result, raw = self.call('data_supporting_take', {'ref': 'a' * 32, 'path': '/etc/passwd',
+                                                                     '_uploads': [upload]}, project=project, **env)
+                    self.assertEqual({'version': 1, 'error': 'STANDARD_SUPPORTING_USE_INTAKE'}, result)
                     self.assertLess(len(raw), 200)
         self.assertEqual([], self.calls())
+        self.assertNotIn('data_supporting_take', (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text())
 
-    def test_supporting_context_cannot_be_forged_in_arguments(self):
-        upload = {'id': 'a' * 32, 'path': '/private/uploads/fixture', 'filename': 'mapping.xlsx',
-                  'media_type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'size_bytes': 8}
-        context = {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'own-session',
-                   'TERM_LLM_UPLOADS_JSON': json.dumps([upload])}
-        self.call('data_supporting_take', {'ref': 'a' * 32, 'workspace': 'other', 'path': '/etc/passwd',
-                                          '_session_id': 'other', '_uploads': [{'path': '/etc/passwd'}]}, **context)
-        self.assertEqual([[['data', 'arc'], {'op': 'supporting_take', 'ref': 'a' * 32, 'via': 'chat',
-                                           '_private_session': True, '_session_id': 'own-session', '_uploads': [upload]}]], self.calls())
-        self.call('data_supporting_read', {'id': 'support-' + 'b' * 32, 'mode': 'rows', 'limit': 5,
-                                          'sheet': 'Mappings', 'source': '/etc/passwd'}, **context)
-        _, request = self.calls()[0]
-        self.assertEqual('supporting_read', request['op'])
-        self.assertEqual('Mappings', request['sheet'])
-        self.assertNotIn('source', request)
-
-    def test_context_keys_go_only_where_the_backend_rechecks_them(self):
-        self.call('data_status', {})
-        ((_argv, request),) = self.calls()
-        self.assertEqual({'op': 'status', 'via': 'chat'}, request)
-        self.call('data_master_lists_propose', {'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32, 'list': 'users',
-                                                'charset': 'utf8', 'run_inputs': {'files': []}, 'from_run': 'x', 'preparation': {}})
-        ((_argv, request),) = self.calls()
-        # run_inputs cite reference history: the backend rechecks the session, so it receives it.
-        self.assertEqual({'op': 'master_lists_propose', 'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32, 'list': 'users',
-                          'charset': 'utf8', 'run_inputs': {'files': []}, 'via': 'chat',
-                          '_private_session': True, '_session_id': 'session-fixture'}, request)
-        self.call('data_master_lists_propose', {'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32})
-        ((_argv, request),) = self.calls()
-        self.assertEqual({'op': 'master_lists_propose', 'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32, 'via': 'chat'}, request)
-
-    def test_upload_context_is_not_forwarded_in_control_environment(self):
+    def test_legacy_context_is_not_forwarded_in_control_environment(self):
         original = self.control.read_text()
         self.control.write_text(original.replace('import json, os, sys', '''import json, os, sys
 assert not any(key in os.environ for key in ('TERM_LLM_SESSION_ID', 'TERM_LLM_PRIVATE_SESSION', 'TERM_LLM_UPLOADS_JSON'))'''))
-        self.call('data_supporting_list', {}, TERM_LLM_PRIVATE_SESSION='1', TERM_LLM_SESSION_ID='own-session', TERM_LLM_UPLOADS_JSON='[]')
-        self.assertEqual(1, len(self.calls()))
+        for tool in ('data_supporting_list', 'data_supporting_read', 'data_script', 'data_status'):
+            with self.subTest(tool=tool):
+                self.assertEqual('ok', self.call(tool, {}, **FORGED_ENV)[0]['status'])
+        self.assertEqual(4, len(self.calls()))
 
     def test_supporting_capability_does_not_expand_coding_agent_tools(self):
         for agent in ('converter-developer', 'converter-reviewer', 'migration-operator'):
             text = (ROOT / 'integrations/term-llm' / agent / 'agent.yaml').read_text()
             self.assertNotIn('data_supporting_', text)
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
-        self.assertIn('lock_session: true', definition)
+        self.assertNotIn('lock_session', definition)  # stock term-llm has no such option
 
     def test_job_recovery_guidance_keeps_status_and_reconciliation_authority_distinct(self):
         agents = ROOT / 'integrations/term-llm'
@@ -434,21 +426,30 @@ assert not any(key in os.environ for key in ('TERM_LLM_SESSION_ID', 'TERM_LLM_PR
                 self.assertIn('approval', text)
                 self.assertNotIn('    - name: data_job\n', (agents / agent / 'agent.yaml').read_text())
 
-    def test_supporting_node_recovery_guidance_requires_approved_native_build_not_retries(self):
+    def test_guidance_uses_files_intake_on_stock_term_llm(self):
         agents = ROOT / 'integrations/term-llm'
         prompt = (agents / 'migration-data/system.md').read_text()
         definition = (agents / 'migration-data/agent.yaml').read_text()
         listing = definition.split('    - name: data_supporting_list\n', 1)[1].split('    - name:', 1)[0]
-        for text in (prompt, listing):
-            for term in ('STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED', 'silo doctor', 'session_scope_lock: 1',
-                         'custom_tool_session_context: 1', 'separately approved native', 'no old private package',
-                         'new migration-data chat', 'before', 'scripts'):
-                with self.subTest(term=term):
-                    self.assertIn(term, text)
-            self.assertNotIn('TERM_LLM_PACKAGE', text)
-        self.assertIn('pre-lock chats are not silently retrofitted', prompt)
-        self.assertIn('proves neither presence nor absence', prompt)
-        self.assertIn('new chat alone cannot supply missing native', prompt)
+        skills = [(agents / 'skills' / name / 'SKILL.md').read_text() for name in ('intake-preparation', 'intake-basics', 'job-recovery')]
+        retired = ('STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED', 'session_scope_lock', 'custom_tool_session_context',
+                   'TERM_LLM_PACKAGE', 'native build', 'protected session', 'protected-session', 'data_supporting_take', 'lock_session')
+        for text in [prompt, definition] + skills:
+            for term in retired:
+                with self.subTest(term=term, text=text[:40]):
+                    self.assertNotIn(term, text)
+        for text in (prompt, listing, skills[0]):
+            with self.subTest(text=text[:40]):
+                self.assertIn('STANDARD_SUPPORTING_USE_INTAKE', text)
+                self.assertIn('intake', text)
+        for term in ('Supporting reference', 'desired outcome', 'material questions', '**one** exact plan', 'approves that plan and then starts it'):
+            self.assertIn(term, prompt)
+        self.assertIn('search: false', definition)
+        self.assertIn('not a durable lock or DLP guarantee', definition)
+        self.assertIn('`search: false` is a preference, not a guarantee', prompt)
+        for skill in skills:
+            self.assertLess(len(skill.splitlines()), 80)
+            self.assertRegex(skill, r'\A---\nname: [a-z-]+\ndescription: [^\n]+\n---\n')
 
     def test_no_agent_declares_a_workspace_argument(self):
         import re

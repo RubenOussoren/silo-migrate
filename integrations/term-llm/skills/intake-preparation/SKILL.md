@@ -10,10 +10,9 @@ says what they want, answers the questions that matter, and approves **one** pla
 Nothing here starts a run: Start stays the engineer's explicit action in Runs.
 
 1. **Find the reference.** `data_supporting_list`, then `data_supporting_read`
-   (`sheets`, then bounded `rows`). Intake-admitted references need no chat upload.
-   `STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED` means this node's host cannot prove a
-   protected session: stop and follow the system prompt's recovery text. Never read
-   the file another way (paths, `data_script` without `references`, another chat).
+   (`sheets`, then bounded `rows`). A file dropped in chat is not read
+   (`STANDARD_SUPPORTING_USE_INTAKE`): ask for an intake upload classified on Files.
+   Never read it another way (paths, `data_script` without `references`, another chat).
 2. **State the desired outcome** back in one or two plain sentences and confirm it.
    Identify the source snapshot, Base (merge) and converter/merge path from
    `data_guide`; the reference never replaces them.

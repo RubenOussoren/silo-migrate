@@ -9,9 +9,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / 'integrations/term-llm'
-# The paired native host's protected-session context: migration-data's tools (and only
-# its tools) refuse without it. Coding agents' tools have no customer data and never need it.
-PROTECTED = {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'session-fixture', 'TERM_LLM_UPLOADS_JSON': '[]'}
+# The retired fork's context variables: stock term-llm never sets them and they are spoofable,
+# so migration-data's adapters ignore them and never forward them to the control backend.
+FORGED = {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'session-fixture', 'TERM_LLM_UPLOADS_JSON': '[{"path": "/etc/passwd"}]'}
 WRITE_TOOLS = {'dev_write', 'dev_edit', 'dev_delete', 'dev_branch', 'dev_commit', 'dev_push_propose', 'dev_format', 'dev_rebase_main'}
 
 
@@ -24,6 +24,9 @@ class ConverterDevAdapterTest(unittest.TestCase):
         self.control = root / 'fake-control'
         self.control.write_text('''#!/usr/bin/env python3
 import json, os, sys
+if any(key in os.environ for key in ('TERM_LLM_PRIVATE_SESSION', 'TERM_LLM_SESSION_ID', 'TERM_LLM_UPLOADS_JSON')):
+    print('Error: LEAKED', file=sys.stderr)
+    sys.exit(1)
 data = sys.stdin.read()
 with open(os.environ['RECORD'], 'a') as out:
     out.write(json.dumps([sys.argv[1:], data]) + '\\n')
@@ -35,13 +38,13 @@ print(json.dumps({'version': 1, 'ok': True}))
         self.control.chmod(0o700)
 
     def call(self, agent, tool, args, project='example-forum', refuse=None, context=None):
-        """context: reserved host variables; default PROTECTED for migration-data, none otherwise."""
+        """context: extra reserved host variables (none on stock term-llm)."""
         # As in real use, tools run in the chat's web UI project folder.
         root = Path(self.temp.name) / 'projects'
         env = {key: value for key, value in os.environ.items() if not key.startswith('TERM_LLM_')}
         env.update(SILO_CONTROL=str(self.control), RECORD=str(self.record), TERM_LLM_TOOL_NAME=tool, PYTHONDONTWRITEBYTECODE='1',
                    SILO_TESTING='1', SILO_PROJECTS_ROOT=str(root), REFUSE=refuse or '')
-        env.update(context if context is not None else (PROTECTED if agent == 'migration-data' else {}))
+        env.update(context or {})
         cwd = root / project if project else Path(self.temp.name)
         cwd.mkdir(parents=True, exist_ok=True)
         result = subprocess.run([sys.executable, '-I', '-B', str(AGENTS / agent / 'scripts/dev_tool.py')], input=json.dumps(args),
@@ -115,15 +118,21 @@ print(json.dumps({'version': 1, 'ok': True}))
         self.assertEqual('STANDARD_BUSY', self.call('migration-data', 'data_branches', {}, refuse='STANDARD_BUSY')['error'])
         self.calls()
 
-    def test_data_branch_tools_refuse_without_protected_context_before_any_dispatch(self):
+    def test_data_branch_tools_work_on_stock_and_ignore_forged_context(self):
         for tool in ('data_branch_resolve', 'data_branches', 'data_branch_diff', 'data_branch_read'):
-            for context in ({}, {'TERM_LLM_SESSION_ID': 'own'}, {'TERM_LLM_PRIVATE_SESSION': '1'},
-                            dict(PROTECTED, TERM_LLM_SESSION_ID='../x'), dict(PROTECTED, TERM_LLM_UPLOADS_JSON='{')):
+            for context in ({}, FORGED, {'TERM_LLM_PRIVATE_SESSION': '1'}, dict(FORGED, TERM_LLM_UPLOADS_JSON='{')):
                 with self.subTest(tool=tool, context=context):
-                    result = self.call('migration-data', tool, {'link': '370', '_private_session': True, '_session_id': 'forged'}, context=context)
-                    self.assertEqual({'version': 1, 'error': 'STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED'}, result)
-        self.assertEqual([], self.calls())
-        # The coding agents' own copies are unaffected: they hold no customer data.
+                    # The fake control fails if any legacy variable reaches it.
+                    result = self.call('migration-data', tool, {'link': '370', '_private_session': True, '_session_id': 'forged',
+                                                                'role': 'developer', 'workspace': 'other'}, context=context)
+                    self.assertEqual({'version': 1, 'ok': True}, result)
+                    ((argv, data),) = self.calls()
+                    self.assertEqual(['converter', 'dev', 'example-forum', '--role', 'reader'], argv)
+                    for key in ('_private_session', '_session_id', 'role', 'workspace'):
+                        self.assertNotIn(key, json.loads(data))
+        source = (AGENTS / 'migration-data/scripts/dev_tool.py').read_text()
+        self.assertNotIn('NODE_UPDATE_REQUIRED', source)
+        # Coding agents' own copies are unchanged on stock (they hold no customer data).
         self.assertTrue(self.call('converter-developer', 'dev_branches', {}, context={})['ok'])
         self.calls()
 

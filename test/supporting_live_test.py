@@ -45,6 +45,8 @@ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><s
 @unittest.skipUnless(os.environ.get('SILO_SUPPORTING_LIVE') == '1', 'opt-in cached-image reference reader test')
 class SupportingLiveTest(unittest.TestCase):
     def test_private_copy_and_real_sandboxed_xlsx_csv_reads(self):
+        old_umask = os.umask(0o022)  # intake admission refuses group-writable ancestors
+        self.addCleanup(os.umask, old_umask)
         with tempfile.TemporaryDirectory(prefix='supporting-live-') as directory:
             base = Path(directory)
             root = base / 'workspaces/invented'
@@ -58,9 +60,11 @@ class SupportingLiveTest(unittest.TestCase):
                                                        'discourse_profile_sha256': hashlib.sha256(profile.read_bytes()).hexdigest()}}))
             before = state.read_bytes(), standard.read_bytes()
             ws = helpers.Workspace(base / 'workspaces', 'invented', ROOT, control, {}, None)
-            uploads = base / 'uploads'
-            uploads.mkdir(mode=0o700)
-            context = {'_private_session': True, '_session_id': 'invented-locked-chat', '_uploads': [], 'via': 'chat'}
+            intake = base / 'intake/invented'
+            intake.mkdir(parents=True, mode=0o700)
+            module, api = helpers.supporting_module(), helpers.supporting_api()
+            # Stock term-llm: the chat request is the adapter's whitelisted JSON plus via: chat.
+            context = {'via': 'chat'}
             names = []
             original = helpers.docker
             def observed(argv, **kwargs):
@@ -69,21 +73,29 @@ class SupportingLiveTest(unittest.TestCase):
                     self.assertIn('none', argv)
                     self.assertIn('--read-only', argv)
                     self.assertNotIn(str(root / 'inputs'), ' '.join(argv))
+                    self.assertNotIn(str(intake), ' '.join(argv))
                 return original(argv, **kwargs)
-            with patch.dict(os.environ, SILO_TESTING='1', SILO_SUPPORT_UPLOADS_ROOT=str(uploads)), patch.object(helpers, 'docker', observed):
+            with patch.object(helpers, 'docker', observed):
                 for number, (filename, data) in enumerate((('mapping.xlsx', workbook()), ('reference.tsv', b'key\tvalue\nfixture\t7\n')), 1):
-                    ref = '%032x' % number
-                    path = uploads / ref
+                    path = intake / filename
                     path.write_bytes(data)
                     path.chmod(0o600)
-                    context['_uploads'] = [{'id': ref, 'path': str(path), 'filename': filename,
-                                             'media_type': 'application/octet-stream', 'size_bytes': len(data)}]
                     def request(op, **kwargs):
-                        return helpers.op_supporting(ws, dict(context, op=op, **kwargs))
-                    admitted = request('supporting_list')['available_refs']
-                    self.assertEqual(ref, admitted[0]['id'])
-                    taken = request('supporting_take', ref=ref)['file']
+                        chat = helpers.Workspace(base / 'workspaces', 'invented', ROOT, control, {}, None)
+                        chat.chat = True
+                        return helpers.op_supporting(chat, dict(context, op=op, **kwargs))
+                    # The engineer's intake admission (Files), not a chat upload.
+                    with ws.lock():
+                        taken = module.admit_reference(ws, {'area': 'intake', 'path': filename, 'origin_id': 'file-live-%d' % number,
+                                                            'by': 'Invented Engineer',
+                                                            'identity': module.source_identity(path.stat(), filename)}, api)['file']
                     self.assertEqual(hashlib.sha256(data).hexdigest(), taken['sha256'])
+                    listed = request('supporting_list')
+                    self.assertEqual([], listed['available_refs'])
+                    self.assertIn(taken['id'], [item['id'] for item in listed['files']])
+                    with self.assertRaisesRegex(helpers.Refusal, '^STANDARD_SUPPORTING_USE_INTAKE$'):
+                        request('supporting_take', ref='%032x' % number, _private_session=True, _session_id='forged',
+                                _uploads=[{'id': '%032x' % number, 'path': str(path)}])
                     if filename.endswith('.xlsx'):
                         sheets = request('supporting_read', id=taken['id'], mode='sheets')
                         self.assertEqual(['Mappings'], sheets['sheets'])
@@ -99,7 +111,7 @@ class SupportingLiveTest(unittest.TestCase):
             for name in names:
                 left = subprocess.check_output(['docker', 'ps', '-aq', '--filter', 'name=^/' + name + '$'], timeout=10)
                 self.assertEqual(b'', left.strip())
-            print(json.dumps({'result': 'supporting custody, XLSX/TSV sandbox reads, formula non-evaluation and exact cleanup passed',
+            print(json.dumps({'result': 'intake reference custody, no-context chat XLSX/TSV sandbox reads, take refused USE_INTAKE, formula non-evaluation and exact cleanup passed',
                               'read_containers': len(names), 'migration_state_unchanged': True}))
 
 

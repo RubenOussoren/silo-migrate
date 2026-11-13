@@ -1708,8 +1708,8 @@ def op_script(ws, request):
 
 # -- supporting references in jobs -------------------------------------------------------
 # A job may read named, active project references through verified per-job snapshots
-# (never the custody originals). Only the protected-session context the fixed adapter
-# supplies admits them; the outputs' provenance records each reference's ID and digest.
+# (never the custody originals). References are engineer-admitted project custody, so
+# no chat session context is needed; the outputs' provenance records each ID and digest.
 
 REFERENCE_DIR = re.compile(r"refs-[0-9a-f]{16}\Z")
 
@@ -1725,7 +1725,6 @@ def job_references(ws, request, identities=None):
         return [], None
     module, api = supporting_module(), supporting_api()
     api.reference_active = lambda support_id: file_roles.reference_active(ws, support_id, roles_api())
-    module.session_context(request, api)
     directory = ws.data_dir("jobs") / ("refs-" + secrets.token_hex(8))
     directory.mkdir(mode=0o700)
     try:
@@ -2513,49 +2512,10 @@ def mcp_entry(ws):
     return {"command": str(control), "args": ["dbhub", ws.name]}
 
 
-PROTECTED_SESSIONS_KEY = "SILO_PROTECTED_SESSIONS"
-
-
-def protected_sessions_enabled(values):
-    """True only when the installer-managed control config literally says SILO_PROTECTED_SESSIONS=1.
-
-    The root-selected path is account-owned; same-account operator writes are trusted,
-    not an OS sandbox. Unsafe, linked, mutable or oversized flag files fail closed.
-    The installer writes it only after verifying a native host that keeps MCP results in a
-    protected migration-data session. Never read from the environment: values begin as
-    os.environ, which a tool host or service unit could carry. DBHub's MCP tools bypass
-    the custom-tool session gate, so without this they are neither registered nor started."""
-    path = values.get("SILO_CONTROL_CONFIG")
-    if not path:
-        return False
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            info = os.fstat(handle.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid())
-                    or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > 64 * 1024):
-                return False
-            content = handle.read(64 * 1024 + 1)
-            after = os.fstat(handle.fileno())
-            if (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-                return False
-        if len(content) > 64 * 1024 or "\x00" in content:
-            return False
-        lines = content.splitlines()
-    except (OSError, UnicodeError):
-        return False
-    return lines.count(PROTECTED_SESSIONS_KEY + "=1") == 1 and not any(
-        line.startswith(PROTECTED_SESSIONS_KEY + "=") and line != PROTECTED_SESSIONS_KEY + "=1" for line in lines)
-
-
 def mcp_register(ws, present=True):
     """Put this project's entry in mcp.json (or take it out), leaving everything else as it is.
     Returns "added", "registered" (already right), "removed", "absent" or why nothing changed.
-    Without protected-session enablement an add instead removes any existing entry."""
-    if present and not protected_sessions_enabled(ws.values):
-        removed = mcp_register(ws, present=False)
-        return ("not changed: free SQL needs a node whose term-llm keeps database results in a protected migration-data chat"
-                + ("; the old entry was removed" if removed == "removed" else ""))
+    Access is limited by term-llm's migration-data MCP rule plus DBHub's read-only user."""
     path = mcp_config_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Serialises silo's own writers (term-llm's web UI can't be coordinated; status repairs it).
@@ -2647,9 +2607,6 @@ def dbhub_main(args, values, base, repo, host):
         refuse("STANDARD_ARGUMENTS_INVALID")
     ws = Workspace(base, args[1], repo, host, values, None)
     ws.require(standard=False)
-    # A stale mcp.json entry (older release, manual edit) must not open a bypass.
-    if not protected_sessions_enabled(values):
-        refuse("STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED: free SQL needs protected-session native support")
     state = db_state(ws)
     if not (state and state.get("ro_user") and state.get("engine") in DBHUB_DSN):
         refuse("STANDARD_DB_STATE_MISSING: start the project's source database with data_db_up first")
@@ -2870,14 +2827,6 @@ def derived_lineage(ws, input_id, roles):
     return lineage
 
 
-def chat_session_required(ws, request):
-    """Model-facing requests (via chat, fixed by the adapter) must carry the host's protected
-    session for private plan documents. The engineer's own proposal (Project page/shell,
-    ws.chat False) is the trusted signed-in path and needs no native chat context."""
-    if ws.chat:
-        supporting_module().session_context(request, supporting_api())
-
-
 # Keys a plan's stored (bound) run_inputs carries that the backend recomputes itself.
 BOUND_RUN_INPUT_KEYS = {"mount", "writable"}
 
@@ -2886,7 +2835,6 @@ def run_inputs_document(ws, request, source):
     if "run_inputs" not in request:
         return None
     code = "STANDARD_RUN_INPUTS_INVALID"
-    chat_session_required(ws, request)
     manifest = request["run_inputs"]
     # files may be empty: e.g. every optional map left at the converter's default, with a fresh
     # writable directory for declared generated files. Never synthesize a placeholder file:
@@ -2942,14 +2890,13 @@ def run_inputs_document(ws, request, source):
 
 
 def preparation_document(ws, request):
-    """Analyst-labelled preparation metadata. Needs the protected-session context."""
+    """Analyst-labelled preparation metadata (the label is fixed, never the caller's)."""
     if "preparation" not in request:
         return None
     code = "STANDARD_PREPARATION_INVALID"
     document = request["preparation"]
     if not isinstance(document, dict) or not isinstance(document.get("analyst"), dict):
         refuse(code + ": preparation needs analyst.text")
-    chat_session_required(ws, request)
     document = dict(document)
     document.setdefault("version", 1)
     # The label is fixed: the agent cannot present its interpretation as anyone else's.
@@ -3776,8 +3723,8 @@ def op_file_roles_commit(ws, request):
 
 def op_supporting(ws, request):
     """Supporting references deliberately bypass named-input/delivery mutation.
-    Admission is a native locked-session capability supplied by the fixed adapter,
-    not a model-selected upload path or workspace."""
+    Chat lists/reads engineer-admitted references only; chat upload admission
+    (supporting_take) refuses USE_INTAKE whatever the request carries."""
     module = supporting_module()
     api = supporting_api()
     api.reference_active = lambda support_id: file_roles.reference_active(ws, support_id, roles_api())

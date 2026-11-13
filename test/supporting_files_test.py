@@ -93,16 +93,18 @@ class SupportingFilesTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.ws = Workspace(self.base / 'project')
+        # A directory outside the project (where an old native host kept chat uploads).
         self.uploads = self.base / 'uploads'
         self.uploads.mkdir(mode=0o700)
-        patch = mock.patch.dict(os.environ, {'SILO_TESTING': '1', 'SILO_SUPPORT_UPLOADS_ROOT': str(self.uploads)})
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.outside = self.uploads / ('0' * 31 + '1')
+        self.outside.write_bytes(b'outside the project')
+        self.outside.chmod(0o600)
         self.docker = FakeDocker()
         self.api = types.SimpleNamespace(open_root=helpers.open_root, open_regular=helpers.open_regular,
                                          sandbox_argv=helpers.sandbox_argv, docker=self.docker, refuse=helpers.refuse)
-        self.context = {'_private_session': True, '_session_id': 'chat-1', '_uploads': []}
-        self.add_upload()
+        # Stock term-llm: chat requests carry no session marker, session ID or manifest.
+        self.context = {}
+        self.legacy_count = 0
         self.sentinels = {}
         for relative in ('inputs/input.sql', 'converter/source.rb', '.silo-migrate/named/state.json',
                          '.silo-migrate/data/deliveries.json', 'settings.yml'):
@@ -111,63 +113,87 @@ class SupportingFilesTest(unittest.TestCase):
             path.write_bytes(b'unchanged')
             self.sentinels[path] = (path.read_bytes(), path.stat().st_mode)
 
-    def add_upload(self, filename='reference.csv', data=b'name,value\na,=1+1\n', ref=None):
-        ref = ref or ('%032x' % (len(self.context['_uploads']) + 1))
-        path = self.uploads / ref
-        path.write_bytes(data)
-        path.chmod(0o600)
-        item = dict(id=ref, path=str(path), filename=filename, media_type='text/plain', size_bytes=len(data))
-        self.context['_uploads'].append(item)
-        return item
+    def legacy(self, filename='reference.csv', data=b'name,value\na,=1+1\n', refid=None, session_id='chat-1'):
+        """Seed a record an earlier native-upload release admitted (history to preserve).
+
+        Uploads can no longer be admitted; this writes the custody blob (0400) and
+        index record (0600) exactly as that release published them."""
+        self.call()  # benign private store initialization
+        self.legacy_count += 1
+        refid = refid or '%032x' % (self.legacy_count + 0x10000)
+        identity = 'support-' + hashlib.sha256((session_id + refid).encode()).hexdigest()[:32]
+        root = self.ws.data_dir() / 'supporting'
+        blob = root / 'files' / identity
+        blob.write_bytes(data)
+        blob.chmod(0o400)
+        record = {'id': identity, 'filename': filename, 'size_bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
+                  'session_id': session_id, 'refid': refid, 'media_type': 'text/plain', 'imported_at': 1700000000,
+                  'provenance': 'private-session-upload'}
+        meta = root / 'index' / (identity + '.json')
+        meta.write_bytes(backend.encoded(record))
+        meta.chmod(0o600)
+        return backend.public(record)
 
     def call(self, op='supporting_list', **kwargs):
         return backend.handle(self.ws, dict(self.context, op=op, **kwargs), self.api)
 
-    def take(self, **kwargs):
-        return self.call('supporting_take', ref=self.context['_uploads'][0]['id'], **kwargs)['file']
+    def store_snapshot(self):
+        root = self.ws.data_dir() / 'supporting'
+        return {str(path.relative_to(root)): (path.read_bytes() if path.is_file() else None, backend.stamp(path.lstat()))
+                for path in root.rglob('*')} if root.exists() else {}
 
     def refusal(self, code, op='supporting_list', **kwargs):
         with self.assertRaisesRegex(helpers.Refusal, '^STANDARD_SUPPORTING_' + code + '$'):
             self.call(op, **kwargs)
 
-    def test_import_permissions_checksum_provenance_and_named_state_unchanged(self):
-        item = self.take()
-        self.assertRegex(item['id'], r'^support-[0-9a-f]{32}$')
+    def test_historical_upload_record_is_listed_and_read_without_session_context(self):
+        item = self.legacy(data=b'name,value\na,1\n', filename='reference.txt')
         root = self.ws.data_dir() / 'supporting'
         for path in (root, root / 'index', root / 'files'):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
-        path = root / 'files' / item['id']
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
-        self.assertEqual(item['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
         meta = root / 'index' / (item['id'] + '.json')
-        self.assertEqual(stat.S_IMODE(meta.stat().st_mode), 0o600)
-        record = json.loads(meta.read_bytes())
-        self.assertEqual(record['session_id'], 'chat-1')
-        self.assertEqual(record['provenance'], 'private-session-upload')
+        before = meta.read_bytes()
+        self.assertEqual(self.call(), {'status': 'ok', 'files': [item], 'available_refs': [], 'has_more': False})
+        self.assertEqual(self.call('supporting_read', id=item['id'])['text'], 'name,value\na,1\n')
+        # History (session ID, refid, provenance) is kept byte-for-byte.
+        self.assertEqual(meta.read_bytes(), before)
+        record = json.loads(before)
+        self.assertEqual((record['session_id'], record['provenance']), ('chat-1', 'private-session-upload'))
         for path, original in self.sentinels.items():
             self.assertEqual((path.read_bytes(), path.stat().st_mode), original)
         self.assertEqual(self.docker.calls, [])
 
-    def test_private_session_and_safe_session_required(self):
-        for value in (False, None, 1, 'true'):
-            with self.subTest(value=value):
-                self.refusal('PRIVATE_SESSION_REQUIRED', _private_session=value)
-        for session in ('../chat', '', '/tmp', 'x\n', 'a' * 129):
-            self.refusal('PRIVATE_SESSION_REQUIRED', _session_id=session)
+    def test_forged_session_keys_are_ignored_not_required(self):
+        item = self.legacy(filename='reference.txt', data=b'kept')
+        expected = self.call()
+        for forged in ({'_private_session': False}, {'_private_session': True, '_session_id': '../chat'},
+                       {'_private_session': True, '_session_id': 'chat-2', '_uploads': [{'id': 'f' * 32, 'path': str(self.outside)}]},
+                       {'_uploads': 'not a list'}, {'_session_id': 'chat-1'}):
+            with self.subTest(forged=forged):
+                self.assertEqual(self.call(**forged), expected)
+                self.assertEqual(self.call('supporting_read', id=item['id'], **forged)['text'], 'kept')
 
-    def test_ref_public_key_and_legacy_alias_invalid(self):
-        ref = self.context['_uploads'][0]['id']
-        self.refusal('REF_INVALID', 'supporting_take', refid=ref)
-        self.refusal('REF_INVALID', 'supporting_take', ref='../invalid', refid=ref)
-        item = self.call('supporting_take', ref=ref)['file']
-        metadata = self.ws.data_dir() / 'supporting/index' / (item['id'] + '.json')
-        self.assertEqual(json.loads(metadata.read_bytes())['refid'], ref)
-        self.assertEqual(stat.S_IMODE(metadata.stat().st_mode), 0o600)
+    def test_take_always_refuses_use_intake_and_changes_nothing(self):
+        prior = self.legacy(refid='a' * 32)
+        before = self.store_snapshot()
+        outside = (self.outside.read_bytes(), backend.stamp(self.outside.stat()))
+        manifest = [dict(id='f' * 32, path=str(self.outside), filename='x.txt', media_type='text/plain', size_bytes=19)]
+        env = {'SILO_TESTING': '1', 'SILO_SUPPORT_UPLOADS_ROOT': str(self.uploads), 'TERM_LLM_PRIVATE_SESSION': '1',
+               'TERM_LLM_SESSION_ID': 'chat-1', 'TERM_LLM_UPLOADS_JSON': json.dumps(manifest)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(self.ws, 'require', side_effect=AssertionError('not reached')):
+            for request in ({}, {'ref': 'f' * 32}, {'ref': '../etc/passwd'}, {'refid': 'f' * 32},
+                            {'ref': 'f' * 32, '_private_session': True, '_session_id': 'chat-1', '_uploads': manifest},
+                            # Replaying a historical session/refid is not "already registered" either.
+                            {'ref': 'a' * 32, '_private_session': True, '_session_id': 'chat-1', '_uploads': manifest}):
+                with self.subTest(request=request):
+                    self.refusal('USE_INTAKE', 'supporting_take', **request)
+        self.assertEqual(self.store_snapshot(), before)
+        self.assertEqual((self.outside.read_bytes(), backend.stamp(self.outside.stat())), outside)
+        self.assertEqual(self.call()['files'], [prior])
+        self.assertEqual(self.docker.calls, [])
 
     def test_tsv_maps_to_fixed_csv_reader(self):
-        self.context['_uploads'] = []
-        self.add_upload('Canonical Original Name.TSV', b'name\tvalue\na\t1\n')
-        item = self.take()
+        item = self.legacy('Canonical Original Name.TSV', b'name\tvalue\na\t1\n')
         self.assertEqual(item['filename'], 'Canonical Original Name.TSV')
         self.call('supporting_read', id=item['id'], mode='rows')
         argv = self.docker.calls[0][0]
@@ -175,7 +201,7 @@ class SupportingFilesTest(unittest.TestCase):
         self.assertIn('/silo/bin/supporting_reader.py', argv)
 
     def test_fixed_parser_error_mapping_and_invalid_codes(self):
-        item = self.take()
+        item = self.legacy()
         for returncode in (0, 1):
             self.docker.returncode = returncode
             for code in sorted(backend.PARSER_ERRORS):
@@ -193,94 +219,40 @@ class SupportingFilesTest(unittest.TestCase):
         self.assertEqual(len(self.docker.calls) % 3, 0)
 
     def test_unknown_reference_and_id_injection(self):
-        self.refusal('REF_NOT_AVAILABLE', 'supporting_take', ref='f' * 32)
-        self.refusal('REF_INVALID', 'supporting_take', ref='../etc/passwd')
         self.refusal('ID_INVALID', 'supporting_read', id='../etc/passwd')
         self.refusal('NOT_FOUND', 'supporting_read', id='support-' + 'f' * 32)
 
-    def test_shared_project_and_current_chat_refs(self):
-        first = self.take()
-        self.assertEqual(self.take(), first)
-        self.context['_session_id'] = 'chat-2'
-        self.context['_uploads'] = []
-        result = self.call()
-        self.assertEqual(result['files'], [first])
-        self.assertEqual(result['available_refs'], [])
-        self.refusal('REF_NOT_AVAILABLE', 'supporting_take', ref='0' * 31 + '1')
+    def test_project_records_are_shared_and_no_chat_refs_are_offered(self):
+        first = self.legacy()
+        for context in ({}, {'_session_id': 'chat-2', '_private_session': True}):
+            result = self.call(**context)
+            self.assertEqual(result['files'], [first])
+            self.assertEqual(result['available_refs'], [])
         self.assertEqual(self.call('supporting_read', id=first['id'])['status'], 'ok')
-        self.add_upload()
-        self.assertNotEqual(self.take()['id'], first['id'])
 
     def test_list_does_not_expose_paths_or_session(self):
-        self.take()
+        self.legacy()
         result = json.dumps(self.call())
         self.assertNotIn(str(self.base), result)
         self.assertNotIn('chat-1', result)
         self.assertIn('reference.csv', result)
 
-    def test_source_must_be_exact_direct_path(self):
-        item = self.context['_uploads'][0]
-        for path in (str(self.uploads / '..' / 'uploads' / item['id']),
-                     str(self.uploads / 'nested' / item['id']), '/etc/passwd', 'relative'):
-            with self.subTest(path=path):
-                self.refusal('PATH_INVALID', 'supporting_take', ref=item['id'],
-                             _uploads=[dict(item, path=path)])
-
-    def test_source_symlink_and_symlink_parent_refused(self):
-        item = self.context['_uploads'][0]
-        path = Path(item['path'])
-        original = self.uploads / 'original'
-        path.rename(original)
-        path.symlink_to(original)
-        with self.assertRaises(helpers.Refusal):
-            self.take()
-        alias = self.base / 'alias'
-        alias.symlink_to(self.uploads, target_is_directory=True)
-        with mock.patch.dict(os.environ, {'SILO_SUPPORT_UPLOADS_ROOT': str(alias)}):
-            with self.assertRaises(helpers.Refusal):
-                self.call('supporting_take', ref=item['id'], _uploads=[dict(item, path=str(alias / item['id']))])
-
-    def test_source_nonregular_hardlink_groupwrite_and_wrongowner(self):
-        path = Path(self.context['_uploads'][0]['path'])
-        path.chmod(0o620)
-        self.refusal('FILE_INVALID', 'supporting_take', ref=self.context['_uploads'][0]['id'])
-        path.chmod(0o600)
-        os.link(path, self.uploads / 'hardlink')
-        self.refusal('FILE_INVALID', 'supporting_take', ref=self.context['_uploads'][0]['id'])
-        (self.uploads / 'hardlink').unlink()
-        real = self.api.open_regular
-        def wrongowner(*args):
-            fd, info = real(*args)
-            fields = list(info)
-            fields[4] = os.getuid() + 1
-            return fd, os.stat_result(fields)
-        self.api.open_regular = wrongowner
-        self.refusal('FILE_INVALID', 'supporting_take', ref=self.context['_uploads'][0]['id'])
-        self.api.open_regular = real
-        path.unlink()
-        os.mkfifo(path, 0o600)
-        with self.assertRaises(helpers.Refusal):
-            self.take()
-
-    def test_filename_controls_and_separators(self):
-        item = self.context['_uploads'][0]
+    def test_record_filename_controls_and_separators(self):
+        item = self.legacy()
+        path = self.ws.data_dir() / 'supporting/index' / (item['id'] + '.json')
+        record = json.loads(path.read_bytes())
         for name in ('../secret', 'x/y', 'x\\y', 'x\n', 'x\x7f', '', '.', '..', 'x' * 129):
-            self.refusal('UPLOADS_INVALID', _uploads=[dict(item, filename=name)])
-
-    def test_upload_caps(self):
-        item = self.context['_uploads'][0]
-        self.refusal('UPLOADS_INVALID', _uploads=[item] * 33)
-        self.refusal('UPLOADS_INVALID', _uploads=[dict(item, size_bytes=backend.MAX_FILE + 1)])
-        self.refusal('UPLOADS_INVALID', _uploads=[dict(item, arbitrary='x' * backend.MAX_RECORD)])
-        self.refusal('UPLOADS_INVALID', _uploads=[item, item])
+            with self.subTest(name=name):
+                path.write_text(json.dumps(dict(record, filename=name)))
+                self.refusal('INDEX_INVALID')
 
     def test_store_symlink_refused(self):
         (self.ws.data_dir() / 'supporting').symlink_to(self.uploads, target_is_directory=True)
         with self.assertRaises(helpers.Refusal):
-            self.take()
+            self.call()
 
     def test_checksum_and_permissions_verified_before_read(self):
-        item = self.take()
+        item = self.legacy()
         path = self.ws.data_dir() / 'supporting/files' / item['id']
         path.chmod(0o600)
         self.refusal('FILE_INVALID', 'supporting_read', id=item['id'])
@@ -289,20 +261,8 @@ class SupportingFilesTest(unittest.TestCase):
         self.refusal('CHECKSUM_MISMATCH', 'supporting_read', id=item['id'])
         self.assertEqual(self.docker.calls, [])
 
-    def test_mutation_during_copy_refused(self):
-        real = backend.os.read
-        path = Path(self.context['_uploads'][0]['path'])
-        def mutate(fd, size):
-            data = real(fd, size)
-            if data and os.fstat(fd).st_ino == path.stat().st_ino:
-                path.write_bytes(b'altered')
-            return data
-        with mock.patch.object(backend.os, 'read', side_effect=mutate):
-            self.refusal('FILE_CHANGED', 'supporting_take', ref=self.context['_uploads'][0]['id'])
-        self.assertEqual(list((self.ws.data_dir() / 'supporting/files').iterdir()), [])
-
     def test_sandbox_fixed_reader_argv_and_no_named_inputs(self):
-        item = self.take()
+        item = self.legacy()
         result = self.call('supporting_read', id=item['id'], mode='rows', sheet='--evil', limit=100, columns=50)
         self.assertEqual(result['rows'][0][0]['type'], 'formula')
         argv, timeout = self.docker.calls[0]
@@ -330,14 +290,14 @@ class SupportingFilesTest(unittest.TestCase):
         self.assertFalse(list(self.ws.data_dir().glob('support-read-*')))
 
     def test_reader_limits(self):
-        item = self.take()
+        item = self.legacy()
         for args in ({'limit': 101}, {'columns': 51}, {'limit': True}, {'offset': -1},
                      {'sheet': 'x\n'}, {'mode': 'execute'}, {'columns': 0}):
             self.refusal('ARGUMENTS_INVALID', 'supporting_read', id=item['id'], **args)
         self.assertEqual(self.docker.calls, [])
 
     def test_failed_parser_cleanup_and_output_refusals(self):
-        item = self.take()
+        item = self.legacy()
         self.docker.returncode = 1
         self.refusal('PARSER_FAILED', 'supporting_read', id=item['id'])
         self.assertEqual(len(self.docker.calls), 3)
@@ -349,33 +309,29 @@ class SupportingFilesTest(unittest.TestCase):
             self.refusal(code, 'supporting_read', id=item['id'])
 
     def test_cleanup_absence_must_be_confirmed(self):
-        item = self.take()
+        item = self.legacy()
         self.docker.cleanup_bad = True
         self.refusal('CLEANUP_FAILED', 'supporting_read', id=item['id'])
         self.docker.timeout = True
         self.refusal('CLEANUP_FAILED', 'supporting_read', id=item['id'])
 
     def test_timeout_is_sanitized_and_cleaned(self):
-        item = self.take()
+        item = self.legacy()
         self.docker.timeout = True
         self.refusal('PARSER_FAILED', 'supporting_read', id=item['id'])
         self.assertEqual([argv[0] for argv, timeout in self.docker.calls], ['run', 'rm', 'ps'])
 
     def test_text_head_and_unsupported_binary(self):
-        self.context['_uploads'] = []
-        self.add_upload('reference.md', b'a' * 20000)
-        item = self.take()
+        item = self.legacy('reference.md', b'a' * 20000)
         result = self.call('supporting_read', id=item['id'], mode='text')
         self.assertEqual(len(result['text']), 16384)
         self.assertTrue(result['truncated'])
-        self.context['_uploads'] = []
-        self.add_upload('file.bin', b'\xff\x00', ref='f' * 32)
-        item = self.take()
+        item = self.legacy('file.bin', b'\xff\x00', refid='f' * 32)
         self.refusal('UNSUPPORTED', 'supporting_read', id=item['id'], mode='text')
         self.assertEqual(self.docker.calls, [])
 
     def test_registered_count_and_total_limits(self):
-        self.take()
+        self.legacy()
         with mock.patch.object(backend, 'MAX_TOTAL', 1):
             self.refusal('LIMIT')
         root = self.ws.data_dir() / 'supporting/index'
@@ -384,7 +340,7 @@ class SupportingFilesTest(unittest.TestCase):
         self.refusal('LIMIT')
 
     def test_metadata_cap_and_corruption(self):
-        self.take()
+        self.legacy()
         path = next((self.ws.data_dir() / 'supporting/index').iterdir())
         path.write_bytes(b'x' * (backend.MAX_RECORD + 1))
         self.refusal('INDEX_INVALID')
@@ -392,28 +348,14 @@ class SupportingFilesTest(unittest.TestCase):
         self.refusal('INDEX_INVALID')
 
     def test_text_limits_utf8_and_binary_refusal(self):
-        self.context['_uploads'] = []
-        self.add_upload('note.txt', b'\xff')
-        item = self.take()
+        item = self.legacy('note.txt', b'\xff')
         self.refusal('UNSUPPORTED', 'supporting_read', id=item['id'])
-        self.context['_uploads'] = []
-        self.add_upload('note.txt', b'valid', ref='e' * 32)
-        item = self.take()
+        item = self.legacy('note.txt', b'valid', refid='e' * 32)
         self.refusal('ARGUMENTS_INVALID', 'supporting_read', id=item['id'], limit=101)
         self.refusal('ARGUMENTS_INVALID', 'supporting_read', id=item['id'], columns=51)
 
-    def test_source_actual_size_and_root_permissions(self):
-        item = self.context['_uploads'][0]
-        self.refusal('FILE_CHANGED', 'supporting_take', ref=item['id'],
-                     _uploads=[dict(item, size_bytes=0)])
-        with Path(item['path']).open('wb') as stream:
-            stream.truncate(backend.MAX_FILE + 1)
-        self.refusal('FILE_INVALID', 'supporting_take', ref=item['id'])
-        self.uploads.chmod(0o770)
-        self.refusal('PATH_INVALID', 'supporting_take', ref=item['id'])
-
-    def test_bounded_list_and_import_quota(self):
-        item = self.take()
+    def test_bounded_list(self):
+        item = self.legacy()
         root = self.ws.data_dir() / 'supporting/index'
         original = json.loads((root / (item['id'] + '.json')).read_bytes())
         for number in range(99):
@@ -425,11 +367,9 @@ class SupportingFilesTest(unittest.TestCase):
         result = self.call()
         self.assertTrue(result['has_more'])
         self.assertLessEqual(len(backend.encoded(result)), backend.MAX_OUTPUT)
-        self.add_upload(ref='f' * 32)
-        self.refusal('LIMIT', 'supporting_take', ref='f' * 32)
 
     def test_snapshot_is_checksum_verified_and_only_mount_is_selected_copy(self):
-        item = self.take()
+        item = self.legacy()
         original = self.ws.data_dir() / 'supporting/files' / item['id']
         real_sandbox = self.api.sandbox_argv
         def sandbox(ws, name, out, mounts, command, inputs=None):
@@ -448,12 +388,10 @@ class SupportingFilesTest(unittest.TestCase):
         self.assertFalse(any('/gems' in arg for arg in self.docker.calls[0][0]))
         self.refusal('CHECKSUM_MISMATCH', 'supporting_read', id=item['id'])
 
-    def test_test_override_requires_testing_flag(self):
-        with mock.patch.dict(os.environ, {'SILO_TESTING': '0', 'XDG_DATA_HOME': str(self.base / 'xdg')}):
-            self.assertEqual(backend.upload_root(), self.base / 'xdg/term-llm/uploads')
-        with mock.patch.dict(os.environ, {}, clear=True):
-            import pwd
-            self.assertEqual(backend.upload_root(), Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local/share/term-llm/uploads')
+    def test_chat_upload_admission_code_is_gone(self):
+        # No upload root, session proof or upload copy path remains to be reached.
+        for name in ('upload_root', 'trusted_context', 'session_context', 'take'):
+            self.assertFalse(hasattr(backend, name), name)
 
 
 class EngineerReferenceTest(SupportingFilesTest):
@@ -512,7 +450,7 @@ class EngineerReferenceTest(SupportingFilesTest):
         self.assertEqual(record['actor'], request['by'])
         self.assertEqual(record['source']['identity'], request['identity'])
         self.assertNotIn('session_id', record)
-        chat = self.take()
+        chat = self.legacy()
         self.assertEqual({f['id'] for f in self.call()['files']}, {item['id'], chat['id']})
         self.assertEqual(self.call('supporting_read', id=item['id'])['text'], before[0].decode())
         for path, original in self.sentinels.items():
@@ -534,12 +472,14 @@ class EngineerReferenceTest(SupportingFilesTest):
         self.ws.chat = True
         self.denied(dict(request, **self.context), 'STANDARD_DATA_OPERATION_REFUSED')
         self.assert_empty()
+        self.ws.chat = True
+        self.denied(dict(request, _private_session=True, _session_id='chat-1', _uploads=[]), 'STANDARD_DATA_OPERATION_REFUSED')
         self.ws.chat = False
-        # An engineer reference is not an alternative admission token to native tools.
-        with self.assertRaisesRegex(helpers.Refusal, '^STANDARD_SUPPORTING_PRIVATE_SESSION_REQUIRED$'):
-            backend.handle(self.ws, dict(request, op='supporting_list'), self.api)
-        self.refusal('PRIVATE_SESSION_REQUIRED', _private_session=False, **request)
+        # Chat operations are not an alternative admission route for an engineer request.
+        self.assertEqual(self.call(**request)['files'], [])
+        self.refusal('USE_INTAKE', 'supporting_take', **request)
         self.refusal('OPERATION_INVALID', 'admit_reference', **request)
+        self.assert_empty()
 
     def test_reference_paths_and_arguments(self):
         _, request = self.reference()
@@ -585,10 +525,10 @@ class EngineerReferenceTest(SupportingFilesTest):
     def test_symlink_hardlink_and_untrusted_directories(self):
         source, request = self.reference()
         source.unlink()
-        source.symlink_to(self.uploads / self.context['_uploads'][0]['id'])
+        source.symlink_to(self.outside)
         self.denied(request)
         source.unlink()
-        os.link(self.uploads / self.context['_uploads'][0]['id'], source)
+        os.link(self.outside, source)
         self.denied(request, 'STANDARD_SUPPORTING_FILE_INVALID')
         source.unlink()
         source, request = self.reference()
@@ -669,7 +609,7 @@ class EngineerReferenceTest(SupportingFilesTest):
         self.assert_empty()
 
     def test_reference_registry_count_limit(self):
-        item = self.take()
+        item = self.legacy()
         root = self.ws.data_dir() / 'supporting/index'
         original = json.loads((root / (item['id'] + '.json')).read_bytes())
         for number in range(99):
@@ -727,7 +667,7 @@ class EngineerReferenceTest(SupportingFilesTest):
         other.chmod(0o600)
         self.refusal('INDEX_INVALID')
         other.unlink()
-        chat = self.take()
+        chat = self.legacy()
         chat_path = root / (chat['id'] + '.json')
         chat_record = json.loads(chat_path.read_bytes())
         chat_path.write_text(json.dumps(dict(chat_record, origin_id='file-invented')))
@@ -738,7 +678,7 @@ class EngineerReferenceTest(SupportingFilesTest):
             return backend.engineer_list(self.ws, self.api)
 
     def test_engineer_inventory_public_all_provenances_and_archives(self):
-        chat = self.take()
+        chat = self.legacy()
         _, request = self.reference()
         reference = self.admit(request)['file']
         # Inventory must not suppress archived rows or depend on the activity callback.
@@ -771,13 +711,13 @@ class EngineerReferenceTest(SupportingFilesTest):
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
 
     def test_engineer_inventory_uses_strict_store_and_index(self):
-        item = self.take()
+        item = self.legacy()
         path = self.ws.data_dir() / 'supporting/index' / (item['id'] + '.json')
         path.write_text('{}')
         with self.assertRaisesRegex(helpers.Refusal, '^STANDARD_SUPPORTING_INDEX_INVALID$'):
             self.engineer_inventory()
         path.unlink()
-        path.symlink_to(self.uploads / self.context['_uploads'][0]['id'])
+        path.symlink_to(self.outside)
         with self.assertRaises(helpers.Refusal):
             self.engineer_inventory()
         path.unlink()
@@ -786,8 +726,8 @@ class EngineerReferenceTest(SupportingFilesTest):
         with self.assertRaisesRegex(helpers.Refusal, '^STANDARD_SUPPORTING_PATH_INVALID$'):
             self.engineer_inventory()
 
-    def test_archived_reference_list_read_and_take_preserve_custody(self):
-        chat = self.take()
+    def test_archived_reference_list_and_read_preserve_custody(self):
+        chat = self.legacy()
         _, request = self.reference()
         reference = self.admit(request)['file']
         root = self.ws.data_dir() / 'supporting'
@@ -798,7 +738,7 @@ class EngineerReferenceTest(SupportingFilesTest):
         self.assertEqual(self.call()['files'], [])
         self.refusal('INACTIVE', 'supporting_read', id=chat['id'])
         self.refusal('INACTIVE', 'supporting_read', id=reference['id'])
-        self.refusal('INACTIVE', 'supporting_take', ref=self.context['_uploads'][0]['id'])
+        self.refusal('USE_INTAKE', 'supporting_take', ref='f' * 32)
         for path, original in originals.items():
             self.assertEqual((path.read_bytes(), backend.stamp(path.stat())), original)
         self.assertEqual(len(self.engineer_inventory()), 2)
@@ -806,41 +746,38 @@ class EngineerReferenceTest(SupportingFilesTest):
         roles[reference['id']] = True
         self.assertEqual(self.call()['files'], [reference])
         self.assertEqual(self.call('supporting_read', id=reference['id'])['text'], 'invented reference')
-        self.refusal('INACTIVE', 'supporting_take', ref=self.context['_uploads'][0]['id'])
         self.assertEqual(self.docker.calls, [])
 
     def test_inactive_read_refused_before_blob_open(self):
-        item = self.take()
+        item = self.legacy()
         (self.ws.data_dir() / 'supporting/files' / item['id']).unlink()
         self.api.reference_active = lambda identity: False
         self.refusal('INACTIVE', 'supporting_read', id=item['id'])
 
     def test_unknown_chat_references_default_active_via_role_authority(self):
-        first = self.take()
-        self.add_upload('second.txt', b'new chat reference', ref='f' * 32)
+        first = self.legacy()
+        second = self.legacy('second.txt', b'new chat reference', refid='f' * 32)
         self.api.reference_active = lambda identity: {first['id']: False}.get(identity, True)
-        second = self.call('supporting_take', ref='f' * 32)['file']
         self.assertEqual(self.call()['files'], [second])
         self.assertEqual(self.call('supporting_read', id=second['id'])['text'], 'new chat reference')
-        self.assertTrue(self.call('supporting_take', ref='f' * 32)['already_registered'])
         self.assertEqual(len(self.engineer_inventory()), 2)
 
     def test_activity_callback_is_internal_and_cannot_bypass_native_gate(self):
-        item = self.take()
+        item = self.legacy()
         self.api.reference_active = mock.Mock(return_value=False)
         # Model-supplied flags cannot override internal authority in either direction.
         for flags in ({'reference_active': True}, {'active': True}, {'_reference_active': True}):
             self.assertEqual(self.call(**flags)['files'], [])
             self.refusal('INACTIVE', 'supporting_read', id=item['id'], **flags)
-            self.refusal('INACTIVE', 'supporting_take', ref=self.context['_uploads'][0]['id'], **flags)
         self.api.reference_active.reset_mock()
-        self.refusal('PRIVATE_SESSION_REQUIRED', _private_session=False, reference_active=True)
+        # take refuses before any authority is consulted, whatever flags it carries.
+        self.refusal('USE_INTAKE', 'supporting_take', ref='f' * 32, reference_active=True, _private_session=True)
         self.api.reference_active.assert_not_called()
         del self.api.reference_active
         self.assertEqual(self.call(reference_active=False, active=False)['files'], [item])
 
     def test_activity_callback_errors_and_nonboolean_results_fail_closed(self):
-        item = self.take()
+        item = self.legacy()
         for callback in (True, 'active', lambda identity: 1, lambda identity: 'true', lambda identity: None,
                          mock.Mock(side_effect=RuntimeError('/invented/private/path')),
                          mock.Mock(side_effect=helpers.Refusal('STANDARD_PRIVATE_DETAIL'))):
@@ -848,7 +785,7 @@ class EngineerReferenceTest(SupportingFilesTest):
                 self.api.reference_active = callback
                 self.refusal('REFERENCE_STATE_INVALID')
                 self.refusal('REFERENCE_STATE_INVALID', 'supporting_read', id=item['id'])
-                self.refusal('REFERENCE_STATE_INVALID', 'supporting_take', ref=self.context['_uploads'][0]['id'])
+                self.refusal('USE_INTAKE', 'supporting_take', ref='f' * 32)
         self.api.reference_active = None
         self.assertEqual(self.call()['files'], [item])
 
@@ -986,13 +923,13 @@ class EngineerReferenceTest(SupportingFilesTest):
         duplicate_path.unlink()
         self.assertEqual(len(self.call()['files']), 1)
 
-    def crash_take(self, mode, ref):
+    def crash_admit(self, mode, request):
         # Real subprocess death bypasses Python finally/exception cleanup. Only
         # this fixture's synthetic paths and the module under test are accessed.
         script = r"""
 import contextlib, importlib.util, json, os, signal, sys, types
 from pathlib import Path
-repo, project, mode, request = sys.argv[1:]
+repo, project, intake, mode, request = sys.argv[1:]
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -1001,8 +938,8 @@ def load(name, path):
 module = load('crash_support', Path(repo) / 'bin/supporting_files.py')
 helpers = load('crash_helpers', Path(repo) / 'bin/data_tools.py')
 root = Path(project) / '.silo-migrate/data'
-ws = types.SimpleNamespace(data_dir=lambda: root, require=lambda standard: None,
-                           lock=lambda: helpers.Locked(root / 'lock'), chat=False)
+ws = types.SimpleNamespace(data_dir=lambda: root, require=lambda standard: None, chat=False,
+                           area_path=lambda area: Path(intake), open_area=lambda area: helpers.open_root(Path(intake)))
 api = types.SimpleNamespace(open_regular=helpers.open_regular, refuse=helpers.refuse)
 if mode == 'preindex':
     module.publish = lambda *args: os._exit(71)
@@ -1023,11 +960,10 @@ else:
                 while True: signal.pause()
             return self.inner.write(data)
     module.os.fdopen = lambda *args, **kwargs: Stream(real_fdopen(*args, **kwargs))
-module.handle(ws, json.loads(request), api)
+module.admit_reference(ws, json.loads(request), api)  # the parent test holds no lock across a crash
 raise AssertionError('crash hook not reached')
 """
-        request = dict(self.context, op='supporting_take', ref=ref)
-        args = [sys.executable, '-I', '-B', '-c', script, str(ROOT), str(self.ws.root), mode, json.dumps(request)]
+        args = [sys.executable, '-I', '-B', '-c', script, str(ROOT), str(self.ws.root), str(self.ws.intake), mode, json.dumps(request)]
         if mode != 'metadata':
             result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
             self.assertEqual(result.returncode, 71 if mode == 'preindex' else 72, result.stderr.decode())
@@ -1048,29 +984,27 @@ raise AssertionError('crash hook not reached')
             child.stderr.close()
 
     def test_abrupt_death_preserves_prior_registry_and_charges_orphans(self):
-        self.context['_uploads'] = []
-        self.add_upload('prior.txt', b'prior registered reference')
-        prior = self.take()
+        prior = self.legacy('prior.txt', b'prior registered reference')
         for number, mode in enumerate(('partialblob', 'preindex', 'metadata'), 10):
             with self.subTest(mode=mode):
-                upload = self.add_upload('interrupted.txt', b'invented interrupted source', ref='%032x' % number)
-                source = Path(upload['path'])
+                source, request = self.reference(path='interrupted-%d.txt' % number, data=b'invented interrupted source',
+                                                 origin='file-crash-%d' % number)
                 before = (source.read_bytes(), backend.stamp(source.stat()))
                 previous = self.call()['files']
-                self.crash_take(mode, upload['id'])
+                self.crash_admit(mode, request)
                 root = self.ws.data_dir() / 'supporting'
                 # No stage filename or partial JSON can enter the index namespace.
                 self.assertTrue(all(json.loads(p.read_bytes()) for p in (root / 'index').iterdir()))
                 self.assertEqual(self.call('supporting_read', id=prior['id'])['text'], 'prior registered reference')
                 self.assertEqual(self.call()['files'], previous)
                 stored = sum(p.stat().st_size for folder in ('files', 'pending') for p in (root / folder).iterdir())
-                with mock.patch.object(backend, 'MAX_TOTAL', stored + upload['size_bytes'] - 1):
-                    self.refusal('LIMIT', 'supporting_take', ref=upload['id'])
+                with mock.patch.object(backend, 'MAX_TOTAL', stored + len(before[0]) - 1):
+                    self.denied(request, 'STANDARD_SUPPORTING_LIMIT')
                     self.assertEqual(self.call('supporting_read', id=prior['id'])['text'], 'prior registered reference')
                 orphan_paths = {p: p.read_bytes() for folder in ('files', 'pending') for p in (root / folder).iterdir()}
-                result = self.call('supporting_take', ref=upload['id'])
+                result = self.admit(request)
                 self.assertFalse(result['already_registered'])
-                self.assertTrue(self.call('supporting_take', ref=upload['id'])['already_registered'])
+                self.assertTrue(self.admit(request)['already_registered'])
                 for path, data in orphan_paths.items():
                     self.assertEqual(path.read_bytes(), data)
                 self.assertEqual((source.read_bytes(), backend.stamp(source.stat())), before)
@@ -1079,14 +1013,14 @@ raise AssertionError('crash hook not reached')
         self.assertEqual(next(pending.iterdir()).read_bytes(), b'{"id":"')
 
     def test_orphan_count_and_pending_bytes_are_admission_only(self):
-        item = self.take()
+        item = self.legacy()
         root = self.ws.data_dir() / 'supporting'
         for number in range(100):
             path = root / 'files' / ('support-%032x' % number)
             path.write_bytes(b'')
             path.chmod(0o600)
-        upload = self.add_upload(ref='e' * 32)
-        self.refusal('LIMIT', 'supporting_take', ref=upload['id'])
+        source, request = self.reference()
+        self.denied(request, 'STANDARD_SUPPORTING_LIMIT')
         self.assertEqual(self.call()['files'], [item])
         # A metadata-only interrupted stage also consumes a count slot and bytes.
         for number in range(100):
@@ -1094,50 +1028,35 @@ raise AssertionError('crash hook not reached')
         pending = root / 'pending' / ('support-' + 'f' * 32 + '.json')
         pending.write_bytes(b'partial metadata')
         pending.chmod(0o600)
-        with mock.patch.object(backend, 'MAX_TOTAL', item['size_bytes'] + upload['size_bytes']):
-            self.refusal('LIMIT', 'supporting_take', ref=upload['id'])
+        with mock.patch.object(backend, 'MAX_TOTAL', item['size_bytes'] + source.stat().st_size):
+            self.denied(request, 'STANDARD_SUPPORTING_LIMIT')
             self.assertEqual(self.call()['files'], [item])
 
     def test_interrupted_storage_validation_does_not_poison_reads(self):
-        item = self.take()
-        upload = self.add_upload(ref='e' * 32)
+        item = self.legacy()
+        _, request = self.reference()
         root = self.ws.data_dir() / 'supporting'
+        (root / 'pending').mkdir(mode=0o700, exist_ok=True)
         stage = root / 'pending' / ('support-' + 'f' * 32 + '.json')
         for mode in (0o400, 0o666):
             stage.write_bytes(b'partial')
             stage.chmod(mode)
-            self.refusal('STORAGE_INVALID' if mode == 0o400 else 'FILE_INVALID', 'supporting_take', ref=upload['id'])
+            self.denied(request, 'STANDARD_SUPPORTING_STORAGE_INVALID' if mode == 0o400 else 'STANDARD_SUPPORTING_FILE_INVALID')
             self.assertEqual(self.call()['files'], [item])
             stage.chmod(0o600)
         stage.unlink()
-        stage.symlink_to(self.uploads / upload['id'])
-        with self.assertRaises(helpers.Refusal):
-            self.call('supporting_take', ref=upload['id'])
+        stage.symlink_to(self.outside)
+        self.denied(request)
         self.assertEqual(self.call()['files'], [item])
         stage.unlink()
         stage.write_bytes(b'partial')
         stage.chmod(0o600)
         os.link(stage, stage.with_name('other-link'))
-        with self.assertRaises(helpers.Refusal):
-            self.call('supporting_take', ref=upload['id'])
+        self.denied(request)
         self.assertEqual(self.call()['files'], [item])
 
-    def test_native_resize_before_copy_fstat_is_refused_and_cleaned(self):
-        upload = self.context['_uploads'][0]
-        source = Path(upload['path'])
-        original = backend.copy_checked
-        def grew(*args, **kwargs):
-            source.write_bytes(b'x' * (upload['size_bytes'] + 100))
-            return original(*args, **kwargs)
-        with mock.patch.object(backend, 'MAX_TOTAL', upload['size_bytes'] + 50), \
-                mock.patch.object(backend, 'copy_checked', side_effect=grew):
-            self.refusal('FILE_CHANGED', 'supporting_take', ref=upload['id'])
-        self.assert_empty()
-        self.assertEqual(self.call()['files'], [])
-
     def test_actual_postcopy_capacity_checked_for_all_admissions(self):
-        prior = self.take()
-        upload = self.add_upload('new.txt', b'new native fixture', ref='e' * 32)
+        prior = self.legacy()
         _, reference = self.reference()
         _, asset = self.asset_reference()
         root = self.ws.data_dir() / 'supporting'
@@ -1148,8 +1067,7 @@ raise AssertionError('crash hook not reached')
             orphan.write_bytes(b'x' * 4096)
             orphan.chmod(0o600)
             return result
-        operations = (lambda: self.call('supporting_take', ref=upload['id']),
-                      lambda: self.admit(reference), lambda: self.admit_asset(asset))
+        operations = (lambda: self.admit(reference), lambda: self.admit_asset(asset))
         for operation in operations:
             with mock.patch.object(backend, 'MAX_TOTAL', 4096), \
                     mock.patch.object(backend, 'copy_checked', side_effect=extra_storage):
@@ -1160,6 +1078,7 @@ raise AssertionError('crash hook not reached')
             orphan.unlink()  # Test-owned injected data only; implementation retains it.
 
     def test_metadata_publication_fsync_order_and_postcommit_failure(self):
+        _, request = self.reference()
         original = os.fsync
         seen = []
         root = self.ws.data_dir() / 'supporting'
@@ -1174,16 +1093,16 @@ raise AssertionError('crash hook not reached')
                             raise OSError('invented post-rename durability failure')
             return original(fd)
         with mock.patch.object(backend.os, 'fsync', side_effect=sync):
-            self.refusal('IO', 'supporting_take', ref=self.context['_uploads'][0]['id'])
+            self.denied(request, 'STANDARD_SUPPORTING_IO')
         self.assertLess(seen.index('files'), seen.index('index'))
         # The rename has committed: failure must not delete the blob or record.
         self.assertEqual(len(self.call()['files']), 1)
-        self.assertTrue(self.call('supporting_take', ref=self.context['_uploads'][0]['id'])['already_registered'])
+        self.assertTrue(self.admit(request)['already_registered'])
         self.assertEqual(len(list((root / 'files').iterdir())), 1)
         self.assertEqual(list((root / 'pending').iterdir()), [])
 
     def test_internal_origin_lookup_distinguishes_prepared_engineer_copies(self):
-        chat = self.take()
+        chat = self.legacy()
         _, request = self.reference()
         engineer = self.admit(request)['file']
         _, asset_request = self.asset_reference()
@@ -1217,7 +1136,7 @@ raise AssertionError('crash hook not reached')
     def test_strict_provenance_union(self):
         _, request = self.reference()
         result = self.admit(request)
-        self.take()
+        self.legacy()
         path = self.ws.data_dir() / 'supporting/index' / (result['file']['id'] + '.json')
         original = json.loads(path.read_bytes())
         for changed in (dict(original, session_id='fake', refid='1' * 32),

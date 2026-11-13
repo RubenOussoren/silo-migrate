@@ -197,7 +197,10 @@ print(json.dumps({'version': 1, 'status': 'ok'}))
 
 
 class AdapterContextTest(unittest.TestCase):
-    """The fixed adapter: which tools need which part of the host's reserved context."""
+    """The fixed adapter on stock term-llm: a whitelisted request plus via: chat, nothing else.
+
+    Legacy fork variables in the environment (stock hosts inherit and never strip
+    them) are not proof of anything: they are neither forwarded nor required."""
     FORK = {'TERM_LLM_PRIVATE_SESSION': '1', 'TERM_LLM_SESSION_ID': 'own-session', 'TERM_LLM_UPLOADS_JSON': '[]'}
 
     def setUp(self):
@@ -225,78 +228,53 @@ class AdapterContextTest(unittest.TestCase):
         self.record.unlink(missing_ok=True)
         return calls
 
-    def test_reading_and_preparing_need_the_protected_session_not_upload_provenance(self):
-        prepare = {'id': 'support-' + 'a' * 32, 'columns': [{'from': 'A'}], 'format': 'csv', 'name': 'a.csv', 'into': 'prep'}
-        for tool, args in (('data_supporting_read', {'id': 'support-' + 'a' * 32}), ('data_supporting_prepare', prepare),
-                           ('data_script', {'code': 'puts 1', 'into': 'x', 'references': ['support-' + 'a' * 32]}),
-                           ('data_plan_propose', {'source': 'input-' + 'a' * 32, 'preparation': {'analyst': {'text': 'x'}}}),
-                           ('data_merge_propose', {'preparation': {'analyst': {'text': 'x'}}})):
-            with self.subTest(tool=tool):
-                self.call(tool, dict(args, _private_session=True, _session_id='forged', _uploads=[{'path': '/etc/passwd'}]), **self.FORK)
-                ((argv, request),) = self.calls()
-                self.assertEqual(['data', 'arc'], argv)
-                self.assertEqual((True, 'own-session'), (request['_private_session'], request['_session_id']))
-                self.assertNotIn('_uploads', request)  # no upload manifest reaches readers/preparation
-        # Same proof without any manifest variable: reading/listing intake references never needs uploads.
-        no_manifest = {key: value for key, value in self.FORK.items() if key != 'TERM_LLM_UPLOADS_JSON'}
-        for tool in ('data_supporting_read', 'data_supporting_list', 'data_supporting_prepare'):
-            self.call(tool, {'id': 'support-' + 'a' * 32}, **no_manifest)
-            ((_argv, request),) = self.calls()
-            self.assertEqual((True, 'own-session'), (request['_private_session'], request['_session_id']))
-            self.assertEqual([] if tool == 'data_supporting_list' else None, request.get('_uploads'))
-        self.assertEqual({'version': 1, 'error': 'STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED'},
-                         self.call('data_supporting_take', {'ref': 'b' * 32}, **no_manifest))  # taking an upload needs the manifest
-        self.assertEqual([], self.calls())
-        upload = {'id': 'b' * 32, 'path': '/x/uploads/b', 'filename': 'm.csv', 'media_type': 'text/csv', 'size_bytes': 3}
-        for tool in ('data_supporting_list', 'data_supporting_take'):
-            self.call(tool, {'ref': 'b' * 32}, **dict(self.FORK, TERM_LLM_UPLOADS_JSON=json.dumps([upload])))
-            ((_argv, request),) = self.calls()
-            self.assertEqual([upload], request['_uploads'])
+    def test_requests_carry_no_context_with_or_without_legacy_variables(self):
+        support = 'support-' + 'a' * 32
+        prepare = {'id': support, 'columns': [{'from': 'A'}], 'format': 'csv', 'name': 'a.csv', 'into': 'prep'}
+        upload = {'id': 'b' * 32, 'path': '/etc/passwd', 'filename': 'm.csv', 'media_type': 'text/csv', 'size_bytes': 3}
+        legacy = (dict(self.FORK), dict(self.FORK, TERM_LLM_UPLOADS_JSON=json.dumps([upload])), {})
+        for tool, args, expected in (
+                ('data_supporting_list', {}, {'op': 'supporting_list'}),
+                ('data_supporting_read', {'id': support}, {'op': 'supporting_read', 'id': support}),
+                ('data_supporting_prepare', prepare, dict(prepare, op='supporting_prepare')),
+                ('data_script', {'code': 'puts 1', 'into': 'x', 'references': [support]},
+                 {'op': 'script', 'code': 'puts 1', 'into': 'x', 'references': [support]}),
+                ('data_plan_propose', {'source': 'input-' + 'a' * 32, 'preparation': {'analyst': {'text': 'x'}}},
+                 {'op': 'plan_propose', 'source': 'input-' + 'a' * 32, 'preparation': {'analyst': {'text': 'x'}}}),
+                ('data_merge_propose', {'preparation': {'analyst': {'text': 'x'}}},
+                 {'op': 'merge_propose', 'preparation': {'analyst': {'text': 'x'}}}),
+                ('data_master_lists_propose', {'source': 'input-' + 'a' * 32},
+                 {'op': 'master_lists_propose', 'source': 'input-' + 'a' * 32})):
+            for context in legacy:
+                with self.subTest(tool=tool, context=sorted(context)):
+                    # Model JSON forging context keys, a workspace or the route is dropped too.
+                    forged = dict(args, _private_session=True, _session_id='forged', _uploads=[upload], workspace='zed', via='shell')
+                    self.assertEqual({'version': 1, 'status': 'ok'}, self.call(tool, forged, **context))
+                    self.assertEqual([[['data', 'arc'], dict(expected, via='chat')]], self.calls())
 
-    def test_stock_or_malformed_hosts_fail_closed_before_any_backend_call(self):
-        stock = ({}, {'TERM_LLM_SESSION_ID': 'own-session'},  # stock 0.9.99 sets a session ID, never the marker/manifest
-                 {'TERM_LLM_PRIVATE_SESSION': '1'},  # marker without a session
-                 {'TERM_LLM_SESSION_ID': 'own-session', 'TERM_LLM_UPLOADS_JSON': '[]'},  # manifest without the admission marker
-                 {'TERM_LLM_PRIVATE_SESSION': '', 'TERM_LLM_SESSION_ID': 'own-session', 'TERM_LLM_UPLOADS_JSON': '[]'},  # unadmitted session
-                 dict(self.FORK, TERM_LLM_UPLOADS_JSON='{}'), dict(self.FORK, TERM_LLM_UPLOADS_JSON=''), dict(self.FORK, TERM_LLM_SESSION_ID='../x'),
-                 dict(self.FORK, TERM_LLM_PRIVATE_SESSION='true'))
-        gated = (('data_supporting_read', {'id': 'support-' + 'a' * 32}), ('data_supporting_list', {}),
-                 ('data_supporting_prepare', {'id': 'support-' + 'a' * 32}),
-                 ('data_script', {'code': 'x', 'into': 'x', 'references': []}),
-                 ('data_plan_propose', {'preparation': {}}), ('data_merge_propose', {'preparation': {}}))
-        for context in stock:
-            for tool, args in gated:
-                with self.subTest(tool=tool, context=context):
-                    self.assertEqual({'version': 1, 'error': 'STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED'}, self.call(tool, args, **context))
-        self.assertEqual([], self.calls())
-
-    def test_existing_tools_keep_their_requests_and_refuse_on_stock_hosts(self):
-        for tool, args, expected in (('data_script', {'code': 'puts 1', 'into': 'x'}, {'op': 'script', 'code': 'puts 1', 'into': 'x'}),
-                                     ('data_plan_propose', {'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32},
-                                      {'op': 'plan_propose', 'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32}),
-                                     ('data_merge_propose', {}, {'op': 'merge_propose'})):
-            with self.subTest(tool=tool):
-                self.call(tool, args, **self.FORK)  # the request is exactly as before: no context keys added
-                self.assertEqual([[['data', 'arc'], dict(expected, via='chat')]], self.calls())
-                self.assertEqual({'version': 1, 'error': 'STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED'}, self.call(tool, args))
+    def test_chat_upload_take_refuses_use_intake_before_any_backend_call(self):
+        upload = {'id': 'b' * 32, 'path': '/etc/passwd', 'filename': 'm.csv', 'media_type': 'text/csv', 'size_bytes': 3}
+        for context in ({}, self.FORK, dict(self.FORK, TERM_LLM_UPLOADS_JSON=json.dumps([upload]))):
+            with self.subTest(context=sorted(context)):
+                self.assertEqual({'version': 1, 'error': 'STANDARD_SUPPORTING_USE_INTAKE'},
+                                 self.call('data_supporting_take', {'ref': 'b' * 32, '_uploads': [upload], '_private_session': True,
+                                                                    '_session_id': 'forged'}, **context))
                 self.assertEqual([], self.calls())
 
     def test_new_definitions_are_declared_and_coding_agents_get_none(self):
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
         block = definition.split('    - name: data_supporting_prepare\n', 1)[1].split('    - name:', 1)[0]
-        for term in ('script: scripts/data_tool.py', 'additionalProperties: false', 'required: [id, columns, format, name, into]',
-                     'STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED', 'never changed', 'refuse'):
+        for term in ('script: scripts/data_tool.py', 'additionalProperties: false', 'required: [id, columns, format, name, into]'):
             self.assertIn(term, block)
         self.assertIn('intake-preparation,', definition)
         self.assertIn('provider: cdck_frontier', definition)
-        self.assertIn('lock_session: true', definition)
         for agent in ('converter-developer', 'converter-reviewer', 'migration-operator'):
             text = (ROOT / 'integrations/term-llm' / agent / 'agent.yaml').read_text()
             for name in ('data_supporting_', 'preparation:', 'references:'):
                 self.assertNotIn(name, text)
         # Stock hosts inherit the service environment and per-tool `env:` into custom
         # tools without stripping reserved keys: shipped definitions/installer config
-        # must never set them, or a stock host could forge the protected context.
+        # never set the legacy fork variables (nothing may look like host-proved context).
         import re
         for path in [*(ROOT / 'integrations/term-llm').glob('*/agent.yaml'), ROOT / 'script/metal']:
             text = path.read_text()
@@ -305,17 +283,14 @@ class AdapterContextTest(unittest.TestCase):
                 for key in ('TERM_LLM_PRIVATE_SESSION', 'TERM_LLM_UPLOADS_JSON', 'TERM_LLM_SESSION_ID'):
                     self.assertNotIn(key, text)
         skill = (ROOT / 'integrations/term-llm/skills/intake-preparation/SKILL.md').read_text()
-        # Guidance names the generic capabilities, never the old private package.
+        # Guidance never names the old private package.
         for path in (ROOT / 'integrations/term-llm/migration-data').rglob('*'):
             if path.is_file():
                 text = path.read_text()
                 for stale in ('TERM_LLM_PACKAGE', 'private_upload_context', 'paired'):
                     self.assertNotIn(stale, text, path.name)
-        for text in ((ROOT / 'integrations/term-llm/migration-data/system.md').read_text(), definition):
-            for term in ('session_scope_lock: 1', 'custom_tool_session_context: 1', 'no old private package'):
-                self.assertIn(term, text)
-        for term in ('code', 'scope choice', 'not implemented', 'data_supporting_prepare', 'one** plan', 'Start'):
-            self.assertIn(term, skill)
+        # Wording of guidance is the integration owner's; only the tool it teaches is pinned here.
+        self.assertIn('data_supporting_prepare', skill)
 
 
 class CodingAgentBoundaryTest(unittest.TestCase):
@@ -348,21 +323,25 @@ class BackendPreparationTest(Fixture):
     """bin/data_tools.py with faked Docker/control and real files, registry and preparer."""
 
     def setUp(self):
+        # Intake admission refuses group-writable ancestors; don't inherit a host's umask 002.
+        old_umask = os.umask(0o022)
+        self.addCleanup(os.umask, old_umask)
         super().setUp()
-        self.uploads = Path(self.temp.name) / 'uploads'
-        self.uploads.mkdir(mode=0o700)
-        patch = mock.patch.dict(os.environ, {'SILO_TESTING': '1', 'SILO_SUPPORT_UPLOADS_ROOT': str(self.uploads)})
-        patch.start()
-        self.addCleanup(patch.stop)
-        self.session = {'_private_session': True, '_session_id': 'chat-1'}
+        # The model path on stock term-llm: the fixed adapter's whitelisted request plus
+        # via: chat. No session marker, session ID or upload manifest exists.
+        self.session = {'via': 'chat'}
 
     def reference(self, data, filename='wishes.xlsx'):
-        path = self.uploads / ('c' * 32)
+        """The ordinary intake flow: the file is dropped in intake and the engineer
+        classifies it as a reference on Files (shell/Project page path)."""
+        path = self.intake / filename
         path.write_bytes(data)
-        path.chmod(0o600)
-        upload = {'id': 'c' * 32, 'path': str(path), 'filename': filename, 'media_type': 'application/octet-stream', 'size_bytes': len(data)}
-        taken = self.op('supporting_take', ref='c' * 32, _uploads=[upload], **self.session)['file']
-        return taken['id'], path
+        item = next(entry for entry in self.d.drop_listing(self.workspace()) if entry['path'] == filename)
+        change = {'action': 'classify', 'role': 'reference', 'files': [item]}
+        preview = self.op('file_roles_preview', change=change, by='Engineer')
+        result = self.op('file_roles_commit', change=change, digest=preview['digest'], by='Engineer')
+        (reference,) = [entry for entry in result['roles']['references'] if entry['identity']['path'] == filename]
+        return reference['support_id'], path
 
     def project(self):
         self.create()
@@ -391,9 +370,8 @@ class BackendPreparationTest(Fixture):
         request = dict(id=identity, sheet='Mapping', header_row=1, format='yaml', shape='map', name='category_map.yml', into='prep',
                        columns=[{'from': 'Old category', 'to': 'source_name', 'required': True},
                                 {'from': 'New category ID', 'to': 'target_id', 'type': 'integer'}])
-        self.refused('STANDARD_SUPPORTING_PRIVATE_SESSION_REQUIRED', 'supporting_prepare', **request)
-        self.refused('STANDARD_SUPPORTING_PRIVATE_SESSION_REQUIRED', 'supporting_prepare', via='chat', **request)
-        started = self.op('supporting_prepare', **request, **self.session)
+        # No session context is needed or consulted; forged legacy keys change nothing.
+        started = self.op('supporting_prepare', **request, **self.session, _private_session=True, _session_id='forged')
         self.assertEqual('work/prep/category_map.yml', started['output'])
         summary, mounts = self.run_job(started)
         self.assertEqual(('ok', 3), (summary['status'], summary['rows']))
@@ -421,12 +399,7 @@ class BackendPreparationTest(Fixture):
                        'outcomes': [{'id': 'cats', 'requirement': 'Categories mapped', 'disposition': 'prepared_input', 'input': 'category_map.yml'}],
                        'questions': [{'id': 'q1', 'text': 'Unmapped?', 'status': 'resolved', 'resolution': 'Keep as is'}],
                        'exclusions': [{'id': 'badges', 'text': 'Badges', 'reason': 'Deferred'}]}
-        # A model-facing (chat) request needs the protected session for both documents.
-        for documents in ({'preparation': preparation}, {'run_inputs': run_inputs}):
-            self.refused('STANDARD_SUPPORTING_PRIVATE_SESSION_REQUIRED', 'plan_propose', source=source, settings=settings, via='chat', **documents)
-        # A chat reference must be on Files (persisted role registry) before a plan can cite it.
-        self.refused('STANDARD_PREPARATION_INVALID: reference', 'plan_propose', source=source, settings=settings,
-                     preparation=preparation, **self.session)
+        # An intake reference is already on Files: the chat proposal needs no context.
         self.assertEqual([], calls)
         self.persist_roles()
         file_id = next(item['id'] for item in self.roles()['files'].values() if item.get('support_id') == identity)
@@ -465,9 +438,10 @@ class BackendPreparationTest(Fixture):
         self.refused('STANDARD_PREPARATION_INVALID: a cited reference changed', 'plan_propose', source=source, settings=settings, preparation=stale)
         forged = dict(bound_inputs, files=[dict(bound_inputs['files'][0], lineage={'preparation': {'job': 'job-' + '0' * 12}})])
         self.refused('STANDARD_RUN_INPUTS_INVALID', 'plan_propose', source=source, settings=settings, run_inputs=forged)
-        # The model-facing path never accepts lineage or bound-only keys, even with the session.
+        # The model-facing path never accepts lineage or bound-only keys, even with forged context.
         for bad in (bound_inputs, dict(run_inputs, mount='/x')):
-            self.refused('STANDARD_RUN_INPUTS_INVALID', 'plan_propose', source=source, settings=settings, run_inputs=bad, via='chat', **self.session)
+            self.refused('STANDARD_RUN_INPUTS_INVALID', 'plan_propose', source=source, settings=settings, run_inputs=bad,
+                         _private_session=True, _session_id='forged', **self.session)
         self.assertEqual(1, len(calls))
         # Lineage carries the digest of the bytes the job actually read; a job record whose
         # digest no longer matches the reference is refused, never re-described.
@@ -536,6 +510,85 @@ class BackendPreparationTest(Fixture):
         state.write_text(json.dumps(doc))
         return input_id
 
+    def historical_upload(self, data=b'legacy chat notes\n', session_id='chat-legacy-1', refid='d' * 32):
+        """A record an earlier native-upload release admitted; kept byte-for-byte as history."""
+        self.op('supporting_list', **self.session)  # initializes the private store
+        root = self.base / 'arc/.silo-migrate/data/supporting'
+        identity = 'support-' + 'f' * 32
+        blob = root / 'files' / identity
+        blob.write_bytes(data)
+        blob.chmod(0o400)
+        record = {'id': identity, 'filename': 'legacy-notes.txt', 'size_bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
+                  'session_id': session_id, 'refid': refid, 'media_type': 'text/plain', 'imported_at': 1700000000,
+                  'provenance': 'private-session-upload'}
+        path = root / 'index' / (identity + '.json')
+        path.write_text(json.dumps(record))
+        path.chmod(0o600)
+        return identity, record, path
+
+    def test_ordinary_intake_reference_lists_and_reads_with_no_session_context(self):
+        self.project()
+        identity, original = self.reference(b'Old,New\nGeneral,4\n', filename='notes.txt')
+        listed = self.op('supporting_list', **self.session)
+        self.assertEqual({'status', 'files', 'available_refs', 'has_more', 'version'}, set(listed))
+        self.assertEqual([], listed['available_refs'])  # no chat uploads are offered on stock term-llm
+        self.assertEqual([identity], [item['id'] for item in listed['files']])
+        self.assertEqual(hashlib.sha256(original.read_bytes()).hexdigest(), listed['files'][0]['sha256'])
+        read = self.op('supporting_read', id=identity, **self.session)
+        self.assertEqual(('text', 'Old,New\nGeneral,4\n', False), (read['mode'], read['text'], read['truncated']))
+        # A forged manifest is never echoed as available uploads.
+        forged = self.op('supporting_list', _private_session=True, _session_id='chat-1',
+                         _uploads=[{'id': 'a' * 32, 'path': str(original), 'filename': 'x.txt', 'media_type': 'text/plain', 'size_bytes': 1}],
+                         **self.session)
+        self.assertEqual(listed, forged)
+
+    def test_forged_upload_take_is_refused_use_intake_and_registers_nothing(self):
+        self.project()
+        legacy, record, path = self.historical_upload()
+        outside = Path(self.temp.name) / 'uploads'
+        outside.mkdir(mode=0o700)
+        stolen = outside / ('a' * 32)
+        stolen.write_bytes(b'host secret')
+        stolen.chmod(0o600)
+        store = self.base / 'arc/.silo-migrate/data/supporting'
+        before = sorted(p.name for p in store.rglob('*'))
+        manifest = [{'id': 'a' * 32, 'path': str(stolen), 'filename': 'x.txt', 'media_type': 'text/plain', 'size_bytes': 11}]
+        env = {'SILO_TESTING': '1', 'SILO_SUPPORT_UPLOADS_ROOT': str(outside), 'TERM_LLM_PRIVATE_SESSION': '1',
+               'TERM_LLM_SESSION_ID': 'chat-1', 'TERM_LLM_UPLOADS_JSON': json.dumps(manifest)}
+        with mock.patch.dict(os.environ, env):
+            for request in ({'ref': 'a' * 32, '_private_session': True, '_session_id': 'chat-1', '_uploads': manifest, 'via': 'chat'},
+                            {'ref': 'a' * 32, '_private_session': True, '_session_id': 'chat-1', '_uploads': manifest},  # shell route too
+                            # Replaying a historical session/refid is not "already registered" either.
+                            {'ref': record['refid'], '_private_session': True, '_session_id': record['session_id'], '_uploads': manifest, 'via': 'chat'},
+                            {'ref': 'a' * 32}, {}):
+                with self.subTest(request=sorted(request)):
+                    self.refused('STANDARD_SUPPORTING_USE_INTAKE', 'supporting_take', **request)
+        self.assertEqual(before, sorted(p.name for p in store.rglob('*')))
+        self.assertEqual(b'host secret', stolen.read_bytes())
+        self.assertEqual(json.dumps(record), path.read_text())  # history untouched, session ID included
+
+    def test_historical_upload_records_keep_lineage_and_stay_usable(self):
+        source = self.project()
+        legacy, record, path = self.historical_upload()
+        self.assertEqual([legacy], [item['id'] for item in self.op('supporting_list', **self.session)['files']])
+        self.assertEqual('legacy chat notes\n', self.op('supporting_read', id=legacy, **self.session)['text'])
+        self.persist_roles()
+        file_id = next(item['id'] for item in self.roles()['files'].values() if item.get('support_id') == legacy)
+        settings = self.inject_input('converter-settings')
+        calls = self.capture_proposals()
+        self.op('plan_propose', source=source, settings=settings, preparation={'analyst': {'text': 'Cite the old notes'},
+                'references': [{'support_id': legacy}]}, **self.session)
+        ((_argv, documents),) = calls
+        self.assertEqual([{'file_id': file_id, 'sha256': record['sha256']}], documents['--preparation']['references'])
+        self.assertEqual(json.dumps(record), path.read_text())
+        # Custody checks are unchanged: tampered bytes are refused, never re-described.
+        blob = self.base / 'arc/.silo-migrate/data/supporting/files' / legacy
+        blob.chmod(0o600)
+        blob.write_bytes(b'LEGACY CHAT NOTES\n')
+        blob.chmod(0o400)
+        self.refused('STANDARD_SUPPORTING_CHECKSUM_MISMATCH', 'supporting_read', id=legacy, **self.session)
+        self.refused('STANDARD_SUPPORTING_CHECKSUM_MISMATCH', 'script', code='puts 1', into='z', references=[legacy], **self.session)
+
     def test_run_inputs_and_preparation_arguments_are_validated_before_the_backend(self):
         source = self.project()
         settings = self.inject_input('converter-settings')
@@ -559,10 +612,10 @@ class BackendPreparationTest(Fixture):
                 self.refused(code, 'plan_propose', **args)
         self.assertEqual([], calls)
 
-    def test_script_references_are_verified_copies_and_need_the_session(self):
+    def test_script_references_are_verified_copies_without_session_context(self):
         self.project()
         identity, _upload = self.reference(b'old,new\na,b\n', filename='map.csv')
-        self.refused('STANDARD_SUPPORTING_PRIVATE_SESSION_REQUIRED', 'script', code='puts 1', into='a', references=[identity])
+        self.refused('STANDARD_SUPPORTING_ID_INVALID', 'script', code='puts 1', into='a', references=['support-x'])
         self.refused('STANDARD_SUPPORTING_ID_INVALID', 'script', code='puts 1', into='b', references=['../x'], **self.session)
         self.refused('STANDARD_SUPPORTING_NOT_FOUND', 'script', code='puts 1', into='c', references=['support-' + 'e' * 32], **self.session)
         self.assertEqual([], list((self.base / 'arc/.silo-migrate/data/jobs').glob('refs-*')))  # refused attempts leave no copies
@@ -733,6 +786,12 @@ class BackendPreparationTest(Fixture):
                 with self.assertRaisesRegex(self.d.Refusal, '^STANDARD_SUPPORTING_NOT_FOUND'):
                     self.d.main(['data', 'zed'], self.values, self.base, ROOT, self.host,
                                 io.StringIO(json.dumps(dict(op=op, **extra, **self.session))), self.control)
+        # A forged session or upload manifest is not provenance: the other project's
+        # custody stays unreachable.
+        with self.assertRaisesRegex(self.d.Refusal, '^STANDARD_SUPPORTING_NOT_FOUND'):
+            self.d.main(['data', 'zed'], self.values, self.base, ROOT, self.host,
+                        io.StringIO(json.dumps({'op': 'supporting_read', 'id': identity, 'via': 'chat', '_private_session': True,
+                                                '_session_id': 'chat-1', '_uploads': []})), self.control)
 
     def test_master_lists_is_one_proposal_never_a_started_job(self):
         source = self.project()
@@ -784,7 +843,6 @@ class BackendPreparationTest(Fixture):
         calls = self.capture_proposals()
         preparation = {'analyst': {'text': 'Merge with categories mapped'}, 'references': [{'support_id': identity}],
                        'outcomes': [{'id': 'a', 'requirement': 'Map A to B', 'disposition': 'manual'}]}
-        self.refused('STANDARD_SUPPORTING_PRIVATE_SESSION_REQUIRED', 'merge_propose', preparation=preparation, via='chat')
         self.op('merge_propose', preparation=preparation, **self.session)
         ((argv, documents),) = calls
         self.assertEqual('--preparation', argv[-2])

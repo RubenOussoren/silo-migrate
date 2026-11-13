@@ -1,5 +1,13 @@
 # Running a Migrations node day to day
 
+> **Current stock workflow:** this release uses official, unmodified term-llm 0.9.103
+> through normal `silo update`. Intake/reference preparation needs no fork package,
+> native marker or capability command. Keep `TERM_LLM_PACKAGE` empty/unset. Earlier
+> protected-native handoff instructions below are historical, not prerequisites.
+> Conversation locking and trusted chat-upload import are deferred. Use Files intake
+> and a new migration-data chat after updating; see [intake-preparation.md](intake-preparation.md).
+
+
 `silo` (in every release at `<prefix>/current/bin/silo`) wraps the routine work. Link it once
 as root so it's on your PATH and always follows the current release:
 
@@ -47,11 +55,16 @@ Then open a chat with **migration-data** (Frontier only) in that project, for ex
 source database, and tell me the forum software and version, table prefix, charset and the
 main row counts. Then propose a schema finding with invented examples."
 
-## Small reference files through chat
+## Supporting references through Files intake
 
-On a node with the **paired private-attachment native build**, open a new migration-data chat in the correct project and use the normal attachment control for an XLSX/CSV/TSV or small reference document. Ask the agent to keep it as a supporting reference and inspect the needed sheets/ranges. This does not replace or label Development/Launch/Base inputs and does not approve/change a run. Dumps/backups continue through intake. Do not attach customer files in coding chats.
-
-Stock 0.9.99 alone is not sufficient: `silo doctor` checks the native upload-context and session-lock capabilities, and supporting tools fail closed when absent. See [private chat attachments](chat-attachments.md) for limits, custody, the exact paired package requirement and deliberate operator installation; an ordinary update must not be described as enabling this feature without that package.
+On the supported official stock host, upload XLSX/CSV/TSV or a supported small
+reference document through the project's intake folder, then classify it as
+**Supporting reference** on Project → Files. Ask migration-data in that project to
+inspect the needed sheets/ranges and prepare the converter-native file. Original
+bytes and provenance remain private to the workspace. This does not replace source
+or Base, approve a plan or start a run. Use a new chat after an update so it selects
+the current tool definitions. Chat-upload import/drag-drop provenance is deferred;
+`STANDARD_SUPPORTING_USE_INTAKE` means use this flow, not install a native package.
 
 ## The data agent (migration-data)
 
@@ -134,21 +147,14 @@ and the web UI keeps chats apart:
   Notes are model-written: like findings, read them before trusting them (a hostile export could
   try to steer what gets written).
 
-**Private analysis has no web tools (current protected-session release).**
-`migration-data` now declares `search: false`; public research belongs in a separate
-clean converter-developer/reviewer chat using generic questions, with only public facts
-relayed back. This supersedes the 2026-11-10 prompt-only decision to leave web tools on.
-Prompts are not a data-loss control, and private analysis must not put customer-derived
-values into a search query, URL or web request.
-
-An isolated older stock 0.9.99 web host still offered `web_search` and `read_url` with
-`search: false`. Such a host cannot satisfy this release's native capability gate.
-The reviewed generic native build clamps search to the locked agent's own setting,
-regardless of request/UI/host defaults, and removes both tools when it is false.
-Actual invented-data/fake-provider tests verify the private offered-tool surface.
-This is not universal DLP: other configured tools and trusted operator chats retain
-their own permissions. See [intake-preparation.md](intake-preparation.md) for the
-context, DBHub enablement and coordinated native-update contract.
+**Stock analysis preferences, not durable DLP.** `migration-data` retains Frontier-only
+`allowed_models` and `search: false`. Use clean coding/research chats for public lookups,
+with generic questions only; never send customer-derived values in a query or URL.
+The supported stock host does not provide the experimental durable conversation lock
+or trusted native session marker. Search preferences must not be described as guaranteed
+web-tool removal. Initial full-flow testing uses invented data. Stronger restart,
+retarget and configuration-widening privacy protections are explicitly deferred.
+See [intake-preparation.md](intake-preparation.md) for the supported stock workflow.
 
 **Private converter links never use web tools.** Links to
 `github.com/discourse-org/discourse-converters` and PR numbers go through `dev_branch_resolve`
@@ -406,47 +412,39 @@ silo prime                                             # on its own: it asks for
 
 `silo doctor` shows the socket and cache time. `op-cache stop` (as the account) clears the key at once.
 
-## Private conversation capability gate (intake-first release)
+## Stock native updates and deferred conversation protection
 
-The intake-first release requires generic native **`session_scope_lock=1`** and
-**`custom_tool_session_context=1`** for its locked private agent, all private custom
-tools and the agent's project DBHub exposure. `lock_session: true` in a YAML file is
-not enough: older stock builds silently ignore it. A copied environment marker is
-not an attestation either. `silo doctor` now reports private data conversation
-support separately from chat uploads; chat drag/drop remains deferred.
+This release pins the official, unmodified **term-llm 0.9.103** archive and verifies
+its reviewed SHA-256 against the official checksums. No capability command, native
+session marker, `lock_session` key or `SILO_PROTECTED_SESSIONS` grant is required.
 
-Installer apply checks the selected binary after package verification and before
-switching to a release with a locked agent or writing private-agent/MCP configuration.
-Forward update deliberately checks the **currently selected** native before the release
-switch; rollback checks the native candidate when `--term-llm` was requested. An existing
-unprotected node therefore **cannot acquire this release via a blind `silo update`**.
-The initial native handoff must be separately approved and use the reviewed package
-verification/application path (`metal plan`/`apply`) before ordinary source updates can
-resume. This is intentional fail-closed behavior, not a suggestion to replace a binary
-by hand. The old attachment package does not satisfy the new generic capabilities.
-Unsupported capabilities refuse with `METAL_PRIVATE_SESSION_REQUIRED`.
-The refusal retains current release/history and originals. A stale
-`SILO_PROTECTED_SESSIONS=1` grant is deliberately removed when the current native
-proof fails, before any binary selection, or on an early agent/default-agent failure;
-it is re-added only after the final verified host/agent checks. If this attempt selects
-an incapable binary, the previous selection is restored and DBHub stays disabled.
-Rollback to an unlocked release removes the literal for older parser compatibility.
-The control file is installer-managed but account-owned; same-account operator writes
-remain trusted, not OS isolation. Unsafe/link/oversized grant files fail closed.
-None of this is permission to remove `lock_session`, forge environment fields, install
-the old attachment package, or manipulate stored job/session JSON. Existing ordinary
-unlocked releases do not require these capabilities. A selected binary passing a probe
-does not by itself prove that an already-running service uses it.
+For an existing node whose installer tracks the right branch, the approved idle-window
+operator command remains:
 
-**No automatic deployment is authorized by source publication.** An engineer must
-separately approve a reviewed native package handoff and the exact coordinated
-installation/service transition. Plan that transition so the old host cannot serve
-new private-agent/MCP definitions during an update. Inspect actual service-process
-binary identity, select fresh protected chats, and perform invented-data runtime
-acceptance before customer enablement. Do not simply run an old source-only update
-recipe to unlock intake. Package transfer, configuration changes and service
-stop/restart remain explicit operator actions, not actions performed by this source
-work or by tests. Preserve the previous release, native binary and receipts.
+```sh
+sudo silo update
+```
+
+That fast-forwards the installer, updates Silo and its pinned official native binary,
+refreshes managed service arguments when needed, restarts the web service and runs
+doctor. Existing 0.9.93/0.9.99 version settings are accepted as older release pins;
+no manual version edit is needed. Keep `TERM_LLM_PACKAGE` empty/unset for stock
+operation. A previously explicit experimental package needs review before returning
+to stock; it is not silently ignored. The existing control-runtime artifact package
+is separate and remains verified, not replaced with a native binary or Ruby gem.
+
+Use an idle maintenance window and preserve the previous release/native receipts
+and a consistent private session-database/configuration backup. Updates interrupt
+chats. Verify the running service and start a new migration-data chat; do not alter
+old session rows, remove locks or fabricate context to retrofit a conversation.
+
+Stronger durable conversation locking, trusted native tool identity, cross-resume/
+retarget privacy guarantees and trusted chat-upload import are **deferred**, not
+implemented by stock settings. Frontier-only agent model rules, project-bound custom
+tools and DBHub's migration-data rules remain, but are not universal DLP or OS
+isolation. Doctor warns about the deferred guarantee without blocking intake tools.
+Run invented-data acceptance before any separately approved customer-data use.
+Source publication does not authorize a server connection, update or restart.
 
 ## Checking a change
 

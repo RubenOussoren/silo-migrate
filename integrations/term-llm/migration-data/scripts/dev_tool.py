@@ -47,29 +47,11 @@ def control_path():
 
 def control_env():
     env = dict(os.environ)
+    # Legacy fork context variables are never trusted or forwarded (stock env is spoofable).
     for key in ("TERM_LLM_UPLOADS_JSON", "TERM_LLM_PRIVATE_SESSION", "TERM_LLM_SESSION_ID"):
         env.pop(key, None)
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     return env
-
-
-def protected_session():
-    """Same uniform gate as data_tool.py: these tools belong to the customer-data agent,
-    so they run only in a chat whose host proves the protected session (private marker
-    and session ID, set by the protected-session native host from trusted context, never by the model).
-    A present-but-malformed upload manifest is an unexpected host: refuse."""
-    session_id = os.environ.get("TERM_LLM_SESSION_ID", "")
-    if os.environ.get("TERM_LLM_PRIVATE_SESSION") != "1" or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
-        return False
-    raw = os.environ.get("TERM_LLM_UPLOADS_JSON")
-    if raw is not None:
-        try:
-            uploads = json.loads(raw) if raw and len(raw.encode("utf-8")) <= 64 * 1024 else None
-        except ValueError:
-            uploads = None
-        if not isinstance(uploads, list) or len(uploads) > 32:
-            return False
-    return True
 
 
 def fail(code):
@@ -121,8 +103,6 @@ def main():
     workspace = chat_project()
     if workspace is None or not WORKSPACE.match(workspace):
         return fail("STANDARD_CHAT_NOT_IN_PROJECT")
-    if not protected_session():
-        return fail("STANDARD_SUPPORTING_NODE_UPDATE_REQUIRED")
     timeout = 85 if tool in ("data_branches", "data_branch_resolve") else 55
     try:
         op, keys = TOOLS[tool]
