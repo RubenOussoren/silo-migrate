@@ -118,6 +118,29 @@ class StandardBaseSiteReviewTest < StandardReviewRunTest
     end
   end
 
+  def test_base_archive_size_selects_the_review_db_tier
+    with_base do
+      seen = []
+      original = @service.method(:review_limits)
+      @service.define_singleton_method(:review_limits) { |input_bytes: 0| seen << input_bytes; original.call(input_bytes: input_bytes) }
+      base_plan
+      propose_review
+      assert_equal [@service.store.named_state.dig('inputs', @base, 'bytes'), 0], seen
+      # A large bound archive on a 128 GiB / 4 CPU host: bigger DB, bound in the plan and forwarded.
+      @service.define_singleton_method(:review_limits) { |input_bytes: 0| original.call(input_bytes: input_bytes + 4 * 1024**3) }
+      @service.define_singleton_method(:host_capacity) { [4, 128 * 1024] }
+      plan = base_plan
+      assert_equal 16_384, plan.dig(:limits, 'db', 'memory_mib')
+      assert_equal 7200, plan.dig(:limits, 'db', 'restore_timeout_seconds')
+      run_review(plan)
+      db = @runtime.calls.find { |cmd| cmd[0, 2] == %w[docker run] && cmd.include?("#{instance_name(plan)}-db") }
+      assert_equal '16384m', db[db.index('--memory') + 1]
+      assert_includes db, 'DB_SHARED_BUFFERS=4096MB'
+      assert_equal '1024m', db[db.index('--shm-size') + 1]
+      assert_equal %w[postgres -c maintenance_work_mem=1024MB], db.last(3)
+    end
+  end
+
   def test_base_wrong_input_type
     with_base { standard_error('STANDARD_INPUTS_INCOMPLETE') { propose_review(base_site: @ids['settings']) } }
   end

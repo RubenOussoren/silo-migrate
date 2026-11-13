@@ -48,6 +48,12 @@ module SiloMigrate
       include StandardMergeInspection
 
       STAGES = %w[preflight convert site_up baseline uploads import verify_site final_backup review_url restore verify_restore].freeze
+      # Host-defined operation labels only: never filenames, SQL, or exception text.
+      STEP_TIMING_NAMES = %w[inputs.copy base.inventory base.hash base.copy base.enable_restore base.restore
+                             base.disable_restore base.web_ready base.verify workers.pre_restore source.quiesce
+                             source.extract source.validate_dump source.copy_dump source.load source.migrate
+                             source.copy_uploads].freeze
+      MAX_STEP_TIMING_MS = 24 * 3600 * 1000
 
       CAPABILITIES = {
         "standard_full_snapshot" => "supported_synthetic",
@@ -65,7 +71,7 @@ module SiloMigrate
 
       RECOVERY = {
         "STANDARD_INPUTS_INCOMPLETE" => "The dataset's registered inputs are incomplete or span more than one input directory. Register a corrected dataset, then re-plan.",
-        "STANDARD_STACK_FAILED" => "A local instance could not start. Inspect private evidence, reset this run, then re-plan.",
+        "STANDARD_STACK_FAILED" => "A local instance startup or shutdown check failed. Keep it for private diagnosis; after addressing the cause, reset this run and re-plan.",
         "STANDARD_RUNNER_FAILED" => "A helper script failed inside an instance. Inspect private evidence, reset this run, then re-plan.",
         "STANDARD_STALE_PLAN" => "Code, runtime or inputs changed after approval. Reset this run, then propose and approve a new plan.",
         "STANDARD_BUSY" => "Another run held the execution lock. Reset this run, then re-plan.",
@@ -1016,6 +1022,35 @@ module SiloMigrate
         end
       end
 
+      # Record elapsed time even when a step raises; durations are not success claims.
+      def measure_run_step(run_id, name)
+        raise StandardWorkflowError, "STANDARD_INTERNAL" unless STEP_TIMING_NAMES.include?(name)
+
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        yield
+      ensure
+        record_step_elapsed(run_id, name, started) if started
+      end
+
+      def record_step_elapsed(run_id, name, started)
+        milliseconds = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round.clamp(0, MAX_STEP_TIMING_MS)
+        @store.update do |state|
+          timings = state.fetch("runs").fetch(run_id).fetch("results")["step_timings_ms"] ||= {}
+          timings[name] = milliseconds
+        end
+      rescue StandardError
+        # Optional telemetry must never mask the operation's own error or stop a
+        # valid restore. Critical stage/checkpoint state writes still fail normally.
+        nil
+      end
+
+      def public_step_timings(run)
+        raw = run.dig("results", "step_timings_ms")
+        return {} unless raw.is_a?(Hash)
+
+        raw.slice(*STEP_TIMING_NAMES).select { |_name, elapsed| elapsed.is_a?(Integer) && elapsed.between?(0, MAX_STEP_TIMING_MS) }
+      end
+
       def record_assertions(run_id, group, failures:)
         @store.write_private(@store.run_dir(run_id, "evidence", "#{group}.failures.json"), JSON.pretty_generate(failures) + "\n") unless failures.empty?
         @store.update do |state|
@@ -1068,6 +1103,7 @@ module SiloMigrate
       end
 
       def materialize_inputs(run_id, body, named, layout: true)
+        timing_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         bound = body.fetch("input_binding").map { |binding| [named.fetch("inputs").fetch(binding.fetch("id")), binding] }
         # Convert plans name their inputs by ID instead of owning one dataset folder.
         problem = layout && input_layout_problem(bound.map(&:first))
@@ -1107,6 +1143,8 @@ module SiloMigrate
           end
           binding.slice("id", "type", "sha256", "bytes").merge("relative" => relative)
         end
+      ensure
+        record_step_elapsed(run_id, "inputs.copy", timing_started) if timing_started
       end
 
       def snapshot_helpers(run_id)
@@ -1333,6 +1371,8 @@ module SiloMigrate
         stack = create_stack(run_id, "review", body.dig("instances", "review"), limits: [REVIEW_OPERATION, MERGE_OPERATION, PREPARE_OPERATION].include?(body["operation"]) ? body.fetch("limits") : nil,
                              extra_env: body["base_site"] ? review_environment(body.dig("instances", "review", "port")).merge([MERGE_OPERATION, PREPARE_OPERATION].include?(body["operation"]) ? { "DISCOURSE_AUTHORIZED_EXTENSIONS" => "*", "DISCOURSE_DISABLE_SYSTEM_EDIT_NOTIFICATIONS" => "true" } : {}) : {})
         assert_runtime_identity!(run_id, stack, "review")
+        # Fail on this image's stop protocol before spending time restoring a large Base.
+        measure_run_step(run_id, "workers.pre_restore") { merge_quiesce_web!(run_id, stack, code: "STANDARD_STACK_FAILED") } if prepare_plan?(plan_for(run_id))
       end
 
       def create_stack(run_id, role, target, limits: nil, extra_env: {})
@@ -1777,22 +1817,27 @@ module SiloMigrate
       end
 
       def restore_archive(run_id, stack, archive, label, expected_sha256:, safe_filename: nil)
-        raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "archive bytes changed") unless Digest::SHA256.file(archive).hexdigest == expected_sha256
+        timed = lambda do |step, &operation|
+          label == "base-restore" ? measure_run_step(run_id, "base.#{step}", &operation) : operation.call
+        end
+        digest = timed.call("hash") { Digest::SHA256.file(archive).hexdigest }
+        raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "archive bytes changed") unless digest == expected_sha256
 
         filename = safe_filename || File.basename(archive)
         ensure_dir = stack.web_exec(["sh", "-c", "mkdir -p #{PrebuiltStack::DISCOURSE_ROOT}/public/backups/default && chown -R discourse:discourse #{PrebuiltStack::DISCOURSE_ROOT}/public/backups /shared/backups"], timeout: 30)
         raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "backup dir") unless ensure_dir.success?
 
-        stack.copy_in(archive, "#{PrebuiltStack::DISCOURSE_ROOT}/public/backups/default/#{filename}")
+        timed.call("copy") { stack.copy_in(archive, "#{PrebuiltStack::DISCOURSE_ROOT}/public/backups/default/#{filename}") }
         result = nil
         begin
-          enabled = stack.discourse_shell(%w[bundle exec script/discourse enable_restore], env_password: false, timeout: 300)
+          enabled = timed.call("enable_restore") { stack.discourse_shell(%w[bundle exec script/discourse enable_restore], env_password: false, timeout: 300) }
           raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "enable_restore") unless enabled.success?
 
-          result = stack.discourse_shell(["bundle", "exec", "script/discourse", "restore", filename, "--location", "local"], timeout: 1200)
+          timeout = review_restore_timeout(plan_for(run_id).dig("body", "limits"))
+          result = timed.call("restore") { stack.discourse_shell(["bundle", "exec", "script/discourse", "restore", filename, "--location", "local"], timeout: timeout) }
           log(run_id, label, result)
         ensure
-          disabled = stack.discourse_shell(%w[bundle exec script/discourse disable_restore], env_password: false, timeout: 300)
+          disabled = timed.call("disable_restore") { stack.discourse_shell(%w[bundle exec script/discourse disable_restore], env_password: false, timeout: 300) }
           log(run_id, "#{label}-disable", disabled)
           raise StandardWorkflowError.new("STANDARD_RESTORE_FAILED", "disable_restore") unless disabled.success?
         end
@@ -1926,6 +1971,8 @@ module SiloMigrate
                                                                        "review_url", "import_issues", "run_inputs", "master_lists", "base_site", "base_site_ahead", "base_site_unknown_migrations", "site_schema_version", "base_discourse_version", "base_schema_version", "discourse_version", "schema_version", "backup_discourse_version", "backup_schema_version", "review_runtime"),
           artifacts: public_artifacts(run["artifacts"]), started_at: run["started_at"], finished_at: run["finished_at"]
         }
+        timings = public_step_timings(run)
+        result[:results]["step_timings_ms"] = timings unless timings.empty?
         if status == "not_started"
           result[:recovery] = "No process has started this run, so no instance was created. Its plan and output names are used. Run: silo-migrate standard run recover #{@workspace} #{run['id']}, then propose and approve a new plan."
         end

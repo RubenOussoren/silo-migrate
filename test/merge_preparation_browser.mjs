@@ -28,12 +28,14 @@ const board = {
     step: step({ kind: 'merge_prepare', plan_id: prepPlan, plan_status: 'consumed', run_id: prepRun, run_status: 'completed' }) }] };
 const plans = {
   [newPrep]: { plan_id: newPrep, status: 'proposed', digest: 'd'.repeat(64), operation: 'standard_merge_prepare', delivery: { kind: 'development', version: 2 },
-    base_site: base, roles: {}, inputs: [], mutations: ['Restores the Base site locally'], not_included: ['merge'] },
+    base_site: base, roles: {}, inputs: [], limits: { db: { cpus: 4, memory_mib: 16384, restore_timeout_seconds: 7200 }, web: { cpus: 2, memory_mib: 8192 } },
+    mutations: ['Restores the Base site locally'], not_included: ['merge'] },
   [mergePlan]: { plan_id: mergePlan, status: 'proposed', digest: 'f'.repeat(64), operation: 'standard_merge', delivery: { kind: 'development', version: 2 },
     base_site: base, roles: {}, inputs: [], merge: { layer: { present: false }, options: {} }, prepared_from: { run_id: prepRun, generation }, intent: 'stock',
     merge_environment: environment, mutations: [], not_included: [] } };
 const prepDetail = { run_id: prepRun, plan_id: prepPlan, status: 'completed', operation: 'standard_merge_prepare', stages: { prepare: 'completed' },
-  results: { review_runtime: { actual_version: '2026.9.0', track: 'stable', mode: 'version_match' } }, merge_environment: environment, review_site_available: true, base_site: base };
+  results: { step_timings_ms: { 'base.restore': 1826000, 'source.load': 12000, 'PRIVATE_TIMING_CANARY': 1, 'base.hash': 'PRIVATE_VALUE_CANARY' },
+    review_runtime: { actual_version: '2026.9.0', track: 'stable', mode: 'version_match' } }, merge_environment: environment, review_site_available: true, base_site: base };
 try {
   const page = await browser.newPage({ viewport: { width: 1100, height: 900 } });
   const errors = [], posts = [];
@@ -85,6 +87,10 @@ try {
   assert.match(run, /Prepared\. No migration has run\. Inspection stays live until a merge or a reset\./);
   assert.match(run, /None: nothing to back up or release before a clean merged result/);
   assert.match(run, /read-only tools only/);
+  assert.match(run, /Step timings/i);
+  assert.match(run, /Restore Base\s+30 min 26 s/);
+  assert.match(run, /Load source SQL\s+12.0 s/);
+  assert.doesNotMatch(run, /PRIVATE_TIMING_CANARY|PRIVATE_VALUE_CANARY/);
   assert.doesNotMatch(run, /ssh -N|Show admin password|Release backup|127\.0\.0\.1/);
   assert.equal(await page.getByRole('button', { name: 'Reset the environment' }).count(), 1);
 
@@ -95,6 +101,8 @@ try {
   assert.match(plan, /Nothing is merged or migrated; there is no output backup to release\./);
   assert.match(plan, /migration-data can read both sites’ private content/);
   assert.doesNotMatch(plan, /Converter/);
+  assert.match(plan, /Database: 4 CPU · 16 GiB RAM; App: 2 CPU · 8 GiB RAM/);
+  assert.match(plan, /120 min · not an estimate/);
   await page.getByRole('button', { name: 'Approve', exact: true }).click();
   await page.waitForFunction(() => true);
   for (let i = 0; i < 50 && posts.length < 2; i++) await new Promise(r => setTimeout(r, 20));

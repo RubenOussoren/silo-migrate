@@ -249,7 +249,8 @@ class StandardReviewRunTest < StandardConvertRunTest
 
       public = @service.show_run(run_id)
       assert_equal({ 'reconciliation_checks' => 3, 'reconciliation_matched' => 1, 'reconciliation_differs' => 1, 'reconciliation_errors' => 1,
-                     'review_url' => 'http://127.0.0.1:18080', 'import_issues' => 0 }, public[:results].reject { |key, _| key == 'review_runtime' })
+                     'review_url' => 'http://127.0.0.1:18080', 'import_issues' => 0 }, public[:results].reject { |key, _| %w[review_runtime step_timings_ms].include?(key) })
+      assert_equal ['inputs.copy'], public.dig(:results, 'step_timings_ms').keys
       assert_equal 'latest', public.dig(:results, 'review_runtime', 'mode')
       assert_equal @service.lock.dig('images', 'web', 'ref'), public.dig(:results, 'review_runtime', 'image_ref')
       assert_match(/\Asha256:[a-f0-9]{64}\z/, public.dig(:results, 'review_runtime', 'resolved_image_id'))

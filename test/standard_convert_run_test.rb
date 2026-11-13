@@ -368,7 +368,8 @@ class StandardConvertRunTest < SiloMigrateTest
 
       public = @service.show_run(run_id)
       assert_equal({ 'input_count' => 3, 'input_bytes' => public.dig(:results, 'input_bytes'), 'conversion_summary' => 'present',
-                     'reconciliation_checks' => 3, 'reconciliation_matched' => 1, 'reconciliation_differs' => 1, 'reconciliation_errors' => 1 }, public[:results])
+                     'reconciliation_checks' => 3, 'reconciliation_matched' => 1, 'reconciliation_differs' => 1, 'reconciliation_errors' => 1 }, public[:results].reject { |key, _| key == 'step_timings_ms' })
+      assert_equal ['inputs.copy'], public.dig(:results, 'step_timings_ms').keys
       [JSON.generate(@service.status), JSON.generate(public)].each do |text|
         refute_match(/"reconciliation":/, text)
         refute_includes text, '1146'

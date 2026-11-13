@@ -9,6 +9,26 @@ const runtimeLabel = (runtime) => runtime ? `${runtime.actual_version} · ${runt
 const resetNote = (release) => release ? 'The released backup stays in the output folder.' : 'The unreleased backup is kept with the run.';
 
 const RUN_DONE = new Set(['completed', 'failed', 'interrupted']);
+const TIMING_LABELS = {
+  'inputs.copy': 'Copy and verify inputs', 'workers.pre_restore': 'Pre-restore shutdown check',
+  'base.inventory': 'Base migration inventory', 'base.hash': 'Verify Base archive', 'base.copy': 'Copy Base archive',
+  'base.enable_restore': 'Enable restore', 'base.restore': 'Restore Base', 'base.disable_restore': 'Disable restore',
+  'base.web_ready': 'Base app health', 'base.verify': 'Verify restored Base', 'source.quiesce': 'Stop Base writers',
+  'source.extract': 'Extract source', 'source.validate_dump': 'Validate source dump', 'source.copy_dump': 'Copy source dump',
+  'source.load': 'Load source SQL', 'source.migrate': 'Migrate source', 'source.copy_uploads': 'Copy source uploads',
+};
+const duration = (ms) => ms < 1000 ? `${ms} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.floor(ms / 60000)} min ${Math.floor(ms / 1000) % 60} s`;
+const resourceLabel = (limits) => ['db', 'web'].flatMap((role) => {
+  const item = (limits || {})[role] || {};
+  if (!Number.isFinite(item.cpus) || item.cpus <= 0 || !Number.isInteger(item.memory_mib) || item.memory_mib <= 0) return [];
+  const gib = (item.memory_mib / 1024).toFixed(2).replace(/\.?0+$/, '');
+  return [`${role === 'db' ? 'Database' : 'App'}: ${item.cpus} CPU · ${gib} GiB RAM`];
+}).join('; ') || null;
+const timingBlock = (values) => {
+  const rows = Object.entries(TIMING_LABELS).filter(([key]) => Number.isInteger((values || {})[key]) && values[key] >= 0 && values[key] <= 86400000)
+    .map(([key, label]) => [label, duration(values[key])]);
+  return rows.length ? block('Step timings', table(['Step', 'Elapsed'], rows), el('p', { class: 'hint' }, 'Elapsed work, including failed steps; not an estimate or proof of success.')) : null;
+};
 const operationLabel = (operation) => (operation === 'standard_review' ? 'Import into a review site' : operation === 'standard_convert' ? 'Convert run' : operation === 'standard_merge' ? 'Merge run'
   : operation === 'standard_master_lists' ? 'Master-list export (preparation)' : operation === PREPARE ? 'Prepare merge environment' : 'Run');
 // Preparing a merge environment is not a merge or a convert run: nothing is migrated, backed up or released.
@@ -424,6 +444,8 @@ export function runsView(ctx) {
       ['Source site', merge ? `Its full backup, with uploads · Discourse ${safe((merging.source || {}).discourse_version || 'unknown')}` : prepare ? 'Its full backup, with uploads' : null],
       ['Base site', onBase ? `${baseLabel(data.base_site)}${data.base_site ? ` · Discourse ${data.base_site.discourse_version}` : ''}${merge || prepare ? ' · the site merged into' : ''}` : null],
       ['Review Discourse', onBase ? runtimeLabel(data.review_runtime) : null],
+      ['Resources', onBase ? resourceLabel(data.limits) : null],
+      ['Restore time limit', onBase && Number.isInteger(((data.limits || {}).db || {}).restore_timeout_seconds) ? `${Math.round(data.limits.db.restore_timeout_seconds / 60)} min · not an estimate` : null],
       ['Prepared environment', bound ? `Run ${short(bound.run_id, 12)} · ${generationLabel(bound)} · exactly this one` : null, true],
       ['Merge rules', merge ? intentLabel(data.intent) : null],
       ['What', convert ? `Converts the data with converters/${data.platform} and checks the counts. Nothing is imported yet.` : review ? 'Imports the converted data into a new local review site and checks the counts there.'
@@ -531,6 +553,8 @@ export function runsView(ctx) {
       : data.status === 'failed' ? `Stopped at ${data.stage || 'a stage'}. Nothing was merged.` : `This preparation is ${data.status.replace('_', ' ')}.`;
     const parts = [];
     if ((data.results || {}).review_runtime) parts.push(block('Pinned Discourse', el('p', {}, safe(runtimeLabel(data.results.review_runtime)))));
+    const timings = timingBlock((data.results || {}).step_timings_ms);
+    if (timings) parts.push(timings);
     if (data.status === 'completed') {
       parts.push(block('Environment', facts([['State', phaseLabel(env)], ['Generation', env && env.generation ? String(env.generation) : 'unknown'],
         ...(live(phase) ? endpointRows(env) : []), ['Output', 'None: nothing to back up or release before a clean merged result']])));
@@ -571,6 +595,8 @@ export function runsView(ctx) {
       : data.status === 'completed' ? (bad.length ? `${bad.map((row) => safe(row.name)).join(', ')} ${bad.length === 1 ? 'doesn\'t' : 'don\'t'} match.` : rows.length ? 'Finished. Every check matches.' : 'Finished.')
         : data.status === 'failed' ? `Stopped at ${data.stage || 'a stage'}.` : `This run is ${data.status.replace('_', ' ')}.`;
     const parts = [];
+    const timings = timingBlock(results.step_timings_ms);
+    if (timings) parts.push(timings);
     if (results.review_runtime) {
       const runtime = results.review_runtime;
       parts.push(block('Review Discourse', el('p', {}, safe(runtimeLabel(runtime))), details(facts([

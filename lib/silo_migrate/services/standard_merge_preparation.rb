@@ -49,28 +49,67 @@ module SiloMigrate
       # Unicorn and every Sidekiq process (forked by unicorn in this image, or its own service)
       # must be gone before a database is sealed, cloned, dropped or renamed.
       #
-      # This script's own command line names the services, as do its parents' and children's:
-      # a Sidekiq process is therefore never found by a command-line substring search. It is a
-      # process of the verified service user, outside this shell's own process chain, whose
-      # program or title is the word "sidekiq". Only those are signalled; a missing tool or an
-      # unreadable process table refuses (exit 4) instead of assuming nothing is running.
-      MERGE_QUIESCE_SCRIPT = <<~'SH'
-        service_uid=$(id -u discourse 2>/dev/null) || exit 4
-        case "$service_uid" in ''|0|*[!0-9]*) exit 4 ;; esac
-        command -v ps >/dev/null 2>&1 || exit 4
-        command -v sv >/dev/null 2>&1 || exit 4
+      # This script's own command line names the services, as do its parents' and children's,
+      # and app-server titles carry request paths: a Sidekiq process is therefore never found by
+      # a command-line substring search. It is a live process of the verified service user,
+      # outside this shell's own ancestors and descendants, whose launch form is Sidekiq's: the
+      # program (or title) is "sidekiq" ("sidekiq 7.3.9 discourse [0 of 5 busy]", ".../bin/sidekiq
+      # -q ..."), the pinned image's demon title "discourse sidekiq", or ruby/bundle launching
+      # that program ("ruby .../bin/sidekiq", "bundle exec sidekiq"). Other arguments never count.
+      # A zombie holds no connection and cannot write, so it is counted, not waited for.
+      #
+      # Drain: TERM (Sidekiq's graceful shutdown; the image uses -t 5 plus a 10 s demon stop)
+      # once, again every 10 s, for at most MERGE_QUIESCE_GRACE seconds. Each signal re-checks
+      # the PID's owner and launch form first (PID reuse). Nothing is ever KILLed: workers still
+      # alive at the deadline fail (exit 2). A missing tool or unreadable process table refuses
+      # (exit 4) instead of assuming nothing is running. Exit codes 1-4 and the final
+      # SILO_QUIESCED are unchanged; one "SILO_QUIESCE reason=..." line carries a fixed reason
+      # and counts only (never process arguments).
+      MERGE_QUIESCE_GRACE = 60
+      MERGE_SERVICE_STOP_WAIT = 30
+      MERGE_QUIESCE_DIAGNOSTIC = /\ASILO_QUIESCE reason=(?:quiesced|stop_failed|workers_remain|app_server_not_down|no_service_user|no_ps|no_sv|process_table_unreadable) workers=\d{1,6} zombies=\d{1,6} stopped=\d{1,6} signalled=\d{1,6} waited=\d{1,6}s grace=\d{1,6}s\z/
+      MERGE_QUIESCE_SCRIPT = (<<~SH + <<~'SH').freeze
+        set -f
+        grace=#{MERGE_QUIESCE_GRACE}
+        stop_wait=#{MERGE_SERVICE_STOP_WAIT}
+        case "${SILO_QUIESCE_GRACE:-}" in ''|*[!0-9]*) ;; *) [ "$SILO_QUIESCE_GRACE" -ge 1 ] && [ "$SILO_QUIESCE_GRACE" -le #{MERGE_QUIESCE_GRACE} ] && grace=$SILO_QUIESCE_GRACE ;; esac
+      SH
+        count=0; zombies=0; stopped=0; signalled=0; waited=0
+        report() { echo "SILO_QUIESCE reason=$1 workers=$count zombies=$zombies stopped=$stopped signalled=$signalled waited=${waited}s grace=${grace}s"; }
+        service_uid=$(id -u discourse 2>/dev/null) || { report no_service_user; exit 4; }
+        case "$service_uid" in ''|0|*[!0-9]*) report no_service_user; exit 4 ;; esac
+        command -v ps >/dev/null 2>&1 || { report no_ps; exit 4; }
+        command -v sv >/dev/null 2>&1 || { report no_sv; exit 4; }
         self=$$
 
+        # $@: one process's arguments, split on whitespace (globbing is off).
+        sidekiq_form() {
+          [ "$#" -gt 0 ] || return 1
+          [ "$*" = "discourse sidekiq" ] && return 0
+          case "${1##*/}" in
+            sidekiq) return 0 ;;
+            ruby|ruby[0-9]*)
+              shift
+              case "${1##*/}" in
+                sidekiq) return 0 ;;
+                bundle) [ "$2" = exec ] && [ "${3##*/}" = sidekiq ] && return 0 ;;
+              esac ;;
+            bundle) [ "$2" = exec ] && [ "${3##*/}" = sidekiq ] && return 0 ;;
+          esac
+          return 1
+        }
+
         workers() {
-          found=""
-          table=$(ps -eo pid=,ppid=,uid=,args= 2>/dev/null) || return 4
+          found=""; count=0; zombies=0; stopped=0
+          table=$(ps -eo pid=,ppid=,uid=,stat=,args= 2>/dev/null) || return 4
           case "$table" in *[0-9]*) ;; *) return 4 ;; esac
+          # Ancestors of this shell.
           chain=" $self "
           cursor=$self
           depth=0
           while [ "$cursor" -gt 1 ] && [ "$depth" -lt 64 ]; do
             parent=0
-            while read -r pid ppid owner args; do
+            while read -r pid ppid owner stat args; do
               [ "$pid" = "$cursor" ] && parent=$ppid
             done <<SILO_TABLE
         $table
@@ -80,31 +119,67 @@ module SiloMigrate
             cursor=$parent
             depth=$((depth + 1))
           done
-          while read -r pid ppid owner args; do
+          # Descendants of this shell, to any depth.
+          own=" $self "
+          pass=0
+          while [ "$pass" -lt 64 ]; do
+            grown=""
+            while read -r pid ppid owner stat args; do
+              case "$own" in *" $pid "*) continue ;; esac
+              case "$own" in *" $ppid "*) grown="$grown$pid " ;; esac
+            done <<SILO_TABLE
+        $table
+        SILO_TABLE
+            [ -z "$grown" ] && break
+            own="$own$grown"
+            pass=$((pass + 1))
+          done
+          chain="$chain$own"
+          while read -r pid ppid owner stat args; do
             case "$pid$ppid$owner" in ''|*[!0-9]*) return 4 ;; esac
+            [ -n "$stat" ] || return 4
             [ "$owner" = "$service_uid" ] || continue
             case "$chain" in *" $pid "*) continue ;; esac
-            [ "$ppid" = "$self" ] && continue
-            case "$args" in
-              sidekiq|sidekiq\ *|*/sidekiq|*/sidekiq\ *|*\ sidekiq|*\ sidekiq\ *) found="$found $pid" ;;
+            sidekiq_form $args || continue
+            case "$stat" in
+              Z*) zombies=$((zombies + 1)); continue ;;
+              T*|t*) stopped=$((stopped + 1)) ;;
             esac
+            found="$found $pid"
+            count=$((count + 1))
           done <<SILO_TABLE
         $table
         SILO_TABLE
           return 0
         }
 
-        sv stop unicorn || exit 1
-        if [ -d /etc/service/sidekiq ]; then sv stop sidekiq || exit 1; fi
-        n=0
+        # Signal one PID only if it is still the service user's live Sidekiq.
+        term() {
+          target=$1
+          row=$(ps -o uid=,stat=,args= -p "$target" 2>/dev/null) || return 0
+          set -- $row
+          [ "$1" = "$service_uid" ] || return 0
+          case "$2" in Z*) return 0 ;; esac
+          shift 2
+          sidekiq_form "$@" || return 0
+          kill -TERM "$target" 2>/dev/null && signalled=$((signalled + 1))
+          return 0
+        }
+
+        sv -w "$stop_wait" stop unicorn || { report stop_failed; exit 1; }
+        if [ -d /etc/service/sidekiq ]; then sv -w "$stop_wait" stop sidekiq || { report stop_failed; exit 1; }; fi
         while :; do
-          workers || exit 4
+          workers || { report process_table_unreadable; exit 4; }
           [ -z "$found" ] && break
-          n=$((n + 1)); [ "$n" -gt 30 ] && exit 2
-          kill -TERM $found 2>/dev/null
+          [ "$waited" -ge "$grace" ] && { report workers_remain; exit 2; }
+          if [ $((waited % 10)) -eq 0 ]; then
+            for pid in $found; do term "$pid"; done
+          fi
           sleep 1
+          waited=$((waited + 1))
         done
-        case "$(sv status unicorn 2>/dev/null)" in down:*) ;; *) exit 3 ;; esac
+        case "$(sv status unicorn 2>/dev/null)" in down:*) ;; *) report app_server_not_down; exit 3 ;; esac
+        report quiesced
         echo SILO_QUIESCED
       SH
 
@@ -175,7 +250,7 @@ module SiloMigrate
         platform = named.fetch("sources").fetch(dataset.fetch("source_id")).fetch("platform").unpack1("m0")
         raise StandardWorkflowError, "STANDARD_INPUTS_INCOMPLETE" unless platform == "discourse"
         source_versions, base = merge_side_bindings!(inputs, base_site)
-        limits = review_limits
+        limits = review_limits(input_bytes: inputs.fetch("source").fetch("bytes") + inputs.fetch("base_site").fetch("bytes"))
         review_capacity!(limits, running: false)
         source_bytes = inputs.fetch("source").fetch("bytes")
         base_bytes = inputs.fetch("base_site").fetch("bytes")
@@ -397,9 +472,15 @@ module SiloMigrate
       end
 
       def merge_quiesce_web!(run_id, stack, code: "STANDARD_MERGE_ENVIRONMENT_DIRTY")
-        result = stack.web_exec(["sh", "-c", MERGE_QUIESCE_SCRIPT], timeout: 120)
+        # Explicit service-stop waits plus the bounded drain and an exec margin.
+        timeout = MERGE_QUIESCE_GRACE + 2 * MERGE_SERVICE_STOP_WAIT + 30
+        result = stack.web_exec(["sh", "-c", MERGE_QUIESCE_SCRIPT], timeout: timeout)
         log(run_id, "merge-quiesce", result)
-        raise StandardWorkflowError.new(code, "quiesce") unless result.success? && result.stdout.to_s.lines.last.to_s.strip == "SILO_QUIESCED"
+        return if result.success? && result.stdout.to_s.lines.last.to_s.strip == "SILO_QUIESCED"
+
+        # Only the script's own fixed-format line (reason and counts) reaches the failure detail.
+        diagnostic = result.stdout.to_s.lines.map(&:strip).grep(MERGE_QUIESCE_DIAGNOSTIC).last
+        raise StandardWorkflowError.new(code, diagnostic ? "quiesce: #{diagnostic.delete_prefix('SILO_QUIESCE ')}" : "quiesce")
       end
 
       # No session may remain on the named databases: terminate, then verify the drain.

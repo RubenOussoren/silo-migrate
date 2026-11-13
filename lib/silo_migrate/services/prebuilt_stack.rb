@@ -23,6 +23,20 @@ module SiloMigrate
                     "BUNDLE_WITH=generic_import", "RAILS_ENV=production",
                     "PGHOST=db", "PGUSER=discourse", "PGPORT=5432", "PGDATABASE=discourse"].freeze
 
+      # The pinned web image's config/pitchfork.conf.rb starts supervised Sidekiq only
+      # when ENV["UNICORN_SIDEKIQS"].to_i > 0; "0" leaves background jobs off.
+      SIDEKIQS = %w[0 1].freeze
+      DEFAULT_SIDEKIQS = "1"
+      ENV_KEY = /\A[A-Z][A-Z0-9_]*\z/
+      # The pinned discourse/postgres image's configure-postgres.sh writes DB_SHARED_BUFFERS
+      # and DB_WORK_MEM into postgresql.conf; its official entrypoint passes `postgres -c`.
+      DEFAULT_SHARED_BUFFERS = "128MB"
+      DEFAULT_WORK_MEM = "8MB"
+      SHARED_BUFFERS_MIB = (128..8192)
+      MAINTENANCE_WORK_MEM_MIB = (64..2048)
+      DEFAULT_DB_SHM = "128m"
+      DB_SHM_MIB = (128..2048)
+
       attr_reader :name, :record
 
       def initialize(runtime:, lock:, name:, record: nil, sleeper: nil)
@@ -39,6 +53,13 @@ module SiloMigrate
       def create!(hostname:, port:, env_file:, labels: {}, extra_env: {}, &progress)
         limits = @lock.fetch("limits").fetch("stack")
         images = @lock.fetch("images")
+        # Refused before any resource exists.
+        sidekiqs = extra_env.fetch("UNICORN_SIDEKIQS", DEFAULT_SIDEKIQS).to_s
+        raise StandardWorkflowError.new("STANDARD_STACK_FAILED", "sidekiqs") unless SIDEKIQS.include?(sidekiqs)
+        unless extra_env.all? { |key, value| key.is_a?(String) && key.match?(ENV_KEY) && !value.to_s.match?(/[\r\n\0]/) }
+          raise StandardWorkflowError.new("STANDARD_STACK_FAILED", "environment")
+        end
+        db_env, db_command, db_shm = db_settings(limits.fetch("db"))
         label_args = labels.merge(LABEL_MANAGED => "true", LABEL_INSTANCE => @name)
                            .flat_map { |key, value| ["--label", "#{key}=#{value}"] }
         record["port"] = port
@@ -64,10 +85,9 @@ module SiloMigrate
         end
 
         start_container("db", images.fetch("db").fetch("id"), limits.fetch("db"), label_args, [
-          "--network", internal, "--network-alias", "db", "--shm-size", "128m",
-          "-v", "#{@name}-pg:/var/lib/postgresql", "--env-file", env_file,
-          "-e", "DB_SHARED_BUFFERS=128MB", "-e", "DB_WORK_MEM=8MB"
-        ], [], &progress)
+          "--network", internal, "--network-alias", "db", "--shm-size", db_shm,
+          "-v", "#{@name}-pg:/var/lib/postgresql", "--env-file", env_file, *db_env
+        ], db_command, &progress)
         wait_for("database") { success?(["docker", "exec", container("db"), "pg_isready", "-U", "postgres"], timeout: 10) }
 
         start_container("redis", images.fetch("redis").fetch("id"), limits.fetch("redis"), label_args, [
@@ -81,8 +101,8 @@ module SiloMigrate
           "-e", "DISCOURSE_REDIS_HOST=redis", "-e", "DISCOURSE_HOSTNAME=#{hostname}",
           "-e", "DISCOURSE_DEVELOPER_EMAILS=sandbox_admin@example.invalid",
           "-e", "DISCOURSE_SMTP_ADDRESS=smtp.invalid", "-e", "DISCOURSE_SMTP_PORT=25",
-          *extra_env.flat_map { |key, value| ["-e", "#{key}=#{value}"] },
-          "-e", "DISCOURSE_DISABLE_EMAILS=yes", "-e", "UNICORN_WORKERS=1", "-e", "UNICORN_SIDEKIQS=1"
+          *extra_env.reject { |key, _value| key == "UNICORN_SIDEKIQS" }.flat_map { |key, value| ["-e", "#{key}=#{value}"] },
+          "-e", "DISCOURSE_DISABLE_EMAILS=yes", "-e", "UNICORN_WORKERS=1", "-e", "UNICORN_SIDEKIQS=#{sidekiqs}"
         ], [], &progress)
 
         start_container("proxy", images.fetch("web").fetch("id"), limits.fetch("proxy"), label_args, [
@@ -204,6 +224,22 @@ module SiloMigrate
           return false
         end
         true
+      end
+
+      # Plan-bound numeric settings only; absent keys keep the legacy defaults and the
+      # image's own command. Each must fit well inside the container's memory cap.
+      def db_settings(limit)
+        shared = limit["shared_buffers_mib"]
+        maintenance = limit["maintenance_work_mem_mib"]
+        shm = limit["shm_mib"]
+        memory = limit.fetch("memory_mib")
+        valid = (shared.nil? || (shared.is_a?(Integer) && SHARED_BUFFERS_MIB.cover?(shared) && shared <= memory / 4)) &&
+                (maintenance.nil? || (maintenance.is_a?(Integer) && MAINTENANCE_WORK_MEM_MIB.cover?(maintenance) && maintenance <= memory / 8)) &&
+                (shm.nil? || (shm.is_a?(Integer) && DB_SHM_MIB.cover?(shm) && shm <= memory / 8))
+        raise StandardWorkflowError.new("STANDARD_STACK_FAILED", "db settings") unless valid
+
+        env = ["-e", "DB_SHARED_BUFFERS=#{shared ? "#{shared}MB" : DEFAULT_SHARED_BUFFERS}", "-e", "DB_WORK_MEM=#{DEFAULT_WORK_MEM}"]
+        [env, maintenance ? ["postgres", "-c", "maintenance_work_mem=#{maintenance}MB"] : [], shm ? "#{shm}m" : DEFAULT_DB_SHM]
       end
 
       def start_container(role, image, limit, label_args, options, command)

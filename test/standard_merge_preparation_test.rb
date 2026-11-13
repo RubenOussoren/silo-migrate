@@ -166,15 +166,23 @@ class StandardMergePreparationTest < StandardMergeRunTest
   # Only the two container facts a test host lacks are supplied: the service account and runit.
   QUIESCE_PRELUDE = <<~'SH'
     id() { if [ "$*" = "-u discourse" ]; then [ -n "$SILO_TEST_SERVICE_UID" ] || return 1; echo "$SILO_TEST_SERVICE_UID"; else command id "$@"; fi; }
-    sv() { echo "sv $*" >> "$SILO_TEST_SV_LOG"; case "$1" in status) echo "down: $2: 1s, normally up" ;; esac; }
+    sv() {
+      echo "sv $*" >> "$SILO_TEST_SV_LOG"
+      if [ "$1" = -w ]; then shift 2; fi
+      case "$1" in
+        stop) [ -z "$SILO_TEST_SV_STOP_FAILS" ] || { echo "timeout: run: $2"; return 1; }; echo "ok: down: $2: 1s, normally up" ;;
+        status) echo "${SILO_TEST_SV_STATUS:-down}: $2: 1s, normally up" ;;
+      esac
+    }
     if [ -n "$SILO_TEST_PS_FAILS" ]; then ps() { return 1; }; fi
   SH
 
-  def quiesce(dir, uid: Process.uid.to_s, path: ENV.fetch('PATH'), wrapped: false, ps_fails: false)
+  def quiesce(dir, uid: Process.uid.to_s, path: ENV.fetch('PATH'), wrapped: false, ps_fails: false, grace: nil, stop_fails: false, status: nil)
     script = QUIESCE_PRELUDE + PREPARATION::MERGE_QUIESCE_SCRIPT
     # Wrapped: a parent shell carries the whole script on its command line as well.
     argv = wrapped ? ['/bin/sh', '-c', '/bin/sh -c "$0"; exit $?', script] : ['/bin/sh', '-c', script]
-    env = { 'SILO_TEST_SERVICE_UID' => uid, 'SILO_TEST_SV_LOG' => File.join(dir, 'sv.log'), 'PATH' => path, 'SILO_TEST_PS_FAILS' => ps_fails ? '1' : '' }
+    env = { 'SILO_TEST_SERVICE_UID' => uid, 'SILO_TEST_SV_LOG' => File.join(dir, 'sv.log'), 'PATH' => path, 'SILO_TEST_PS_FAILS' => ps_fails ? '1' : '',
+            'SILO_QUIESCE_GRACE' => grace.to_s, 'SILO_TEST_SV_STOP_FAILS' => stop_fails ? '1' : '', 'SILO_TEST_SV_STATUS' => status.to_s }
     Open3.capture2e(env, *argv)
   end
 
@@ -190,61 +198,154 @@ class StandardMergePreparationTest < StandardMergeRunTest
     pid
   end
 
+  # A Ruby process that takes the title Sidekiq (or the pinned image's demon) gives itself.
+  def titled(title, ignore_term: false)
+    trap = ignore_term ? 'Signal.trap("TERM", "IGNORE"); ' : ''
+    decoy(RbConfig.ruby, '-e', "#{trap}Process.setproctitle(#{title.dump}); sleep 300", title: title)
+  end
+
   def running?(pid)
     Process.waitpid(pid, Process::WNOHANG).nil?
   rescue Errno::ECHILD
     false
   end
 
+  def diagnostic(out)
+    out.lines.map(&:strip).grep(PREPARATION::MERGE_QUIESCE_DIAGNOSTIC).last.to_s
+  end
+
+  def quiesce_host?
+    File.executable?('/bin/sh') && File.directory?('/proc/self') && system('ps -eo pid=,ppid=,uid=,stat=,args= >/dev/null 2>&1')
+  end
+
+  def with_decoys
+    skip 'needs /bin/sh, /proc and procps ps' unless quiesce_host?
+    @decoys = []
+    Dir.mktmpdir('silo-quiesce') { |dir| yield dir }
+  ensure
+    # Only this test's own children are ever cleaned up here.
+    Array(@decoys).each do |pid|
+      Process.kill('KILL', pid) rescue nil
+      Process.waitpid(pid) rescue nil
+    end
+  end
+
   def test_prepare_quiesce_script_stops_real_sidekiq_and_never_its_own_shell
-    skip 'needs /bin/sh, /proc and procps ps' unless File.executable?('/bin/sh') && File.directory?('/proc/self') && system('ps -eo pid=,ppid=,uid=,args= >/dev/null 2>&1')
     script = PREPARATION::MERGE_QUIESCE_SCRIPT
     # The regression's premise: the script names the services, so its own shell (and any parent
     # or child carrying it) looks like a worker to a command-line search.
     assert_match(%r{/etc/service/sidekiq }, script)
-    refute_match(/pgrep|pkill|killall/, script)
-    @decoys = []
-    Dir.mktmpdir('silo-quiesce') do |dir|
-      File.write(File.join(dir, 'sidekiq'), "trap 'exit 0' TERM\nwhile :; do sleep 1; done\n")
-      program = decoy('/bin/sh', File.join(dir, 'sidekiq'))
-      titled = decoy(RbConfig.ruby, '-e', 'Process.setproctitle("sidekiq 7.3.9 discourse [0 of 5 busy]"); sleep 300', title: 'sidekiq 7.3.9')
-      bystander = decoy('/bin/sh', '-c', 'while :; do sleep 1; done', 'my-sidekiq-notes')
+    refute_match(/pgrep|pkill|killall|KILL/, script)
+    with_decoys do |dir|
+      bin = File.join(dir, 'bin')
+      Dir.mkdir(bin)
+      File.write(File.join(bin, 'sidekiq'), "sleep 300\n")
+      File.write(File.join(dir, 'diagnostic.rb'), "sleep 300\n")
+      # Real launch forms: ruby running a sidekiq program, Sidekiq's own title, the demon's title.
+      program = decoy(RbConfig.ruby, File.join(bin, 'sidekiq'), '-q', 'critical,8')
+      sidekiq = titled('sidekiq 7.3.9 discourse [0 of 5 busy]')
+      demon = titled('discourse sidekiq')
+      # Bystanders that merely carry the word as an argument, a title fragment or a request path.
+      bystanders = [
+        decoy(RbConfig.ruby, File.join(dir, 'diagnostic.rb'), '--label', 'sidekiq'),
+        decoy('/bin/sh', '-c', 'while :; do sleep 1; done', 'my-sidekiq-notes', 'sidekiq'),
+        titled('pitchfork (gen:0) worker[0] - requests: 1, processing: /sidekiq'),
+        titled('ruby /invented/tool sidekiq')
+      ]
 
       # Another account's processes are not this stack's service, whatever they are called.
       out, status = quiesce(dir, uid: (Process.uid + 1).to_s)
       assert_equal [0, 'SILO_QUIESCED'], [status.exitstatus, out.lines.last.to_s.strip], out
-      assert [program, titled, bystander].all? { |pid| running?(pid) }
+      assert_equal 'SILO_QUIESCE reason=quiesced workers=0 zombies=0 stopped=0 signalled=0 waited=0s grace=60s', diagnostic(out)
+      assert [program, sidekiq, demon, *bystanders].all? { |pid| running?(pid) }
 
       # Same account as the workers, script on the shell's and its parent's command line: the
       # workers go, the shell survives to report, and nothing else is signalled.
       out, status = quiesce(dir, wrapped: true)
       refute status.signaled?, out
       assert_equal [0, 'SILO_QUIESCED'], [status.exitstatus, out.lines.last.to_s.strip], out
-      refute running?(program)
-      refute running?(titled)
-      assert running?(bystander)
+      assert_match(/\ASILO_QUIESCE reason=quiesced workers=0 zombies=0 stopped=0 signalled=3 waited=[1-9]\d*s grace=60s\z/, diagnostic(out))
+      [program, sidekiq, demon].each { |pid| refute running?(pid) }
+      assert bystanders.all? { |pid| running?(pid) }
       calls = File.readlines(File.join(dir, 'sv.log'), chomp: true)
-      assert_equal ['sv stop unicorn', 'sv status unicorn'], calls.last(2)
+      assert_equal ['sv -w 30 stop unicorn', 'sv status unicorn'], calls.last(2)
 
-      # Nothing left to stop: an immediate pass, again without touching the bystander.
+      # Already down, nothing left to stop: an immediate pass, again without touching bystanders.
       out, status = quiesce(dir)
       assert_equal [0, 'SILO_QUIESCED'], [status.exitstatus, out.lines.last.to_s.strip], out
-      assert running?(bystander)
+      assert_includes diagnostic(out), 'signalled=0 waited=0s'
+      assert bystanders.all? { |pid| running?(pid) }
+      # No process argument ever reaches the output.
+      refute_match(/diagnostic|processing|notes|invented/, out)
+    end
+  end
+
+  def test_prepare_quiesce_script_bounded_drain_and_fail_closed
+    with_decoys do |dir|
+      # A worker that ignores TERM: bounded wait, repeated TERM, a fixed reason and counts; it is
+      # never KILLed and the script never reports quiesced.
+      stubborn = titled('sidekiq 7.3.9 discourse [1 of 5 busy] stopping', ignore_term: true)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      out, status = quiesce(dir, grace: 2)
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      assert_equal 2, status.exitstatus, out
+      refute_includes out, 'SILO_QUIESCED'
+      assert_equal 'SILO_QUIESCE reason=workers_remain workers=1 zombies=0 stopped=0 signalled=1 waited=2s grace=2s', diagnostic(out)
+      assert_operator elapsed, :<, 30
+      assert running?(stubborn)
+      # The grace can only be shortened by the environment, never extended or disabled.
+      head = PREPARATION::MERGE_QUIESCE_SCRIPT.lines.take_while { |line| !line.include?("count=0;") }.join
+      assert_equal "grace=#{PREPARATION::MERGE_QUIESCE_GRACE}\n", head.lines[1]
+      { '' => '60', '0' => '60', '600' => '60', '61' => '60', 'x' => '60', '-1' => '60', '5' => '5' }.each do |given, effective|
+        out, = Open3.capture2e({ 'SILO_QUIESCE_GRACE' => given }, '/bin/sh', '-c', head + 'echo "$grace"')
+        assert_equal "#{effective}\n", out, given
+      end
+      Process.kill('KILL', stubborn)
+      Process.waitpid(stubborn)
+
+      # A failed stop or an app server still up refuses, with its own exit code and reason.
+      out, status = quiesce(dir, stop_fails: true)
+      assert_equal [1, 'reason=stop_failed'], [status.exitstatus, diagnostic(out).split[1]], out
+      out, status = quiesce(dir, status: 'run')
+      assert_equal [3, 'reason=app_server_not_down'], [status.exitstatus, diagnostic(out).split[1]], out
 
       # Fail closed: no verified service account, no ps, or an unreadable process table.
       empty = File.join(dir, 'empty')
       Dir.mkdir(empty)
-      [{ uid: '' }, { uid: '0' }, { uid: 'discourse' }, { path: empty }, { ps_fails: true }].each do |options|
+      [[{ uid: '' }, 'no_service_user'], [{ uid: '0' }, 'no_service_user'], [{ uid: 'discourse' }, 'no_service_user'],
+       [{ path: empty }, 'no_ps'], [{ ps_fails: true }, 'process_table_unreadable']].each do |options, reason|
         out, status = quiesce(dir, **options)
         assert_equal 4, status.exitstatus, options.inspect + out
         refute_includes out, 'SILO_QUIESCED'
+        assert_equal "reason=#{reason}", diagnostic(out).split[1], options.inspect + out
       end
-      assert running?(bystander)
     end
-  ensure
-    Array(@decoys).each do |pid|
-      Process.kill('KILL', pid) rescue nil
-      Process.waitpid(pid) rescue nil
+  end
+
+  # The failure keeps its public code; only the script's fixed reason/count line reaches the
+  # private failure detail, never other output.
+  def test_prepare_quiesce_failure_detail_is_reason_and_counts_only
+    with_prepare do
+      @runtime.quiesce_result = SiloMigrate::Runtime::CommandResult.new(
+        success?: false, status: 2, stderr: '',
+        stdout: "ok: down: unicorn: 1s, normally up\nruby /invented/private.rb --customer secret\nSILO_QUIESCE reason=workers_remain workers=1 zombies=0 stopped=0 signalled=6 waited=60s grace=60s\n"
+      )
+      run = run_prepare
+      assert_equal 'STANDARD_STACK_FAILED', run.dig(:failure, 'code')
+      detail = JSON.parse(failure_detail(run)).fetch('detail')
+      assert_equal 'STANDARD_STACK_FAILED: quiesce: reason=workers_remain workers=1 zombies=0 stopped=0 signalled=6 waited=60s grace=60s', detail
+      refute_includes run.inspect, 'secret'
+    end
+    with_prepare do
+      @runtime.quiesce_result = SiloMigrate::Runtime::CommandResult.new(success?: false, status: 2, stderr: '',
+        stdout: "SILO_QUIESCE reason=invented_secret workers=1 zombies=0 stopped=0 signalled=1 waited=1s grace=60s\n")
+      run = run_prepare
+      assert_equal 'STANDARD_STACK_FAILED: quiesce', JSON.parse(failure_detail(run)).fetch('detail')
+    end
+    with_prepare do
+      @runtime.quiesce_result = SiloMigrate::Runtime::CommandResult.new(success?: false, status: 2, stderr: '', stdout: "SILO_QUIESCE reason=workers_remain path=/invented/secret\n")
+      run = run_prepare
+      assert_equal 'STANDARD_STACK_FAILED: quiesce', JSON.parse(failure_detail(run)).fetch('detail')
     end
   end
 
@@ -300,7 +401,7 @@ class StandardMergePreparationTest < StandardMergeRunTest
       # Unicorn and Sidekiq are quiesced before anything is sealed or copied; the app starts on
       # the copy and only then is inspection opened, once, for the preparation run.
       quiesce = merge_lines.each_index.select { |index| merge_lines[index].include?('SILO_QUIESCED') }
-      assert_equal 2, quiesce.size
+      assert_equal 3, quiesce.size
       assert merge_lines[quiesce.last].include?('sidekiq')
       seal = index_of(/RENAME TO silo_clean_base/)
       start = index_of(/sv start unicorn/, from: seal)
@@ -706,7 +807,7 @@ class StandardMergePreparationTest < StandardMergeRunTest
       @runtime.quiesce_result = review_ok_output("ok: down: unicorn: 0s\n")
       run = run_prepare
       assert_equal 'STANDARD_STACK_FAILED', run.dig(:failure, 'code')
-      assert_equal 'failed', run.dig(:stages, 'source_load')
+      assert_equal 'failed', run.dig(:stages, 'site_up')
     end
   end
 

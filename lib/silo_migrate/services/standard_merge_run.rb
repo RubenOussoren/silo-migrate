@@ -71,7 +71,7 @@ module SiloMigrate
           limits = prepared_body.fetch("limits")
           instance = prepared_body.dig("instances", "review")
         else
-          limits = review_limits
+          limits = review_limits(input_bytes: inputs.fetch("source").fetch("bytes") + inputs.fetch("base_site").fetch("bytes"))
           review_capacity!(limits, running: false)
           instance = { "name" => "silomig-#{plan_id.delete_prefix('plan-')[0, 8]}-review", "hostname" => "127.0.0.1", "port" => select_review_port(state, port) }
         end
@@ -333,28 +333,32 @@ module SiloMigrate
       def stage_source_load(run_id)
         stack = stack_for(run_id, "review")
         # Unicorn and Sidekiq: nothing may write the restored Base while the source is loaded.
-        merge_quiesce_web!(run_id, stack, code: "STANDARD_STACK_FAILED")
+        measure_run_step(run_id, "source.quiesce") { merge_quiesce_web!(run_id, stack, code: "STANDARD_STACK_FAILED") }
         before = merge_state(stack, run_id: run_id)
         evidence(run_id, "merge-before.json", before)
         source = role_input(run_inputs(run_id), "source")
         directory = @store.run_dir(run_id, "private", "merge-source")
-        extracted = merge_extract!(input_path(run_id, source), directory, [@disk_free.call / 3, 1].max)
+        extracted = measure_run_step(run_id, "source.extract") { merge_extract!(input_path(run_id, source), directory, [@disk_free.call / 3, 1].max) }
         evidence(run_id, "merge-uploads.json", extracted)
         # Checked before any database object exists for it: a refused dump changes nothing.
         adapted = File.join(directory, "adapted.sql.gz")
-        merge_adapt_dump!(File.join(directory, "dump.sql.gz"), adapted, @disk_free.call / 2)
+        measure_run_step(run_id, "source.validate_dump") { merge_adapt_dump!(File.join(directory, "dump.sql.gz"), adapted, @disk_free.call / 2) }
         merge_db(run_id, "CREATE DATABASE merge_source OWNER discourse", db: "postgres", user: "postgres")
         merge_db(run_id, "CREATE EXTENSION IF NOT EXISTS hstore; CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent; CREATE EXTENSION IF NOT EXISTS vector;", user: "postgres")
         functions = @runtime.run(["docker", "exec", stack.container("db"), "pg_dump", "-U", "discourse", "-d", "discourse", "--schema=discourse_functions", "--schema-only", "--no-owner", "--no-acl"], capture: true, timeout: 120)
         merge_checked(run_id, "merge-functions", functions)
         merge_checked(run_id, "merge-functions-load", @runtime.run(["docker", "exec", "-i", stack.container("db"), "psql", "-v", "ON_ERROR_STOP=1", "-U", "discourse", "-d", "merge_source"], capture: true, stdin_data: functions.stdout, timeout: 120))
-        merge_checked(run_id, "merge-dump-copy", @runtime.run(["docker", "cp", adapted, "#{stack.container('db')}:/tmp/silo-merge.sql.gz"], capture: true, timeout: 7200))
+        measure_run_step(run_id, "source.copy_dump") { merge_checked(run_id, "merge-dump-copy", @runtime.run(["docker", "cp", adapted, "#{stack.container('db')}:/tmp/silo-merge.sql.gz"], capture: true, timeout: 7200)) }
         # pipefail propagates either gzip CRC failures or psql ON_ERROR_STOP failures.
-        load = @runtime.run(["docker", "exec", stack.container("db"), "bash", "-o", "pipefail", "-c", "gzip -dc /tmp/silo-merge.sql.gz | psql -v ON_ERROR_STOP=1 -U discourse -d merge_source"], capture: true, timeout: 7200)
-        merge_checked(run_id, "merge-source-load", load)
+        measure_run_step(run_id, "source.load") do
+          load = @runtime.run(["docker", "exec", stack.container("db"), "bash", "-o", "pipefail", "-c", "gzip -dc /tmp/silo-merge.sql.gz | psql -v ON_ERROR_STOP=1 -U discourse -d merge_source"], capture: true, timeout: 7200)
+          merge_checked(run_id, "merge-source-load", load)
+        end
         merge_checked(run_id, "merge-source-config", stack.web_exec(["sh", "-c", "cp /var/www/discourse/config/discourse.conf /shared/merge-source.conf; printf \"\\ndb_name = 'merge_source'\\n\" >> /shared/merge-source.conf; chown discourse:discourse /shared/merge-source.conf; chmod 600 /shared/merge-source.conf"]))
-        migration = stack.discourse_shell(["env", "SILO_MERGE_CONFIG=/shared/merge-source.conf", "SKIP_POST_DEPLOYMENT_MIGRATIONS=0", "RUBYOPT=-r/tmp/merge_source_config.rb", "bundle", "exec", "rake", "db:migrate"], timeout: 7200)
-        merge_checked(run_id, "merge-migrate", migration)
+        measure_run_step(run_id, "source.migrate") do
+          migration = stack.discourse_shell(["env", "SILO_MERGE_CONFIG=/shared/merge-source.conf", "SKIP_POST_DEPLOYMENT_MIGRATIONS=0", "RUBYOPT=-r/tmp/merge_source_config.rb", "bundle", "exec", "rake", "db:migrate"], timeout: 7200)
+          merge_checked(run_id, "merge-migrate", migration)
+        end
         source_state = merge_state(stack, source: true, run_id: run_id)
         unless source_state["database"] == "merge_source" && source_state["pending"] == false
           raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID"
@@ -364,10 +368,12 @@ module SiloMigrate
         # schema_migrations row is added or removed to satisfy the merger. The compatibility
         # stage decides, from both actual inventories, whether a merger may be constructed.
         evidence(run_id, "merge-source.json", source_state)
-        if extracted["root"]
-          stack.copy_in(File.join(directory, "uploads", extracted.fetch("root")), "/shared/source-uploads")
-        else
-          merge_checked(run_id, "merge-empty-uploads", stack.web_exec(%w[mkdir -p /shared/source-uploads]))
+        measure_run_step(run_id, "source.copy_uploads") do
+          if extracted["root"]
+            stack.copy_in(File.join(directory, "uploads", extracted.fetch("root")), "/shared/source-uploads")
+          else
+            merge_checked(run_id, "merge-empty-uploads", stack.web_exec(%w[mkdir -p /shared/source-uploads]))
+          end
         end
         merge_result(run_id, target_before: before.fetch("counts"), source: source_state.fetch("counts"), source_upload_files: extracted.fetch("uploads").size)
       end

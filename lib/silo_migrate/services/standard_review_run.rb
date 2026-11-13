@@ -41,6 +41,23 @@ module SiloMigrate
       REVIEW_MAX_WEB_MIB = 6144
       REVIEW_MAX_DB_MIB = 4096
       REVIEW_MAX_CPUS = 2.0
+      # Large-database tier: chosen only from bound input archive sizes (a compressed
+      # proxy, not the expanded database size) and this host's measured CPUs/RAM.
+      # Smaller inputs or hosts keep the sizing above unchanged.
+      LARGE_INPUT_BYTES = 1024**3
+      LARGE_MIN_HOST_CPUS = 4
+      LARGE_MIN_HOST_MIB = 32 * 1024
+      LARGE_MAX_DB_MIB = 32 * 1024
+      LARGE_MIN_DB_MIB = 16 * 1024
+      LARGE_MAX_WEB_MIB = 8 * 1024
+      LARGE_MAX_DB_CPUS = 4.0
+      LARGE_MAX_WEB_CPUS = 2.0
+      LARGE_MAX_SHARED_BUFFERS_MIB = 8 * 1024
+      LARGE_MAX_MAINTENANCE_WORK_MEM_MIB = 2048
+      LARGE_MAX_SHM_MIB = 2048
+      # Discourse restore command timeout: legacy default, and the bounded large-input one.
+      RESTORE_TIMEOUT_SECONDS = 1200
+      LARGE_RESTORE_TIMEOUT_SECONDS = 7200
 
       # -- planning -------------------------------------------------------------
 
@@ -139,7 +156,8 @@ module SiloMigrate
         end
         delivery = delivery_binding!(source_plan.dig("body", "dataset_id"))
         delivery_roles!(named, roles, delivery)
-        limits = review_limits
+        # The bound Base archive is restored before import; its size picks the DB tier.
+        limits = review_limits(input_bytes: base_site ? named.fetch("inputs").fetch(base_site)["bytes"].to_i : 0)
         review_capacity!(limits, running: false)
         review_port = select_review_port(state, port)
         plan_id = @store.new_id("plan")
@@ -447,7 +465,7 @@ module SiloMigrate
         end
         input = role_input(run_inputs(run_id), "base_site")
         archive = input_path(run_id, input)
-        versions = base_site_dump_migrations!(archive)
+        versions = measure_run_step(run_id, "base.inventory") { base_site_dump_migrations!(archive) }
         raise StandardWorkflowError, "STANDARD_BASE_SITE_INVALID" unless versions.last == binding.fetch("schema_version")
 
         known = site.fetch("migration_versions").to_set
@@ -456,8 +474,17 @@ module SiloMigrate
         restore_versions = ahead ? site : binding
         suffix = "-v#{restore_versions["discourse_version"]&.tr(".", "-")&.+("-")}#{restore_versions.fetch("schema_version")}.sql.gz"
         restore_archive(run_id, stack, archive, "base-restore", expected_sha256: input.fetch("sha256"), safe_filename: "silo-base#{suffix}")
-        wait_restored_web(stack, internal: true)
-        restored = stack.rails_runner("/tmp/review_state.rb")
+        measure_run_step(run_id, "base.web_ready") do
+          # The early Prepare stop deliberately leaves runit down. A native restore
+          # need not restart an app that was down on entry; request up explicitly.
+          if prepare_plan?(plan_for(run_id))
+            started = stack.web_exec(%w[sv up unicorn])
+            log(run_id, "base-web-start", started)
+            raise StandardWorkflowError.new("STANDARD_STACK_FAILED", "base web start") unless started.success?
+          end
+          wait_restored_web(stack, internal: true)
+        end
+        restored = measure_run_step(run_id, "base.verify") { stack.rails_runner("/tmp/review_state.rb") }
         unless restored.dig("settings", "allow_restore") == false && (review_image_migrations - restored.fetch("migration_versions")).empty?
           raise StandardWorkflowError, "STANDARD_RESTORE_FAILED"
         end
@@ -667,16 +694,47 @@ module SiloMigrate
         "from_run"
       end
 
-      def review_limits
+      # input_bytes: total bound archive bytes to restore/load (0 = legacy sizing).
+      # Large inputs on a large enough host get a bigger, still bounded, database and web
+      # site plus plan-bound PostgreSQL memory settings; every role still leaves host
+      # headroom and never drops below the small sizing or the profile minima.
+      def review_limits(input_bytes: 0)
         host_cpus, host_memory = host_capacity
         base = lock.dig("limits", "stack")
         sized = lambda do |role, cpus, memory|
           entry = base.fetch(role)
           { "cpus" => [entry.fetch("cpus"), cpus].max.round(2), "memory_mib" => [entry.fetch("memory_mib"), memory].max, "pids" => entry.fetch("pids") }
         end
-        { "web" => sized.call("web", [REVIEW_MAX_CPUS, host_cpus / 2.0].min, [REVIEW_MAX_WEB_MIB, host_memory / 4].min),
-          "db" => sized.call("db", [REVIEW_MAX_CPUS, host_cpus / 4.0].min, [REVIEW_MAX_DB_MIB, host_memory / 8].min),
-          "redis" => base.fetch("redis").slice("cpus", "memory_mib", "pids"), "proxy" => base.fetch("proxy").slice("cpus", "memory_mib", "pids") }
+        limits = { "web" => sized.call("web", [REVIEW_MAX_CPUS, host_cpus / 2.0].min, [REVIEW_MAX_WEB_MIB, host_memory / 4].min),
+                   "db" => sized.call("db", [REVIEW_MAX_CPUS, host_cpus / 4.0].min, [REVIEW_MAX_DB_MIB, host_memory / 8].min),
+                   "redis" => base.fetch("redis").slice("cpus", "memory_mib", "pids"), "proxy" => base.fetch("proxy").slice("cpus", "memory_mib", "pids") }
+        input_bytes = input_bytes.to_i
+        return limits unless input_bytes >= LARGE_INPUT_BYTES
+
+        limits["db"]["restore_timeout_seconds"] = LARGE_RESTORE_TIMEOUT_SECONDS
+        return limits unless host_cpus >= LARGE_MIN_HOST_CPUS && host_memory >= LARGE_MIN_HOST_MIB
+
+        # Roughly 4x the compressed archive, between 16 and 32 GiB, never above a
+        # quarter of the host. Web gets a sixteenth of the host, up to 8 GiB.
+        input_mib = input_bytes / 1024**2
+        db_mib = [[LARGE_MIN_DB_MIB, input_mib * 4].max, LARGE_MAX_DB_MIB, host_memory / 4].min
+        web_mib = [LARGE_MAX_WEB_MIB, host_memory / 16].min
+        limits["web"]["cpus"] = [limits["web"]["cpus"], [LARGE_MAX_WEB_CPUS, host_cpus / 4.0].min].max.round(2)
+        limits["web"]["memory_mib"] = [limits["web"]["memory_mib"], web_mib].max
+        limits["db"]["cpus"] = [limits["db"]["cpus"], [LARGE_MAX_DB_CPUS, host_cpus / 2.0].min].max.round(2)
+        limits["db"]["memory_mib"] = [limits["db"]["memory_mib"], db_mib].max
+        db_memory = limits["db"]["memory_mib"]
+        limits["db"]["shared_buffers_mib"] = [LARGE_MAX_SHARED_BUFFERS_MIB, db_memory / 4].min
+        limits["db"]["maintenance_work_mem_mib"] = [LARGE_MAX_MAINTENANCE_WORK_MEM_MIB, db_memory / 16].min
+        # Dynamic shared memory for parallel index builds; counted inside the memory cap.
+        limits["db"]["shm_mib"] = [LARGE_MAX_SHM_MIB, [512, db_memory / 16].max].min
+        limits
+      end
+
+      # The plan-bound Discourse restore timeout; plans without one keep the legacy value.
+      def review_restore_timeout(limits)
+        value = limits.is_a?(Hash) ? limits.dig("db", "restore_timeout_seconds") : nil
+        value.is_a?(Integer) && value.between?(RESTORE_TIMEOUT_SECONDS, LARGE_RESTORE_TIMEOUT_SECONDS) ? value : RESTORE_TIMEOUT_SECONDS
       end
 
       # Memory caps of this site plus those of running managed containers must fit in

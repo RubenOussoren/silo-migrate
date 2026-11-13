@@ -252,7 +252,7 @@ tools:
         required: [confirm]
         additionalProperties: false
     - name: data_run_evidence
-      description: "Read one workflow run's private evidence: stages, assertions, results and failure record first, then every log with its size and stage, then bounded tails (failed stage first). run_id may also be the plan ID the Project page's Runs tab shows; the answer names the run."
+      description: "Read one workflow run's private evidence: stages, assertions, results and failure record first, then every log with its size and stage, then bounded tails (failed stage first). run_id may also be the plan ID the Project page's Runs tab shows; the answer names the run. step_timings_ms contains fixed operation labels and elapsed milliseconds, including failed steps, not success claims. Report quiesce reason/counts exactly; do not infer that an already-down app caused a worker-drain timeout or that Reset alone cures it."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 70
@@ -431,7 +431,7 @@ tools:
         required: [source, settings]
         additionalProperties: false
     - name: data_merge_prepare
-      description: "Discourse merge only: propose restoring the current registered Base and full source backup into a disposable prepared merge environment. The host performs source schema migration with the selected Base runtime, validates compatibility and preserves clean checkpoints plus inspection copies. No merge, converter, layer or settings are required. Engineer Approve and separate Start are required. After completion use the returned run ID and generation for inspection and the exact merge plan; do not extract either backup yourself. runtime_preparing means poll this proposal, not a customer run."
+      description: "Discourse merge only: propose restoring the current registered Base and full source backup into a disposable prepared merge environment. The host auto-sizes containers from detected CPU/RAM and bound backup sizes, checks service shutdown before the expensive Base restore, performs source schema migration with the selected Base runtime, validates compatibility and preserves clean checkpoints plus inspection copies. No merge, converter, layer or settings are required. Engineer Approve and separate Start are required. After completion use the returned run ID and generation for inspection and the exact merge plan; do not extract either backup yourself. runtime_preparing means poll this proposal, not a customer run."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 295

@@ -38,6 +38,53 @@ Preparation and Merge have separate approvals: the first authorizes restoring an
 reading the copies, not future mappings. A ready inspection environment is not an
 active migration and should not hold the execution lock indefinitely.
 
+## Large backups and worker shutdown
+
+New plans size the review/preparation containers from the control host's detected
+CPU/RAM and the sizes of the bound backup archives. There is no manual sizing grid
+or new image to install. The plan shows the Database/App CPU and RAM allocation;
+those limits and database memory settings are covered by its exact approval.
+Archive bytes are a useful proxy, not a measurement of the expanded database.
+
+Below 1 GiB total bound archive size, legacy sizing is unchanged. At or above that
+size the restore-command budget is 2 hours rather than 20 minutes; it is a limit,
+not an ETA. Hosts with at least 4 CPUs and 32 GiB RAM also get a larger bounded
+allocation: the database targets 4x archive size within 16–32 GiB, capped at a
+quarter of host memory (never below the existing profile minimum). The app grows
+up to 8 GiB. CPU allocation uses detected capacity, leaving headroom. Existing
+host-memory, retained-instance and disk checks still apply at proposal/start.
+For example, a 128 GiB host and a 2 GiB archive get a 16 GiB DB and 8 GiB app;
+the DB gets 2 CPUs on a 4-CPU host or 4 on an 8-CPU host. Larger archives can grow
+the DB to 32 GiB. Settings/limits on existing instances are not changed in place.
+
+Shared buffers, index-maintenance memory and `/dev/shm` scale within that DB cap;
+`work_mem` stays conservative. The image's durability defaults are not weakened.
+This is not parallel SQL restore: the current plain SQL format cannot be sped up
+by merely adding `pg_restore -j`.
+
+New Prepare runs exercise the service-stop check before restoring the Base, then
+explicitly bring the app back up for the post-restore health check. Workers are
+stopped again before source loading and checkpoint creation. The image's normal
+worker configuration is preserved for later merge finalization and result review;
+preparation does not permanently disable post-processing. The service-stop wait
+and graceful worker drain are bounded; an already-down app is valid. Unknown state or remaining workers still fail closed. A diagnostic reports
+only a fixed reason and counts (no process arguments or customer values). Do not
+interpret an exit-2 worker-drain failure as proof Unicorn was already down/crashed.
+
+The run page and `data_run_evidence` show `step_timings_ms`: fixed operation labels
+with elapsed milliseconds, including failed steps. These separate inventory,
+hashing/copying, restore, health checks, source SQL load and migrations. They are
+not success claims or estimates. Timings are best-effort telemetry; absence of an
+entry alone is not evidence that a step never ran. Use them before further tuning; no speedup for a
+particular customer database has been benchmarked by these source tests.
+
+After a failed Prepare there is still no supported partial-stage resume. Retain
+needed private evidence, address the failure, then explicitly Reset the failed
+run's owned resources and review/Approve/Start a new Prepare plan. Do not edit
+stage flags, adopt a dirty database as clean, or reuse the consumed old plan.
+Once a generation is ready, its later Merge already reuses its clean checkpoints
+without another backup restore. Original input backups remain untouched.
+
 ## CLI (no LLM required)
 
 The same backend is available through the engineer CLI:
