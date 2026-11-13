@@ -308,6 +308,45 @@ class SupportingFilesTest(unittest.TestCase):
             self.docker.stdout = output
             self.refusal(code, 'supporting_read', id=item['id'])
 
+    def test_parser_diagnostic_categories_match_reader(self):
+        self.assertEqual(backend.PARSER_PART_KINDS, load('supporting_reader').PART_KINDS)
+
+    def test_parser_diagnostic_is_bounded_and_allowlisted(self):
+        item = self.legacy()
+        self.docker.returncode = 1
+        code = 'STANDARD_SUPPORTING_INVALID_DOCUMENT'
+        for kind in sorted(backend.PARSER_PART_KINDS):
+            with self.subTest(kind=kind):
+                self.docker.stdout = json.dumps({'status': 'error', 'error': code,
+                    'diagnostic': {'reader_line': 123, 'part_kind': kind}}).encode()
+                with self.assertRaises(helpers.Refusal) as caught:
+                    self.call('supporting_read', id=item['id'])
+                self.assertEqual(code + ': reader_line=123; part_kind=' + kind, str(caught.exception))
+                self.assertNotIn('/secret/path', str(caught.exception))
+                self.assertEqual('ps', self.docker.calls[-1][0][0])
+
+    def test_parser_diagnostic_never_forwards_extra_or_input_derived_detail(self):
+        item = self.legacy()
+        self.docker.returncode = 1
+        valid = {'reader_line': 123, 'part_kind': 'worksheet_relationships'}
+        invalid = [None, [], 'PRIVATE_CANARY', {},
+                   dict(valid, target='https://PRIVATE_CANARY.invalid/secret'),
+                   dict(valid, part_kind='/PRIVATE_CANARY/customer-sheet.xml'),
+                   dict(valid, part_kind=['worksheet']), dict(valid, part_kind=123),
+                   dict(valid, reader_line=True), dict(valid, reader_line=0),
+                   dict(valid, reader_line=-1), dict(valid, reader_line=10001),
+                   dict(valid, reader_line=1.5), dict(valid, reader_line='PRIVATE_CANARY')]
+        for diagnostic in invalid:
+            with self.subTest(diagnostic=diagnostic):
+                self.docker.stdout = json.dumps({'status': 'error',
+                    'error': 'STANDARD_SUPPORTING_INVALID_DOCUMENT', 'diagnostic': diagnostic,
+                    'exception': '/PRIVATE_CANARY/private-path'}).encode()
+                self.refusal('INVALID_DOCUMENT', 'supporting_read', id=item['id'])
+        # Diagnostics cannot make an unknown code trustworthy.
+        self.docker.stdout = json.dumps({'status': 'error', 'error': 'PRIVATE_CANARY',
+                                         'diagnostic': valid}).encode()
+        self.refusal('PARSER_FAILED', 'supporting_read', id=item['id'])
+
     def test_cleanup_absence_must_be_confirmed(self):
         item = self.legacy()
         self.docker.cleanup_bad = True

@@ -207,6 +207,9 @@ if mode == 'refuse':
 if mode == 'detail':
     print('Error: STANDARD_ARGUMENTS_INVALID: timeout_minutes\\nnot this line', file=sys.stderr)
     sys.exit(1)
+if mode == 'reader_diagnostic':
+    print('Error: STANDARD_SUPPORTING_INVALID_DOCUMENT: reader_line=123; part_kind=worksheet_relationships', file=sys.stderr)
+    sys.exit(1)
 if mode == 'large':
     print(json.dumps({'version': 1, 'text': 'x' * (49 * 1024)}))
 elif mode == 'garbage':
@@ -300,6 +303,12 @@ else:
     def test_a_refusal_keeps_its_detail_on_this_side_only(self):
         result, _raw = self.call('data_script', {}, mode='detail')
         self.assertEqual({'version': 1, 'error': 'STANDARD_ARGUMENTS_INVALID: timeout_minutes'}, result)
+
+    def test_supporting_reader_safe_diagnostic_reaches_the_model(self):
+        result, raw = self.call('data_supporting_read', {'id': 'support-' + 'a' * 32}, mode='reader_diagnostic')
+        self.assertEqual({'version': 1, 'error': 'STANDARD_SUPPORTING_INVALID_DOCUMENT: '
+                          'reader_line=123; part_kind=worksheet_relationships'}, result)
+        self.assertLess(len(raw), 200)
 
     def test_bad_arguments_or_unknown_tool_never_invoke_control(self):
         for tool, args in (('data_status', []), ('data_release_finding', {}), ('analyst_run_evidence', {'run_id': self.run_id}),

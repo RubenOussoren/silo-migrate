@@ -31,16 +31,19 @@ helpers = load('live_data_tools', 'bin/data_tools.py')
 control = load('live_control', 'bin/silo-migrate-control')
 
 
-def workbook():
+def workbook(unsafe_relationship=False):
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as archive:
         archive.writestr('[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
         archive.writestr('xl/workbook.xml', '''<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Mappings" sheetId="1" r:id="rId1"/></sheets></workbook>''')
         archive.writestr('xl/_rels/workbook.xml.rels', '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>''')
-        archive.writestr('xl/worksheets/sheet1.xml', '''<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>invented-reference-marker</t></is></c><c r="B1"><f>1+1</f><v>2</v></c></row></sheetData><hyperlinks><hyperlink ref="A1" r:id="rLink"/></hyperlinks></worksheet>''')
+        archive.writestr('xl/worksheets/sheet1.xml', '''<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>invented-reference-marker</t></is></c><c r="B1"><f>1+1</f><v>2</v></c></row></sheetData><hyperlinks><hyperlink ref="A1" r:id="rLink"/></hyperlinks><drawing r:id="rDraw"/></worksheet>''')
         # Common export shape: clickable metadata, not an external data source.
-        archive.writestr('xl/worksheets/_rels/sheet1.xml.rels', '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.invalid/LINK_TARGET_NEVER_FETCH_OR_RETURN" TargetMode="External"/></Relationships>''')
+        # Standard OPC parent-relative reference stays within the ZIP, not the filesystem.
+        target = '../../../PRIVATE_PART_NEVER_RETURN' if unsafe_relationship else '../drawings/drawing1.xml'
+        archive.writestr('xl/worksheets/_rels/sheet1.xml.rels', '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.invalid/LINK_TARGET_NEVER_FETCH_OR_RETURN" TargetMode="External"/><Relationship Id="rDraw" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="%s"/></Relationships>''' % target)
+        archive.writestr('xl/drawings/drawing1.xml', '<wsDr xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>')
     return stream.getvalue()
 
 
@@ -117,7 +120,7 @@ class SupportingLiveTest(unittest.TestCase):
             for name in names:
                 left = subprocess.check_output(['docker', 'ps', '-aq', '--filter', 'name=^/' + name + '$'], timeout=10)
                 self.assertEqual(b'', left.strip())
-            print(json.dumps({'result': 'intake reference custody, no-context chat XLSX/TSV sandbox reads with external hyperlink metadata ignored, take refused USE_INTAKE, formula non-evaluation and exact cleanup passed',
+            print(json.dumps({'result': 'intake reference custody, no-context chat XLSX/TSV sandbox reads with archive-contained parent-relative drawing and inert external hyperlink metadata, take refused USE_INTAKE, formula non-evaluation and exact cleanup passed',
                               'read_containers': len(names), 'migration_state_unchanged': True}))
 
 

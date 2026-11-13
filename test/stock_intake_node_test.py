@@ -23,11 +23,11 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = os.environ.get('STOCK_TERM_LLM_BINARY')
 
 
-def workbook():
+def workbook(unsafe_relationship=False):
     spec = importlib.util.spec_from_file_location('supporting_live_fixture', ROOT / 'test/supporting_live_test.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.workbook()
+    return module.workbook(unsafe_relationship=unsafe_relationship)
 
 
 @unittest.skipUnless(BINARY and os.environ.get('SILO_SUPPORTING_LIVE') == '1', 'opt-in official stock binary and cached Docker test')
@@ -38,7 +38,10 @@ class StockIntakeNodeTest(unittest.TestCase):
     def test_intake_reference_prepares_converter_native_file_in_real_sandbox(self):
         self.check_reference_route(prepare_reference=True)
 
-    def check_reference_route(self, prepare_reference=False):
+    def test_refusal_preserves_safe_diagnostic_through_stock_host(self):
+        self.check_reference_route(refuse_reference=True)
+
+    def check_reference_route(self, prepare_reference=False, refuse_reference=False):
         previous_umask = os.umask(0o077)
         self.addCleanup(os.umask, previous_umask)
         # Preparation uses the real job disk-reserve admission. Use a private
@@ -76,7 +79,7 @@ class StockIntakeNodeTest(unittest.TestCase):
             standard_state.write_text(json.dumps({'config': {'discourse_profile': profile.stem,
                                                             'discourse_profile_sha256': hashlib.sha256(profile.read_bytes()).hexdigest()}}))
             before = named_state.read_bytes(), standard_state.read_bytes()
-            intake_bytes = workbook()
+            intake_bytes = workbook(unsafe_relationship=refuse_reference)
             # Real engineer reference classification; no chat-upload context.
             def load_local(name, relative):
                 loader = importlib.machinery.SourceFileLoader(name, str(ROOT / relative))
@@ -100,7 +103,7 @@ class StockIntakeNodeTest(unittest.TestCase):
             config.mkdir(parents=True)
             (config / 'agents').symlink_to(ROOT / 'integrations/term-llm')
             control = home / 'test-control'
-            control.write_text(f'''#!/usr/bin/env python3
+            control.write_text(f'''#!/usr/bin/env -S python3 -I -B
 import importlib.machinery, importlib.util, io, json, os, sys
 from pathlib import Path
 root = Path({str(ROOT)!r})
@@ -279,11 +282,18 @@ serve:
                 else:
                     self.assertEqual(3, len(requests))
                 self.assertEqual({'CDCK/MoM'}, {item['model'] for item in requests})
-                self.assertIn('rows', outputs[0], outputs)
-                self.assertEqual(1, outputs[0]['ignored_external_hyperlinks'])
+                if refuse_reference:
+                    self.assertEqual({'version', 'error'}, set(outputs[0]))
+                    self.assertRegex(outputs[0]['error'], r'^STANDARD_SUPPORTING_INVALID_DOCUMENT: '
+                                     r'reader_line=[1-9][0-9]{0,4}; part_kind=worksheet_relationships$')
+                    self.assertEqual([], prepared_jobs)
+                else:
+                    self.assertIn('rows', outputs[0], outputs)
+                    self.assertEqual(1, outputs[0]['ignored_external_hyperlinks'])
+                    self.assertEqual('invented-reference-marker', outputs[0]['rows'][0][0]['value'])
+                    self.assertEqual({'type': 'formula', 'formula': True, 'value': None}, outputs[0]['rows'][0][1])
                 self.assertNotIn('LINK_TARGET_NEVER_FETCH_OR_RETURN', json.dumps(requests))
-                self.assertEqual('invented-reference-marker', outputs[0]['rows'][0][0]['value'])
-                self.assertEqual({'type': 'formula', 'formula': True, 'value': None}, outputs[0]['rows'][0][1])
+                self.assertNotIn('PRIVATE_PART_NEVER_RETURN', json.dumps(requests))
                 before_denial = len(requests)
                 code, denied = api('/v1/responses', {'input': 'Do not disclose this transcript.', 'provider': 'chatgpt',
                                                'model': 'gpt-6.1-sol', 'stream': False, 'client_message_id': 'fixture-denied-2',
@@ -301,8 +311,9 @@ serve:
                                  'same-agent stock continuation used the forbidden provider')
                 self.assertEqual(before, (named_state.read_bytes(), standard_state.read_bytes()))
                 self.assertEqual(intake_bytes, original.read_bytes())
-                print(json.dumps({'result': 'official stock intake/read/preparation and same-agent model-policy control passed',
-                                  'arrival': 'intake_without_chat_upload', 'ignored_external_hyperlinks': 1,
+                print(json.dumps({'result': 'official stock intake/read/preparation or bounded refusal and same-agent model-policy control passed',
+                                  'arrival': 'intake_without_chat_upload', 'archive_bound_parent_relative_drawing': not refuse_reference,
+                                  'safe_refusal_diagnostic': refuse_reference,
                                   'stock_web_tools_offered': stock_web_tools,
                                   'durable_conversation_privacy': 'deferred_not_attested',
                                   'prepared_in_real_sandbox': prepare_reference,

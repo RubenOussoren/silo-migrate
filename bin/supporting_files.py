@@ -31,6 +31,13 @@ PARSER_ERRORS = frozenset("STANDARD_SUPPORTING_" + code for code in (
     "INVALID_ARGUMENT", "INVALID_DOCUMENT", "IO", "LIMIT", "OUTPUT_LIMIT",
     "SHEET_NOT_FOUND", "UNSAFE_RELATIONSHIP", "UNSAFE_XML", "UNSUPPORTED",
 ))
+# Diagnostics contain public reader source locations and fixed categories only.
+# Treat even the sandbox's error JSON as untrusted; never forward arbitrary detail.
+PARSER_PART_KINDS = frozenset((
+    "archive", "content_types", "root_relationships", "workbook", "workbook_relationships",
+    "worksheet", "worksheet_relationships", "shared_strings", "other_relationships",
+    "other_xml", "other_part", "csv", "arguments",
+))
 # These identifiers validate retained historical upload records, not current host proof.
 SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -780,6 +787,12 @@ def parser_read(ws, request, api, snapshot, out, format):
         code = value.get("error")
         if (isinstance(code, str) and len(code) <= 80
                 and re.fullmatch(r"STANDARD_SUPPORTING_[A-Z_]+", code) and code in PARSER_ERRORS):
+            diagnostic = value.get("diagnostic")
+            if (isinstance(diagnostic, dict) and set(diagnostic) == {"reader_line", "part_kind"}
+                    and type(diagnostic["reader_line"]) is int and 1 <= diagnostic["reader_line"] <= 10000
+                    and isinstance(diagnostic["part_kind"], str) and diagnostic["part_kind"] in PARSER_PART_KINDS):
+                code += (": reader_line=" + str(diagnostic["reader_line"])
+                         + "; part_kind=" + diagnostic["part_kind"])
             api.refuse(code)
         fail(api, "PARSER_FAILED")
     if result.returncode or not isinstance(value, dict) or value.get("status") != "ok":

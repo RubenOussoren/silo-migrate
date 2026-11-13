@@ -23,6 +23,10 @@ NS = reader.MAIN_NS
 REL = reader.DOC_REL_NS
 PKG = reader.PKG_REL_NS
 CANARY = 'INVENTED-PRIVATE-PATH-AND-CONTENT-7431'
+SOURCE_LINES = SCRIPT.read_text().splitlines()
+PART_KINDS = {'archive', 'content_types', 'root_relationships', 'workbook', 'workbook_relationships', 'worksheet',
+              'worksheet_relationships', 'shared_strings', 'other_relationships', 'other_xml', 'other_part',
+              'csv', 'arguments'}
 
 
 def worksheet(body):
@@ -80,14 +84,29 @@ class SupportingReaderTest(unittest.TestCase):
             self.path.write_bytes(data if isinstance(data, bytes) else data.encode())
         return reader.read_document(self.path, format=kwargs.pop('format', 'xlsx'), **kwargs)
 
-    def refused(self, result, code=None):
+    def refused(self, result, code=None, part=None, diagnostic=True):
+        """Fixed refusal; read_document refusals carry exactly the bounded diagnostic."""
         self.assertEqual(result['status'], 'error', result)
-        self.assertEqual(set(result), {'status', 'error'})
+        self.assertEqual(set(result), {'status', 'error', 'diagnostic'} if diagnostic else {'status', 'error'})
         self.assertTrue(result['error'].startswith('STANDARD_SUPPORTING_'))
         if code:
             self.assertEqual(result['error'], 'STANDARD_SUPPORTING_' + code)
-        self.assertNotIn(CANARY, json.dumps(result))
+        if diagnostic:
+            detail = result['diagnostic']
+            self.assertEqual(set(detail), {'reader_line', 'part_kind'})
+            self.assertIs(type(detail['reader_line']), int)
+            self.assertTrue(1 <= detail['reader_line'] <= min(10000, len(SOURCE_LINES)))
+            self.assertIn(detail['part_kind'], PART_KINDS)
+            if part:
+                self.assertEqual(detail['part_kind'], part)
+        output = json.dumps(result)
+        for leaked in (CANARY, str(ROOT), 'supporting_reader', 'Traceback', '.xml', 'http', 'Error'):
+            self.assertNotIn(leaked, output)
         self.assertLessEqual(len(reader.encoded(result)), 32768)
+        return result.get('diagnostic')
+
+    def source_at(self, result):
+        return SOURCE_LINES[result['diagnostic']['reader_line'] - 1]
 
     def test_sheet_discovery_and_selection(self):
         result = self.read(entries=members([('One & Two', ''), ('Second', '<row><c><v>7</v></c></row>')]))
@@ -367,15 +386,156 @@ class SupportingReaderTest(unittest.TestCase):
         self.refused(self.read(entries=entries, mode='rows'), 'LIMIT')
 
     def test_relationship_target_path_attacks_and_missing_targets(self):
-        targets = ['../outside.xml', 'worksheets/../worksheets/sheet1.xml', '//xl/worksheets/sheet1.xml',
+        targets = ['../outside.xml', '//xl/worksheets/sheet1.xml', '//host/xl/worksheets/sheet1.xml',
                    'worksheets\\sheet1.xml', 'https://example.invalid/x', 'file:///etc/passwd',
-                   'worksheets/%73heet1.xml', 'worksheets/sheet1.xml#part', './worksheets/sheet1.xml',
-                   '', 'missing.xml']
+                   'worksheets/%73heet1.xml', 'worksheets/sheet1.xml#part', 'worksheets/sheet1.xml?x=1',
+                   '', 'missing.xml', 'worksheets//sheet1.xml', 'worksheets/sheet1.xml/', 'worksheets/',
+                   'worksheets', '.', '..', '/', '/../xl/worksheets/sheet1.xml', '/xl/../../xl/worksheets/sheet1.xml',
+                   # Escape above the package root, then re-enter it: refused, never clamped.
+                   '../../xl/worksheets/sheet1.xml', '../../../xl/worksheets/sheet1.xml',
+                   'worksheets/../../../xl/worksheets/sheet1.xml', '/../../xl/worksheets/sheet1.xml',
+                   'worksheets/sheet1.xml\x7f', 'worksheets/\tsheet1.xml', 'C:/xl/worksheets/sheet1.xml',
+                   'worksheets/sheet1.xml/.', 'worksheets/sheet1.xml/fake/..',
+                   'x' * 1025]
         for target in targets:
+            with self.subTest(target=target[:60]):
+                entries = members()
+                entries['xl/worksheets/'] = ''
+                entries['xl/_rels/workbook.xml.rels'] = relationships(relationship('r1', target))
+                self.refused(self.read(entries=entries), 'INVALID_DOCUMENT', 'workbook_relationships')
+        # Same escapes from the package root relationships part.
+        for target in ('../xl/workbook.xml', '/../xl/workbook.xml', './../xl/workbook.xml'):
+            with self.subTest(root_target=target):
+                entries = members()
+                entries['_rels/.rels'] = relationships(relationship('root', target, 'officeDocument'))
+                self.refused(self.read(entries=entries), 'INVALID_DOCUMENT', 'root_relationships')
+
+    def test_dot_segments_resolve_inside_package_without_relaxing_sheet_checks(self):
+        for target in ('./worksheets/sheet1.xml', 'worksheets/../worksheets/sheet1.xml', 'worksheets/./sheet1.xml',
+                       '../xl/worksheets/sheet1.xml', '/xl/./worksheets/../worksheets/sheet1.xml',
+                       'worksheets/../../xl/worksheets/sheet1.xml'):
             with self.subTest(target=target):
                 entries = members()
                 entries['xl/_rels/workbook.xml.rels'] = relationships(relationship('r1', target))
-                self.refused(self.read(entries=entries))
+                result = self.read(entries=entries, mode='rows', columns=1)
+                self.assertEqual(result.get('rows'), [[reader.cell('number', '42')]], result)
+        # Resolved targets still must be xl/*.xml worksheets and unique per workbook.
+        for name, target in (('other/sheet1.xml', '../other/sheet1.xml'), ('xl/worksheets/sheet1.txt',
+                                                                            'worksheets/sheet1.txt')):
+            with self.subTest(target=target):
+                entries = members()
+                entries[name] = entries['xl/worksheets/sheet1.xml']
+                entries['xl/_rels/workbook.xml.rels'] = relationships(relationship('r1', target))
+                self.refused(self.read(entries=entries), 'INVALID_DOCUMENT', 'workbook')
+        entries = members([('A', ''), ('B', '')])
+        entries['xl/_rels/workbook.xml.rels'] = relationships(
+            relationship('r1', 'worksheets/sheet1.xml') + relationship('r2', './worksheets/../worksheets/sheet1.xml'))
+        self.refused(self.read(entries=entries), 'INVALID_DOCUMENT', 'workbook')
+        # sharedStrings must still resolve under xl/.
+        entries = members(shared='<si><t>x</t></si>')
+        entries['shared.xml'] = entries.pop('xl/sharedStrings.xml')
+        entries['xl/_rels/workbook.xml.rels'] = entries['xl/_rels/workbook.xml.rels'].replace(
+            '"sharedStrings.xml"', '"../shared.xml"')
+        self.refused(self.read(entries=entries), 'INVALID_DOCUMENT', 'workbook')
+
+    def drawing_book(self, drawing_target='../drawings/drawing1.xml', image_target='../media/image1.png'):
+        # Invented, Excel-shaped: sheet -> drawing -> image via parent-relative targets.
+        entries = members([('Pictured', '<row><c t="inlineStr"><is><t>caption</t></is></c><c><v>5</v></c></row>')])
+        entries['xl/worksheets/sheet1.xml'] = entries['xl/worksheets/sheet1.xml'].replace(
+            '</worksheet>', '<drawing xmlns:r="%s" r:id="rId1"/></worksheet>' % REL)
+        entries['xl/worksheets/_rels/sheet1.xml.rels'] = relationships(
+            relationship('rId1', drawing_target, 'drawing'))
+        entries['xl/drawings/drawing1.xml'] = (
+            '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+            'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="%s">'
+            '<xdr:pic><a:blip r:embed="rId1"/></xdr:pic></xdr:wsDr>' % REL)
+        entries['xl/drawings/_rels/drawing1.xml.rels'] = relationships(
+            relationship('rId1', image_target, 'image'))
+        entries['xl/media/image1.png'] = b'\x89PNG\r\n\x1a\n' + b'\x00' * 32
+        return entries
+
+    def test_parent_relative_drawing_and_image_targets_accepted(self):
+        # Before the resolver fix these exact bytes refused INVALID_DOCUMENT ('..' was rejected outright).
+        data = zip_bytes(self.drawing_book())
+        sheets = self.read(data)
+        self.assertEqual(sheets, {'status': 'ok', 'format': 'xlsx', 'mode': 'sheets', 'sheets': ['Pictured']})
+        rows = self.read(mode='rows', columns=2)
+        self.assertEqual(rows['rows'], [[reader.cell('string', 'caption'), reader.cell('number', '5')]])
+        # Package-absolute equivalents also work.
+        result = self.read(entries=self.drawing_book('/xl/drawings/drawing1.xml', '/xl/media/image1.png'))
+        self.assertEqual(result['status'], 'ok', result)
+        # Escapes, missing targets and directories in the same parts still refuse with a generic part kind.
+        cases = [('../../drawings/drawing1.xml', None, 'worksheet_relationships'),
+                 ('../../../xl/drawings/drawing1.xml', None, 'worksheet_relationships'),
+                 ('../drawings/missing.xml', None, 'worksheet_relationships'),
+                 ('../drawings/', None, 'worksheet_relationships'),
+                 ('../drawings', None, 'worksheet_relationships'),
+                 (None, '../../../media/image1.png', 'other_relationships'),
+                 (None, '../media/%69mage1.png', 'other_relationships'),
+                 (None, '..\\media\\image1.png', 'other_relationships'),
+                 (None, '../media/image1.png#x', 'other_relationships')]
+        for drawing, image, part in cases:
+            with self.subTest(drawing=drawing, image=image):
+                entries = self.drawing_book(drawing or '../drawings/drawing1.xml', image or '../media/image1.png')
+                entries['xl/drawings/'] = ''  # explicit directory member: never a valid target
+                self.refused(self.read(entries=entries), 'INVALID_DOCUMENT', part)
+
+    def test_refusal_diagnostics_are_bounded_located_and_canary_free(self):
+        def expect(result, code, part, source):
+            self.refused(result, code, part)
+            self.assertIn(source, self.source_at(result))
+        expect(self.read(CANARY), 'INVALID_DOCUMENT', 'archive', 'zipfile.ZipFile(')
+        # A missing required part reports its category, not whichever member was read last.
+        entries = members()
+        del entries['xl/workbook.xml'], entries['_rels/.rels']
+        expect(self.read(entries=entries), 'INVALID_DOCUMENT', 'workbook', 'require(name in self.members)')
+        # Malicious ZIP member filename: located in the unchanged safe_name checks.
+        expect(self.read(zip_bytes(list(members().items()) + [('../' + CANARY, 'x')])),
+               'INVALID_DOCUMENT', 'archive', 'require(not name.startswith')
+        # Internal relationship target carrying a URL/host canary.
+        entries = members()
+        entries['xl/_rels/workbook.xml.rels'] = relationships(relationship('r1', 'https://' + CANARY + '.invalid/x'))
+        expect(self.read(entries=entries), 'INVALID_DOCUMENT', 'workbook_relationships', 'require(not any(ord(c)')
+        # Root escape then re-entry.
+        entries['xl/_rels/workbook.xml.rels'] = relationships(relationship('r1', '../../xl/worksheets/sheet1.xml'))
+        expect(self.read(entries=entries), 'INVALID_DOCUMENT', 'workbook_relationships', 'require(parts)')
+        # Cell value canary.
+        expect(self.read(entries=members([(CANARY, '<row><c t="b"><v>%s</v></c></row>' % CANARY)]), mode='rows'),
+               'INVALID_DOCUMENT', 'worksheet', "require(value in ('0', '1'))")
+        # XML parser errors in different parts (including an unused one) are located at the parse call.
+        for name, part in (('xl/worksheets/sheet1.xml', 'worksheet'), ('xl/unused.xml', 'other_xml'),
+                           ('xl/_rels/unused.xml.rels', 'other_relationships'), ('[Content_Types].xml', 'content_types')):
+            with self.subTest(name=name):
+                entries = members()
+                entries[name] = '<broken attr="%s">' % CANARY
+                expect(self.read(entries=entries), 'INVALID_DOCUMENT', part, 'ET.iterparse(')
+        # Non-default shared strings name and worksheet-level limit use fixed kinds.
+        entries = members(shared='<si><t>%s</t><x/></si>' % CANARY)
+        entries['xl/strings/other.xml'] = entries.pop('xl/sharedStrings.xml')
+        entries['xl/_rels/workbook.xml.rels'] = entries['xl/_rels/workbook.xml.rels'].replace(
+            '"sharedStrings.xml"', '"strings/other.xml"')
+        self.assertEqual(self.read(entries=entries)['status'], 'ok')
+        entries['xl/strings/other.xml'] = '<sst xmlns="%s"><bad>%s</bad></sst>' % (NS, CANARY)
+        expect(self.read(entries=entries), 'INVALID_DOCUMENT', 'shared_strings', "== '{' + MAIN_NS + '}si'")
+        expect(self.read(entries=members(), mode='rows', sheet=CANARY), 'SHEET_NOT_FOUND', 'workbook', 'SHEET_NOT_FOUND')
+        expect(reader.read_document(self.path, format='xlsx', limit=CANARY), 'INVALID_ARGUMENT', 'arguments', 'limit')
+        expect(self.read(b'\xff' + CANARY.encode(), format='csv'), 'INVALID_DOCUMENT', 'csv', 'decode(')
+        expect(reader.read_document(self.path.parent / CANARY, format='xlsx'), 'IO', 'archive', 'open(path')
+        # Raw library exception text (with private canaries) never escapes; the reader call site does.
+        self.path.write_bytes(zip_bytes(members()))
+        secret = ValueError('%s %s Traceback http://example.invalid' % (CANARY, self.path))
+        with mock.patch.object(reader.ET, 'iterparse', side_effect=secret):
+            expect(reader.read_document(self.path, format='xlsx'), 'INVALID_DOCUMENT', None, 'ET.iterparse(')
+        with mock.patch.object(reader.zipfile, 'ZipFile', side_effect=OSError(CANARY)):
+            expect(reader.read_document(self.path, format='xlsx'), 'IO', 'archive', 'zipfile.ZipFile(')
+        # CLI: same fixed JSON line, diagnostic included, nothing on stderr.
+        self.path.write_bytes(zip_bytes(self.drawing_book('../../../' + CANARY + '/drawing1.xml')))
+        result = subprocess.run([sys.executable, '-I', '-B', str(SCRIPT), '--format', 'xlsx', str(self.path)],
+                                capture_output=True, timeout=10)
+        self.assertEqual((result.returncode, result.stderr, result.stdout.count(b'\n')), (1, b'', 1))
+        parsed = json.loads(result.stdout)
+        self.refused(parsed, 'INVALID_DOCUMENT', 'worksheet_relationships')
+        self.assertEqual(self.source_at(parsed).strip(), 'require(parts)')
 
     def test_package_absolute_relationship_and_nondefault_worksheet_filename(self):
         entries = members()
@@ -573,7 +733,9 @@ class SupportingReaderTest(unittest.TestCase):
                 result = subprocess.run(base + args, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(result.stderr, b'')
-                self.refused(json.loads(result.stdout), 'INVALID_ARGUMENT')
+                # Argument-parser refusals stay exactly fixed; range checks in read_document add a diagnostic.
+                semantic = '101' in args or '51' in args
+                self.refused(json.loads(result.stdout), 'INVALID_ARGUMENT', 'arguments', diagnostic=semantic)
         self.path.write_bytes(b'not-a-zip-' + CANARY.encode())
         result = subprocess.run(base + ['--format', 'xlsx', str(self.path)], capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 1)

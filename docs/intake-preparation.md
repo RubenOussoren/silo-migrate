@@ -39,11 +39,24 @@ refusals, formula non-evaluation and no-network sandboxing remain unchanged.
 Ignored links neither prove that linked content is in the file nor resolve a
 migration ambiguity. The parser has not visited those links.
 
+Internal OPC references such as `../drawings/drawing1.xml` are resolved relative
+to the source part, entirely inside the ZIP namespace. Every resolved target must
+exist in that archive; attempted package-root escape, filesystem/network/encoded
+URI ambiguity and directory targets still refuse. Archive member names themselves
+remain strict: dot-segment ZIP entries are not admitted. This is not a general URI
+resolver or permission to ignore data relationships.
+
 If a registered reference is visible but refused, do not move it between source
 deliveries, Make-current a different dataset, re-export or mutate its bytes merely
-to bypass the reader. Diagnose the supported parser path; report the fixed error
-code if an unsupported relationship remains. Existing references need not be
-re-admitted just to use a newer reader.
+to bypass the reader. A refusal may append `reader_line=N; part_kind=...` to the
+original fixed error code. These are a **public parser source line, not a workbook
+row**, and a fixed package-part category, not the actual ZIP filename or sheet
+name. No exception text, target URL/host, path or cell contents are included.
+Report that bounded diagnostic and the installed Silo release (`silo doctor`);
+source locations must be interpreted against that exact release. A generic
+`INVALID_DOCUMENT` alone does not establish the presence of macros, external data
+or a particular hyperlink. Do not request the private workbook or finding merely
+to diagnose this reader. Existing references need not be re-admitted for updates.
 
 ### Deterministic preparation (`data_supporting_prepare`)
 

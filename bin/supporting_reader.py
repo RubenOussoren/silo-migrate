@@ -13,8 +13,16 @@ ignored_external_hyperlinks (a count, only when > 0): ordinary
 TargetMode="External" hyperlink relationships are validated and discarded,
 never resolved, fetched or returned. Any other external relationship refuses.
 
-All refusals return {status: 'error', error: 'STANDARD_SUPPORTING_*'} with no
-input-derived diagnostics. The UTF-8 JSON representation, including newline,
+Internal relationship targets resolve '.'/'..' segments strictly inside the ZIP
+namespace (escape above the package root refuses) and must name an existing
+non-directory member; nothing is extracted to disk.
+
+All refusals return {status: 'error', error: 'STANDARD_SUPPORTING_*'}. Refusals
+from read_document may add diagnostic={reader_line: int 1..10000, part_kind:
+one of PART_KINDS}: a line of this public source file and a fixed generic part
+category. No paths, member/sheet names, targets, cell values or exception text
+are ever included. CLI argument-parser refusals carry no diagnostic. The UTF-8
+JSON representation, including newline,
 is at most 32 KiB. CLI exits 0 on success, 1 on any refusal. Host code owns
 registration, path authorization, sandboxing and process deadlines.
 """
@@ -48,6 +56,10 @@ DOC_REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationship
 PKG_REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
 CELL_REF = re.compile(r'([A-Z]{1,3})([1-9][0-9]{0,6})\Z')
 NUMBER = re.compile(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z')
+
+PART_KINDS = frozenset(('archive', 'content_types', 'root_relationships', 'workbook', 'workbook_relationships',
+                        'worksheet', 'worksheet_relationships', 'shared_strings', 'other_relationships',
+                        'other_xml', 'other_part', 'csv', 'arguments'))
 
 
 class Refusal(Exception):
@@ -86,6 +98,36 @@ def safe_name(name):
     return name
 
 
+def resolve_target(base, target):
+    """Resolve an internal OPC relationship target to a ZIP member name (no I/O).
+
+    Relative targets resolve against the source part's directory; '/xl/...' is
+    package-absolute. '.' and '..' segments are resolved inside the ZIP
+    namespace; any step above the package root refuses (never clamped), so
+    '../../xl/x.xml' from 'xl' and '/../x' refuse. Schemes, percent escapes,
+    query, fragment, backslash, control characters, network ('//') and empty
+    path components refuse. The result must still pass safe_name.
+    """
+    require(isinstance(target, str) and 0 < len(target) <= 1024)
+    require(not any(ord(c) < 32 or ord(c) == 127 for c in target) and not any(c in target for c in '\\:%?#'))
+    require(not target.startswith('//'))
+    if target.startswith('/'):
+        parts, target = [], target[1:]
+    else:
+        parts = base.split('/') if base else []
+    segments = target.split('/')
+    # A trailing dot segment denotes a directory, never a file part.
+    require(segments[-1] not in ('.', '..'))
+    for segment in segments:
+        require(segment != '')
+        if segment == '..':
+            require(parts)
+            parts.pop()
+        elif segment != '.':
+            parts.append(segment)
+    return safe_name('/'.join(parts))
+
+
 def xml_root(data):
     # Inspect the ENTIRE bounded member, not a prefix. NUL-free UTF-8 XML only:
     # this deliberately refuses UTF-16/32 rather than allowing encoded DTD bypasses.
@@ -108,8 +150,27 @@ def validate_xml(data, budget):
             element.clear()
 
 
+def part_kind(name):
+    # Fixed enum only: the member name itself is never reported.
+    fixed = {'[Content_Types].xml': 'content_types', '_rels/.rels': 'root_relationships',
+             'xl/workbook.xml': 'workbook', 'xl/_rels/workbook.xml.rels': 'workbook_relationships',
+             'xl/sharedStrings.xml': 'shared_strings'}
+    if name in fixed:
+        return fixed[name]
+    if re.fullmatch(r'xl/worksheets/[^/]+\.xml', name):
+        return 'worksheet'
+    if re.fullmatch(r'xl/worksheets/_rels/[^/]+\.xml\.rels', name):
+        return 'worksheet_relationships'
+    if name.endswith('.rels'):
+        return 'other_relationships'
+    return 'other_xml' if name.lower().endswith('.xml') else 'other_part'
+
+
 class Workbook:
-    def __init__(self, data):
+    def __init__(self, data, diagnostic=None):
+        # diagnostic['part'] tracks the generic kind of part being processed.
+        self.diagnostic = {} if diagnostic is None else diagnostic
+        self.diagnostic['part'] = 'archive'
         self.archive = zipfile.ZipFile(io.BytesIO(data))
         self.members = {}
         self.relationships = {}
@@ -173,7 +234,8 @@ class Workbook:
         require(self.sheets)
         self.shared = self.shared_strings()
 
-    def read(self, name):
+    def read(self, name, kind=None):
+        self.diagnostic['part'] = kind or part_kind(name)
         require(name in self.members)
         info = self.members[name]
         with self.archive.open(info) as stream:
@@ -181,8 +243,8 @@ class Workbook:
         require(len(data) <= MAX_MEMBER and len(data) == info.file_size, 'LIMIT')
         return data
 
-    def root(self, name):
-        return ET.fromstring(xml_root(self.read(name)))
+    def root(self, name, kind=None):
+        return ET.fromstring(xml_root(self.read(name, kind)))
 
     def read_relationships(self, name, data):
         root = ET.fromstring(xml_root(data))
@@ -211,11 +273,8 @@ class Workbook:
                 seen.add(identity)
                 self.ignored_external_hyperlinks += 1
                 continue
-            target = entry.get('Target', '')
-            # OPC package-absolute targets are allowed, filesystem paths are not.
-            safe_name(target[1:] if target.startswith('/') else target)
-            target = target.lstrip('/') if target.startswith('/') else posixpath.join(base, target)
-            require(target in self.members and not target.endswith('/'))
+            target = resolve_target(base, entry.get('Target', ''))
+            require(target in self.members and not self.members[target].is_dir())
             require(identity and identity not in seen and kind)
             seen.add(identity)
             result[identity] = (target, kind)
@@ -229,7 +288,7 @@ class Workbook:
         if not targets:
             return []
         require(targets[0].startswith('xl/'))
-        root = self.root(targets[0])
+        root = self.root(targets[0], 'shared_strings')
         require(root.tag == '{' + MAIN_NS + '}sst')
         result, chars = [], 0
         for entry in root:
@@ -242,7 +301,7 @@ class Workbook:
 
     def rows(self, sheet, offset, limit, columns):
         shared = self.shared
-        root = self.root(self.sheets[sheet])
+        root = self.root(self.sheets[sheet], 'worksheet')
         require(root.tag == '{' + MAIN_NS + '}worksheet')
         sections = root.findall('{' + MAIN_NS + '}sheetData')
         require(len(sections) == 1)
@@ -362,12 +421,14 @@ def csv_document(data, mode, sheet, offset, limit, columns):
 
 def read_document(path, *, format, mode='sheets', sheet=None, offset=0, limit=20, columns=20):
     """Return bounded JSON-compatible success or fixed refusal; never parser errors."""
+    diagnostic = {'part': 'arguments'}
     try:
         require(format in ('xlsx', 'csv') and mode in ('sheets', 'rows'), 'INVALID_ARGUMENT')
         require(sheet is None or isinstance(sheet, str) and 0 < len(sheet) <= 128, 'INVALID_ARGUMENT')
         require(type(offset) is int and 0 <= offset < MAX_ROWS, 'INVALID_ARGUMENT')
         require(type(limit) is int and 1 <= limit <= 100, 'INVALID_ARGUMENT')
         require(type(columns) is int and 1 <= columns <= 50, 'INVALID_ARGUMENT')
+        diagnostic['part'] = 'csv' if format == 'csv' else 'archive'
         with open(path, 'rb') as stream:
             info = os.fstat(stream.fileno())
             require(stat.S_ISREG(info.st_mode), 'UNSUPPORTED')
@@ -378,8 +439,9 @@ def read_document(path, *, format, mode='sheets', sheet=None, offset=0, limit=20
         if format == 'csv':
             result.update(csv_document(data, mode, sheet, offset, limit, columns))
         else:
-            book = Workbook(data)
+            book = Workbook(data, diagnostic)
             try:
+                diagnostic['part'] = 'workbook'
                 if mode == 'sheets':
                     result['sheets'] = list(book.sheets)
                 else:
@@ -395,12 +457,32 @@ def read_document(path, *, format, mode='sheets', sheet=None, offset=0, limit=20
             result.update(offset=offset, limit=limit, columns=columns)
         return bounded(result)
     except Refusal as error:
-        return {'status': 'error', 'error': error.code}
-    except OSError:
-        return {'status': 'error', 'error': 'STANDARD_SUPPORTING_IO'}
-    except Exception:
-        # Parser/library diagnostics can contain private paths and cell contents.
-        return {'status': 'error', 'error': 'STANDARD_SUPPORTING_INVALID_DOCUMENT'}
+        return refusal(error.code, error, diagnostic)
+    except OSError as error:
+        return refusal('STANDARD_SUPPORTING_IO', error, diagnostic)
+    except Exception as error:
+        # Parser/library messages can contain private paths and cell contents:
+        # only this module's own line number and the fixed part kind survive.
+        return refusal('STANDARD_SUPPORTING_INVALID_DOCUMENT', error, diagnostic)
+
+
+def refusal(code, error, diagnostic):
+    """Fixed refusal plus optional {reader_line, part_kind}; never exception text.
+
+    reader_line is the innermost traceback line executing in THIS module,
+    skipping require() itself so a check reports its call site; for library
+    errors it is the reader line that invoked the library.
+    """
+    result = {'status': 'error', 'error': code}
+    line, frame = None, error.__traceback__
+    while frame is not None:
+        if frame.tb_frame.f_globals is globals() and frame.tb_frame.f_code is not require.__code__:
+            line = frame.tb_lineno
+        frame = frame.tb_next
+    part = diagnostic.get('part')
+    if type(line) is int and 0 < line <= 10000 and part in PART_KINDS:
+        result['diagnostic'] = {'reader_line': line, 'part_kind': part}
+    return result
 
 
 class FixedParser(argparse.ArgumentParser):
