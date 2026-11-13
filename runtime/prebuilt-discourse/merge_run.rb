@@ -51,6 +51,31 @@ if (layer = ENV["SILO_MERGE_LAYER"])
   merger = layers.first
 end
 
+# Prepared custom merges must validate destination policy before the stock constructor
+# writes settings, and validate the resulting ACLs before the host finalizes/backs up.
+# These hooks are reviewed project code, not proof by themselves that a policy is correct.
+required_checks = ENV["SILO_MERGE_REQUIRE_CHECKS"] == "1"
+checks = %i[silo_merge_preflight! silo_merge_postflight!]
+if required_checks && (!layer || checks.any? { |hook| !merger.respond_to?(hook) })
+  warn "SILO_MERGE: layer must define preflight and postflight policy checks"
+  exit 3
+end
+
+run_check = lambda do |hook|
+  next unless required_checks
+
+  begin
+    result = merger.public_send(hook)
+    raise "check refused" unless result == true
+  rescue Exception => e # includes a layer's SystemExit; a hook cannot signal success by exiting
+    # Never surface an exception message: it may contain a customer name/value.
+    warn "SILO_MERGE: layer policy check failed (#{e.class})"
+    exit 3
+  end
+end
+
+run_check.call(:silo_merge_preflight!)
 puts "SILO_MERGE: start layer=#{layer ? 'yes' : 'no'}"
 merger.new.start
+run_check.call(:silo_merge_postflight!)
 puts "SILO_MERGE: done"

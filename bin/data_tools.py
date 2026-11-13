@@ -16,7 +16,7 @@ operation is appended to the workspace's audit log; moved and derived files get 
 provenance record (checksums, script hash, job). Output stays under the tool limit.
 """
 import base64
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import bz2
 import fcntl
 import gzip
@@ -2448,9 +2448,36 @@ def mcp_rule(name, term):
     return result.returncode == 0 and mcp_rule_present(name)
 
 
+def mcp_control(repo):
+    repo = Path(repo).resolve()
+    control = repo.parent.parent / "bin/silo-migrate-control" if repo.parent.name == "releases" else repo / "bin/silo-migrate-control"
+    return str(control)
+
+
 def silo_servers(servers):
-    return {name: server for name, server in servers.items()
-            if isinstance(name, str) and name.startswith("db-") and isinstance(server, dict) and (server.get("args") or [None])[0] == "dbhub"}
+    """Owned generic DBHub and generation-bound merge connectors, for admission repair."""
+    owned = {}
+    control = mcp_control(Path(__file__).resolve().parents[1])
+    for name, server in servers.items():
+        if not isinstance(name, str) or not isinstance(server, dict):
+            continue
+        args = server.get("args")
+        if not isinstance(args, list) or not args:
+            continue
+        if name.startswith("db-") and args[0] == "dbhub":
+            owned[name] = server
+            continue
+        if (set(server) != {"command", "args"} or server.get("command") != control
+                or len(args) != 5 or args[0] not in ("merge-mcp", "merge-dbhub")):
+            continue
+        _command, workspace, run_id, generation, side = args
+        if not all(isinstance(value, str) for value in (workspace, run_id, generation, side)):
+            continue
+        expected = "merge-dbhub" if side == "source" else "merge-mcp"
+        if (side in ("source", "base", "result") and args[0] == expected and WORKSPACE.fullmatch(workspace)
+                and RUN.fullmatch(run_id) and DIGEST.fullmatch(generation) and name == "merge-" + side + "-" + workspace):
+            owned[name] = server
+    return owned
 
 
 def write_mcp_config(path, config):
@@ -2460,12 +2487,6 @@ def write_mcp_config(path, config):
         json.dump(config, handle, indent=2)
         handle.write("\n")
     os.replace(temporary, path)
-
-
-def mcp_lock():
-    path = mcp_config_path()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return Locked(path.parent / ".mcp.json.silo-lock", wait=True)
 
 
 def mcp_rules_main(args, values, base, repo):
@@ -2507,9 +2528,28 @@ def mcp_name(ws):
 
 def mcp_entry(ws):
     # The installed shim sets the control config itself; term-llm passes it no environment.
-    repo = ws.repo.resolve()
-    control = repo.parent.parent / "bin/silo-migrate-control" if repo.parent.name == "releases" else repo / "bin/silo-migrate-control"
-    return {"command": str(control), "args": ["dbhub", ws.name]}
+    return {"command": mcp_control(ws.repo), "args": ["dbhub", ws.name]}
+
+
+@contextmanager
+def mcp_lock():
+    """The same host-owned lock used by generic DBHub registration; no model path input."""
+    path = mcp_config_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(path.parent / ".mcp.json.silo-lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    refuse("STANDARD_BUSY: MCP registration lock")
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def mcp_register(ws, present=True):
@@ -3079,6 +3119,107 @@ def merge_source(ws, request, inputs, records):
     return found[0]
 
 
+def merge_base(ws, request):
+    try:
+        base = review_base_site(ws, {"base_site": request["base_site"]} if "base_site" in request else {})
+    except Refusal as refusal:
+        if not str(refusal).startswith("STANDARD_BASE_SITE_NOT_TAKEN"):
+            raise
+        refuse("STANDARD_BASE_SITE_NOT_TAKEN: take the labelled Base site file with data_take type=base_site, then propose again")
+    if not base:
+        refuse("STANDARD_MERGE_BASE_SITE_MISSING: a merge needs the site to merge into: the engineer labels its SQL-only backup Base site on the Files tab")
+    return base
+
+
+def merge_environment_projection(value):
+    """Only the public lifecycle identity; never connector profiles, paths or credentials."""
+    if not isinstance(value, dict):
+        return None
+    result = {}
+    preparation = value.get("preparation_run_id")
+    if isinstance(preparation, str) and RUN.fullmatch(preparation):
+        result["preparation_run_id"] = preparation
+    generation = value.get("generation")
+    if isinstance(generation, str) and DIGEST.fullmatch(generation):
+        result["generation"] = generation
+    phase = value.get("phase")
+    if phase in ("preparing", "checkpointing", "ready", "inspection", "fencing", "merging", "consumed", "dirty", "reset", "result", "closed", "released", "stale"):
+        result["phase"] = phase
+    endpoints = []
+    for endpoint in value.get("endpoints", []) if isinstance(value.get("endpoints"), list) else []:
+        if not isinstance(endpoint, dict) or endpoint.get("kind") not in ("dbhub", "discourse_mcp"):
+            continue
+        name = endpoint.get("name")
+        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", name):
+            endpoints.append({"kind": endpoint["kind"], "name": name, "ready": endpoint.get("ready") is True})
+    if endpoints:
+        result["endpoints"] = endpoints
+    return result
+
+
+def prepared_from_projection(value):
+    if not isinstance(value, dict):
+        return None
+    run, generation = value.get("run_id"), value.get("generation")
+    if isinstance(run, str) and RUN.fullmatch(run) and isinstance(generation, str) and DIGEST.fullmatch(generation):
+        return {"run_id": run, "generation": generation}
+    return None
+
+
+def merge_layer_contract(ws):
+    """Render the same fixed contract dev_merge_guide uses, without a converter checkout."""
+    spec = importlib.util.spec_from_file_location("merge_contract_source", Path(__file__).with_name("merge_contract.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.MERGE_GUIDE.format(path="mergers/%s/merger.rb" % ws.name, files=module.MERGE_LAYER_MAX_FILES,
+                                     kib=module.MERGE_LAYER_MAX_BYTES // 1024, tests="test/mergers/%s" % ws.name)
+
+
+def op_merge_prepare(ws, request):
+    """Restore/prepare a native merge pair, never refresh or require a converter/layer."""
+    ws.require()
+    if ws.meta().get("platform") != MERGE_PLATFORM:
+        refuse("STANDARD_MERGE_NOT_DISCOURSE: a merge needs a project whose source platform is discourse")
+    inputs = ws.named_state().get("inputs") or {}
+    source = merge_source(ws, request, inputs, read_deliveries(ws))
+    base = merge_base(ws, request)
+    argv = ["standard", "plan", "propose", ws.name, "--operation", "merge-prepare", "--source", source, "--base-site", base]
+    plan = json.loads(ws.control(argv, timeout=240))
+    if pending := runtime_preparing(plan):
+        return pending
+    if "merge_environment" in plan:
+        plan["merge_environment"] = merge_environment_projection(plan["merge_environment"])
+    raw_merge = plan.get("merge") if isinstance(plan.get("merge"), dict) else {}
+    raw_source = raw_merge.get("source") if isinstance(raw_merge.get("source"), dict) else {}
+    source_facts = {key: raw_source[key] for key in ("input_id", "discourse_version", "schema_version") if key in raw_source}
+    if isinstance(raw_source.get("delivery"), dict):
+        source_facts["delivery"] = {key: raw_source["delivery"][key] for key in ("kind", "version") if key in raw_source["delivery"]}
+    plan["merge"] = {"source": source_facts}
+    keys = ("plan_id", "digest", "status", "operation", "roles", "inputs", "base_site", "merge", "review_runtime",
+            "merge_environment", "limits", "mutations", "not_included")
+    return {**{key: plan[key] for key in keys if key in plan}, "layer_contract": merge_layer_contract(ws),
+            "next": "The Prepare merge environment plan is waiting in Runs. The engineer approves and separately starts it. "
+                    "It restores/migrates disposable source and Base copies but runs no merger. After preparation, use the returned "
+                    "environment generation for trusted inspection, then propose the exact merge with its settings and explicit stock/custom intent."}
+
+
+def op_merge_inspection(ws, request):
+    """Register a fixed, generation-bound private connector; never return credentials."""
+    ws.require()
+    if ws.meta().get("platform") != MERGE_PLATFORM:
+        refuse("STANDARD_MERGE_NOT_DISCOURSE")
+    if not isinstance(request.get("run_id"), str) or not RUN.fullmatch(request["run_id"]):
+        refuse("STANDARD_ARGUMENTS_INVALID: run_id")
+    if not isinstance(request.get("generation"), str) or not DIGEST.fullmatch(request["generation"]):
+        refuse("STANDARD_ARGUMENTS_INVALID: generation")
+    if request.get("side") not in ("source", "base", "result"):
+        refuse("STANDARD_ARGUMENTS_INVALID: side is source, base or result")
+    spec = importlib.util.spec_from_file_location("merge_mcp", Path(__file__).with_name("merge_mcp.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.inspection_info(ws, request, roles_api())
+
+
 def op_merge_propose(ws, request):
     """Propose merging the project's source Discourse site into its Base site. Only a proposal:
     the engineer approves and starts it."""
@@ -3089,36 +3230,53 @@ def op_merge_propose(ws, request):
     if not all(isinstance(value, bool) for value in options.values()):
         refuse("STANDARD_ARGUMENTS_INVALID: options are true or false")
     inputs = ws.named_state().get("inputs") or {}
-    source = merge_source(ws, request, inputs, read_deliveries(ws))
-    try:
-        base = review_base_site(ws, {"base_site": request["base_site"]} if "base_site" in request else {})
-    except Refusal as refusal:
-        if not str(refusal).startswith("STANDARD_BASE_SITE_NOT_TAKEN"):
-            raise
-        refuse("STANDARD_BASE_SITE_NOT_TAKEN: take the labelled Base site file with data_take type=base_site, then propose again")
-    if not base:
-        refuse("STANDARD_MERGE_BASE_SITE_MISSING: a merge needs the site to merge into: the engineer labels its SQL-only backup Base site on the Files tab")
+    prepared = request.get("prepared_from")
+    generation, intent = request.get("generation"), request.get("intent")
+    if prepared is not None:
+        if not isinstance(prepared, str) or not RUN.fullmatch(prepared):
+            refuse("STANDARD_ARGUMENTS_INVALID: prepared_from")
+        if not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation) or intent not in ("stock", "custom"):
+            refuse("STANDARD_ARGUMENTS_INVALID: a prepared merge needs its generation and explicit stock/custom intent")
+        argv = ["standard", "plan", "propose", ws.name, "--operation", "merge", "--prepared-from", prepared,
+                "--generation", generation, "--intent", intent]
+        # Optional explicit identities must still be registered and are rechecked against the
+        # preparation by the backend. Never replace the prepared Base with the newest arrival.
+        if "source" in request:
+            argv += ["--source", merge_source(ws, request, inputs, read_deliveries(ws))]
+        if "base_site" in request:
+            argv += ["--base-site", merge_base(ws, request)]
+    else:
+        if generation is not None or intent is not None:
+            refuse("STANDARD_ARGUMENTS_INVALID: generation and intent require prepared_from")
+        source = merge_source(ws, request, inputs, read_deliveries(ws))
+        base = merge_base(ws, request)
+        argv = ["standard", "plan", "propose", ws.name, "--operation", "merge", "--source", source, "--base-site", base]
     settings = request.get("settings")
+    if prepared and intent == "stock" and settings is not None:
+        refuse("STANDARD_MERGE_INTENT_MISMATCH: merge-settings require custom intent and a committed layer")
     if settings is not None and (not isinstance(settings, str) or not INPUT_ID.fullmatch(settings)
                                  or (inputs.get(settings) or {}).get("type") != MERGE_SETTINGS_TYPE):
         refuse("STANDARD_MERGE_SETTINGS_INVALID: settings must name a registered input of type merge-settings")
-    argv = ["standard", "plan", "propose", ws.name, "--operation", "merge", "--source", source, "--base-site", base]
     if settings is not None:
         argv += ["--settings", settings]
     preparation = preparation_document(ws, request)
     argv += ["--" + key.replace("_", "-") for key, value in options.items() if value]
     # Bind the workspace to the converter checkout's committed branch head: the merge layer, if the
     # project has one, is read from exactly that commit. A dirty checkout refuses: commit first.
-    converter = json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
+    converter = {} if prepared and intent == "stock" else json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
     # checks the registered inputs (a backup can be GBs)
     with PlanDocuments(ws, {"--preparation": ("STANDARD_PREPARATION_INVALID", preparation)}) as extra:
         plan = json.loads(ws.control(argv + extra, timeout=240))
     if pending := runtime_preparing(plan):
         return pending
+    if "merge_environment" in plan:
+        plan["merge_environment"] = merge_environment_projection(plan["merge_environment"])
+    if "prepared_from" in plan:
+        plan["prepared_from"] = prepared_from_projection(plan["prepared_from"])
     merge = plan.get("merge") or {}
     layer = merge.get("layer") or {}
     return {**{key: plan.get(key) for key in ("plan_id", "digest", "status", "operation", "roles", "inputs", "base_site", "merge", "review_runtime",
-                                              "converter_revision", "limits", "mutations", "not_included")},
+                                              "converter_revision", "limits", "mutations", "not_included", "prepared_from", "merge_environment", "intent")},
             **({"preparation": plan["preparation"]} if "preparation" in plan else {}),
             "converter_branch": converter.get("branch"),
             "instances": {"review": {"port": ((plan.get("instances") or {}).get("review") or {}).get("port")}},
@@ -3325,7 +3483,10 @@ def guide_records(ws):
         return dataset
 
     plans = [{"plan_id": plan.get("plan_id"), "file_role_lineage_current": lineage.get(plan.get("plan_id"), True), "dataset_id": dataset_of(plan.get("plan_id")), "kind": kinds.get(plan.get("plan_id")), "status": plan.get("status"), "delivery": plan.get("delivery"),
-              "run_id": plan.get("run_id"), "created_at": plan.get("created_at") or ""} for plan in status.get("plans", [])]
+              "run_id": plan.get("run_id"), "created_at": plan.get("created_at") or "",
+              "merge_environment": merge_environment_projection(plan.get("merge_environment")),
+              "prepared_from": prepared_from_projection(plan.get("prepared_from"))}
+             for plan in status.get("plans", [])]
     runs = []
     for run in status.get("runs", []):
         results = run.get("results") or {}
@@ -3337,7 +3498,9 @@ def guide_records(ws):
                      "checks": results.get("reconciliation_checks") or 0, "matched": results.get("reconciliation_matched") or 0,
                      "differ": results.get("reconciliation_differs") or 0, "errors": results.get("reconciliation_errors") or 0,
                      "release": run.get("release"), "backup": (run.get("artifacts") or {}).get("backup"),
-                     "import_issues": results.get("import_issues"), "failure": failure.get("code") if isinstance(failure, dict) else None})
+                     "import_issues": results.get("import_issues"), "failure": failure.get("code") if isinstance(failure, dict) else None,
+                     "merge_environment": merge_environment_projection(run.get("merge_environment") or results.get("merge_environment")),
+                     "prepared_from": prepared_from_projection(run.get("prepared_from"))})
     sites = [{"run_id": site.get("run_id"), "state": site.get("state"), "live": site.get("live"), "port": site.get("port")}
              for site in status.get("instances", []) if site.get("role") == "review" and site.get("state") != "removed"]
     return {"plans": plans, "runs": runs, "sites": sites, "findings": guide_findings(state), "pushes": guide_pushes(standard), "warning": None}
@@ -3535,11 +3698,29 @@ def guide_merge_flow(ws, facts, records):
         return ("engineer", "Copy the SQL-only backup of the site to merge into (discourse backup --sql-only, original name) to the drop folder, run "
                 "`silo intake %s` as root, then label it Base site on the Files tab." % ws.name, "server terminal")
     latest = merges[-1] if merges else None
+    preparations = [run for run in records["runs"] if run.get("kind") == "merge_prepare"]
+    prepared = preparations[-1] if preparations else None
+    if prepared and (not latest or prepared["started_at"] > latest["started_at"]):
+        environment = prepared.get("merge_environment") or {}
+        if prepared.get("status") in ("claimed", "running"):
+            return ("nobody", "Merge preparation %s is still running; wait for its recorded ready/failure state, without proposing or starting another operation."
+                    % prepared["run_id"], "Runs tab")
+        if prepared.get("status") in ("abandoned", "not_started", "interrupted"):
+            return ("engineer", "The preparation stopped without finishing. Recover/reset its exact run in Runs before proposing another preparation.", "Runs tab")
+        if prepared.get("status") != "completed":
+            return ("agent", "Preparation %s failed at %s (%s). Read data_run_evidence; do not bypass compatibility or restore guards."
+                    % (prepared["run_id"], prepared.get("stage"), prepared.get("failure") or "no code"), "this chat")
+        if environment.get("phase") in ("ready", "inspection") and environment.get("generation"):
+            return ("agent", "Inspect the prepared source/Base with data_merge_inspection using run %s and generation %s. "
+                    "Resolve material questions, register merge-settings when required, then data_merge_propose prepared_from=%s "
+                    "with that generation and explicit stock/custom intent. The engineer approves and separately starts the exact merge."
+                    % (prepared["run_id"], environment["generation"], prepared["run_id"]), "this chat")
+        return ("agent", "This preparation is no longer available for inspection/merge. Check data_run_evidence and propose a new data_merge_prepare if needed; never reuse stale credentials or generations.", "this chat")
     pushed = [item for item in records["pushes"] if item["status"] == "pushed"]
     if not latest or latest["started_at"] < (pushed[-1]["at"] if pushed else ""):
-        return ("agent", "Propose the merge with data_merge_propose; the engineer approves and starts it on the Project page. If this merge needs rules of "
-                "its own (for example source categories into chosen categories of the other site), the engineer first asks converter-developer for a "
-                "merge layer, and you register the values it reads as type merge-settings.", "this chat")
+        return ("agent", "Propose data_merge_prepare first; the engineer approves and starts the restore/preparation operation. "
+                "Inspect source/Base before authoring settings. If this merge needs a merge layer, have converter-developer commit it; "
+                "then propose the exact data_merge_propose with the prepared run/generation and explicit stock/custom intent.", "this chat")
     if latest["status"] in ("abandoned", "not_started"):
         return ("engineer", "The merge run %s stopped without finishing. Recover it in the Project page's Runs tab, then a new plan can be proposed." % latest["run_id"], "Runs tab")
     if latest["status"] != "completed":
@@ -3737,7 +3918,8 @@ OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_creat
        "supporting_prepare": op_supporting_prepare,
        "script": op_script, "extract": op_extract, "job": op_job, "db_up": op_db_up, "db_load": op_db_load,
        "db_status": op_db_status, "db_reset": op_db_reset, "run_evidence": op_run_evidence, "run_count": op_run_count, "propose_finding": op_propose_finding,
-       "plan_propose": op_plan_propose, "merge_propose": op_merge_propose, "master_lists_propose": op_master_lists_propose,
+       "plan_propose": op_plan_propose, "merge_prepare": op_merge_prepare, "merge_inspection": op_merge_inspection,
+       "merge_propose": op_merge_propose, "master_lists_propose": op_master_lists_propose,
        "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions, "deliveries": op_deliveries, "delivery_label": op_delivery_label,
        "finding_done": op_finding_done, "site_process": op_site_process, "site_review": op_site_review}
 # Logged with their arguments (minus script code, finding text, count SQL and decisions, logged by hash).

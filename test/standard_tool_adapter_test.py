@@ -182,7 +182,8 @@ CONTEXT_KEYS = {'_private_session', '_session_id', '_uploads'}
 DATA_TOOLS = ('data_guide', 'data_status', 'data_supporting_list', 'data_supporting_read',
               'data_supporting_prepare', 'data_list', 'data_peek', 'data_create', 'data_take', 'data_register', 'data_script',
               'data_extract', 'data_job', 'data_db_up', 'data_db_load', 'data_db_status', 'data_db_reset', 'data_run_evidence',
-              'data_run_count', 'data_plan_propose', 'data_master_lists_propose', 'data_merge_propose', 'data_propose_finding',
+              'data_run_count', 'data_plan_propose', 'data_master_lists_propose', 'data_merge_prepare', 'data_merge_inspection',
+              'data_merge_propose', 'data_propose_finding',
               'data_notes', 'data_decide', 'data_decisions', 'data_notes_write')
 BRANCH_TOOLS = ('data_branch_resolve', 'data_branches', 'data_branch_diff', 'data_branch_read')
 
@@ -248,9 +249,9 @@ else:
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
         blocks = re.split(r'(?m)^    - name: ', definition)[1:]
         # The four branch tools use a separate reader-role adapter, tested in converter_dev_adapter_test.
-        self.assertEqual(31, len(blocks))
+        self.assertEqual(33, len(blocks))
         declared = [block.splitlines()[0] for block in blocks if 'script: scripts/data_tool.py' in block]
-        self.assertEqual(27, len(declared))
+        self.assertEqual(29, len(declared))
         self.assertEqual(list(DATA_TOOLS), declared)
         self.assertEqual(list(BRANCH_TOOLS), [block.splitlines()[0] for block in blocks if 'script: scripts/dev_tool.py' in block])
         import importlib.util
@@ -284,6 +285,10 @@ else:
                                {'op': 'run_count', 'run_id': self.run_id, 'side': 'destination', 'sql': 'SELECT COUNT(*) FROM posts'}),
             'data_plan_propose': ({'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32, 'reconciliation': None, 'plan_id': 'x'},
                                   {'op': 'plan_propose', 'source': 'input-' + 'a' * 32, 'settings': 'input-' + 'b' * 32}),
+            'data_merge_prepare': ({'source': 'input-' + 'a' * 32, 'settings': 'not-allowed', 'confirm': True},
+                                   {'op': 'merge_prepare', 'source': 'input-' + 'a' * 32}),
+            'data_merge_inspection': ({'run_id': self.run_id, 'generation': 'c' * 64, 'side': 'base', 'api_key': 'NEVER-FORWARD', 'site': 'https://example.invalid'},
+                                      {'op': 'merge_inspection', 'run_id': self.run_id, 'generation': 'c' * 64, 'side': 'base'}),
             'data_merge_propose': ({'source': 'input-' + 'a' * 32, 'base_site': 'input-' + 'b' * 32, 'settings': None, 'restore_proof': False,
                                     'ignore_global_pins': True, 'from_run': 'x', 'fresh_site': True},  # restore_proof is not an option
                                    {'op': 'merge_propose', 'source': 'input-' + 'a' * 32, 'base_site': 'input-' + 'b' * 32, 'ignore_global_pins': True}),

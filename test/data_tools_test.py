@@ -856,6 +856,26 @@ class DataToolsTest(unittest.TestCase):
         self.assertIn("couldn't be limited", self.op('db_up', engine='mariadb')['queries']['registration'])
         self.assertNotIn('db-arc', (self.mcp() if (self.config_home / 'term-llm/mcp.json').exists() else {'servers': {}})['servers'])
 
+    def test_mcp_rule_repair_covers_exact_owned_merge_connectors_only(self):
+        directory = self.config_home / 'term-llm'
+        directory.mkdir(parents=True)
+        run, generation = 'run-' + 'c' * 32, 'd' * 64
+        control = self.d.mcp_control(ROOT)
+        owned = {'merge-base-arc': {'command': control, 'args': ['merge-mcp', 'arc', run, generation, 'base']},
+                 'merge-source-arc': {'command': control, 'args': ['merge-dbhub', 'arc', run, generation, 'source']}}
+        foreign = {'merge-result-arc': {'command': 'foreign', 'args': ['merge-mcp', 'arc', run, generation, 'result']},
+                   'merge-base-other': {'command': control, 'args': ['merge-mcp', 'arc', run, generation, 'base']},
+                   'merge-base-extra': {'command': control, 'env': {}, 'args': ['merge-mcp', 'extra', run, generation, 'base']}}
+        (directory / 'mcp.json').write_text(json.dumps({'servers': dict(owned, **foreign)}))
+        (directory / 'config.yaml').write_text('providers: {}\n')
+        out = io.StringIO()
+        with mock.patch('sys.stdout', out):
+            self.assertEqual(0, self.d.mcp_rules_main(['mcp-rules'], self.values, self.base, ROOT))
+        self.assertEqual({'version': 1, 'project_servers': 2, 'limited_to_migration_data': 2, 'taken_out': 0}, json.loads(out.getvalue()))
+        self.assertEqual({name: ['migration-data'] for name in owned}, self.rules())
+        self.assertEqual(set(owned), set(self.d.silo_servers(dict(owned, **foreign))))
+        self.assertNotIn('arc', out.getvalue())
+
     def test_mcp_rules_limits_every_project_database_and_names_none(self):
         (self.config_home / 'term-llm').mkdir(parents=True)
         servers = {'db-arc': {'command': 'c', 'args': ['dbhub', 'arc']}, 'db-other': {'command': 'c', 'args': ['dbhub', 'other']},
@@ -909,7 +929,8 @@ class DataToolsTest(unittest.TestCase):
         state = json.loads((standard / 'state.json').read_text())
         state['findings'] = {key: dict(value) for key, value in (findings or {}).items()}
         dataset = json.loads((self.base / 'arc/.silo-migrate/data/workspace.json').read_text())['dataset_id']
-        state['plans'] = {plan['plan_id']: {'body': {'operation': 'standard_' + plan['kind'], 'dataset_id': plan.get('dataset_id', dataset)}} for plan in (plans or [])}
+        state['plans'] = {plan['plan_id']: {'body': {'operation': 'standard_' + plan['kind'], 'dataset_id': plan.get('dataset_id', dataset),
+                                                   **({'prepared_from': plan['prepared_from']} if 'prepared_from' in plan else {})}} for plan in (plans or [])}
         for run in runs or []:
             state['plans'].setdefault(run['plan_id'], {'body': {'operation': 'standard_' + run['kind'], 'dataset_id': run.get('dataset_id', dataset)}})
         (standard / 'state.json').write_text(json.dumps(state))
@@ -918,9 +939,11 @@ class DataToolsTest(unittest.TestCase):
         for push in pushes or []:
             (folder / (push['digest'] + '.json')).write_text(json.dumps(dict(push, proposal={'branch': push.get('branch', 'migration/arc/x')})))
         self.control.status = {'version': 1, 'instances': sites or [],
-                               'plans': [{'plan_id': plan['plan_id'], 'status': plan['status'], 'run_id': plan.get('run_id'), 'created_at': plan.get('created_at', '2026-01-01T00:00:00Z')}
+                               'plans': [{'plan_id': plan['plan_id'], 'status': plan['status'], 'run_id': plan.get('run_id'), 'created_at': plan.get('created_at', '2026-01-01T00:00:00Z'),
+                                          **({'prepared_from': plan['prepared_from']} if 'prepared_from' in plan else {})}
                                          for plan in plans or []],
                                'runs': [{'run_id': run['run_id'], 'plan_id': run['plan_id'], 'status': run['status'], 'stage': run.get('stage'),
+                                         'merge_environment': run.get('merge_environment'),
                                          'started_at': run.get('started_at', '2026-01-02T00:00:00Z'), 'finished_at': None, 'failure': run.get('failure'),
                                          'results': {'reconciliation_checks': run.get('checks', 0), 'reconciliation_matched': run.get('matched', 0),
                                                      'reconciliation_differs': run.get('differ', 0), 'reconciliation_errors': run.get('errors', 0)}}
@@ -1680,6 +1703,113 @@ class DataToolsTest(unittest.TestCase):
         (self.intake / self.SOURCE_BACKUP).write_bytes(gzip.compress(b'invented full backup'))
         self.refused('STANDARD_MERGE_SOURCE_INVALID', 'take', path=self.SOURCE_BACKUP, type='discourse-backup', name='renamed.tar.gz')
         self.assertTrue(self.op('take', path=self.SOURCE_BACKUP, type='discourse-backup')['input_id'].startswith('input-'))
+
+    def test_merge_preparation_does_not_refresh_or_require_a_converter(self):
+        source, base = self.merge_project()
+        calls = []
+        self.merge_control(calls, base)
+        original = self.control
+        def tainted(argv, input=None, timeout=120):
+            payload = json.loads(original(argv, input=input, timeout=timeout))
+            payload['merge'] = {'source': {'input_id': source, 'schema_version': '20261104011110', 'private_path': MARKER}, 'private': MARKER}
+            payload['merge_environment'] = {'phase': 'preparing', 'profile': MARKER}
+            return json.dumps(payload)
+        self.control = tainted
+        result = self.op('merge_prepare')
+        self.assertEqual([['standard', 'plan', 'propose', 'arc', '--operation', 'merge-prepare',
+                           '--source', source, '--base-site', base]], [argv for argv, _ in calls])
+        self.assertIn('runs no merger', result['next'])
+        self.assertIn('SILO_MERGE_SETTINGS', result['layer_contract'])
+        self.assertIn('call super first', result['layer_contract'])
+        self.assertIn('Do not write files', result['layer_contract'])
+        self.assertIn('mergers/arc/merger.rb', result['layer_contract'])
+        self.assertNotIn('private', json.dumps({key: value for key, value in result.items() if key != 'layer_contract'}))
+        self.assertNotIn('converter_branch', result)
+        self.assertNotIn(MARKER, json.dumps(result))
+        self.assertEqual({'source': {'input_id': source, 'schema_version': '20261104011110'}}, result['merge'])
+
+    def test_prepared_merge_binds_observed_generation_without_selecting_a_newest_base(self):
+        self.merge_project()
+        calls = []
+        original = self.control
+        run = 'run-' + '7' * 32
+        generation = '8' * 64
+
+        def control(argv, input=None, timeout=120):
+            calls.append(argv)
+            if argv[:3] == ['standard', 'converter', 'refresh']:
+                return json.dumps({'branch': 'migration/arc/merge-layer'})
+            if argv[:3] == ['standard', 'plan', 'propose']:
+                return json.dumps({'operation': 'standard_merge', 'status': 'proposed', 'merge': {'layer': {'present': False}},
+                                   'prepared_from': {'run_id': run, 'generation': generation, 'private': MARKER},
+                                   'merge_environment': {'preparation_run_id': run, 'generation': generation, 'phase': 'inspection', 'private': MARKER},
+                                   'private': 'NEVER-EXPOSE'})
+            return original(argv, input=input, timeout=timeout)
+
+        self.control = control
+        result = self.op('merge_propose', prepared_from=run, generation=generation, intent='stock')
+        argv = calls[-1]
+        self.assertEqual(['standard', 'plan', 'propose', 'arc', '--operation', 'merge', '--prepared-from', run,
+                          '--generation', generation, '--intent', 'stock'], argv)
+        self.assertNotIn('--base-site', argv)
+        self.assertNotIn('--source', argv)
+        self.assertEqual({'run_id': run, 'generation': generation}, result['prepared_from'])
+        self.assertNotIn('NEVER-EXPOSE', json.dumps(result))
+        self.assertNotIn(MARKER, json.dumps(result))
+        self.assertEqual(1, len(calls))  # explicit stock does not depend on a dirty converter
+        calls.clear()
+        # The already-registered identities are selected explicitly, not inferred from arrival order.
+        named = json.loads((self.base / 'arc/.silo-migrate/named/state.json').read_text())
+        source = next(key for key, value in named['inputs'].items() if value.get('type') == 'discourse-backup')
+        base = next(key for key, value in named['inputs'].items() if value.get('type') == 'base_site')
+        self.op('merge_propose', prepared_from=run, generation=generation, intent='custom', source=source, base_site=base)
+        self.assertEqual(['standard', 'converter', 'refresh'], calls[0][:3])
+        self.assertIn('--source', calls[-1])
+        self.assertIn('--base-site', calls[-1])
+        self.refused('STANDARD_MERGE_INTENT_MISMATCH', 'merge_propose', prepared_from=run, generation=generation,
+                     intent='stock', settings=self.settings_input())
+        for bad in ({'prepared_from': '../other', 'generation': generation, 'intent': 'stock'},
+                    {'prepared_from': run, 'generation': 'bad', 'intent': 'stock'},
+                    {'prepared_from': run, 'generation': generation},
+                    {'prepared_from': run, 'generation': generation, 'intent': 'guess'},
+                    {'generation': generation}, {'intent': 'stock'}, {'intent': 'custom'}):
+            with self.subTest(request=bad):
+                self.refused('STANDARD_ARGUMENTS_INVALID', 'merge_propose', **bad)
+
+    def test_merge_inspection_validates_scope_before_loading_a_connector(self):
+        self.merge_project()
+        for request in ({'run_id': '../other', 'generation': 'a' * 64, 'side': 'base'},
+                        {'run_id': 'run-' + 'b' * 32, 'generation': 'x', 'side': 'base'},
+                        {'run_id': 'run-' + 'b' * 32, 'generation': 'a' * 64, 'side': 'production'}):
+            with self.subTest(request=request):
+                self.refused('STANDARD_ARGUMENTS_INVALID', 'merge_inspection', **request)
+
+    def test_merge_guide_distinguishes_preparation_lifecycle_and_drops_nested_secrets(self):
+        self.merge_project()
+        run = {'run_id': 'run-' + '7' * 32, 'plan_id': 'plan-' + '7' * 32, 'kind': 'merge_prepare', 'stage': 'source_load'}
+        for status in ('claimed', 'running'):
+            self.guide_state(runs=[dict(run, status=status)])
+            guide = self.op('guide')
+            self.assertEqual('nobody', guide['next']['who'])
+            self.assertNotIn('failed', guide['next']['action'].lower())
+        self.guide_state(runs=[dict(run, status='interrupted')])
+        self.assertNext('engineer', 'Recover/reset')
+        environment = {'preparation_run_id': run['run_id'], 'generation': '8' * 64, 'phase': 'inspection',
+                       'profile': MARKER, 'endpoints': [{'kind': 'discourse_mcp', 'name': 'merge-base-arc', 'ready': True, 'api_key': MARKER}]}
+        self.guide_state(runs=[dict(run, status='completed', merge_environment=environment)])
+        guide = self.op('guide')
+        self.assertNext('agent', 'data_merge_inspection', guide)
+        self.assertIn('8' * 64, guide['next']['action'])
+        self.assertNotIn(MARKER, json.dumps(guide))
+        waiting = {'plan_id': 'plan-' + '9' * 32, 'kind': 'merge', 'status': 'proposed',
+                   'prepared_from': {'run_id': run['run_id'], 'generation': '8' * 64, 'key': MARKER}}
+        self.guide_state(plans=[waiting], runs=[dict(run, status='completed', merge_environment=environment)])
+        guide = self.op('guide')
+        self.assertEqual('engineer', guide['next']['who'])
+        self.assertNotIn('data_merge_propose', guide['next']['action'])
+        self.assertNotIn(MARKER, json.dumps(guide))
+        self.guide_state(runs=[dict(run, status='completed', merge_environment=dict(environment, phase='reset'))])
+        self.assertNext('agent', 'no longer available')
 
     def test_merge_propose_uses_the_registered_source_and_base_site(self):
         source, base = self.merge_project()

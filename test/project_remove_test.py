@@ -272,6 +272,21 @@ class RemoveTest(unittest.TestCase):
 
     # -- the plan ------------------------------------------------------------------------------
 
+    def test_remove_mcp_also_removes_only_owned_merge_connectors(self):
+        path = self.home / '.config/term-llm/mcp.json'
+        config = json.loads(path.read_text())
+        servers = config['servers']
+        for project, side in (('arc', 'source'), ('arc', 'base'), ('other', 'result')):
+            servers['merge-' + side + '-' + project] = {'command': self.dt.mcp_control(ROOT), 'args': [
+                'merge-dbhub' if side == 'source' else 'merge-mcp', project, 'run-' + 'a' * 32, 'b' * 64, side]}
+        servers['merge-result-arc'] = {'command': 'foreign', 'args': ['not-silo']}
+        path.write_text(json.dumps(config))
+        removal = self.removal()
+        self.assertTrue(removal.mcp_present())
+        self.assertTrue(removal.remove_mcp())
+        self.assertFalse(removal.mcp_present())
+        self.assertEqual(['db-other', 'github', 'merge-result-arc', 'merge-result-other'], self.mcp())
+
     def test_the_plan_lists_what_goes_and_what_stays_and_changes_nothing(self):
         before = self.everything_on_disk()
         plan = self.removal(keep=True).plan()

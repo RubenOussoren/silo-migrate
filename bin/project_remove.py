@@ -314,8 +314,12 @@ class Removal:
         except (OSError, ValueError):
             return False
         servers = config.get("servers") if isinstance(config, dict) else None
-        entry = servers.get(self.dt.mcp_name(self.ws)) if isinstance(servers, dict) else None
-        return isinstance(entry, dict) and (entry.get("args") or [None])[0] == "dbhub"
+        if not isinstance(servers, dict):
+            return False
+        entry = servers.get(self.dt.mcp_name(self.ws))
+        generic = isinstance(entry, dict) and (entry.get("args") or [None])[0] == "dbhub"
+        return generic or any((server.get("args") or [None, None])[1] == self.ws.name
+                              for name, server in self.dt.silo_servers(servers).items() if name.startswith("merge-"))
 
     def converter_unsaved(self):
         """What the converter checkout holds that GitHub doesn't: a short phrase, '' or None (unknown)."""
@@ -567,6 +571,24 @@ class Removal:
             self.dt.mcp_register(self.ws, present=False)
         except OSError:  # its audit line, when the workspace is already gone; the entry itself went first
             pass
+        # Exact owned native merge connectors are separate from the generic source DBHub.
+        # Removal is engineer-confirmed; preserve other projects and foreign same-name entries.
+        with self.dt.mcp_lock():
+            path = self.dt.mcp_config_path()
+            try:
+                config = json.loads(path.read_text())
+            except (OSError, ValueError):
+                refuse("STANDARD_REMOVE_INCOMPLETE: MCP settings could not be read")
+            servers = config.get("servers") if isinstance(config, dict) else None
+            if not isinstance(servers, dict):
+                refuse("STANDARD_REMOVE_INCOMPLETE: MCP settings are invalid")
+            owned = self.dt.silo_servers(servers)
+            remove = [name for name, server in owned.items()
+                      if name.startswith("merge-") and server["args"][1] == self.ws.name]
+            for name in remove:
+                del servers[name]
+            if remove:
+                self.dt.write_mcp_config(path, config)
         if self.mcp_present():
             refuse("STANDARD_REMOVE_INCOMPLETE: its db-" + self.ws.name + " entry in term-llm's MCP settings couldn't be removed")
         return True

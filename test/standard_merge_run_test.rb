@@ -2,7 +2,9 @@
 require_relative 'standard_base_site_review_test'
 
 class MergeScriptedRuntime < BaseSiteScriptedRuntime
-  attr_accessor :layer_entries, :layer_blobs, :merger_result
+  attr_accessor :layer_entries, :layer_blobs, :merger_result, :target_state, :source_state, :quiesce_result
+
+  MERGE_TABLES = %w[users topics posts categories groups tags uploads].freeze
 
   def commands = (@commands ||= [])
 
@@ -18,13 +20,14 @@ class MergeScriptedRuntime < BaseSiteScriptedRuntime
     line = cmd.join(' ')
     if line.include?('merge_state.rb') && !cmd.include?('chown') && cmd[1] == 'exec'
       source = line.include?('SILO_MERGE_CONFIG')
-      return site_json('database' => source ? 'merge_source' : 'discourse', 'pending' => false,
-        'base_url' => 'https://private-source.example.invalid', 'counts' => %w[users topics posts categories groups tags uploads].to_h { |key| [key, @merged ? 3 : 1] },
-        'columns' => [['users', 'id']], 'settings' => {})
-    elsif cmd.include?('psql') && cmd.last.include?('SELECT MAX(version)')
-      return review_ok("20261109000000\n")
-    elsif cmd.include?('psql') && cmd.last.include?('WITH ')
-      return review_ok(cmd.last.include?('WITH added') ? "1\n" : "0\n")
+      state = { 'database' => source ? 'merge_source' : 'discourse', 'pending' => false,
+                'base_url' => 'https://private-source.example.invalid', 'counts' => MERGE_TABLES.to_h { |key| [key, @merged ? 3 : 1] },
+                'migrations' => ['20261104011110'],
+                'columns' => (MERGE_TABLES + %w[schema_migrations]).map { |table| [table, table == 'schema_migrations' ? 'version' : 'id', 'bigint'] },
+                'merger' => { 'available' => true, 'layer_scanned' => false, 'tables' => MERGE_TABLES }, 'settings' => {} }
+      return site_json(state.merge((source ? source_state : target_state) || {}))
+    elsif line.include?('SILO_QUIESCED')
+      return quiesce_result || review_ok("ok: down: unicorn: 0s, normally up\nSILO_QUIESCED\n")
     elsif line.include?('ruby /tmp/merge_run.rb')
       @merged = true
       return merger_result || review_ok("SILO_MERGE_TOTAL: routed=1\nSILO_MERGE: done\n")
@@ -51,8 +54,8 @@ class StandardMergeRunTest < StandardBaseSiteReviewTest
     public_instance_methods.grep(/^test_merge/).map(&:to_s)
   end
 
-  def with_merge
-    with_base(ahead: true) do
+  def with_merge(ahead: false)
+    with_base(ahead: ahead) do
       runtime = MergeScriptedRuntime.new
       runtime.service = @service
       @runtime = runtime
@@ -79,6 +82,11 @@ class StandardMergeRunTest < StandardBaseSiteReviewTest
       @dataset = old
       yield
     end
+  end
+
+  # The scripted runtime's shared command log holds argv arrays and joined lines.
+  def merge_lines
+    @runtime.commands.map { |command| Array(command).join(' ') }
   end
 
   def merge_plan(**opts)
@@ -257,6 +265,58 @@ class StandardMergeRunTest < StandardBaseSiteReviewTest
       @service.reset_run(run_id: run[:run_id], yes: true)
       refute File.exist?(directory)
       standard_error('STANDARD_TRANSITION_INVALID') { @service.admin_password(run[:run_id]) }
+    end
+  end
+
+  # The Base is ahead of the pinned runtime (a migration this code doesn't have). The old
+  # bridge edited the source's schema_migrations to satisfy the merger; now it is refused.
+  def test_merge_ahead_base_is_refused_without_marker_edits
+    with_merge(ahead: true) do
+      @runtime.target_state = { 'migrations' => %w[20261104011110 20261109000000] }
+      run = @service.run_plan(plan_id: approve(merge_plan))
+      assert_equal 'STANDARD_MERGE_INCOMPATIBLE', run.dig(:failure, 'code')
+      assert_equal 'failed', run.dig(:stages, 'compatibility')
+      assert_equal 'pending', run.dig(:stages, 'merge')
+      assert_equal 'refused', run.dig(:results, 'merge', 'compatibility', 'status')
+      refute merge_lines.any? { |line| line.include?('ruby /tmp/merge_run.rb') }
+      refute merge_lines.any? { |line| line.match?(/schema_migrations/i) && line.match?(/DELETE|INSERT|UPDATE/i) }
+      checks = JSON.parse(File.read(@service.store.run_dir(run[:run_id], 'evidence', 'merge-compatibility.json'))).fetch('failures').map { |f| f['check'] }
+      assert_equal %w[schema-version-differs target-newer-than-runtime], checks.sort
+      refute_includes JSON.generate(run.dig(:results, 'merge')), '20261109000000'
+    end
+  end
+
+  def test_merge_never_edits_migration_markers_and_quiesces_sidekiq
+    with_merge do
+      run = @service.run_plan(plan_id: approve(merge_plan))
+      assert_equal 'completed', run[:status], run[:failure].inspect
+      assert_equal 'passed', run.dig(:results, 'merge', 'compatibility', 'status')
+      refute merge_lines.any? { |line| line.match?(/schema_migrations/i) && line.match?(/DELETE|INSERT|UPDATE/i) }
+      quiesce = merge_lines.index { |line| line.include?('SILO_QUIESCED') }
+      assert_includes merge_lines[quiesce], 'sidekiq'
+      assert_operator quiesce, :<, merge_lines.index { |line| line.include?('CREATE DATABASE merge_source') }
+      refute run.dig(:results, 'merge').key?('source_migration_added')
+      assert_nil run[:merge_environment]
+    end
+    with_merge do
+      @runtime.quiesce_result = review_ok_without_marker
+      run = @service.run_plan(plan_id: approve(merge_plan))
+      assert_equal 'STANDARD_STACK_FAILED', run.dig(:failure, 'code')
+      assert_equal 'failed', run.dig(:stages, 'source_load')
+    end
+  end
+
+  def review_ok_without_marker
+    SiloMigrate::Runtime::CommandResult.new(success?: true, stdout: "ok: down: unicorn: 0s\n", stderr: '', status: 0)
+  end
+
+  def test_merge_legacy_callers_cannot_name_intent_or_generation
+    with_merge do
+      standard_error('STANDARD_ARGUMENT_INVALID') { merge_plan(intent: 'stock') }
+      standard_error('STANDARD_ARGUMENT_INVALID') { merge_plan(generation: 'a' * 64) }
+      plan = merge_plan(intent: nil, generation: nil, prepared_from: nil, port: nil)
+      assert_nil plan[:prepared_from]
+      assert_nil plan[:intent]
     end
   end
 

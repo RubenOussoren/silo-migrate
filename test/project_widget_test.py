@@ -386,6 +386,22 @@ print(json.dumps({'version': 1, 'unlabelled_files': [{'path': 'a.sql'}] if sys.a
         self.assertEqual({'op': 'merge_propose', 'source': 'input-1'}, requests[1])
         self.assertEqual(2, len(requests))
 
+    def test_a_prepared_environment_never_hands_out_a_sign_in_but_merged_sites_still_do(self):
+        base = self.base / 'arc/.silo-migrate/named/standard'
+        base.mkdir(parents=True)
+        state = {'plans': {'plan-' + 'a' * 32: {'body': {'operation': 'standard_merge_prepare', 'roles': {}}},
+                           'plan-' + 'b' * 32: {'body': {'operation': 'standard_merge', 'roles': {}}}},
+                 'runs': {'run-' + 'a' * 32: {'plan_id': 'plan-' + 'a' * 32, 'status': 'completed'},
+                          'run-' + 'b' * 32: {'plan_id': 'plan-' + 'b' * 32, 'status': 'completed'}}}
+        (base / 'state.json').write_text(json.dumps(state))
+        headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
+        status, raw, _ = self.request('POST', '/api/runs/admin-password', {'workspace': 'arc', 'run_id': 'run-' + 'a' * 32}, headers)
+        self.assertEqual((409, 'STANDARD_PREPARED_ENVIRONMENT_NO_SIGN_IN'), (status, json.loads(raw)['error']))
+        self.assertEqual([], self.calls())
+        with mock.patch.object(self.m.runs, 'decide', return_value={'username': 'invented'}) as decide:
+            self.assertEqual(200, self.request('POST', '/api/runs/admin-password', {'workspace': 'arc', 'run_id': 'run-' + 'b' * 32}, headers)[0])
+        self.assertEqual('admin-password', decide.call_args[0][2])
+
     def test_marking_done_sends_only_the_finding_and_the_servers_reviewer(self):
         headers = {'X-Silo-Project': '1', 'Content-Type': 'application/json'}
         self.assertEqual(200, self.request('POST', '/api/findings/done', {'workspace': 'arc', 'id': 'finding-' + 'a' * 32, 'by': 'Other', 'undo': 'yes'}, headers)[0])

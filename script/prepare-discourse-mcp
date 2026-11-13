@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Prepare the pinned official Discourse MCP connector for local merge inspection.
+
+Host preparation only (run by `silo update` / the installer, or by the engineer):
+
+    script/prepare-discourse-mcp            prepare if needed (pulls the pinned Node image by digest)
+    script/prepare-discourse-mcp --no-pull  prepare only from an already present pinned image
+    script/prepare-discourse-mcp --check    report readiness; never changes anything
+
+Needs Docker only (no host Node/npm). Uses integrations/discourse-mcp/{runtime.json,
+package.json,package-lock.json}; the install runs `npm ci --ignore-scripts` inside the pinned
+Node image on a staging directory that holds only those committed public files, then stores a
+verified, digested tree under $XDG_DATA_HOME/silo-migrate/discourse-mcp/. It also stages the
+existing pinned DBHub image for prepared-source inspection (no generic source DB is created).
+Launching a connector never downloads anything: a missing or altered install is refused (STANDARD_MERGE_MCP_NOT_PREPARED).
+Prints one JSON line with non-secret facts; exit 1 with a fixed reason on failure.
+"""
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+import types
+
+sys.dont_write_bytecode = True
+REPO = Path(__file__).resolve().parent.parent
+
+
+def docker(argv, timeout=120, input=None):
+    try:
+        return subprocess.run(["docker", *argv], input=input, capture_output=True, timeout=timeout,
+                              stdin=None if input is not None else subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, b"", b"")
+
+
+def load_peer(name):
+    spec = importlib.util.spec_from_file_location(name, REPO / "bin" / (name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def main(argv):
+    if argv not in ([], ["--check"], ["--no-pull"]):
+        print("usage: prepare-discourse-mcp [--check|--no-pull]", file=sys.stderr)
+        return 2
+    module = load_peer("merge_mcp")
+    data = load_peer("data_tools")
+    host = types.SimpleNamespace(docker=docker)
+    if argv == ["--check"]:
+        pin, _ = module.runtime_pin(REPO)
+        site_ready = module.connector_ready(REPO, host) is not None
+        source_ready = data.dbhub_image(0)
+        ready = site_ready and source_ready
+        print(json.dumps({"version": 1, "connector": pin["package"] + "@" + pin["package_version"], "ready": ready,
+                          "site_ready": site_ready, "source_ready": source_ready}))
+        return 0 if ready else 1
+    try:
+        prepared = module.prepare_connector(REPO, host, pull=argv != ["--no-pull"])
+        # Native merge inspection needs the same existing pinned DBHub image, not
+        # a separately created generic source database. Pull public dependencies
+        # here, before the release switch; connector launches never download.
+        if not data.dbhub_image(0 if argv == ["--no-pull"] else 300):
+            raise ValueError("MERGE_MCP_PREPARE_FAILED: pinned source DBHub runtime unavailable")
+        print(json.dumps({**prepared, "source_ready": True}))
+    except ValueError as error:
+        reason = str(error) if str(error).startswith("MERGE_MCP_PREPARE_FAILED") else "MERGE_MCP_PREPARE_FAILED"
+        print(reason, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -451,6 +451,31 @@ class InstallerTests(unittest.TestCase):
                 self.m.main()
             roots.assert_not_called()
 
+    def test_merge_connector_prepare_is_public_only_and_fail_closed_before_switch(self):
+        release = self.root / 'candidate'
+        (release / 'script').mkdir(parents=True)
+        with patch.object(self.m, 'run') as runner:
+            self.assertFalse(self.m.prepare_merge_connector(release))
+            runner.assert_not_called()
+        helper = release / 'script/prepare-discourse-mcp'
+        helper.write_text('# fixed release helper\n')
+        ready = subprocess.CompletedProcess([], 0, json.dumps({'version': 1, 'status': 'prepared'}), '')
+        with patch.object(self.m, 'run', return_value=ready) as runner, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertTrue(self.m.prepare_merge_connector(release))
+        self.assertEqual('METAL_MERGE_MCP_READY\n', output.getvalue())
+        self.assertEqual(['python3', '-I', '-B', helper], runner.call_args.args[0])
+        self.assertEqual({'account': True, 'check': False, 'timeout': 1900}, runner.call_args.kwargs)
+        for result in (None, subprocess.CompletedProcess([], 1, '', 'PRIVATE-DEPENDENCY-ERROR'),
+                       subprocess.CompletedProcess([], 0, '[]', ''), subprocess.CompletedProcess([], 0, '{}', ''),
+                       subprocess.CompletedProcess([], 0, 'not json', '')):
+            with self.subTest(result=result), patch.object(self.m, 'run', return_value=result):
+                with self.assertRaises(self.m.Refusal) as raised:
+                    self.m.prepare_merge_connector(release)
+                self.assertIn('METAL_MERGE_MCP_PREPARE_FAILED', str(raised.exception))
+                self.assertNotIn('PRIVATE-DEPENDENCY-ERROR', str(raised.exception))
+        body = (ROOT / 'script/metal').read_text().split('def account_update(', 1)[1]
+        self.assertLess(body.index('prepare_merge_connector(release)'), body.index('previous = switch(release)'))
+
     def test_second_apply_is_noop_and_existing_user_config_preserved(self):
         P = self.m.P
         for path in [P, self.m.W] + [P/p for p in ("bin", "etc", "releases", "term-llm", "control", "control/gems", "control/site-cache", "state", "state/logs", "state/tmp", "state/runtime-profiles")]:

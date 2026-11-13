@@ -10,7 +10,24 @@ const resetNote = (release) => release ? 'The released backup stays in the outpu
 
 const RUN_DONE = new Set(['completed', 'failed', 'interrupted']);
 const operationLabel = (operation) => (operation === 'standard_review' ? 'Import into a review site' : operation === 'standard_convert' ? 'Convert run' : operation === 'standard_merge' ? 'Merge run'
-  : operation === 'standard_master_lists' ? 'Master-list export (preparation)' : 'Run');
+  : operation === 'standard_master_lists' ? 'Master-list export (preparation)' : operation === PREPARE ? 'Prepare merge environment' : 'Run');
+// Preparing a merge environment is not a merge or a convert run: nothing is migrated, backed up or released.
+const PREPARE = 'standard_merge_prepare';
+const PREPARE_WHAT = 'Preparation only: selects one compatible pinned Discourse runtime, restores the Base site, loads and upgrades a disposable copy of the source site’s database with it, checks compatibility and keeps the source uploads unchanged. It keeps a clean prepared checkpoint, and separate inspection copies for migration-data. Nothing is merged or migrated; there is no output backup to release.';
+const PREPARE_ACCESS = 'While it is ready, migration-data can read both sites’ private content through the inspection copies (read-only tools only: DBHub for the source database, Discourse MCP for the local Base site). That access lasts until a merge fences it or you reset the environment. Each copy needs about another full database of disk space.';
+const PREPARE_APPROVAL = 'It restores and prepares both sites locally and gives migration-data read-only inspection access. Nothing is merged: the merge needs its own plan and approval.';
+const PHASES = { preparing: 'Preparing', ready: 'Ready · inspection copies live', inspection: 'Ready · being inspected', fencing: 'Fencing inspection for a merge', merging: 'A merge is using it',
+  consumed: 'Used by a merge', dirty: 'Not clean: prepare it again', reset: 'Reset' };
+const phaseLabel = (env) => (env && env.phase ? PHASES[env.phase] || `State: ${safe(env.phase)}` : 'State not reported');
+const ENDPOINTS = { dbhub: 'DBHub · prepared source database (inspection copy)', discourse_mcp: 'Discourse MCP · local Base site (inspection copy)' };
+// Only the fixed kind, name and readiness the host reports: never a profile, key, host path or URL.
+const endpointRows = (env) => ((env && env.endpoints) || []).filter((point) => ENDPOINTS[point.kind])
+  .map((point) => [ENDPOINTS[point.kind], `${point.ready ? 'ready' : 'not ready'}${point.name ? ` · ${safe(point.name)}` : ''}`]);
+const live = (phase) => phase === 'ready' || phase === 'inspection';  // prepared and clean, not yet used by a merge
+// A generation is the host's 64-hex identity (or a small counter): shown short, never edited.
+const generationLabel = (bound) => (bound && bound.generation ? `generation ${short(String(bound.generation), 12)}` : 'generation unknown');
+const intentLabel = (intent) => (intent === 'stock' ? 'Stock: Discourse’s own merger only' : intent === 'custom' ? 'Custom: the committed merge layer and settings' : null);
+const PREPARED_MERGE = (bound) => `This merge runs in the same prepared environment (${generationLabel(bound)} of run ${short(bound.run_id, 12)}). Inspection access is fenced and its copies discarded, then the clean prepared checkpoint is activated, its binding rechecked and the merge run. The backups are not restored anew. If that environment changed, was reset or used, the run refuses: it never switches to a fresh restore.`;
 // A preparation job is not a pass: it neither converts nor imports.
 const MASTER_WHAT = 'Preparation only: loads a disposable copy of the source and runs the converter’s committed master-list exporter. It rebuilds staging tables in that copy (not a read-only check). Nothing is converted or imported; the exported CSVs are kept as this run’s private artifacts, and using them needs a new plan.';
 const isMerge = (group) => group.kind === 'merge';
@@ -71,6 +88,7 @@ export function runsView(ctx) {
     }
     if (['claimed', 'running'].includes(step.run_status)) return `Running: ${step.stage || 'starting'}`;
     if (step.run_status === 'completed' && step.kind === 'merge') return 'Merged · no automatic count checks: check the site';
+    if (step.run_status === 'completed' && step.kind === 'merge_prepare') return 'Prepared · no migration has run';
     if (step.run_status === 'completed') {
       const checks = step.checks ? (step.matched === step.checks ? `All ${step.checks} checks match` : `${step.matched} of ${step.checks} checks match`) : 'No count checks';
       return `${checks}${site ? ' on the site' : ''}`;
@@ -78,7 +96,7 @@ export function runsView(ctx) {
     return `${step.run_status.replace('_', ' ')}${step.stage ? ` at ${step.stage}` : ''}`;
   };
   const stepTone = (step) => (!step.run_status ? 'now' : ['claimed', 'running'].includes(step.run_status) ? 'run'
-    : step.run_status === 'completed' && (step.kind === 'merge' || (step.checks && step.matched === step.checks)) ? '' : 'warn');
+    : step.run_status === 'completed' && (step.kind === 'merge' || step.kind === 'merge_prepare' || (step.checks && step.matched === step.checks)) ? '' : 'warn');
   const stepPill = (step) => (!step.run_status ? (step.plan_status === 'stale' ? 'out of date' : 'for you') : step.run_status === 'completed' ? 'finished' : step.run_status.replace('_', ' '));
   const stepRow = (name, step, site) => el('button', { type: 'button', class: 'step', onclick: () => (step.run_id ? ctx.open('run', step.run_id) : ctx.open('plan', step.plan_id)) },
     el('span', { class: `dot ${stepTone(step)}` }), el('span', {}, name), el('span', { class: 'what' }, stepText(step, site)),
@@ -108,7 +126,9 @@ export function runsView(ctx) {
     }
     if (!busy && convert.run_id) {
       const again = el('button', { type: 'button', class: full ? 'btn q' : 'link', onclick: async () => {
-        const outcome = await act('again', { run_id: convert.run_id }, isMerge(group)
+        const outcome = await act('again', { run_id: convert.run_id }, isMerge(group) && group.prepared_from
+          ? `Propose a new merge of ${ctx.project} with the same source backup, settings and options as pass ${group.number}, in the same prepared environment (${generationLabel(group.prepared_from)}), with the merge layer as it is committed now? Only while that environment is still ready at that generation: otherwise nothing is proposed and you prepare it again. This only proposes it: you approve it next.`
+          : isMerge(group)
           ? `Start a new merge of ${ctx.project} with the same source backup, settings and options as pass ${group.number}, on the current Base site, with the merge layer as it is committed now? This only proposes it: you approve it next.`
           : `Start a new pass of ${ctx.project} with the same data, settings and checks as pass ${group.number}, and the converter as it is now? This only proposes it: you approve it next.`);
         if (outcome && outcome.plan_id) { toast('Proposed. Check it and approve.'); ctx.open('plan', outcome.plan_id); }
@@ -178,7 +198,9 @@ export function runsView(ctx) {
     if (isMerge(group)) {
       const merge = group.convert;
       const site = merge.site_up ? [el('div', { class: 'step static' }, el('span', { class: 'dot run' }), el('span', {}, 'Merged site'), el('span', { class: 'what' }, 'Up · holds customer data until reset'), el('span', { class: 'pill now' }, 'check it'))] : [];
-      return [stepRow('Merge run', merge, false), ...site, ...backupRows(merge)];
+      const prepared = group.prepared_from ? [el('div', { class: 'step static' }, el('span', { class: 'dot' }), el('span', {}, 'Prepared environment'),
+        el('span', { class: 'what' }, `${generationLabel(group.prepared_from)} · its clean checkpoint, activated for the merge (not restored anew)`))] : [];
+      return [...prepared, stepRow('Merge run', merge, false), ...site, ...backupRows(merge)];
     }
     const rows = [stepRow('Convert run', group.convert, false), ...group.imports.map((step, i) => stepRow(group.imports.length > 1 ? `Import ${i + 1}` : 'Import', step, true))];
     const last = group.imports[group.imports.length - 1];
@@ -218,6 +240,55 @@ export function runsView(ctx) {
     const head = el('button', { type: 'button', class: 'pass-head', onclick: () => ctx.open('pass', group.key) },
       el('div', {}, el('span', { class: 'name' }, `Pass ${group.number}`), el('small', {}, passMeta(group))), el('span', { class: `pill ${tone(group)}` }, group.status[0]));
     return el('div', { class: `pass ${open ? '' : 'closed'}` }, head, open ? el('div', { class: 'pass-body' }, group.base_site ? el('p', { class: 'hint' }, passSay(group)) : null, steps(group), decideBox(group), passActions(group, false), releasedDetails(isMerge(group) ? group.convert : group.imports[group.imports.length - 1])) : null);
+  }
+
+  // A prepared merge environment: its own card, never a numbered pass. No backup, release or sign-in.
+  function envActions(item, full) {
+    const step = item.step;
+    const actions = [];
+    const done = step.run_id && step.run_status && !['claimed', 'running'].includes(step.run_status);
+    const phase = (item.environment || {}).phase;
+    if (done && !['reset', 'consumed', 'fencing', 'merging'].includes(phase)) {
+      actions.push(el('button', { type: 'button', class: 'btn q', onclick: async () => {
+        if (await act('reset', { run_id: step.run_id }, `Reset the prepared merge environment of ${ctx.project}? Its inspection copies, connectors and clean prepared checkpoint are removed; a merge plan bound to ${generationLabel(item.environment)} can no longer run. Evidence and plans stay.`)) { toast('Reset.'); ctx.refresh(); }
+      } }, 'Reset the environment'));
+    }
+    if (done) {
+      const again = el('button', { type: 'button', class: full ? 'btn q' : 'link', onclick: async () => {
+        const outcome = await act('again', { run_id: step.run_id }, `Propose preparing a new merge environment of ${ctx.project} with the same source backup, on the current Base site? This only proposes it: you approve it next, then start it. Nothing is merged.`);
+        if (outcome && outcome.plan_id) { toast('Proposed. Check it and approve.'); ctx.open('plan', outcome.plan_id); }
+      } }, 'Run again');
+      if (!full) again.style.marginLeft = 'auto';
+      actions.push(again);
+    }
+    return actions.length ? el('div', { class: 'actions' }, actions) : null;
+  }
+
+  function envSay(item) {
+    const step = item.step;
+    if (step.run_status !== 'completed') return item.status[0];
+    const phase = (item.environment || {}).phase;
+    if (live(phase)) return 'Prepared. No migration has run. Inspection stays live until a merge or a reset; ask migration-data to propose the merge when its questions are answered.';
+    if (phase === 'consumed') return 'A merge used this environment. Its result and backup are on that merge pass.';
+    return item.status[0];
+  }
+
+  function envCard(item) {
+    const step = item.step;
+    const env = item.environment;
+    const head = el('button', { type: 'button', class: 'pass-head', onclick: () => (step.run_id ? ctx.open('run', step.run_id) : ctx.open('plan', step.plan_id)) },
+      el('div', {}, el('span', { class: 'name' }, 'Prepare merge environment'), el('small', {}, [item.delivery || 'Data not labelled', item.base_site, env && env.generation ? generationLabel(env) : null, ago(item.at)].filter(Boolean).join(' · '))),
+      el('span', { class: `pill ${tone(item)}` }, item.status[0]));
+    const row = (name, text) => el('div', { class: 'step static' }, el('span', { class: 'dot' }), el('span', {}, name), el('span', { class: 'what' }, text));
+    const rows = [stepRow('Prepare', step, false)];
+    if (step.run_status === 'completed') {
+      rows.push(row('Environment', phaseLabel(env)));
+      if (env && live(env.phase)) rows.push(...endpointRows(env).map(([name, text]) => row(name, text)));
+      rows.push(row('Output', 'None: no migration has run, nothing to back up or release'));
+    }
+    if (item.used_by && item.used_by.length) rows.push(row('Merge', `Used by pass ${item.used_by.join(', ')}`));
+    else if (item.proposed_merges && item.proposed_merges.length) rows.push(row('Merge', `Proposed as pass ${item.proposed_merges.join(', ')}: approve it there`));
+    return el('div', { class: 'pass' }, head, el('div', { class: 'pass-body' }, el('p', { class: 'hint' }, envSay(item)), rows, envActions(item, false)));
   }
 
   function updatesList(all) {
@@ -269,7 +340,13 @@ export function runsView(ctx) {
     if (waitingPushes.length) {
       nodes.push(el('h2', {}, 'WAITING FOR YOU'), ...waitingPushes.map((update) => item(`Converter update: ${safe(update.title || '')}`, 'Push it to GitHub and open or update the draft PR', () => ctx.open('push', update.digest))));
     }
-    if (!data.passes.length) nodes.push(el('p', { class: 'quiet' }, 'No runs yet. migration-data proposes the first run (a convert run, or a merge run in a Discourse merge project); it appears here as pass 1.'));
+    const prepared = data.environments || [];
+    if (prepared.length) {
+      nodes.push(el('h2', {}, 'MERGE ENVIRONMENT'), el('p', { class: 'hint' }, 'Preparing a merge environment is not a pass: nothing is merged, backed up or released in it.'),
+        ...prepared.map((item) => envCard(item)));
+      if (data.passes.length) nodes.push(el('h2', {}, 'PASSES'));
+    }
+    if (!data.passes.length) nodes.push(el('p', { class: 'quiet' }, prepared.length ? 'No merge has run yet. When the environment is ready and inspected, migration-data proposes the merge; it appears here as pass 1.' : 'No runs yet. migration-data proposes the first run (a convert run, or a merge run in a Discourse merge project); it appears here as pass 1.'));
     nodes.push(...data.passes.map((group, i) => passCard(group, i === 0)));
     const preparing = data.preparations || [];
     if (preparing.length) {
@@ -316,7 +393,9 @@ export function runsView(ctx) {
     const changed = before ? el('p', { class: 'changed' }, `Changed since pass ${before.number}: `, el('b', {}, changes.length ? changes.join(', ') : 'nothing'), '.') : null;
     const layer = group.layer || {};
     const more = details(facts(isMerge(group)
-      ? [['Merge run', group.convert.run_id, true], ['Merge plan', group.convert.plan_id, true], ['Merge layer', layer.present ? layer.path : 'None: Discourse’s own merger only', true],
+      ? [['Merge run', group.convert.run_id, true], ['Merge plan', group.convert.plan_id, true],
+        ['Prepared environment', group.prepared_from ? `${group.prepared_from.run_id} · ${generationLabel(group.prepared_from)}` : null, true],
+        ['Merge layer', layer.present ? layer.path : 'None: Discourse’s own merger only', true],
         ['Layer commit', layer.present ? layer.revision : null, true], ['Layer SHA-256', layer.present ? layer.sha256 : null, true], ['Branch', group.branch, true]]
       : [['Convert run', group.convert.run_id, true], ['Convert plan', group.convert.plan_id, true],
         ...group.imports.map((step, i) => [`Import ${i + 1}`, step.run_id || step.plan_id, true]), ['Converter', group.converter, true], ['Branch', group.branch, true]]));
@@ -329,28 +408,33 @@ export function runsView(ctx) {
     const review = data.operation === 'standard_review';
     const merge = data.operation === 'standard_merge';
     const master = data.operation === 'standard_master_lists';
+    const prepare = data.operation === PREPARE;
+    const bound = merge ? data.prepared_from : null;  // a prepared merge binds one exact environment generation
     const merging = merge ? (data.merge || {}) : {};
     const layer = merging.layer || {};
-    const onBase = review || merge;
+    const onBase = review || merge || prepare;
     const converter = data.converter || {};
     const texts = data.texts || {};
     const unseen = ((convert || master) && texts.settings == null) || (merge && (data.roles || {}).settings && texts.settings == null)
       || ((convert || review) && (data.roles || {}).reconciliation && texts.reconciliation == null);
-    const say = data.status === 'proposed' ? `Approve this ${convert ? 'convert run' : review ? 'import' : merge ? 'merge' : master ? 'master-list export (preparation)' : 'run'} on ${dataLabel(data)}${onBase ? ` · ${baseLabel(data.base_site)}` : ''}?`
+    const say = data.status === 'proposed' ? `Approve this ${convert ? 'convert run' : review ? 'import' : merge ? (bound ? 'merge in the prepared environment' : 'merge') : master ? 'master-list export (preparation)' : prepare ? 'merge environment preparation (no merge)' : 'run'} on ${dataLabel(data)}${onBase ? ` · ${baseLabel(data.base_site)}` : ''}?`
       : data.status === 'approved' ? 'Approved. Start it when you are ready.' : `This plan is ${data.status === 'stale' ? 'out of date' : data.status.replace('_', ' ')}.`;
     const summary = facts([
       ['Data', el('strong', {}, dataLabel(data))],
-      ['Source site', merge ? `Its full backup, with uploads · Discourse ${safe((merging.source || {}).discourse_version || 'unknown')}` : null],
-      ['Base site', onBase ? `${baseLabel(data.base_site)}${data.base_site ? ` · Discourse ${data.base_site.discourse_version}` : ''}${merge ? ' · the site merged into' : ''}` : null],
+      ['Source site', merge ? `Its full backup, with uploads · Discourse ${safe((merging.source || {}).discourse_version || 'unknown')}` : prepare ? 'Its full backup, with uploads' : null],
+      ['Base site', onBase ? `${baseLabel(data.base_site)}${data.base_site ? ` · Discourse ${data.base_site.discourse_version}` : ''}${merge || prepare ? ' · the site merged into' : ''}` : null],
       ['Review Discourse', onBase ? runtimeLabel(data.review_runtime) : null],
+      ['Prepared environment', bound ? `Run ${short(bound.run_id, 12)} · ${generationLabel(bound)} · exactly this one` : null, true],
+      ['Merge rules', merge ? intentLabel(data.intent) : null],
       ['What', convert ? `Converts the data with converters/${data.platform} and checks the counts. Nothing is imported yet.` : review ? 'Imports the converted data into a new local review site and checks the counts there.'
+        : merge && bound ? 'Fences inspection access, activates the environment’s clean prepared checkpoint (it does not restore the backups anew), rechecks it, merges the source site into it with Discourse’s own merger, and takes a full backup. No automatic count checks.'
         : merge ? 'Restores the Base site in a new local review site, merges the source site into it with Discourse’s own merger, and takes a full backup. No automatic count checks.'
-        : master ? MASTER_WHAT : operationLabel(data.operation)],
+        : prepare ? PREPARE_WHAT : master ? MASTER_WHAT : operationLabel(data.operation)],
       ['Exporter', master && data.master_lists ? `${safe(data.master_lists.script || '')} · list ${safe(data.master_lists.list || 'all')}` : null, true],
       ['Merge layer', merge ? (layer.present ? `${safe(layer.path)} @ ${short(layer.revision, 12)} · ${layer.files} file${layer.files === 1 ? '' : 's'}` : 'None: Discourse’s own merger only') : null, true],
       ['Merge settings', merge ? ((data.roles || {}).settings ? 'A settings file: shown under Details' : 'None') : null],
       ['Options', merge ? ([(merging.options || {}).ignore_global_pins ? 'ignore globally pinned topics' : null, (merging.options || {}).separate_same_named_groups ? 'keep same-named groups separate' : null].filter(Boolean).join(', ') || 'Discourse’s defaults') : null],
-      ['Converter', review || merge ? null : `${converter.branch || ''} @ ${short(data.converter_revision, 12)}`, true],
+      ['Converter', review || merge || prepare ? null : `${converter.branch || ''} @ ${short(data.converter_revision, 12)}`, true],
       ['Proposed', ago(data.created_at)],
       ['Approved by', data.approved_by],
     ]);
@@ -370,6 +454,11 @@ export function runsView(ctx) {
       const source = data.from_run || {};
       more.push(block('Review source', facts([['Source run', source.run_id, true], ['Intermediate SHA-256', source.intermediate_sha256, true], ['Loopback port', ((data.instances || {}).review || {}).port]])));
     }
+    if (bound || data.merge_environment) {
+      const env = data.merge_environment || {};
+      more.push(block('Prepared environment', facts([['Preparation run', (bound || {}).run_id || env.preparation_run_id, true],
+        ['Generation', String((bound || env).generation || 'unknown'), true], ['State', data.merge_environment ? phaseLabel(env) : null]])));
+    }
     if (merge) {
       more.push(block('Merge', facts([['Source site', `Discourse ${safe((merging.source || {}).discourse_version || '')} · schema ${safe((merging.source || {}).schema_version || '')}`],
         ['Merge layer', layer.present ? layer.path : 'none', true], ['Layer commit', layer.present ? layer.revision : null, true], ['Layer size', layer.present ? `${layer.files} file(s), ${layer.bytes} bytes` : null],
@@ -388,7 +477,8 @@ export function runsView(ctx) {
     if (data.status === 'proposed') {
       const question = unseen
         ? `Approve this run of ${ctx.project} on ${dataLabel(data)}${onBase ? ` · ${baseLabel(data.base_site)}` : ''}?\nApproval code ${short(data.digest, 16)}…\nThe settings or checks could NOT be shown here: you approve them by their checksum only.`
-        : `Approve this run of ${ctx.project} on ${dataLabel(data)}${onBase ? ` · ${baseLabel(data.base_site)}` : ''}?\nApproval code ${short(data.digest, 16)}…\n${merge && layer.present ? `It runs the merge layer at commit ${short(layer.revision, 12)} next to the customer data.` : 'It runs exactly what this page shows.'}`;
+        : `Approve ${prepare ? 'preparing the merge environment' : 'this run'} of ${ctx.project} on ${dataLabel(data)}${onBase ? ` · ${baseLabel(data.base_site)}` : ''}?\nApproval code ${short(data.digest, 16)}…\n${prepare ? PREPARE_APPROVAL
+          : `${bound ? `It merges in the prepared environment, ${generationLabel(bound)} only. ` : ''}${merge && layer.present ? `It runs the merge layer at commit ${short(layer.revision, 12)} next to the customer data.` : 'It runs exactly what this page shows.'}`}`;
       actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
         if (blocked) return;
         if (await act('approve', { plan_id: data.plan_id, digest: data.digest }, question)) { toast('Approved. Start it when you are ready.'); ctx.refresh(); }
@@ -410,6 +500,8 @@ export function runsView(ctx) {
     if (data.review_runtime) notes.push(el('p', { class: 'hint' }, 'Chosen automatically for this plan. A replacement Base backup is resolved again for the next plan; existing runs keep their original version. Restore the output on the same or a compatible newer Discourse version.'));
     if (data.review_runtime && data.review_runtime.core_comparison_complete === false && data.base_site) notes.push(el('p', { class: 'note' }, 'The selected version is compatible, but comparison with the current build was unavailable. Core/schema coverage is not fully confirmed; the run still verifies its identity and required runtime migrations.'));
     if (data.review_runtime && data.review_runtime.missing_known_core_migrations > 0) notes.push(el('p', { class: 'note' }, `${data.review_runtime.missing_known_core_migrations} known Base-site core migrations are not in this image. This is a compatibility warning, not a claim of an exact match.`));
+    if (prepare) notes.push(el('p', { class: 'note' }, PREPARE_ACCESS));
+    if (bound) notes.push(el('p', { class: 'note' }, PREPARED_MERGE(bound)));
     if (merge && layer.present) notes.push(el('p', { class: 'note' },
       `The merge layer is code converter-developer wrote. It runs inside the review site, next to the customer data, exactly as committed at ${short(layer.revision, 12)}. Have converter-reviewer check it before you approve.`));
     if (onBase && data.base_site && data.base_site.ahead) notes.push(el('p', { class: 'note' },
@@ -428,7 +520,44 @@ export function runsView(ctx) {
       spec.checks.map((c) => [safe(c.name), el('code', {}, safe(c.source_sql || '')), el('code', {}, safe(c.intermediate_sql || '')), ...(destination ? [el('code', {}, safe(c.destination_sql || ''))] : []), safe(c.note || '')]));
   }
 
+  // A prepare run's own page: the environment's state and fixed inspection endpoints, then Reset and
+  // Run again. Never a backup, release, review URL or admin password: nothing has been merged yet.
+  function prepareRun(data) {
+    const env = data.merge_environment;
+    const phase = (env || {}).phase;
+    const say = ['claimed', 'running'].includes(data.status) ? `Preparing: ${data.stage || 'starting'}.`
+      : data.status === 'completed' && live(phase) ? 'Prepared. No migration has run. Inspection stays live until a merge or a reset.'
+      : data.status === 'completed' ? `Prepared · ${phaseLabel(env)}. No migration ran in this job.`
+      : data.status === 'failed' ? `Stopped at ${data.stage || 'a stage'}. Nothing was merged.` : `This preparation is ${data.status.replace('_', ' ')}.`;
+    const parts = [];
+    if ((data.results || {}).review_runtime) parts.push(block('Pinned Discourse', el('p', {}, safe(runtimeLabel(data.results.review_runtime)))));
+    if (data.status === 'completed') {
+      parts.push(block('Environment', facts([['State', phaseLabel(env)], ['Generation', env && env.generation ? String(env.generation) : 'unknown'],
+        ...(live(phase) ? endpointRows(env) : []), ['Output', 'None: nothing to back up or release before a clean merged result']])));
+      if (live(phase)) parts.push(el('p', { class: 'note' }, PREPARE_ACCESS),
+        el('p', { class: 'hint' }, 'When migration-data’s questions are answered, it proposes one exact merge plan bound to this generation. You approve and start that separately.'));
+    }
+    if (data.failure && data.failure.recovery) parts.push(el('p', { class: 'note' }, data.failure.recovery));
+    if (data.recovery) parts.push(el('p', { class: 'note' }, data.recovery));
+    const actions = [];
+    if (['abandoned', 'not_started'].includes(data.status)) {
+      actions.push(el('button', { type: 'button', class: 'btn', onclick: async () => {
+        if (await act('recover', { run_id: data.run_id }, `Mark this preparation of ${ctx.project} as interrupted? Only do this if its process is gone, for example after a restart. Then reset it.`)) { toast('Marked interrupted.'); ctx.refresh(); }
+      } }, 'Recover'));
+    }
+    const item = { step: { run_id: data.run_id, run_status: data.status }, environment: env };
+    const more = envActions(item, true);
+    if (RUN_DONE.has(data.status) && (phase === 'reset' || (!env && !data.review_site_available))) parts.push(el('p', { class: 'hint' }, 'Nothing of this environment is left to reset. Evidence and plans stay with the run.'));
+    if (more) actions.push(...more.childNodes);
+    const details_ = details(facts([['Run', data.run_id, true], ['Plan', data.plan_id, true], ['Started', data.started_at], ['Finished', data.finished_at],
+      ['Problem', data.failure ? `${data.failure.code} (stage ${data.failure.stage})` : null, true]]),
+    el('div', { class: 'stagelist' }, Object.entries(data.stages || {}).map(([name, status]) => el('span', {}, `${name} `, badge(status)))));
+    const eyebrow = ['claimed', 'running'].includes(data.status) ? 'IN PROGRESS' : data.status === 'completed' && !['dirty'].includes(phase) ? 'PREPARED' : 'NEEDS A LOOK';
+    return [card(eyebrow, say, ...parts, actions.length ? el('div', { class: 'actions' }, actions) : null, details_)];
+  }
+
   function run(data) {
+    if (data.operation === PREPARE) return prepareRun(data);
     const results = data.results || {};
     const rows = Array.isArray(data.reconciliation) ? data.reconciliation : [];
     const destination = rows.some((row) => row.destination != null);
@@ -514,6 +643,7 @@ export function runsView(ctx) {
       } }, review ? 'Reset the site' : 'Reset'));
     }
     const more = [facts([['Run', data.run_id, true], ['Plan', data.plan_id, true], ['Started', data.started_at], ['Finished', data.finished_at],
+      ['Prepared environment', merge && data.prepared_from ? `${data.prepared_from.run_id} · ${generationLabel(data.prepared_from)}` : null, true],
       ['Problem', data.failure ? `${data.failure.code} (stage ${data.failure.stage})` : null, true], ['Import issues', results.import_issues],
       ...(merged ? [['Columns only the Base site has', merged.target_only_columns], ['Source upload files', merged.source_upload_files], ['Upload files in the backup', merged.archive_upload_files], ['Site settings changed by the merge', merged.site_settings_changed],
         ['Restore proof', merged.restore_proof === 'skipped' ? 'Not run in this version' : merged.restore_proof]] : [])]),

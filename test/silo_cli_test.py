@@ -98,6 +98,22 @@ class SiloTest(unittest.TestCase):
             self.assertEqual('OK', checks[name]['status'], (name, checks[name]))
         self.assertNotIn('secret', json.dumps(checks))
 
+    def test_doctor_reports_pinned_merge_connector_without_printing_subprocess_details(self):
+        helper = self.prefix / 'current/script/prepare-discourse-mcp'
+        helper.parent.mkdir()
+        helper.write_text('# release-owned helper\n')
+        for receipt, code, expected in (({'ready': True}, 0, 'OK'), ({'ready': False}, 1, 'WARN'), ([], 0, 'WARN')):
+            with self.subTest(receipt=receipt):
+                responses = dict(self.healthy(), **{'prepare-discourse-mcp --check': (code, json.dumps(receipt))})
+                check = self.statuses(responses)['merge inspection MCP']
+                self.assertEqual(expected, check['status'])
+                if expected == 'WARN':
+                    self.assertIn('silo update', check['fix'])
+        responses = dict(self.healthy(), **{'prepare-discourse-mcp --check': (1, 'PRIVATE-CANARY')})
+        check = self.statuses(responses)['merge inspection MCP']
+        self.assertEqual('WARN', check['status'])
+        self.assertNotIn('PRIVATE-CANARY', json.dumps(check))
+
     def test_doctor_stock_host_needs_no_experimental_capability_command(self):
         responses = dict(self.healthy(), **{'capabilities --json': (1, '')})
         calls = []

@@ -9,12 +9,17 @@ module SiloMigrate
     # diagnostics stay under the private run directory; only fixed counters leave it.
     module StandardMergeRun
       MERGE_OPERATION = "standard_merge"
-      MERGE_STAGES = %w[preflight site_up base_restore source_load merge finalize verify backup site_setup review_url].freeze
+      MERGE_STAGES = %w[preflight site_up base_restore source_load compatibility merge finalize verify backup site_setup review_url].freeze
       MERGE_TOTAL_KEYS = %w[users topics posts categories groups tags uploads].freeze
       MERGE_LAYER_BYTES = 512 * 1024
       MERGE_SETTINGS_BYTES = 256 * 1024
 
       def propose_merge_plan(**options)
+        options = options.compact
+        # A prepared merge consumes one environment generation; intent exists only there.
+        return propose_prepared_merge_plan(**options) if options.key?(:prepared_from)
+        raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" if options.key?(:generation) || options.key?(:intent)
+
         ids = options.values_at(:source, :base_site, :settings).compact
         unless options[:source].is_a?(String) && options[:base_site].is_a?(String) && ids.uniq.size == ids.size
           raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID"
@@ -25,11 +30,14 @@ module SiloMigrate
         end
       end
 
-      def build_merge_plan(source:, base_site:, settings: nil, ignore_global_pins: false, separate_same_named_groups: false, port: nil, allow_unqualified_runtime: false, preparation: nil, runtime_selection:)
+      def build_merge_plan(source:, base_site:, settings: nil, ignore_global_pins: false, separate_same_named_groups: false, port: nil, allow_unqualified_runtime: false, preparation: nil, runtime_selection:, prepared: nil, intent: nil)
         state = @store.load
         config = state.fetch("config")
         raise StandardWorkflowError, "STANDARD_SIZE_LIMIT" if state.fetch("plans").size >= self.class::MAX_PLANS
-        raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless profile_current?(config) && check_converter!(config)
+        raise StandardWorkflowError, "STANDARD_ARGUMENT_INVALID" unless prepared ? StandardMergePreparation::MERGE_INTENTS.include?(intent) : intent.nil?
+        # An explicit stock merge of a prepared environment uses no converter code at all.
+        stock = prepared && intent == "stock"
+        raise StandardWorkflowError, "STANDARD_STALE_PLAN" unless profile_current?(config) && (stock || check_converter!(config))
         qualified = lock.dig("qualification", "status") == "qualified"
         review_ready = lock.dig("qualification", "status") == "review_ready"
         raise StandardWorkflowError, "STANDARD_RUNTIME_UNQUALIFIED" unless qualified || review_ready || allow_unqualified_runtime
@@ -47,26 +55,27 @@ module SiloMigrate
         dataset = named.fetch("datasets").fetch(inputs.fetch("source").fetch("dataset_id"))
         platform = named.fetch("sources").fetch(dataset.fetch("source_id")).fetch("platform").unpack1("m0")
         raise StandardWorkflowError, "STANDARD_INPUTS_INCOMPLETE" unless platform == "discourse"
-        source_versions = merge_source_versions!(inputs.fetch("source").fetch("path").unpack1("m0"))
-        begin
-          base_site_compatible!(source_versions, { "discourse_version" => lock.fetch("app").fetch("version") })
-        rescue StandardWorkflowError => error
-          raise unless error.code == "STANDARD_BASE_SITE_NEWER"
-          raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_NEWER"
-        end
-        base_versions = base_site_versions!(inputs.fetch("base_site").fetch("path").unpack1("m0"))
-        base_site_compatible!(base_versions, { "discourse_version" => lock.fetch("app").fetch("version") })
-        migrations = review_image_migrations
-        base_delivery = delivery_record!(inputs.fetch("base_site").fetch("dataset_id"))
-        base = { "input_id" => base_site, "delivery" => base_delivery.slice("kind", "version"), "site_schema_version" => migrations.last,
-                 "ahead" => base_versions.fetch("schema_version") > migrations.last }.merge(base_versions)
+        source_versions, base = merge_side_bindings!(inputs, base_site)
+        # Settings are read by a merge layer only: a stock merge would silently ignore the mapping.
+        raise StandardWorkflowError, "STANDARD_MERGE_INTENT_MISMATCH" if stock && settings
         merge_settings!(merge_settings_input!(inputs.fetch("settings"))) if settings
-        layer, = merge_layer!(config.fetch("converter_worktree"), config.fetch("converter_revision"), @workspace)
-        limits = review_limits
-        review_capacity!(limits, running: false)
-        disk_headroom!(3 * inputs.fetch("source").fetch("bytes"))
+        layer = stock ? { "present" => false } : merge_layer!(config.fetch("converter_worktree"), config.fetch("converter_revision"), @workspace).first
+        raise StandardWorkflowError, "STANDARD_MERGE_INTENT_MISMATCH" if prepared && intent == "custom" && layer["present"] != true
         plan_id = @store.new_id("plan")
-        review_port = select_review_port(state, port)
+        if prepared
+          prepared_body = prepared.fetch("body")
+          # Same inputs under the same runtime bind the same facts; anything else is another environment.
+          unless base == prepared_body["base_site"] && source_versions == prepared_body.dig("merge", "source").slice(*source_versions.keys) && delivery == prepared_body["delivery"]
+            raise StandardWorkflowError, "STANDARD_MERGE_ENVIRONMENT_STALE"
+          end
+          limits = prepared_body.fetch("limits")
+          instance = prepared_body.dig("instances", "review")
+        else
+          limits = review_limits
+          review_capacity!(limits, running: false)
+          instance = { "name" => "silomig-#{plan_id.delete_prefix('plan-')[0, 8]}-review", "hostname" => "127.0.0.1", "port" => select_review_port(state, port) }
+        end
+        disk_headroom!(3 * inputs.fetch("source").fetch("bytes"))
         ids = roles.values.sort
         role_binding = file_role_binding(named, roles)
         body = {
@@ -82,13 +91,21 @@ module SiloMigrate
           "review_runtime" => runtime_selection.fetch("selection"), "base_site_generation" => review_base_generation,
           "image_content_ids" => lock.fetch("images").transform_values { |image| image.fetch("content_id") },
           "runtime_qualified" => qualified, "allow_unqualified_runtime" => allow_unqualified_runtime,
-          "converter" => config["converter"], "converter_binding" => config["converter_binding"], "converter_revision" => config["converter_revision"],
+          "converter" => stock ? nil : config["converter"], "converter_binding" => stock ? nil : config["converter_binding"],
+          "converter_revision" => stock ? nil : config["converter_revision"],
           "app_revision" => lock.dig("app", "revision"), "limits" => limits,
-          "instances" => { "review" => { "name" => "silomig-#{plan_id.delete_prefix('plan-')[0, 8]}-review", "hostname" => "127.0.0.1", "port" => review_port } },
+          "instances" => { "review" => instance },
           "outputs" => { "backup" => "validated full merged backup for #{plan_id}; engineer release to outbox" },
           "mutations" => ["restore the target sandbox in one isolated local review site", "load and migrate a disposable source copy, then merge it into the target", "take a full backup before creating the local review admin", "keep the review site until reset"],
-          "not_included" => ["automatic count checks", "restore proof", "hosted restore", "DNS or cutover", "remote pushes"]
+          "not_included" => ["automatic count checks", "restore proof", StandardMergePreparation::MERGE_NOT_CARRIED, "hosted restore", "DNS or cutover", "remote pushes"]
         }
+        if prepared
+          body["prepared_from"] = prepared.slice("run_id", "generation")
+          body["intent"] = intent
+          body["mutations"] = ["use prepared merge environment #{prepared.fetch('run_id')} once: close its inspection access and drop its inspection copies",
+                               "return the sealed prepared databases to their working names, then merge the prepared source into the prepared Base",
+                               "take a full backup before creating the local review admin and before any new inspection access", "keep the review site until reset"]
+        end
         body["file_role_binding"] = role_binding if role_binding
         if preparation
           readiness = { "kind" => "merge_layer", "present" => layer["present"] == true }.merge(layer.slice("path", "revision", "sha256", "files"))
@@ -109,7 +126,7 @@ module SiloMigrate
       def merge_evidence(run_id)
         run = @store.load.fetch("runs")[run_id]
         raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
-        return nil unless merge_plan?(plan_for(run_id))
+        return nil unless merge_plan?(plan_for(run_id)) || prepare_plan?(plan_for(run_id))
 
         columns = @store.run_dir(run_id, "evidence", "merge-target-only-columns.json")
         log_path = @store.run_dir(run_id, "logs", "merge.log")
@@ -192,13 +209,18 @@ module SiloMigrate
         return "delivery" unless base_record.slice("kind", "version") == body.dig("base_site", "delivery")
         return "code" unless body["code_identity"] == code_identity
         return "runtime" unless review_runtime_current?(body, state.fetch("config"))
-        return "converter" unless check_converter!(state.fetch("config")) && state.dig("config", "converter_revision") == body["converter_revision"] && state.dig("config", "converter_binding") == body["converter_binding"]
+        unless body["prepared_from"] && body["intent"] == "stock"
+          return "converter" unless check_converter!(state.fetch("config")) && state.dig("config", "converter_revision") == body["converter_revision"] && state.dig("config", "converter_binding") == body["converter_binding"]
+        end
+        return prepared_environment_stale_reason(plan, state) if body["prepared_from"]
         nil
       rescue StandardWorkflowError, NamedError, Errno::ENOENT
         "inputs"
       end
 
       def merge_preflight(run_id, plan)
+        return prepared_merge_preflight(run_id, plan) if prepared_merge_plan?(plan)
+
         body = plan.fetch("body")
         resolved = lock.fetch("images").transform_values { |image| ImageIdentity.resolve(@runtime, image) }
         @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["resolved_image_ids"] = resolved }
@@ -291,8 +313,12 @@ module SiloMigrate
         merge_checked(run_id, "merge-db", result)
       end
 
-      def merge_state(stack, source: false, run_id: nil)
-        env = source ? { "SILO_MERGE_CONFIG" => "/shared/merge-source.conf", "RUBYOPT" => "-r/tmp/merge_source_config.rb" } : {}
+      def merge_source_url?(url)
+        url.is_a?(String) && url.match?(%r{\Ahttps?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[^\s?#]*)?\z})
+      end
+
+      def merge_state(stack, source: false, run_id: nil, env: {})
+        env = (source ? { "SILO_MERGE_CONFIG" => "/shared/merge-source.conf", "RUBYOPT" => "-r/tmp/merge_source_config.rb" } : {}).merge(env)
         result = stack.discourse_shell(["env", *env.map { |key, value| "#{key}=#{value}" }, "bundle", "exec", "rails", "runner", "/tmp/merge_state.rb"], timeout: 300)
         log(run_id, "merge-state", result) if run_id
         raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID" unless result.success?
@@ -306,20 +332,22 @@ module SiloMigrate
 
       def stage_source_load(run_id)
         stack = stack_for(run_id, "review")
-        merge_checked(run_id, "merge-stop", stack.web_exec(%w[sv stop unicorn]))
+        # Unicorn and Sidekiq: nothing may write the restored Base while the source is loaded.
+        merge_quiesce_web!(run_id, stack, code: "STANDARD_STACK_FAILED")
         before = merge_state(stack, run_id: run_id)
         evidence(run_id, "merge-before.json", before)
         source = role_input(run_inputs(run_id), "source")
         directory = @store.run_dir(run_id, "private", "merge-source")
         extracted = merge_extract!(input_path(run_id, source), directory, [@disk_free.call / 3, 1].max)
         evidence(run_id, "merge-uploads.json", extracted)
+        # Checked before any database object exists for it: a refused dump changes nothing.
+        adapted = File.join(directory, "adapted.sql.gz")
+        merge_adapt_dump!(File.join(directory, "dump.sql.gz"), adapted, @disk_free.call / 2)
         merge_db(run_id, "CREATE DATABASE merge_source OWNER discourse", db: "postgres", user: "postgres")
         merge_db(run_id, "CREATE EXTENSION IF NOT EXISTS hstore; CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent; CREATE EXTENSION IF NOT EXISTS vector;", user: "postgres")
         functions = @runtime.run(["docker", "exec", stack.container("db"), "pg_dump", "-U", "discourse", "-d", "discourse", "--schema=discourse_functions", "--schema-only", "--no-owner", "--no-acl"], capture: true, timeout: 120)
         merge_checked(run_id, "merge-functions", functions)
         merge_checked(run_id, "merge-functions-load", @runtime.run(["docker", "exec", "-i", stack.container("db"), "psql", "-v", "ON_ERROR_STOP=1", "-U", "discourse", "-d", "merge_source"], capture: true, stdin_data: functions.stdout, timeout: 120))
-        adapted = File.join(directory, "adapted.sql.gz")
-        merge_adapt_dump!(File.join(directory, "dump.sql.gz"), adapted, @disk_free.call / 2)
         merge_checked(run_id, "merge-dump-copy", @runtime.run(["docker", "cp", adapted, "#{stack.container('db')}:/tmp/silo-merge.sql.gz"], capture: true, timeout: 7200))
         # pipefail propagates either gzip CRC failures or psql ON_ERROR_STOP failures.
         load = @runtime.run(["docker", "exec", stack.container("db"), "bash", "-o", "pipefail", "-c", "gzip -dc /tmp/silo-merge.sql.gz | psql -v ON_ERROR_STOP=1 -U discourse -d merge_source"], capture: true, timeout: 7200)
@@ -331,55 +359,83 @@ module SiloMigrate
         unless source_state["database"] == "merge_source" && source_state["pending"] == false
           raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID"
         end
-        url = source_state["base_url"]
-        raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID" unless url.is_a?(String) && url.match?(%r{\Ahttps?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[^\s?#]*)?\z})
+        raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID" unless merge_source_url?(source_state["base_url"])
+        # The source is migrated by the pinned runtime and then left exactly as migrated: no
+        # schema_migrations row is added or removed to satisfy the merger. The compatibility
+        # stage decides, from both actual inventories, whether a merger may be constructed.
         evidence(run_id, "merge-source.json", source_state)
-        target_max = merge_db(run_id, "SELECT MAX(version) FROM schema_migrations", db: "discourse").strip
-        raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID" unless target_max.match?(/\A\d{14}\z/)
-        known = review_image_migrations
-        removed = merge_db(run_id, "WITH removed AS (DELETE FROM schema_migrations WHERE version > '#{target_max}' AND version NOT IN (#{known.map { |v| "'#{v}'" }.join(',')}) RETURNING version) SELECT COUNT(*) FROM removed").strip.to_i
-        added = merge_db(run_id, "WITH added AS (INSERT INTO schema_migrations VALUES ('#{target_max}') ON CONFLICT DO NOTHING RETURNING version) SELECT COUNT(*) FROM added").strip.to_i
-        common_tables = source_state.fetch("columns").map(&:first).to_set
-        columns = before.fetch("columns").select { |table, _column| common_tables.include?(table) } - source_state.fetch("columns")
-        evidence(run_id, "merge-target-only-columns.json", columns)
         if extracted["root"]
           stack.copy_in(File.join(directory, "uploads", extracted.fetch("root")), "/shared/source-uploads")
         else
           merge_checked(run_id, "merge-empty-uploads", stack.web_exec(%w[mkdir -p /shared/source-uploads]))
         end
-        merge_result(run_id, target_before: before.fetch("counts"), source: source_state.fetch("counts"), target_only_columns: columns.size,
-                     source_migrations_removed: removed, source_migration_added: added, source_upload_files: extracted.fetch("uploads").size)
+        merge_result(run_id, target_before: before.fetch("counts"), source: source_state.fetch("counts"), source_upload_files: extracted.fetch("uploads").size)
       end
 
+      # The source dump is replayed by psql inside the PostgreSQL cluster that also holds the
+      # restored Base, so it may only ever act on the declared merge_source database. Outside COPY
+      # data a standard pg_dump needs no psql command (bar the \restrict pair newer versions
+      # write) and no database, role, system or session-identity statement: a dump that carries
+      # one is refused before anything is loaded. This is a guard for standard dump directives
+      # (--create/--clean, pg_dumpall, hand-edited dumps), by line; it is not a SQL sandbox.
+      MERGE_DUMP_IDENT = /(?:[A-Za-z_\x80-\xff][A-Za-z0-9_$\x80-\xff]*|"(?:[^"\x00\n]|"")+")/n
+      MERGE_DUMP_COPY = /\ACOPY (?:#{MERGE_DUMP_IDENT}\.)?#{MERGE_DUMP_IDENT} (?:\(#{MERGE_DUMP_IDENT}(?:, #{MERGE_DUMP_IDENT})*\))? FROM stdin;\r?\n\z/n
+      MERGE_DUMP_RESTRICT = /\A\\(?:un)?restrict [A-Za-z0-9]{1,128}\r?\n\z/n
+      MERGE_DUMP_METACOMMAND = /(?:\A|[\s;])\\(?:!|(?:c|connect|copy|i|ir|include|include_relative|o|out|w|write|g|gx|gexec|gset|gdesc|e|edit|ef|ev|s|set|setenv|cd|bind|lo_import|lo_export|lo_unlink|password|watch)(?![A-Za-z0-9_]))/n
+      MERGE_DUMP_DIRECTIVE = /(?:\A|;)\s*(?:(?:CREATE|ALTER|DROP)\s+(?:DATABASE|ROLE|USER|GROUP|TABLESPACE)|ALTER\s+SYSTEM|(?:REASSIGN|DROP)\s+OWNED|(?:SET|RESET)\s+(?:(?:SESSION|LOCAL)\s+)?(?:ROLE|SESSION\s+AUTHORIZATION))(?![A-Za-z0-9_$])/in
+
       # Only the single exact schema declaration is adapted. Owners/roles/ACLs are
-      # deliberately not rewritten: PostgreSQL refuses unsupported dumps.
+      # deliberately not rewritten: PostgreSQL refuses unsupported dumps. COPY data (customer
+      # cell values) is passed through byte for byte and never inspected for directives.
       def merge_adapt_dump!(source, destination, cap)
         declarations = 0
         bytes = 0
         copy_data = false
         line_start = true
+        refuse = ->(reason) { raise StandardWorkflowError.new("STANDARD_MERGE_SOURCE_INVALID", reason) }
         Zlib::GzipReader.open(source) do |input|
           Zlib::GzipWriter.open(destination) do |output|
             until input.eof?
               line = input.gets(64 * 1024).b
               bytes += line.bytesize
               raise StandardWorkflowError, "STANDARD_CAPACITY" if bytes > cap
-              if line_start && !copy_data && line == "CREATE SCHEMA public;\n"
-                declarations += 1
-                line = "CREATE SCHEMA IF NOT EXISTS public;\n"
-              end
-              if line_start
-                copy_data = false if copy_data && line == "\\.\n"
-                copy_data = true if !copy_data && line.match?(/\ACOPY .+ FROM stdin;\r?\n\z/)
+              # psql reads C strings: a NUL would make it see a different script than this check.
+              refuse.call("dump-nul") if line.include?("\0")
+              if copy_data
+                # The terminator exactly as psql recognises it, at a true line start.
+                copy_data = false if line_start && (line == "\\.\n" || line == "\\.\r\n")
+              else
+                # A statement line too long to judge as a whole is not a standard dump's.
+                refuse.call("dump-line") unless line_start && (line.end_with?("\n") || input.eof?)
+                if line == "CREATE SCHEMA public;\n"
+                  declarations += 1
+                  line = "CREATE SCHEMA IF NOT EXISTS public;\n"
+                elsif line.start_with?("\\")
+                  refuse.call("dump-metacommand") unless line.match?(MERGE_DUMP_RESTRICT)
+                elsif line.match?(/\ACOPY\s/in)
+                  # Anything but the exact pg_dump form would leave data and statements confused.
+                  refuse.call("dump-copy-form") unless line.match?(MERGE_DUMP_COPY)
+                  copy_data = true
+                elsif line.match?(MERGE_DUMP_METACOMMAND)
+                  refuse.call("dump-metacommand")
+                elsif line.match?(MERGE_DUMP_DIRECTIVE)
+                  refuse.call("dump-directive")
+                end
               end
               line_start = line.end_with?("\n")
               output.write(line)
             end
           end
         end
-        raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID" unless declarations == 1
+        refuse.call("dump-copy-open") if copy_data
+        refuse.call("dump-schema") unless declarations == 1
       rescue Zlib::Error, EOFError
+        FileUtils.rm_f(destination)
         raise StandardWorkflowError, "STANDARD_MERGE_SOURCE_INVALID"
+      rescue StandardWorkflowError
+        # Nothing refused is left behind to be loaded; the extracted original stays as evidence.
+        FileUtils.rm_f(destination)
+        raise
       end
 
       # A total's name must be written out in the committed layer: a name built from a
@@ -411,6 +467,9 @@ module SiloMigrate
         stack = stack_for(run_id, "review")
         merge_checked(run_id, "merge-directory", stack.web_exec(%w[mkdir -p /shared/merge]))
         env = ["DB_NAME=merge_source", "DB_HOST=db", "UPLOADS_PATH=/shared/source-uploads"]
+        prepared = prepared_merge_plan?(plan)
+        # A prepared custom merge must run its layer's destination-policy checks.
+        env << "SILO_MERGE_REQUIRE_CHECKS=1" if prepared && plan.dig("body", "intent") == "custom"
         source = JSON.parse(File.read(@store.run_dir(run_id, "evidence", "merge-source.json")))
         # The source site's address names the customer: it reaches the merger from a file inside
         # the stack, never on a command line the host's process list would show.
@@ -443,6 +502,14 @@ module SiloMigrate
         declared = plan.dig("body", "merge", "layer", "present") ? merge_layer_source(run_id) : ""
         merge_result(run_id, layer_totals: merge_totals(result.stdout.to_s + "\n" + result.stderr.to_s, declared))
         raise StandardWorkflowError, merge_failure(result) unless result.success?
+        return unless prepared
+
+        # Exit status alone can be forged by an early exit: the entry point's own last line,
+        # printed once after the merger and its checks, is required as well.
+        lines = result.stdout.to_s.lines.map(&:chomp).reject(&:empty?)
+        unless lines.count("SILO_MERGE: done") == 1 && lines.last == "SILO_MERGE: done"
+          raise StandardWorkflowError.new("STANDARD_MERGE_FAILED", "merger did not report completion")
+        end
       end
 
       def stage_finalize(run_id)
@@ -480,6 +547,11 @@ module SiloMigrate
           raise StandardWorkflowError, "STANDARD_BACKUP_FAILED" unless checked.fetch("upload_sha256")[member] == sha256
         end
         merge_result(run_id, archive_upload_files: checked.fetch("upload_sha256").size)
+        # A prepared merge's backup names the one environment generation it came from, so result
+        # access can be tied to exactly this backup and never to an older artifact.
+        if (binding = plan_for(run_id).dig("body", "prepared_from"))
+          artifact = artifact.merge("merge_generation" => binding.fetch("generation"), "preparation_run_id" => binding.fetch("run_id"))
+        end
         @store.update { |state| state.fetch("runs").fetch(run_id).fetch("artifacts")["backup"] = artifact }
       end
     end

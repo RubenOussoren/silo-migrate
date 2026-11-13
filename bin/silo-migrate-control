@@ -192,6 +192,68 @@ def host_remove(args, values, base):
     return module.main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], data_tools())
 
 
+def merge_inspection_module():
+    import importlib.util
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("merge_mcp", Path(__file__).resolve().parent / "merge_mcp.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def host_merge_inspection(args, values, base):
+    """Fixed generation-bound stdio connectors; credentials never pass through this shim."""
+    return merge_inspection_module().main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], data_tools())
+
+
+def host_merge_lifecycle_cleanup(args, values, base, repo, host):
+    """Drop exact owned connector registrations at an explicit merge start/reset.
+
+    The Ruby lifecycle remains authoritative for DB fencing/checkpoints. This host
+    hook can edit MCP configuration without mounting term-llm configuration into a
+    control container. Status/read commands never perform cleanup.
+    """
+    if args[:3] not in (["standard", "run", "start"], ["standard", "run", "execute"], ["standard", "run", "reset"]):
+        return
+    if len(args) < 5:
+        return
+    data = data_tools()
+    workspace, identity = args[3:5]
+    if not isinstance(workspace, str) or not data.WORKSPACE.fullmatch(workspace):
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    state_path = Path(base) / workspace / ".silo-migrate/named/standard/state.json"
+    if not state_path.is_file():
+        return  # backend owns initialization/grammar errors; no connector state can exist yet
+    ws = data.Workspace(base, workspace, repo, host, values, None)
+    state = data.standard_state(ws)
+    runs, plans = state.get("runs") or {}, state.get("plans") or {}
+    run = None if args[2] == "start" else runs.get(identity)
+    plan = plans.get(identity) if args[2] == "start" else plans.get((run or {}).get("plan_id"))
+    body = (plan or {}).get("body") or {}
+    if body.get("operation") not in ("standard_merge", "standard_merge_prepare"):
+        return
+    if args[2] == "reset" and (run or {}).get("status") in ("claimed", "running"):
+        return  # let the backend refuse busy, without disrupting an active environment
+    ids = set()
+    bound = body.get("prepared_from")
+    if isinstance(bound, dict):
+        ids.add(bound.get("run_id"))
+    environment = (run or {}).get("merge_environment")
+    if isinstance(environment, dict):
+        ids.add(environment.get("preparation_run_id"))
+        ids.add(environment.get("consumed_by"))
+    if run and (body.get("operation") == "standard_merge_prepare" or environment):
+        ids.add(identity)
+    ids.discard(None)
+    if not ids:
+        return
+    if any(not isinstance(run_id, str) or not data.RUN.fullmatch(run_id) for run_id in ids):
+        refuse("STANDARD_MERGE_INSPECTION_INVALID")
+    connector = merge_inspection_module()
+    for run_id in sorted(ids):
+        connector.cleanup(ws, data, run_id=run_id)
+
+
 def host_data(args, values, base, self):
     """`data WS`: the migration-data agent's operations (bin/data_tools.py), JSON on stdin.
     `dbhub WS`: the project's DBHub MCP server over stdio (term-llm starts it; never prints here)."""
@@ -391,12 +453,13 @@ def prepare_review_runtime(args, values, base, repo):
     if args[:3] != ["standard", "plan", "propose"] or len(args) < 7:
         return
     tail = args[4:]
-    if tail[:2] not in (["--operation", "review"], ["--operation", "merge"]):
+    if tail[:2] not in (["--operation", "review"], ["--operation", "merge"], ["--operation", "merge-prepare"]):
         return
     workspace = args[3]
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}", workspace):
         refuse("STANDARD_ARGUMENTS_INVALID")
-    pairs = {"--operation", "--from-run", "--reconciliation", "--base-site", "--port", "--source", "--settings"}
+    pairs = {"--operation", "--from-run", "--reconciliation", "--base-site", "--port", "--source", "--settings",
+             "--preparation", "--prepared-from", "--generation", "--intent"}
     flags = {"--allow-unqualified-runtime", "--ignore-global-pins", "--separate-same-named-groups"}
     opts = {}
     while tail:
@@ -405,10 +468,24 @@ def prepare_review_runtime(args, values, base, repo):
         if key in opts or key not in pairs | flags or (key in pairs and (not tail or tail[0].startswith("--"))):
             refuse("STANDARD_ARGUMENTS_INVALID")
         opts[key] = tail.pop(0) if key in pairs else True
-    required = {"--from-run"} if opts["--operation"] == "review" else {"--source", "--base-site"}
-    allowed = ({"--operation", "--from-run", "--reconciliation", "--base-site", "--port", "--allow-unqualified-runtime"}
-               if opts["--operation"] == "review" else pairs - {"--from-run", "--reconciliation"} | flags)
+    prepared_merge = opts["--operation"] == "merge" and "--prepared-from" in opts
+    if opts["--operation"] == "review":
+        required = {"--from-run"}
+        allowed = {"--operation", "--from-run", "--reconciliation", "--base-site", "--port", "--allow-unqualified-runtime"}
+    elif opts["--operation"] == "merge-prepare":
+        required = {"--source", "--base-site"}
+        allowed = {"--operation", "--source", "--base-site", "--port", "--allow-unqualified-runtime"}
+    elif prepared_merge:
+        required = {"--prepared-from", "--generation", "--intent"}
+        allowed = (pairs | flags) - {"--from-run", "--reconciliation", "--port", "--allow-unqualified-runtime"}
+    else:
+        required = {"--source", "--base-site"}
+        allowed = (pairs | flags) - {"--from-run", "--reconciliation", "--prepared-from", "--generation", "--intent"}
     if not required <= opts.keys() or not opts.keys() <= allowed:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    if prepared_merge and (not re.fullmatch(r"run-[0-9a-f]{32}", opts["--prepared-from"])
+                           or not re.fullmatch(r"[0-9a-f]{64}", opts["--generation"])
+                           or opts["--intent"] not in ("stock", "custom")):
         refuse("STANDARD_ARGUMENTS_INVALID")
     if "--port" in opts and not re.fullmatch(r"[1-9][0-9]{0,4}", opts["--port"]):
         refuse("STANDARD_ARGUMENTS_INVALID")
@@ -417,6 +494,10 @@ def prepare_review_runtime(args, values, base, repo):
             prefix = "run" if key == "--from-run" else "input"
             if not re.fullmatch(prefix + r"-[0-9a-f]{32}", opts[key]):
                 refuse("STANDARD_ARGUMENTS_INVALID")
+    if prepared_merge:
+        # The backend binds the preparation's exact runtime. Never resolve a moving
+        # image or re-read the latest Base for an already prepared environment.
+        return
 
     root = base / workspace
     def document(path):
@@ -503,6 +584,8 @@ def main(args):
     gems = Path(values.get("SILO_CONTROL_GEMS", str(project / ".runtime-cache/gems")))
     if args[:1] == ["converter"]:
         return host_converter(args, values, base, self)
+    if args[:1] in (["merge-mcp"], ["merge-dbhub"]):
+        return host_merge_inspection(args, values, base)
     if args[:1] in (["data"], ["dbhub"]):
         return host_data(args, values, base, self)
     if args[:1] == ["remove-project"]:
@@ -547,6 +630,7 @@ def main(args):
         if result.returncode:
             print("Error: STANDARD_RUN_NOT_STARTED. Recover with: standard run recover " + args[1] + " " + run_id, file=sys.stderr)
         return result.returncode
+    host_merge_lifecycle_cleanup(args, values, base, repo, sys.modules.get(__name__))
     # Short UI reads need not throttle Ruby startup to a quarter CPU. Mutation/executor ceilings
     # stay unchanged, as do memory, mounts, identity checks and every other isolation setting.
     read_only = args[:2] == ["standard", "status"] or args[:3] in (["standard", "plan", "show"], ["standard", "run", "show"])

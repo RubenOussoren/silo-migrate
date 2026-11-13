@@ -414,6 +414,18 @@ def doctor_checks(entry, runner=run):
     add("OK" if identity else "WARN", "commit identity", "set" if identity else "missing: converter-developer can't commit",
         None if identity else "printf 'name=…\\nemail=…\\n' > ~/.config/silo-migrate/git-identity (as the service account)")
 
+    connector_helper = current / "script/prepare-discourse-mcp"
+    if connector_helper.is_file():
+        checked = runner(as_account(["python3", "-I", "-B", str(connector_helper), "--check"], entry), timeout=60)
+        try:
+            receipt = json.loads(checked.stdout or "{}")
+            connector_ready = checked.returncode == 0 and isinstance(receipt, dict) and receipt.get("ready") is True
+        except (ValueError, AttributeError):
+            connector_ready = False
+        add("OK" if connector_ready else "WARN", "merge inspection MCP",
+            "pinned public connector runtime ready" if connector_ready else "not prepared or changed; merge site inspection unavailable",
+            None if connector_ready else "silo update (prepares the pinned public connector without customer data)")
+
     docker = runner(as_account(["docker", "info", "--format", "{{.ServerVersion}}"], entry), timeout=30)
     add("OK" if docker.returncode == 0 else "FAIL", "Docker", ("server " + docker.stdout.strip()) if docker.returncode == 0 else "unreachable for the service account")
 

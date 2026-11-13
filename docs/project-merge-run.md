@@ -11,8 +11,8 @@ What is specific to one customer (which categories go where, what to skip) lives
    - the **target's backup without uploads** (`discourse backup --sql-only`, `.sql.gz`).
 2. As root: `silo intake PROJECT`.
 3. On the Project page's Files tab, create the workspace with source platform **`discourse`**. Label the source backup **Development** (or Launch) and the target backup **Base site**. Either can come first.
-4. In a chat in the project, ask migration-data to propose the merge. It takes the source backup (type `discourse-backup`) and proposes a merge run on the current Base site.
-5. The tool automatically selects/prepares the review Discourse runtime from the current Base backup, preferring a match or a compatible newer build on the same track. A replacement Base backup is resolved again; pending earlier plans become stale and existing runs keep their original version. First preparation may take several minutes; the page waits, or migration-data polls a `runtime_preparing` proposal. No merge has started yet. On the Runs tab: read the plan (including the selected runtime), **Approve**, **Start**.
+4. Ask migration-data for `data_merge_prepare`. Review, Approve and separately Start this preparation plan. It restores the Base and migrates a disposable source copy with the selected pinned runtime, then exposes inspection copies without running the merger. No layer/settings are required yet.
+5. Inspect the prepared source through DBHub and the running local Base through Discourse MCP in Frontier, resolve material questions, and prepare/review layer/settings as needed. Then propose `data_merge_propose` with that exact preparation run, generation and explicit stock/custom intent. Review the exact Merge plan, **Approve**, then separately **Start**. Runtime preparation may first report `runtime_preparing`; poll the same proposal. The merge consumes clean prepared state, not API inspection side effects. See [Prepare and inspect a merge](merge-preparation.md) for CLI commands, credentials, capacity and recovery. The legacy one-shot engineer proposal remains available but has no inspection pause.
 6. When it finishes, open the merged site through the SSH tunnel and check it. The run shows totals for the Base site before, the source site and the merged site.
 7. **Release backup…** copies the merged site's full backup and a manifest to the project's output folder. Nothing is sent anywhere. Restoring it on the hosted migration site is the engineer's step, outside this tool.
 8. **Reset the site** when done: it holds customer data until then.
@@ -38,7 +38,7 @@ converter-reviewer checks a layer like any converter change, and also that it ho
 
 ## What the run does
 
-Stages: preflight, site up, base restore, source load, merge, finalize, verify, backup, site setup, review URL.
+Stages of the legacy one-shot path: preflight, site up, base restore, source load, merge, finalize, verify, backup, site setup, review URL. The prepared path splits restore/source migration/checkpoint/inspection from a separately approved merge consuming that environment; see [preparation lifecycle](merge-preparation.md). Prepared custom layers must return exactly `true` from class hooks `silo_merge_preflight!` (before the stock constructor) and `silo_merge_postflight!` (after copying, before finalization/backup). Reviewed hook logic owns the project-specific policy, not a generic grant-count heuristic.
 
 - **Source load** unpacks the source backup inside the run's private folder, loads its database as a separate, disposable copy next to the target and migrates that copy to the server's Discourse schema. Uploads come from the backup's own files.
 - **Merge** runs the merger (with the layer, if any) with the options the plan shows.

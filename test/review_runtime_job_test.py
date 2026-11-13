@@ -494,6 +494,33 @@ class ReviewRuntimeHostTest(unittest.TestCase):
             control.prepare_review_runtime(self.args(),{},self.base,self.repo)
         self.assertFalse((self.repo / 'bin/observed.json').exists())
 
+    def test_merge_prepare_resolves_runtime_from_its_exact_base(self):
+        args = ['standard', 'plan', 'propose', 'invented', '--operation', 'merge-prepare',
+                '--source', 'input-' + 'c' * 32, '--base-site', self.input]
+        self.assertEqual({'status': 'runtime_preparing'}, control.prepare_review_runtime(args, {}, self.base, self.repo))
+        observed = json.loads((self.repo / 'bin/observed.json').read_text())
+        self.assertEqual(('2026.11.0-latest.1', '20261109000000'), (observed['version'], observed['schema']))
+        for extra in (['--settings', self.input], ['--ignore-global-pins']):
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, 'STANDARD_ARGUMENTS_INVALID'):
+                control.prepare_review_runtime(args + extra, {}, self.base, self.repo)
+
+    def test_prepared_merge_never_resolves_or_reads_another_runtime(self):
+        args = ['standard', 'plan', 'propose', 'invented', '--operation', 'merge',
+                '--prepared-from', self.run, '--generation', 'd' * 64, '--intent', 'custom',
+                '--settings', self.input, '--preparation', '/private/invented.json']
+        # Even a missing state/profile must not lead this host seam to choose a fresh runtime.
+        (self.named / 'standard/state.json').unlink()
+        self.assertIsNone(control.prepare_review_runtime(args, {}, self.base, self.repo))
+        self.assertFalse((self.repo / 'bin/observed.json').exists())
+        for extra in (['--port', '8080'], ['--allow-unqualified-runtime']):
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, 'STANDARD_ARGUMENTS_INVALID'):
+                control.prepare_review_runtime(args + extra, {}, self.base, self.repo)
+        for key, bad in (('--generation', 'not-a-generation'), ('--prepared-from', '../other'), ('--intent', 'guess')):
+            malformed = list(args)
+            malformed[malformed.index(key) + 1] = bad
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'STANDARD_ARGUMENTS_INVALID'):
+                control.prepare_review_runtime(malformed, {}, self.base, self.repo)
+
     def test_reads_start_and_reset_do_not_prepare(self):
         for args in (['standard','status','invented'], ['start-run','invented','plan-'+'a'*32], ['standard','run','reset','invented',self.run,'--yes']):
             self.assertIsNone(control.prepare_review_runtime(args,{},self.base,self.repo))

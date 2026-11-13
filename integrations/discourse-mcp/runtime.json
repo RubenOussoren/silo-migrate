@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "package": "@discourse/mcp",
+  "package_version": "0.3.1",
+  "package_integrity": "sha512-ohHr4jx3+m6uL1/cheFFrLQErC0XQJTmBzh4jeK8G9apaIvibQ68rEapBzSB60PxdfdKXBkJp98quMozhnSBgA==",
+  "entry": "node_modules/@discourse/mcp/dist/index.js",
+  "node_image": "node:24.22.3-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54",
+  "notes": "Installed only by script/prepare-discourse-mcp (npm ci --ignore-scripts from package-lock.json). The launcher never downloads; it verifies the prepared tree digest and the recorded node image ID."
+}

@@ -188,4 +188,32 @@ class StandardCLITest < SiloMigrateTest
     assert_equal 1, cli.run(%w[plan propose synthetic --operation merge --source source --base-site base --port invalid])
   end
 
+  def test_prepare_and_prepared_merge_grammar_never_approves_unknown_future_settings
+    output, error = StringIO.new, StringIO.new
+    cli = SiloMigrate::StandardCLI.new(output: output, error: error)
+    received = nil
+    fake = Object.new
+    fake.define_singleton_method(:propose_merge_preparation_plan) { |**kwargs| received = kwargs; { operation: 'standard_merge_prepare' } }
+    fake.define_singleton_method(:propose_merge_plan) { |**kwargs| received = kwargs; { operation: 'standard_merge' } }
+    cli.define_singleton_method(:service) { |_workspace| fake }
+    assert_equal 0, cli.run(%w[plan propose synthetic --operation merge-prepare --source input-source --base-site input-base])
+    assert_equal({ source: 'input-source', base_site: 'input-base', port: nil, allow_unqualified_runtime: false }, received)
+    assert_equal 1, cli.run(%w[plan propose synthetic --operation merge-prepare --source input-source --base-site input-base --settings input-private])
+    run, generation = 'run-' + 'a' * 32, 'b' * 64
+    args = %w[plan propose synthetic --operation merge] + ['--prepared-from', run, '--generation', generation, '--intent', 'stock']
+    assert_equal 0, cli.run(args)
+    assert_equal run, received[:prepared_from]
+    assert_equal generation, received[:generation]
+    assert_equal 'stock', received[:intent]
+    assert_nil received[:source]
+    assert_nil received[:base_site]
+    assert_equal 1, cli.run(args + ['--port', '4200'])
+    assert_equal 1, cli.run(args + ['--allow-unqualified-runtime'])
+    assert_equal 1, cli.run(args[0...-2])
+    assert_equal 1, cli.run(args[0...-1] + ['guess'])
+    assert_equal 1, cli.run(%w[plan propose synthetic --operation merge --source s --base-site b --generation bad])
+    assert_equal 1, cli.run(%w[plan propose synthetic --operation merge --source s --base-site b --intent custom])
+    assert_equal 1, cli.run(%w[plan propose synthetic --operation merge-prepare --source s --base-site b --intent stock])
+  end
+
 end

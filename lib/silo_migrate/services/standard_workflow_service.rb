@@ -26,6 +26,8 @@ require_relative "standard_run_inputs"
 require_relative "standard_convert_run"
 require_relative "standard_review_run"
 require_relative "standard_merge_run"
+require_relative "standard_merge_preparation"
+require_relative "standard_merge_inspection"
 
 module SiloMigrate
   module Services
@@ -42,6 +44,8 @@ module SiloMigrate
       include StandardConvertRun
       include StandardReviewRun
       include StandardMergeRun
+      include StandardMergePreparation
+      include StandardMergeInspection
 
       STAGES = %w[preflight convert site_up baseline uploads import verify_site final_backup review_url restore verify_restore].freeze
 
@@ -55,7 +59,8 @@ module SiloMigrate
         "new_converter_development" => "not_implemented_in_workbench",
         "delta_import" => "not_implemented_requires_base_lineage",
         "multi_source_merge" => "not_implemented_requires_namespaces_and_order",
-        "native_discourse_merge" => "supported_local_discourse_merge"
+        "native_discourse_merge" => "supported_local_discourse_merge",
+        "prepared_discourse_merge" => "supported_local_prepare_inspect_then_one_use_merge"
       }.freeze
 
       RECOVERY = {
@@ -96,6 +101,15 @@ module SiloMigrate
         "STANDARD_MERGE_SETTINGS_INVALID" => "Register a valid merge settings mapping and re-plan.",
         "STANDARD_MERGE_SCHEMA" => "Inspect private schema evidence, correct the layer or runtime and re-plan.",
         "STANDARD_MERGE_FAILED" => "Inspect private merge evidence, reset the dirty run and re-plan.",
+        "STANDARD_MERGE_INCOMPATIBLE" => "The source and Base schemas or migrations are not ones the pinned merger supports together; nothing was merged and no migration marker was edited. Inspect the private compatibility evidence, align the Base/runtime or supply a compatible source, reset this run, then re-plan.",
+        "STANDARD_MERGE_ENVIRONMENT_STALE" => "The prepared merge environment is not this ready, unused generation any more (used, reset, or its inputs or runtime changed). Check the preparation run's merge_environment, prepare again if needed, then propose a merge of the current generation.",
+        "STANDARD_MERGE_ENVIRONMENT_DIRTY" => "The prepared merge environment could not be checkpointed or returned to its sealed state, so its state is uncertain. Reset this run (that removes the environment), then prepare again.",
+        "STANDARD_MERGE_INTENT_MISMATCH" => "A custom merge needs a committed merge layer for this workspace. Commit the layer and refresh the converter, or propose a stock merge.",
+        "STANDARD_MERGE_INSPECTION_INVALID" => "The merge inspection request is not valid for this run.",
+        "STANDARD_MERGE_INSPECTION_ORDER" => "Merge inspection access can open only on a running prepared copy, or on a result after its backup is recorded.",
+        "STANDARD_MERGE_INSPECTION_UNAVAILABLE" => "Local merge inspection access could not be opened. Inspect private evidence, reset this run, then prepare again.",
+        "STANDARD_MERGE_INSPECTION_UNSUPPORTED" => "This runtime cannot provide read-only merge inspection access. Reset this run and use a supported runtime.",
+        "STANDARD_MERGE_INSPECTION_FENCE_FAILED" => "Merge inspection access could not be proven closed, so nothing was merged. Reset this run, then prepare again.",
         "STANDARD_RUN_INPUTS_INVALID" => "The run-input manifest does not match registered inputs, the source or the converter's settings contract. Correct and register it, then propose a new plan.",
         "STANDARD_RUN_INPUTS_MUTATED" => "The converter changed, removed or added run-input files outside the plan's declared generated files. Inspect private evidence, reset this run, then re-plan.",
         "STANDARD_PREPARATION_INVALID" => "The preparation review metadata is malformed, cites a missing reference or claims code/input/setting this plan does not bind. Correct it, then propose a new plan.",
@@ -514,6 +528,7 @@ module SiloMigrate
             run["failure"] = { "stage" => run["stage"], "code" => "STANDARD_INTERRUPTED", "recovery" => RECOVERY.fetch("STANDARD_INTERRUPTED") }
             run["finished_at"] = now
             mark_instances_dirty(state, run)
+            merge_environment_failed(state, run)
             public_run(run, held: true)
           end
         end
@@ -531,6 +546,9 @@ module SiloMigrate
           raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
           raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" if %w[claimed running].include?(run["status"])
 
+          # Only the environment this run owns; inspection access is fenced before its stack goes.
+          environment = merge_reset_scope!(state, run, state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+          unfenced = environment ? merge_reset_close(environment) : []
           stacks = run.fetch("instances", {}).values.filter_map do |name|
             record = state.fetch("instances")[name]
             next unless record && record["state"] != "removed"
@@ -547,12 +565,13 @@ module SiloMigrate
           if review_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {})) || merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
             %w[admin-password review-setup.env].each { |name| FileUtils.rm_f(@store.run_dir(run_id, "private", name)) }
           end
-          if merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+          if merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {})) || prepare_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
             %w[merge-source merge].each { |name| FileUtils.rm_rf(@store.run_dir(run_id, "private", name)) }
           end
           @store.update do |current|
             stacks.each { |stack| current.fetch("instances")[stack.name] = stack.record }
           end
+          merge_reset_finish!(environment, unfenced) if environment
           { version: 1, run_id: run_id, status: "reset", removed: stacks.map(&:name) }
         end
       end
@@ -759,6 +778,7 @@ module SiloMigrate
         return role_reason if role_reason
         reference_reason = references_stale_reason(plan)
         return reference_reason if reference_reason
+        return prepare_stale_reason(plan, state) if prepare_plan?(plan)
         return merge_stale_reason(plan, state) if merge_plan?(plan)
         return convert_stale_reason(plan, state) if source_db_plan?(plan)
         return review_stale_reason(plan, state) if review_plan?(plan)
@@ -803,7 +823,8 @@ module SiloMigrate
           stale = stale_reason(plan, state)
           raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
 
-          instances = plan.dig("body", "instances")
+          # A prepared merge creates no instance: it takes over its environment's running one.
+          instances = prepared_merge_plan?(plan) ? {} : plan.dig("body", "instances")
           instances.each_value do |target|
             raise StandardWorkflowError, "STANDARD_INSTANCE_CONFLICT" if state.fetch("instances").key?(target["name"])
             raise StandardWorkflowError, "STANDARD_PORT_OCCUPIED" unless @port_probe.call(target["port"])
@@ -817,6 +838,10 @@ module SiloMigrate
           raise StandardWorkflowError.new("STANDARD_DIRTY_INSTANCE", "reset the earlier run first") unless dirty.empty?
 
           operation_admission!(plan, state)
+          # One generation, one merge: taken in the same durable update as the claim.
+          environment = if prepared_merge_plan?(plan) then claim_prepared_environment!(state, plan, run_id)
+                        elsif prepare_plan?(plan) then { "preparation_run_id" => run_id, "generation" => nil, "phase" => "preparing", "consumed_by" => nil, "updated_at" => now }
+                        end
           state.fetch("consumed_outputs").concat(outputs)
           plan["status"] = "consumed"
           plan["run_id"] = run_id
@@ -826,6 +851,7 @@ module SiloMigrate
             "started_at" => now, "finished_at" => nil, "failure" => nil,
             "instances" => {}, "artifacts" => {}, "results" => {}, "assertions" => {}
           }
+          state.fetch("runs")[run_id]["merge_environment"] = environment if environment
         end
         run_id
       end
@@ -835,7 +861,8 @@ module SiloMigrate
       # while this one is between containers.
       def operation_admission!(plan, state)
         return convert_admission!(plan.fetch("body")) if source_db_plan?(plan)
-        return review_capacity!(plan.dig("body", "limits")) if review_plan?(plan) || merge_plan?(plan)
+        return nil if prepared_merge_plan?(plan) # its stack is already running and counted
+        return review_capacity!(plan.dig("body", "limits")) if review_plan?(plan) || merge_plan?(plan) || prepare_plan?(plan)
 
         admission!(state)
       end
@@ -879,7 +906,7 @@ module SiloMigrate
 
       def execute_stages(run_id)
         plan = plan_for(run_id)
-        if review_plan?(plan) || merge_plan?(plan)
+        if review_plan?(plan) || merge_plan?(plan) || prepare_plan?(plan)
           begin
             selected = review_runtime_for(plan.fetch("body"))
           rescue StandardWorkflowError, SystemCallError
@@ -968,6 +995,7 @@ module SiloMigrate
         recovery = RECOVERY.fetch(code) { RECOVERY.fetch("STANDARD_INTERNAL") }
         run["failure"] = { "stage" => stage, "code" => RECOVERY.key?(code) ? code : "STANDARD_INTERNAL", "recovery" => recovery }
         mark_instances_dirty(state, run)
+        merge_environment_failed(state, run)
       end
 
       def mark_instances_dirty(state, run)
@@ -1021,6 +1049,7 @@ module SiloMigrate
         # checked again by the process that will actually use it.
         stale = stale_reason(plan, @store.load)
         raise StandardWorkflowError.new("STANDARD_STALE_PLAN", stale) if stale
+        return prepare_preflight(run_id, plan) if prepare_plan?(plan)
         return merge_preflight(run_id, plan) if merge_plan?(plan)
         return convert_preflight(run_id, plan) if source_db_plan?(plan)
         return review_preflight(run_id, plan) if review_plan?(plan)
@@ -1301,8 +1330,8 @@ module SiloMigrate
       def stage_site_up(run_id)
         body = plan_for(run_id).fetch("body")
         # Review runs import real data: their stack is sized per host and bound by the plan.
-        stack = create_stack(run_id, "review", body.dig("instances", "review"), limits: [REVIEW_OPERATION, MERGE_OPERATION].include?(body["operation"]) ? body.fetch("limits") : nil,
-                             extra_env: body["base_site"] ? review_environment(body.dig("instances", "review", "port")).merge(body["operation"] == MERGE_OPERATION ? { "DISCOURSE_AUTHORIZED_EXTENSIONS" => "*", "DISCOURSE_DISABLE_SYSTEM_EDIT_NOTIFICATIONS" => "true" } : {}) : {})
+        stack = create_stack(run_id, "review", body.dig("instances", "review"), limits: [REVIEW_OPERATION, MERGE_OPERATION, PREPARE_OPERATION].include?(body["operation"]) ? body.fetch("limits") : nil,
+                             extra_env: body["base_site"] ? review_environment(body.dig("instances", "review", "port")).merge([MERGE_OPERATION, PREPARE_OPERATION].include?(body["operation"]) ? { "DISCOURSE_AUTHORIZED_EXTENSIONS" => "*", "DISCOURSE_DISABLE_SYSTEM_EDIT_NOTIFICATIONS" => "true" } : {}) : {})
         assert_runtime_identity!(run_id, stack, "review")
       end
 
@@ -1363,7 +1392,7 @@ module SiloMigrate
         failures.concat(StandardOracle.runtime_failures(site, lock))
         evidence(run_id, "runtime-#{label}.json", site.slice("versions", "runtime"))
         assert_clean!(run_id, "runtime_#{label}", failures, "STANDARD_RUNTIME_MISMATCH")
-        if (review_plan?(plan_for(run_id)) || merge_plan?(plan_for(run_id))) && label == "review"
+        if (review_plan?(plan_for(run_id)) || merge_plan?(plan_for(run_id)) || prepare_plan?(plan_for(run_id))) && label == "review"
           record_review_runtime(run_id, running_version: site.dig("versions", "discourse"),
                                 running_revision: site.dig("versions", "git"), schema_before_restore: site.dig("versions", "schema"))
         end
@@ -1874,6 +1903,8 @@ module SiloMigrate
         ).merge(body.key?("run_inputs") ? { run_inputs: run_inputs_projection(body["run_inputs"], detail: detail) } : {})
           .merge(body.key?("master_lists") ? { master_lists: body["master_lists"] } : {})
           .merge(body.key?("preparation") ? { preparation: preparation_projection(body["preparation"], detail: detail) } : {})
+          .merge(body.key?("prepared_from") ? { prepared_from: body["prepared_from"].slice("run_id", "generation"), intent: body["intent"] } : {})
+          .merge(body.key?("capacity") ? { capacity: body["capacity"] } : {})
       end
 
       def plan_status(plan, state)
@@ -1911,6 +1942,9 @@ module SiloMigrate
           )
         end
         result[:failure] = run["failure"] if run["failure"]
+        # Three fixed fields; where inspection access lives is never part of a projection.
+        environment = merge_environment_summary(run)
+        result[:merge_environment] = environment if environment
         result
       end
 

@@ -1,0 +1,9 @@
+{
+  "name": "silo-migrate-discourse-mcp",
+  "private": true,
+  "description": "Pinned official Discourse MCP connector for local, trusted merge inspection (installed only by script/prepare-discourse-mcp).",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@discourse/mcp": "0.3.1"
+  }
+}

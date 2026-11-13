@@ -837,7 +837,7 @@ def make_plan(allow=False):
     if needs:
         users = [
             {"action": "term-llm", "detail": ("verify/copy explicitly configured private-node package and probe required capabilities; preserve previous binary for rollback" if native else ("verify existing version/binary receipts (download skipped); ensure bin symlink" if (versiondir/"term-llm").exists() else "download https://github.com/samsaffron/term-llm/releases/download/v" + C["TERM_LLM_VERSION"] + "/term-llm_" + C["TERM_LLM_VERSION"] + "_linux_amd64.tar.gz; verify pinned SHA256 " + PIN + " AND release checksums.txt; install version directory and atomic bin symlink"))},
-            {"action": "release", "detail": ("verify clean detached release (clone skipped): " if (P/"releases"/commit).exists() else "clone detached commit into ") + str(P/"releases"/commit) + "; validate release profile against package"},
+            {"action": "release", "detail": ("verify clean detached release (clone skipped): " if (P/"releases"/commit).exists() else "clone detached commit into ") + str(P/"releases"/commit) + "; validate release profile against package; when shipped, prepare its pinned Discourse MCP Node/npm runtime using only public dependency context before switching (no customer restore or MCP registration)"},
             {"action": "artifacts", "detail": "verify SHA256SUMS/profile; " + "; ".join(image_steps) if package else "SKIPPED: no ARTIFACT_PACKAGE; shell/service install only, NOT migration-ready"},
             {"action": "configuration", "detail": "write control env and shim; fresh term-llm config/data only if absent; preserve existing account config; agents from the release (refuse conflicting old links); link ~/.config/term-llm/skills to the release skills if absent; atomic current switch"}]
         if C["TERM_LLM_SERVICE"] != "skip":
@@ -1304,6 +1304,28 @@ def install_lock():
     finally:
         os.close(fd)
 
+def prepare_merge_connector(release):
+    """Stage only the release-pinned public Node/npm runtime, before switching releases.
+
+    No customer mounts, credentials, MCP registration or running site is involved.
+    Old releases without the feature remain valid rollback targets.
+    """
+    helper = Path(release)/"script/prepare-discourse-mcp"
+    if not helper.is_file():
+        return False
+    result = run(["python3", "-I", "-B", helper], account=True, check=False, timeout=1900)
+    if result is None or result.returncode:
+        refuse("METAL_MERGE_MCP_PREPARE_FAILED", "pinned public connector runtime could not be prepared; release switch was not performed; retry the normal update after checking registry access")
+    try:
+        prepared = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        refuse("METAL_MERGE_MCP_PREPARE_FAILED", "connector preparation did not return a verified receipt")
+    if not isinstance(prepared, dict) or prepared.get("status") not in ("ready", "prepared"):
+        refuse("METAL_MERGE_MCP_PREPARE_FAILED", "connector preparation did not attest readiness")
+    print("METAL_MERGE_MCP_READY", flush=True)
+    return True
+
+
 def account_apply(saved):
     global STAGE
     if os.geteuid() != pwd.getpwnam(C["SILO_ACCOUNT"]).pw_uid:
@@ -1327,6 +1349,8 @@ def account_apply(saved):
     print("METAL_RELEASE_READY", flush=True)
     STAGE = "ARTIFACT_LOAD"
     images, image_state, gems = extract_artifacts(release, plan["target"]["artifact_package"])
+    STAGE = "MERGE_MCP_PREPARE"
+    prepare_merge_connector(release)
     env = {"SILO_MIGRATE_BASE_PATH": str(W), "SILO_CONTROL_GEMS": gems or str(P/"control/gems/unavailable"),
            "SILO_CONTROL_SITE_CACHE": str(P/"control/site-cache/site_settings.yml"), "SILO_RUNTIME_PROFILES_DIR": str(P/"state/runtime-profiles")}
     # Start untrusted: agent/configuration failures must not leave a DBHub grant.
@@ -1581,6 +1605,7 @@ def account_update(rollback=False, branch=None, term=False):
             if commit == old["commit"]:
                 # The service settings, term-llm and the agents' trust are still checked, so an
                 # interrupted update finishes.
+                prepare_merge_connector(P/"current")
                 changed = node_term_llm()
                 if changed:
                     kept = {key: value for key, value in old.items() if key not in ("installed_at", "operation", "previous_commit")}
@@ -1604,6 +1629,8 @@ def account_update(rollback=False, branch=None, term=False):
         images, verification = verify_release_images(release, bound)
         target["images"] = images
         target["image_verification"] = verification
+        if not rollback:
+            prepare_merge_connector(release)
         if rollback and term:
             previous_bin = P/"bin/term-llm.previous"
             if not previous_bin.is_symlink() or not previous_bin.resolve().is_file():

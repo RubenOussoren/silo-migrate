@@ -333,6 +333,8 @@ module SiloMigrate
       # The review module precedes the convert module in method lookup; all other plans
       # retain the existing stage selector.
       def stages_for(plan)
+        return StandardMergePreparation::PREPARE_STAGES if prepare_plan?(plan)
+        return StandardMergePreparation::PREPARED_MERGE_STAGES if prepared_merge_plan?(plan)
         return StandardMergeRun::MERGE_STAGES if merge_plan?(plan)
         return BASE_SITE_STAGES if review_plan?(plan) && plan.dig("body", "base_site")
 

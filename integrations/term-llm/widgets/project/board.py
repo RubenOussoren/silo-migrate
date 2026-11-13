@@ -6,6 +6,7 @@ from released to fixed to checked as the pushes that name it are pushed and a la
 """
 
 from datetime import datetime, timezone
+import re
 
 ACTIVE = ("claimed", "running")
 _EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
@@ -102,8 +103,10 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=
         merge = body.get("merge") if isinstance(body.get("merge"), dict) else {}
         layer = merge.get("layer") if isinstance(merge.get("layer"), dict) else {}
         delivery = body.get("delivery") or {}
+        # A merge proposed from a prepared environment names exactly which one (and which generation).
+        step["prepared_from"] = body_prepared_from(body)
         groups[plan.get("plan_id")] = {
-            "key": plan.get("plan_id"), "kind": "merge", "convert": step, "imports": [],
+            "key": plan.get("plan_id"), "kind": "merge", "convert": step, "imports": [], "prepared_from": step["prepared_from"],
             "delivery": ("Launch" if delivery.get("kind") == "launch" else "Development v%s" % delivery.get("version")) if delivery else None,
             "dataset_id": delivery.get("dataset_id") or body.get("dataset_id"),
             "converter": body.get("converter_revision"), "branch": (body.get("converter") or {}).get("branch"),
@@ -145,8 +148,141 @@ def build_passes(plans, runs, bodies, review_sites, pushes, deliveries, reviews=
                         "full_head": head, "branch": proposal.get("branch"), "pushed_at": record.get("pushed_at"), "proposed_at": record.get("proposed_at"),
                         "findings": proposal.get("findings") or [], "used_by": used.get(head, [])})
     updates.sort(key=lambda update: _t(update.get("pushed_at") or update.get("proposed_at")), reverse=True)
-    return {"passes": ordered[::-1], "updates": updates, "banner": banner(ordered, updates, deliveries, active=active),
-            "preparations": preparations(plans, run_of_plan, bodies)}
+    prepared = environments(plans, run_of_plan, bodies, ordered)
+    shown = banner(ordered, updates, deliveries, active=active)
+    if any(item["status"][0] in ("Waiting for your approval", "Running") for item in prepared):
+        shown = None
+    elif shown and shown.get("kind") == "converter" and any(item["live"] for item in prepared):
+        # Its action re-proposes the last merge, which is not bound to the live prepared environment:
+        # a prepared merge plan comes from migration-data, never from this shortcut.
+        shown = None
+    return {"passes": ordered[::-1], "updates": updates, "banner": shown,
+            "preparations": preparations(plans, run_of_plan, bodies), "environments": prepared}
+
+
+# -- prepared merge environment ---------------------------------------------------------------
+# Only these fixed, non-secret facts leave the host's records: never connector profiles, keys,
+# host paths, URLs, customer file names or private contents.
+
+_RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
+_PHASE = re.compile(r"[a-z][a-z_]{0,31}\Z")
+_ENDPOINT_NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+ENDPOINT_KINDS = ("dbhub", "discourse_mcp")
+PREPARE_OPERATION = "standard_merge_prepare"
+LIVE_PHASES = ("ready", "inspection")  # prepared and clean; inspection copies may be in use
+INTENTS = ("stock", "custom")
+
+
+def _generation(value):
+    """A generation as the host records it: its 64-hex identity (or a small counter)."""
+    if type(value) is int and 0 < value < 2**31:
+        return value
+    return value if isinstance(value, str) and _DIGEST.fullmatch(value) else None
+
+
+def prepared_from(value, generation=None):
+    """{run_id, generation} of the prepared environment a merge plan binds, or None if absent/unsafe.
+    Accepts {run_id, generation} or a run ID with its generation recorded beside it."""
+    if isinstance(value, str):
+        value = {"run_id": value, "generation": generation}
+    if not isinstance(value, dict):
+        return None
+    run_id, generation = value.get("run_id"), _generation(value.get("generation"))
+    if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id) or generation is None:
+        return None
+    return {"run_id": run_id, "generation": generation}
+
+
+def body_prepared_from(body):
+    """A merge plan body's binding, whichever of the two recorded shapes it uses."""
+    body = body if isinstance(body, dict) else {}
+    return prepared_from(body.get("prepared_from"), body.get("generation"))
+
+
+def merge_environment(value):
+    """The safe projection of a prepared merge environment: preparation run, generation, phase and,
+    only if the host provided them, the fixed inspection endpoints' kind, name and readiness."""
+    if not isinstance(value, dict):
+        return None
+    run_id = value.get("preparation_run_id")
+    phase = value.get("phase")
+    result = {"preparation_run_id": run_id if isinstance(run_id, str) and _RUN_ID.fullmatch(run_id) else None,
+              "generation": _generation(value.get("generation")),
+              "phase": phase if isinstance(phase, str) and _PHASE.fullmatch(phase) else None}
+    endpoints = []
+    for entry in value.get("endpoints") if isinstance(value.get("endpoints"), list) else []:
+        if not isinstance(entry, dict) or entry.get("kind") not in ENDPOINT_KINDS or not isinstance(entry.get("ready"), bool):
+            continue
+        name = entry.get("name")
+        endpoints.append({"kind": entry["kind"], "name": name if isinstance(name, str) and _ENDPOINT_NAME.fullmatch(name) else None,
+                          "ready": entry["ready"]})
+    if endpoints:
+        result["endpoints"] = endpoints[:4]
+    return result if any(result.get(key) is not None for key in ("preparation_run_id", "generation", "phase")) else None
+
+
+def run_environment(run):
+    """A run record's environment, wherever the host put it (top level or in its results)."""
+    run = run if isinstance(run, dict) else {}
+    results = run.get("results") if isinstance(run.get("results"), dict) else {}
+    return merge_environment(run.get("merge_environment") if run.get("merge_environment") is not None else results.get("merge_environment"))
+
+
+def environment_status(step, env, used_by):
+    """One phrase for where a prepared environment stands, and its tone. Ready never means migrated."""
+    if step["run_status"] in ACTIVE:
+        return ("Running", "now")
+    if step["run_status"] is None:
+        if step["plan_status"] in WAITING:
+            return ("Waiting for your approval", "now")
+        return ("Out of date: propose it again", "warn") if step["plan_status"] == "stale" else ("Not started", "wait")
+    if step["run_status"] != "completed":
+        return ("Preparation needs a look", "warn")
+    phase = (env or {}).get("phase")  # the host's record decides; a merge refused before writing leaves it ready
+    if phase in LIVE_PHASES:
+        return ("Ready: inspect, then propose the merge", "now")
+    if phase in ("fencing", "merging"):
+        return ("In use by a merge", "now")
+    if phase == "consumed" or (phase is None and used_by):
+        return ("Used by a merge", "ok")
+    if phase == "dirty":
+        return ("Not clean: prepare it again", "warn")
+    if phase == "reset":
+        return ("Reset", "wait")
+    return ("Prepared: state unknown", "warn")
+
+
+def environments(plans, run_of_plan, bodies, merge_passes=()):
+    """Prepare merge environment jobs: not a pass and never numbered. No migration happens in them,
+    so they carry no backup or release; they show which merge pass (if any) used them."""
+    items = []
+    for plan in plans:
+        body = bodies.get(plan.get("plan_id")) or {}
+        if body.get("operation") != PREPARE_OPERATION:
+            continue
+        run = run_of_plan.get(plan.get("plan_id"))
+        if not run and plan.get("status") not in WAITING + ("stale",):
+            continue
+        step = _step("merge_prepare", dict(plan, base_site=body.get("base_site")), run)
+        # Nothing to release before a clean merged artifact; raw results may name connector details.
+        step.update(backup=None, release=None, backup_state="none", results={})
+        env = run_environment(run) if run else None
+        if env and env.get("preparation_run_id") not in (None, step["run_id"]):
+            env = None  # another run's environment: never shown as this one's
+        used_by = sorted(group["number"] for group in merge_passes if group.get("kind") == "merge" and group["convert"].get("run_id")
+                         and (group.get("prepared_from") or {}).get("run_id") == step["run_id"] and step["run_id"])
+        bound_by = sorted(group["number"] for group in merge_passes if group.get("kind") == "merge" and not group["convert"].get("run_id")
+                          and (group.get("prepared_from") or {}).get("run_id") == step["run_id"] and step["run_id"])
+        status = environment_status(step, env, used_by)
+        delivery = body.get("delivery") or {}
+        items.append({"key": plan.get("plan_id"), "kind": "merge_prepare", "name": "Prepare merge environment", "step": step,
+                      "environment": env, "used_by": used_by, "proposed_merges": bound_by, "status": status,
+                      "live": step["run_status"] == "completed" and (env or {}).get("phase") in LIVE_PHASES,
+                      "delivery": ("Launch" if delivery.get("kind") == "launch" else "Development v%s" % delivery.get("version")) if delivery else None,
+                      "base_site": step["base_site"], "at": step["started_at"]})
+    items.sort(key=lambda item: _t(item["at"]), reverse=True)
+    return items[:10]
 
 
 PREPARATION_OPERATIONS = {"standard_master_lists": "Master-list export"}

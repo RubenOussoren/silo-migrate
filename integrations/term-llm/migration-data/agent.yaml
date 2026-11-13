@@ -430,15 +430,42 @@ tools:
             additionalProperties: false
         required: [source, settings]
         additionalProperties: false
-    - name: data_merge_propose
-      description: "Merge project only (source platform discourse): propose a merge run that restores the Base site, loads the source site's full backup (type discourse-backup) beside it and runs Discourse's merger, with the project's merge layer (mergers/<workspace>/merger.rb at the converter checkout's committed revision) when one exists. Omit source and base_site to use the registered ones. settings is an optional merge-settings input (YAML mapping the layer reads; customer values belong there, never in the repository). Returns the plan ID, digest and which layer applies. Automatically prepares the matching Base-site review runtime; runtime_preparing means wait briefly and poll the same proposal, not that a merge has started. The engineer approves and starts it."
+    - name: data_merge_prepare
+      description: "Discourse merge only: propose restoring the current registered Base and full source backup into a disposable prepared merge environment. The host performs source schema migration with the selected Base runtime, validates compatibility and preserves clean checkpoints plus inspection copies. No merge, converter, layer or settings are required. Engineer Approve and separate Start are required. After completion use the returned run ID and generation for inspection and the exact merge plan; do not extract either backup yourself. runtime_preparing means poll this proposal, not a customer run."
       script: scripts/data_tool.py
       call: json
       timeout_seconds: 295
       input:
         type: object
         properties:
-          source: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the source site's full backup (type discourse-backup); omit to use the one in the newest Development delivery"}
+          source: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Registered full incoming Discourse backup; omit to use the active source"}
+          base_site: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Registered destination SQL-only backup; omit to use the current Base"}
+        additionalProperties: false
+    - name: data_merge_inspection
+      description: "Expose an owned, generation-bound inspection connector for a prepared merge: source uses read-only DBHub; base/result use a site-tethered read-only Discourse MCP connector. Returns only readiness and the MCP server name, never a credential or private path. The engineer enables only this project's connector in this Frontier migration-data chat. No writes, production connection or merge is authorized. Access is fenced during merge and revoked by Reset; Base and result are different stages, never silently interchangeable."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 100
+      input:
+        type: object
+        properties:
+          run_id: {type: string, pattern: "^run-[0-9a-f]{32}$"}
+          generation: {type: string, pattern: "^[0-9a-f]{64}$"}
+          side: {type: string, enum: [source, base, result]}
+        required: [run_id, generation, side]
+        additionalProperties: false
+    - name: data_merge_propose
+      description: "Propose the exact Discourse merge after preparing and inspecting its environment. Pass prepared_from, generation and explicit intent stock or custom; custom requires the committed merge layer and any needed merge-settings. The engineer reviews one exact plan, Approves, then separately Starts. It consumes the bound clean prepared state, not an unrelated newest Base. Customer values belong in merge-settings, never code. For compatibility the legacy one-shot source/base proposal remains accepted, but do not skip preparation when destination/source facts must be inspected first. A stale generation refuses; never reset or relabel inputs to bypass it."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 295
+      input:
+        type: object
+        properties:
+          prepared_from: {type: string, pattern: "^run-[0-9a-f]{32}$", description: "Completed Prepare merge environment run; pair with its generation and explicit intent"}
+          generation: {type: string, pattern: "^[0-9a-f]{64}$", description: "Exact prepared environment generation you inspected; changes make the plan stale"}
+          intent: {type: string, enum: [stock, custom], description: "stock explicitly chooses the shipped merger; custom requires the committed project layer"}
+          source: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the source site's full backup (type discourse-backup); omit when bound by prepared_from"}
           base_site: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the site to merge into (type base_site); omit to use the current Base site"}
           settings: {type: string, pattern: "^input-[0-9a-f]{32}$", description: "Input ID of the merge settings (type merge-settings); optional"}
           ignore_global_pins: {type: boolean, description: "true: source topics pinned globally are not pinned globally after the merge"}

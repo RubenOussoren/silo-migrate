@@ -32,9 +32,14 @@ module SiloMigrate
                                                        (real data: convert and reconcile counts only; no import)
         plan propose WORKSPACE --operation review --from-run RUN_ID [--reconciliation INPUT_ID] [--base-site INPUT_ID] [--port N]
                                                        (real data: import a completed convert run into a local review site)
+        plan propose WORKSPACE --operation merge-prepare --source INPUT_ID --base-site INPUT_ID [--port N] [--allow-unqualified-runtime]
+                     (restore and prepare isolated source/Base inspection copies; no merge or layer required)
+        plan propose WORKSPACE --operation merge --prepared-from RUN_ID --generation SHA256 --intent stock|custom
+                     [--settings INPUT_ID] [--ignore-global-pins] [--separate-same-named-groups]
+                     [--preparation PREPARATION.json]
         plan propose WORKSPACE --operation merge --source INPUT_ID --base-site INPUT_ID [--settings INPUT_ID]
                      [--ignore-global-pins] [--separate-same-named-groups] [--port N] [--allow-unqualified-runtime]
-                     [--preparation PREPARATION.json]
+                     [--preparation PREPARATION.json]   (legacy one-shot engineer path)
         plan show WORKSPACE PLAN_ID [--detail]                (--detail: engineer-only preparation text, run-input names/lineage)
         plan approve WORKSPACE PLAN_ID --sha256 DIGEST --reviewer NAME
         plan discard WORKSPACE PLAN_ID --reviewer NAME          (a proposal nobody will approve)
@@ -206,18 +211,36 @@ module SiloMigrate
                                                               charset: opts.fetch("--charset", "utf8mb4"), allow_unqualified_runtime: !allow.nil?,
                                                               **plan_documents(opts))
         end
+        if args[0, 2] == %w[--operation merge-prepare]
+          args.shift(2)
+          opts = options!(args, "--source", "--base-site", "--port", optional: %w[--port])
+          port = opts["--port"]
+          invalid! if port && !port.match?(/\A[1-9]\d{0,4}\z/)
+          return service(workspace).propose_merge_preparation_plan(source: opts.fetch("--source"), base_site: opts.fetch("--base-site"),
+            port: port&.to_i, allow_unqualified_runtime: !allow.nil?)
+        end
         if args[0, 2] == %w[--operation merge]
           args.shift(2)
           flags = %w[--ignore-global-pins --separate-same-named-groups].to_h do |flag|
             invalid! if args.count(flag) > 1
             [flag, !args.delete(flag).nil?]
           end
-          opts = options!(args, "--source", "--base-site", "--settings", "--port", "--preparation", optional: %w[--settings --port --preparation])
+          opts = options!(args, "--source", "--base-site", "--settings", "--port", "--preparation", "--prepared-from", "--generation", "--intent",
+                          optional: %w[--source --base-site --settings --port --preparation --prepared-from --generation --intent])
           port = opts["--port"]
           invalid! if port && !port.match?(/\A[1-9]\d{0,4}\z/)
-          return service(workspace).propose_merge_plan(source: opts.fetch("--source"), base_site: opts.fetch("--base-site"), settings: opts["--settings"],
+          prepared = opts["--prepared-from"]
+          if prepared
+            invalid! unless prepared.match?(/\Arun-[0-9a-f]{32}\z/) && opts["--generation"]&.match?(/\A[0-9a-f]{64}\z/) && %w[stock custom].include?(opts["--intent"])
+            invalid! if port || allow
+          else
+            invalid! unless opts["--source"] && opts["--base-site"]
+            invalid! if opts["--generation"] || opts["--intent"]
+          end
+          binding = prepared ? { prepared_from: prepared, generation: opts.fetch("--generation"), intent: opts.fetch("--intent") } : {}
+          return service(workspace).propose_merge_plan(source: opts["--source"], base_site: opts["--base-site"], settings: opts["--settings"],
             ignore_global_pins: flags["--ignore-global-pins"], separate_same_named_groups: flags["--separate-same-named-groups"],
-            port: port&.to_i, allow_unqualified_runtime: !allow.nil?, **plan_documents(opts))
+            port: port&.to_i, allow_unqualified_runtime: !allow.nil?, **binding, **plan_documents(opts))
         end
         if args[0, 2] == %w[--operation review]
           args.shift(2)

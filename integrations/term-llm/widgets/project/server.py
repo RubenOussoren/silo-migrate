@@ -124,10 +124,15 @@ def passes_of(base, control, workspace):
     view = runs.overview(store, control, workspace)
     bodies = {plan_id: (plan.get("body") or {}) for plan_id, plan in store.plans(workspace).items()}
     instances = store.state(workspace).get("instances") or {}
-    review_sites = {}
+    review_sites, recorded = {}, {}
     for run_id, run in store.runs(workspace).items():
         record = instances.get(((run.get("instances") or {}).get("review"))) if isinstance(run.get("instances"), dict) else None
         review_sites[run_id] = isinstance(record, dict) and record.get("state") != "removed"
+        recorded[run_id] = board.run_environment(run)
+    for run in view["runs"]:
+        # A prepared environment's phase as the host recorded it, if the status view leaves it out.
+        if isinstance(run, dict) and not board.run_environment(run) and recorded.get(run.get("run_id")):
+            run["merge_environment"] = recorded[run.get("run_id")]
     named = base / workspace / ".silo-migrate/named"
     deliveries = read_json_file(named / "deliveries.json").get("deliveries") or {}
     reviews = read_json_file(named / "site-reviews.json").get("reviews") or []
@@ -221,6 +226,21 @@ def propose_again(base, control, body, import_next=False):
                    **{key: options[key] for key in ("ignore_global_pins", "separate_same_named_groups") if isinstance(options.get(key), bool)}}
         if roles.get("settings"):
             request["settings"] = roles["settings"]
+        if plan_body.get("prepared_from") is not None:
+            # Continue in the same prepared environment only while it is still exactly that one:
+            # never silently fall back to a fresh restore or to another generation.
+            bound = current_environment(store, workspace, plan_body)
+            intent = plan_body.get("intent", (plan_body.get("merge") or {}).get("intent"))
+            if intent not in board.INTENTS:
+                raise Refused("STANDARD_MERGE_ENVIRONMENT_INVALID: the earlier merge's stock/custom intent is not recorded; ask migration-data to propose it", 409)
+            request.update(prepared_from=bound["run_id"], generation=bound["generation"], intent=intent)
+            if not isinstance(request.get("source"), str):
+                request.pop("source")  # the preparation binds its own source; an explicit one is only rechecked
+    elif operation == board.PREPARE_OPERATION:
+        # Prepare again: the same source backup on the project's current Base site, as a new
+        # proposal (and a new generation) for a new approval. No layer, settings or mapping inputs.
+        checks = None
+        request = {"op": "merge_prepare", "source": roles.get("source")}
     else:
         raise Refused("STANDARD_ARGUMENTS_INVALID")
     if checks:
@@ -231,6 +251,27 @@ def propose_again(base, control, body, import_next=False):
         request.update(retained_choices(control, store, workspace, plan_body))
     # Proposing may prepare the converter's gems first: data_tools allows itself up to 290 s.
     return data(control, workspace, request, timeout=300)
+
+
+STALE_ENVIRONMENT = ("STANDARD_MERGE_ENVIRONMENT_STALE: the prepared merge environment this merge used is no longer ready"
+                     " at that generation; prepare it again and ask migration-data to propose the merge")
+
+
+def current_environment(store, workspace, plan_body):
+    """{run_id, generation} if that prepared environment is still ready at exactly that generation and
+    not consumed (the host's recorded phase); otherwise refused. The host checks again when the plan
+    is proposed and when it runs: this only keeps the page from proposing a merge bound to a gone one."""
+    bound = board.body_prepared_from(plan_body)
+    if not bound:
+        raise Refused("STANDARD_MERGE_ENVIRONMENT_INVALID", 409)
+    run = store.runs(workspace).get(bound["run_id"]) or {}
+    plan = store.plans(workspace).get(run.get("plan_id")) or {}
+    env = board.run_environment(run)
+    if ((plan.get("body") or {}).get("operation") != board.PREPARE_OPERATION or run.get("status") != "completed" or not env
+            or env.get("preparation_run_id") not in (None, bound["run_id"]) or env.get("generation") != bound["generation"]
+            or env.get("phase") not in board.LIVE_PHASES):
+        raise Refused(STALE_ENVIRONMENT, 409)
+    return bound
 
 
 def retained_choices(control, store, workspace, plan_body):
@@ -434,17 +475,63 @@ def plan_detail(store, control, workspace, plan_id):
     # plan name its source site's backup (a Discourse backup's name starts with the site's name)
     # or its settings file (named by whoever wrote it). The settings' content is still shown.
     roles = result.get("roles") or {}
-    merge = result.get("operation") == "standard_merge"
+    operation = result.get("operation") or body.get("operation")
+    # Preparing a merge environment uses the same two backups: neither is named either.
+    merge = operation in ("standard_merge", board.PREPARE_OPERATION)
     hidden = {roles.get("base_site"), roles.get("source") if merge else None, roles.get("settings") if merge else None} - {None}
     if hidden:
         result["input_paths"] = {key: value for key, value in (result.get("input_paths") or {}).items() if key not in hidden}
+    return environment_view(result, operation, body)
+
+
+# What a host record might carry about inspection access: only the safe projection is ever shown.
+RAW_ENVIRONMENT_KEYS = ("merge_environment", "prepared_from", "inspection", "connectors", "connector", "mcp", "dbhub", "endpoints", "profile", "profiles")
+
+
+def environment_view(result, operation, body, run=None):
+    """Replace any raw environment/connector fields with the safe projection: preparation run,
+    generation, phase, fixed endpoint kind/name/readiness and (on a merge) the bound prepared_from."""
+    env = board.merge_environment(result.get("merge_environment")) or board.run_environment(result) \
+        or board.merge_environment(body.get("merge_environment")) or (board.run_environment(run) if run else None)
+    bound = board.prepared_from(result["prepared_from"], result.get("generation")) if result.get("prepared_from") is not None \
+        else board.body_prepared_from(body)
+    for key in RAW_ENVIRONMENT_KEYS:
+        result.pop(key, None)
+    if isinstance(result.get("results"), dict):
+        result["results"] = {key: value for key, value in result["results"].items() if key not in RAW_ENVIRONMENT_KEYS}
+    if operation == board.PREPARE_OPERATION:
+        if env and run is not None and env.get("preparation_run_id") not in (None, result.get("run_id")):
+            env = None  # another run's environment is never shown as this one's
+        # No migration happened: no output backup, release or ordinary review sign-in to offer.
+        result.update(release=None)
+        if isinstance(result.get("artifacts"), dict):
+            result["artifacts"] = {key: value for key, value in result["artifacts"].items() if key != "backup"}
+        if isinstance(result.get("results"), dict):
+            result["results"].pop("review_url", None)
+    if env:
+        result["merge_environment"] = env
+    if bound and operation == "standard_merge":
+        result["prepared_from"] = bound
     return result
 
 
 def run_detail(store, control, workspace, run_id):
     result = runs.run_detail(store, control, workspace, run_id)
     plan = store.plans(workspace).get(result.get("plan_id")) or {}
-    return dict(result, base_site=(plan.get("body") or {}).get("base_site"))
+    body = plan.get("body") if isinstance(plan.get("body"), dict) else {}
+    operation = result.get("operation") or body.get("operation")
+    return environment_view(dict(result, base_site=body.get("base_site")), operation, body, run=store.runs(workspace).get(run_id) or {})
+
+
+def no_prepared_sign_in(store, body):
+    """The page never asks for an ordinary review sign-in on a prepared (not yet merged) environment."""
+    try:
+        run = store.runs(body.get("workspace")).get(body.get("run_id")) or {}
+        operation = ((store.plans(body.get("workspace")).get(run.get("plan_id")) or {}).get("body") or {}).get("operation")
+    except REFUSALS:
+        return  # the unchanged decision refuses what it cannot find
+    if operation == board.PREPARE_OPERATION:
+        raise Refused("STANDARD_PREPARED_ENVIRONMENT_NO_SIGN_IN", 409)
 
 
 RUN_VIEWS["plan"] = plan_detail
@@ -597,6 +684,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path in ("/api/runs/approve", "/api/runs/start"):
                 result = guarded(runs.Store(self.server.base), self.server.control, action, body)
             elif path in RUN_PATHS:
+                if action == "admin-password" and isinstance(body.get("run_id"), str) and RUN.fullmatch(body["run_id"]):
+                    no_prepared_sign_in(runs.Store(self.server.base), body)
                 result = runs.decide(runs.Store(self.server.base), self.server.control, action, body)
             elif path in FINDING_PATHS:
                 result = findings.decide(self.server.control, action, body.get("workspace"), body.get("id"), body.get("text"))
