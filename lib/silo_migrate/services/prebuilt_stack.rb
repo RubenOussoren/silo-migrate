@@ -35,7 +35,7 @@ module SiloMigrate
       SHARED_BUFFERS_MIB = (128..8192)
       MAINTENANCE_WORK_MEM_MIB = (64..2048)
       DEFAULT_DB_SHM = "128m"
-      DB_SHM_MIB = (128..2048)
+      DB_SHM_MIB = (128..4096)
 
       attr_reader :name, :record
 

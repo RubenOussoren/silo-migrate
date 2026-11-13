@@ -376,6 +376,26 @@ class StandardMergePreparationTest < StandardMergeRunTest
     end
   end
 
+  def test_prepare_binds_shm_headroom_and_merge_keeps_the_approved_limits
+    with_prepare do
+      @service.define_singleton_method(:host_capacity) { [8, 128 * 1024] }
+      original = @service.method(:review_limits)
+      # Tiny invented archives exercise the large tier without creating a huge fixture.
+      @service.define_singleton_method(:review_limits) { |input_bytes: 0| original.call(input_bytes: input_bytes + 20 * 1024**3) }
+      plan = prepare_plan
+      assert_equal 2048, plan.dig(:limits, 'db', 'maintenance_work_mem_mib')
+      assert_equal 4096, plan.dig(:limits, 'db', 'shm_mib')
+      run = run_prepare(plan)
+      assert_equal 'completed', run[:status], run[:failure].inspect + failure_detail(run)
+      db = @runtime.calls.find { |cmd| cmd[0, 2] == %w[docker run] && cmd.include?("#{@instance}-db") }
+      assert_equal '4096m', db[db.index('--shm-size') + 1]
+      @service.define_singleton_method(:review_limits) { |**_options| raise 'prepared merge must not recalculate limits' }
+      merge = prepared_plan(run)
+      assert_equal run[:run_id], merge.dig(:prepared_from, 'run_id')
+      assert_equal plan[:limits], merge[:limits]
+    end
+  end
+
   def test_prepare_run_reaches_ready_without_constructing_a_merger
     with_prepare do
       run = prepared

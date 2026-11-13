@@ -136,7 +136,7 @@ class StandardBaseSiteReviewTest < StandardReviewRunTest
       db = @runtime.calls.find { |cmd| cmd[0, 2] == %w[docker run] && cmd.include?("#{instance_name(plan)}-db") }
       assert_equal '16384m', db[db.index('--memory') + 1]
       assert_includes db, 'DB_SHARED_BUFFERS=4096MB'
-      assert_equal '1024m', db[db.index('--shm-size') + 1]
+      assert_equal '2048m', db[db.index('--shm-size') + 1]
       assert_equal %w[postgres -c maintenance_work_mem=1024MB], db.last(3)
     end
   end

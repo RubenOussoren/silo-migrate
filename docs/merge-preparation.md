@@ -57,7 +57,14 @@ For example, a 128 GiB host and a 2 GiB archive get a 16 GiB DB and 8 GiB app;
 the DB gets 2 CPUs on a 4-CPU host or 4 on an 8-CPU host. Larger archives can grow
 the DB to 32 GiB. Settings/limits on existing instances are not changed in place.
 
-Shared buffers, index-maintenance memory and `/dev/shm` scale within that DB cap;
+Shared buffers, index-maintenance memory and `/dev/shm` scale within that DB cap.
+New large-host/input plans give `/dev/shm` twice `maintenance_work_mem`, capped at
+4 GiB and one eighth of DB memory. Some parallel index methods allocate an arena
+near the maintenance budget, leaving an equal-sized mount vulnerable to other
+dynamic shared-memory usage. This headroom targets the current plain SQL restore
+(one index build at a time), not arbitrary concurrent maintenance. It is mount
+capacity inside the existing DB memory quota, not additional reserved RAM.
+Earlier approved plans and retained containers are not resized or rewritten.
 `work_mem` stays conservative. The image's durability defaults are not weakened.
 This is not parallel SQL restore: the current plain SQL format cannot be sped up
 by merely adding `pg_restore -j`.

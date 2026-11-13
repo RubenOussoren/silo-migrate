@@ -54,7 +54,7 @@ module SiloMigrate
       LARGE_MAX_WEB_CPUS = 2.0
       LARGE_MAX_SHARED_BUFFERS_MIB = 8 * 1024
       LARGE_MAX_MAINTENANCE_WORK_MEM_MIB = 2048
-      LARGE_MAX_SHM_MIB = 2048
+      LARGE_MAX_SHM_MIB = 4096
       # Discourse restore command timeout: legacy default, and the bounded large-input one.
       RESTORE_TIMEOUT_SECONDS = 1200
       LARGE_RESTORE_TIMEOUT_SECONDS = 7200
@@ -726,8 +726,11 @@ module SiloMigrate
         db_memory = limits["db"]["memory_mib"]
         limits["db"]["shared_buffers_mib"] = [LARGE_MAX_SHARED_BUFFERS_MIB, db_memory / 4].min
         limits["db"]["maintenance_work_mem_mib"] = [LARGE_MAX_MAINTENANCE_WORK_MEM_MIB, db_memory / 16].min
-        # Dynamic shared memory for parallel index builds; counted inside the memory cap.
-        limits["db"]["shm_mib"] = [LARGE_MAX_SHM_MIB, [512, db_memory / 16].max].min
+        # Some parallel index methods allocate a DSM arena near maintenance_work_mem;
+        # an equal mount leaves little room for other segments. Plain SQL restores
+        # build one index at a time: leave 2x headroom, still <= DB memory / 8 and
+        # counted inside the same container memory cap (not additional RAM).
+        limits["db"]["shm_mib"] = [LARGE_MAX_SHM_MIB, 2 * limits["db"]["maintenance_work_mem_mib"]].min
         limits
       end
 
