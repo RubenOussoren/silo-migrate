@@ -2245,7 +2245,7 @@ class DataToolsTest(unittest.TestCase):
                 return json.dumps({'finding_id': finding, 'status': 'proposed', 'proposal': text,
                                    'proposal_sha256': digest, 'proposal_revision': 1})
             if argv[:3] == ['standard', 'finding', 'revise']:
-                return json.dumps({'finding_id': finding, 'status': 'proposed', 'proposal_revision': 2,
+                return json.dumps({'version': 1, 'finding_id': finding, 'status': 'proposed', 'proposal_revision': 2,
                                    'proposal_sha256': hashlib.sha256(input.encode()).hexdigest(), 'private_extra': MARKER})
             return original(argv, input=input, timeout=timeout)
         self.control = control
@@ -2268,6 +2268,32 @@ class DataToolsTest(unittest.TestCase):
                      {'finding_id': finding, 'text': ' ', 'expected_proposal_sha256': digest}):
             self.refused('STANDARD_ARGUMENTS_INVALID', 'revise_finding', **args)
         self.refused('STANDARD_ARGUMENTS_INVALID', 'finding_proposal', finding_id=finding, offset=True)
+
+    def test_revision_response_accepts_the_real_cli_version_envelope_after_one_write(self):
+        self.create()
+        finding, expected = 'finding-' + 'a' * 32, 'b' * 64
+        text = 'Corrected invented policy'
+        applied = []
+        original = self.control
+
+        def control(argv, input=None, timeout=120):
+            if argv[:3] == ['standard', 'finding', 'revise']:
+                applied.append((argv, input))  # the service commits before returning its receipt
+                return json.dumps({'version': 1, 'finding_id': finding, 'status': 'proposed',
+                                   'proposal_revision': 2, 'proposal_sha256': hashlib.sha256(input.encode()).hexdigest(),
+                                   'bytes': len(input.encode()), 'private_extra': MARKER})
+            return original(argv, input=input, timeout=timeout)
+
+        self.control = control
+        result = self.op('revise_finding', finding_id=finding, expected_proposal_sha256=expected, text=text)
+        self.assertEqual({'version': 1, 'finding_id': finding, 'status': 'proposed', 'proposal_revision': 2,
+                          'proposal_sha256': hashlib.sha256(text.encode()).hexdigest(), 'bytes': len(text.encode())}, result)
+        self.assertEqual(1, len(applied))  # no retry or second mutation to obtain a successful response
+        self.assertEqual(text, applied[0][1])
+        audit = [json.loads(line) for line in (self.base / 'arc/.silo-migrate/data/audit.jsonl').read_text().splitlines()]
+        self.assertEqual('ok', audit[-1]['result'])
+        self.assertNotIn(text, json.dumps(audit))
+        self.assertNotIn(MARKER, json.dumps(result))
 
     def test_plan_propose_passes_input_ids_and_prepares_dependencies_once(self):
         self.create()

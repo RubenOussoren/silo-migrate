@@ -3353,7 +3353,9 @@ def op_revise_finding(ws, request):
         refuse("STANDARD_ARGUMENTS_INVALID: expected_proposal_sha256")
     result = json.loads(ws.control(["standard", "finding", "revise", ws.name, identifier,
                                    "--file", "-", "--expected-proposal-sha256", expected], input=text))
-    return {key: result[key] for key in ("version", "finding_id", "status", "proposal_revision", "proposal_sha256", "bytes") if key in result}
+    # The outer data dispatcher owns the version envelope. Forward only receipt
+    # fields: a duplicate version keyword would report failure after the save.
+    return {key: result[key] for key in ("finding_id", "status", "proposal_revision", "proposal_sha256", "bytes") if key in result}
 
 
 # -- dispatch ------------------------------------------------------------------------------
