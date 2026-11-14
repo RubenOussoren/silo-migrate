@@ -98,6 +98,96 @@ class StandardMergeProcessTest < SiloMigrateTest
     end
   end
 
+  def refusal_frame(phase = "preflight", counts = nil)
+    counts ||= phase == "preflight" ? { "selected" => 4 } : {}
+    merger = Object.new
+    merger.define_singleton_method(:silo_merge_audit) { |_| counts }
+    envelope = SiloMergeRefusal.capture(contract: @contract, merger: merger, context: "execution",
+      phase: phase, reason: "#{phase}_refused", error: RuntimeError.new("PRIVATE primary"))
+    SiloMergeRefusal::PREFIX + JSON.generate(envelope) + "\n"
+  end
+
+  def test_preconstructor_refusal_is_available_without_ordinary_evidence_or_backup_artifacts
+    with_process do
+      @host.merge_process_collect!("run-invented", @stack, result(refusal_frame, success: false))
+      evidence = @host.merge_process_evidence("run-invented")
+      assert evidence["available"]
+      refute evidence["complete"]
+      assert_equal "preflight_refused", evidence.dig("failure", "reason")
+      assert_equal({ "selected" => 4 }, evidence.dig("audit_aggregates", "preflight"))
+      refute File.exist?(@host.store.run_dir("run-invented", "private", "merge-process.json"))
+      refute File.exist?(@host.store.run_dir("run-invented", "private", "merge-asset-manifest.json"))
+      assert_equal 0o600, File.stat(@host.store.run_dir("run-invented", "private", "merge-refusal.json")).mode & 0o777
+      error = assert_raises(SiloMigrate::StandardWorkflowError) { @host.merge_process_manifest("run-invented") }
+      assert_equal "STANDARD_BACKUP_FAILED", error.code
+      refute_includes JSON.generate(evidence), "PRIVATE"
+    end
+  end
+
+  def test_postflight_refusal_keeps_earlier_counts_and_unknown_missing_counts
+    with_process do
+      @host.merge_process_collect!("run-invented", @stack,
+        result(output(%w[preflight transfer]) + refusal_frame("postflight"), success: false))
+      evidence = @host.merge_process_evidence("run-invented")
+      assert evidence["available"]
+      refute evidence["complete"]
+      assert_equal({ "selected" => 1 }, evidence.dig("audit_aggregates", "preflight"))
+      assert_equal({}, evidence.dig("audit_aggregates", "postflight"))
+      assert_equal ["verified"], evidence.dig("failure", "missing_keys")
+      assert_equal 1, evidence.dig("runner", "files_copied")
+      refute File.exist?(@host.store.run_dir("run-invented", "private", "merge-asset-manifest.json"))
+    end
+  end
+
+  def test_forged_malformed_and_multiple_refusals_do_not_replace_failed_subprocess
+    with_process do
+      valid = refusal_frame
+      forged = JSON.parse(valid.delete_prefix(SiloMergeRefusal::PREFIX))
+      forged["counts"] = { "PRIVATE_UNDECLARED" => 4 }
+      wrong_context = JSON.parse(valid.delete_prefix(SiloMergeRefusal::PREFIX))
+      wrong_context["context"] = "validation"
+      [SiloMergeRefusal::PREFIX + "PRIVATE bad json\n", valid + valid,
+        SiloMergeRefusal::PREFIX + JSON.generate(forged),
+        SiloMergeRefusal::PREFIX + JSON.generate(wrong_context),
+        SiloMergeRefusal::PREFIX + ('x' * (128 * 1024 + 1))].each do |frame|
+        # A secondary parser error here would prevent the workflow from raising
+        # its original subprocess failure. This collector must simply return.
+        @host.merge_process_collect!("run-invented", @stack, result(frame, success: false))
+        evidence = @host.merge_process_evidence("run-invented")
+        refute evidence["complete"]
+        assert_equal "evidence_invalid", evidence.dig("failure", "reason")
+        refute evidence["audit_aggregates"]
+        refute_match(/PRIVATE|bad json/, JSON.generate(evidence))
+      end
+    end
+  end
+
+  def test_secondary_private_evidence_write_error_does_not_replace_failed_subprocess
+    with_process do
+      @host.store.define_singleton_method(:write_private) { |*| raise IOError, "PRIVATE storage detail" }
+      @host.merge_process_collect!("run-invented", @stack, result(refusal_frame, success: false))
+      assert_equal false, @host.merge_process_evidence("run-invented")["available"]
+      error = assert_raises(SiloMigrate::StandardWorkflowError) do
+        @host.merge_process_collect!("run-invented", @stack, result(refusal_frame))
+      end
+      assert_equal "STANDARD_MERGE_EVIDENCE_INVALID", error.code
+      refute_includes error.message, "PRIVATE"
+    end
+  end
+
+  def test_success_with_any_refusal_frame_rejects_before_copying_backup_artifacts
+    with_process do
+      [refusal_frame, SiloMergeRefusal::PREFIX + "broken\n", refusal_frame + refusal_frame].each do |frame|
+        error = assert_raises(SiloMigrate::StandardWorkflowError) do
+          @host.merge_process_collect!("run-invented", @stack, result(output + frame))
+        end
+        assert_equal "STANDARD_MERGE_EVIDENCE_INVALID", error.code
+        refute @host.merge_process_evidence("run-invented")["complete"]
+        refute File.exist?(@host.store.run_dir("run-invented", "private", "merge-asset-manifest.json"))
+      end
+    end
+  end
+
   def test_missing_final_report_or_duplicate_phase_cannot_claim_success
     with_process do
       [output(["preflight"]), output(["preflight", "preflight"])].each do |text|

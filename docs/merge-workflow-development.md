@@ -354,6 +354,52 @@ are automatically projected into clean project info. Clean developer/reviewer
 agents receive no new runtime or raw-data tools; release remains a separate,
 engineer-reviewed decision.
 
+### Structured evidence when policy preflight refuses
+
+A policy refusal remains a refusal. The runner now asks the same loaded class for
+its declared `silo_merge_audit("preflight")` counters after a failed preflight
+(and `"postflight"` after a failed postflight). Keep meaningful numeric refusal
+flags assigned before raising; do not rely on parsing `SILO_MERGE_AUDIT` log lines.
+An already validated preflight audit is reused if a later validation step fails,
+without calling the project hook a second time.
+
+Failure collection is best effort, bounded to two seconds for a callback, and
+cannot grant a success binding or replace the primary policy refusal. Its private
+`failure` envelope contains phase/reason, a bounded exception **class name only**,
+`complete: false`, `audit_status`, `counts` and `missing_keys`. It never copies
+exception messages/tags, raw settings or undeclared metrics. Status is:
+
+- `partial`: declared numeric observations were captured, possibly only a subset.
+- `unavailable`: no eligible audit callback was available.
+- `invalid`: callback data or optional telemetry failed schema validation.
+- `hook_failed`: the audit callback raised/exited/timed out.
+
+Missing values stay absent/unknown, never synthetic zeros. The layer must report
+only observations it actually has; numeric shape validation is not an independent
+proof that a layer's business-policy counts are correct. Successful phase audits
+still require every declared key. A failed phase is never marked complete merely
+because every key happened to be returned.
+
+For class-only validation, read `data_workflow_validate`'s private `audit` and
+`failure` fields and its private receipt. Refusal happens without claiming a Merge
+run, so it does **not** create a fictitious run or attach a Merge result to an
+already completed Prepare. A later Start gate can also refuse before claim; rerun
+explicit validation to obtain the current diagnostic receipt, without reset.
+
+For an executed Merge, the trusted `merge.audit_aggregates` evidence block has
+`complete: false`, `failure`, and numeric phase values under its nested
+`audit_aggregates`. The host stores a private `merge-refusal.json` even when the
+ordinary process phase report was never reached. Invalid/multiple frames yield
+fixed unavailable/invalid diagnostics, not free-form data or a replacement primary
+failure. A successful process carrying a refusal frame is rejected before backup.
+Ordinary coder-facing plan/project projections do not gain these private fields.
+
+`write_boundary` is `read_only_clones` for validation, `before_constructor` for
+execution preflight and `after_constructor` for execution postflight. These describe
+the runner's control flow/connection boundary, **not an OS sandbox or blanket
+attestation that arbitrary project code performed no writes**. All existing
+settings-preservation, failed/dirty environment and backup gates remain in force.
+
 ### Real Rails acceptance and operator rollout
 
 The separately opted-in, invented-data acceptance test is:

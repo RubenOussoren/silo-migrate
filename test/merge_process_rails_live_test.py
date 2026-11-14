@@ -5,6 +5,8 @@
 Actual pinned Rails3158 overlay, PostgreSQL and dedicated validation Redis; production
 merge_validation_config.rb, merge_validate.rb, merge_run.rb, stock merger start,
 physical adapter, settings preservation, reference verifier and engine backup verifier.
+Refused validation/execution collects declared partial audit counters without stock
+construction; the actual host refusal collector consumes the serialized guest frame.
 The production StandardMergeValidation provisioning SQL, journal shape and template
 custody checks are called through a socket-free, exact-owned-PG stdio fixture
 transport in the cached Ruby control image. Journal persistence is fixture-only.
@@ -232,7 +234,7 @@ class RailsProcessAcceptance(unittest.TestCase):
                 'semantic_ok': {'type': 'boolean'}, 'upload_id': {'type': 'integer', 'minimum': 1},
                 'sha1': {'type': 'string'}, 'raw': {'type': 'string'}}},
             'asset_policy_key': 'asset_mode', 'asset_policies': {'selected': 'carried'},
-            'audit_aggregates': {'preflight': ['selected_uploads'], 'postflight': ['selected_uploads']}}
+            'audit_aggregates': {'preflight': ['selected_uploads', 'refused_policy'], 'postflight': ['selected_uploads']}}
         spec = {'asset_mode': 'selected', 'semantic_ok': True, 'upload_id': source['carried']['id'],
                 'sha1': source['carried']['sha1'], 'raw': source['raw']}
         f.stage('live-contract.json', json.dumps(contract))
@@ -271,6 +273,13 @@ class RailsProcessAcceptance(unittest.TestCase):
         run, answer = validate('semantic')
         self.assertTrue(run.returncode != 0 and answer['status'] == 'refused' and answer['reason'] == 'preflight_refused',
                         'semantic refusal not proven; production validation failed earlier')
+        failure = answer.get('failure') or {}
+        self.assertEqual('partial', failure.get('audit_status'))
+        self.assertEqual({'selected_uploads': 1, 'refused_policy': 1}, failure.get('counts'))
+        self.assertEqual(failure.get('counts'), answer['audit'])
+        self.assertEqual('read_only_clones', failure.get('write_boundary'))
+        self.assertIs(failure.get('complete'), False)
+        print('LIVE:validation_refusal_structured_audit=true', flush=True)
         after = f.fingerprints()
         for db in before:
             changed = sorted(table for table in before[db] if before[db][table] != after[db].get(table))
@@ -303,6 +312,28 @@ class RailsProcessAcceptance(unittest.TestCase):
             'SILO_MERGE_ASSET_PREFLIGHT_SHA256': answer['asset_preflight_sha256'],
             'SILO_MERGE_OWNER_PREFLIGHT_SHA256': answer['owner_preflight_sha256']}
         execution_before = f.fingerprints()
+        spec['semantic_ok'] = False
+        f.stage('live-settings.yml', json.dumps(spec))
+        f.stage('live-run-env.json', json.dumps(run_env))
+        f.sql('ALTER DATABASE merge_source ALLOW_CONNECTIONS true')
+        refused_policy = f.drive('run')
+        policy_log = f.docker('exec', f.web, 'cat', '/tmp/live-output').stdout
+        self.assertTrue(refused_policy.returncode != 0 and b'SILO_MERGE: start' not in policy_log,
+                        'policy refusal reached stock construction')
+        failures = [json.loads(line.split(b':', 1)[1]) for line in policy_log.splitlines()
+                    if line.startswith(b'SILO_MERGE_REFUSAL:')]
+        self.assertEqual(1, len(failures))
+        self.assertEqual('preflight_refused', failures[0]['reason'])
+        self.assertEqual('before_constructor', failures[0]['write_boundary'])
+        self.assertEqual({'selected_uploads': 1, 'refused_policy': 1}, failures[0]['counts'])
+        self.assertIs(failures[0]['complete'], False)
+        self.assertTrue(execution_before == f.fingerprints(), 'policy refusal changed database rows')
+        # Exercise the real host collector with the serialized real-guest frame.
+        # This remains a scoped module/transport test, not a host lifecycle run.
+        f.host({'action': 'refusal', 'contract': contract, 'output': policy_log.decode()})
+        print('LIVE:execution_refusal_structured_audit_before_stock_writes=true', flush=True)
+        spec['semantic_ok'] = True
+        f.stage('live-settings.yml', json.dumps(spec))
         bad_env = dict(run_env, SILO_MERGE_SELECTION_SHA256='0' * 64)
         f.stage('live-run-env.json', json.dumps(bad_env))
         f.sql('ALTER DATABASE merge_source ALLOW_CONNECTIONS true')
@@ -323,7 +354,7 @@ class RailsProcessAcceptance(unittest.TestCase):
                     print(line.decode(), flush=True)
         self.assertTrue(run.returncode == 0 and b'SILO_MERGE: done' in log, 'production merge_run failed (raw output suppressed)')
         self.assertTrue([r['phase'] for r in reports] == ['preflight', 'transfer', 'postflight'] and reports[-1]['complete'], 'complete process evidence missing')
-        self.assertTrue(reports[-1]['audit_aggregates'] == {'preflight': {'selected_uploads': 1}, 'postflight': {'selected_uploads': 1}}, 'audit count evidence differs')
+        self.assertTrue(reports[-1]['audit_aggregates'] == {'preflight': {'selected_uploads': 1, 'refused_policy': 0}, 'postflight': {'selected_uploads': 1}}, 'audit count evidence differs')
         transfer = reports[-1]['transfer']
         self.assertTrue(transfer['files_copied'] == 1 and transfer['files_skipped_by_policy'] == 1, 'selective physical transfer counts differ')
         self.assertTrue({k: v[:2] for k, v in rows.items()} == {k: v[:2] for k, v in f.rows().items()}, 'T2 stored setting equality failed')

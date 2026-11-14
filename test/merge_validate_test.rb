@@ -9,6 +9,8 @@ require_relative "../runtime/prebuilt-discourse/merge_validation_config"
 ENV.delete("SILO_MERGE_VALIDATION_CONFIG_TEST")
 
 class MergeValidateTest < Minitest::Test
+  class InventedPolicyDenied < StandardError; end
+
   def contract
     SiloMergeContract.load(JSON.generate({ "version" => 1, "engine" => "discourse-merger-v1", "settings_schema" => { "type" => "object", "properties" => { "policy" => { "type" => "string", "enum" => ["carried"] } }, "required" => ["policy"], "additionalProperties" => false }, "asset_policy_key" => "policy", "asset_policies" => { "carried" => "carried" }, "audit_aggregates" => { "preflight" => ["uploads"], "postflight" => [] } }))
   end
@@ -81,6 +83,88 @@ class MergeValidateTest < Minitest::Test
     klass.define_singleton_method(:silo_merge_preflight!) { false }
     klass.define_singleton_method(:silo_merge_asset_ids) { raise "unreachable" }
     assert_equal "preflight_refused", validate(klass)["reason"]
+  end
+
+  def test_raised_preflight_collects_private_partial_counters_before_selection
+    klass = merger
+    declared = JSON.parse(JSON.generate(contract))
+    declared["audit_aggregates"]["preflight"] = %w[observed refused_policy]
+    calls = []
+    klass.define_singleton_method(:silo_merge_preflight!) do
+      calls << :preflight
+      @refused_policy = 1
+      raise InventedPolicyDenied, "PRIVATE POLICY VALUE"
+    end
+    klass.define_singleton_method(:silo_merge_asset_ids) { calls << :selection; raise "unreachable" }
+    klass.define_singleton_method(:silo_merge_audit) do |phase|
+      calls << phase
+      raise "lost policy environment" unless ENV["SILO_MERGE_UPLOAD_COPY_POLICY"] == "carried"
+      { "refused_policy" => @refused_policy }
+    end
+    result = validate(klass, contract: declared)
+    assert_equal "refused", result["status"]
+    assert_equal "validation_unproven", result["reason"]
+    assert_equal [:preflight, "preflight"], calls
+    assert_equal({ "refused_policy" => 1 }, result["audit"])
+    failure = result.fetch("failure")
+    assert_equal "partial", failure["audit_status"]
+    assert_equal ["observed"], failure["missing_keys"]
+    assert_equal "read_only_clones", failure["write_boundary"]
+    assert_equal "MergeValidateTest::InventedPolicyDenied", failure["error_class"]
+    assert_equal false, failure["complete"]
+    refute_includes JSON.generate(result), "PRIVATE POLICY VALUE"
+    refute SiloMergeValidation.projection(result).key?("failure")
+    refute SiloMergeValidation.projection(result).key?("audit")
+  end
+
+  def test_failure_audit_exception_does_not_replace_boolean_policy_refusal
+    klass = merger
+    klass.define_singleton_method(:silo_merge_preflight!) { false }
+    klass.define_singleton_method(:silo_merge_audit) { |_| raise SystemExit, "PRIVATE AUDIT VALUE" }
+    result = validate(klass)
+    assert_equal "preflight_refused", result["reason"]
+    assert_equal "hook_failed", result.dig("failure", "audit_status")
+    assert_equal({}, result["audit"])
+    assert_equal ["uploads"], result.dig("failure", "missing_keys")
+    refute_includes JSON.generate(result), "PRIVATE AUDIT VALUE"
+  end
+
+  def test_failure_audit_rejects_undeclared_data_without_replacing_policy_refusal
+    klass = merger
+    klass.define_singleton_method(:silo_merge_preflight!) { false }
+    klass.define_singleton_method(:silo_merge_audit) { |_| { "PRIVATE_DYNAMIC_KEY" => 1 } }
+    result = validate(klass)
+    assert_equal "preflight_refused", result["reason"]
+    assert_equal "invalid", result.dig("failure", "audit_status")
+    assert_equal({}, result["audit"])
+    refute_includes JSON.generate(result), "PRIVATE_DYNAMIC_KEY"
+  end
+
+  def test_success_does_not_add_refusal_metadata_or_repeat_audit
+    klass = merger
+    calls = []
+    klass.define_singleton_method(:silo_merge_audit) { |phase| calls << phase; { "uploads" => 2 } }
+    result = validate(klass)
+    assert_equal "passed", result["status"]
+    refute result.key?("failure")
+    assert_equal ["preflight"], calls
+  end
+
+  def test_later_asset_refusal_uses_the_already_validated_audit_snapshot
+    klass = merger
+    calls = 0
+    klass.define_singleton_method(:silo_merge_audit) do |_phase|
+      calls += 1
+      raise "PRIVATE SECOND CALLBACK" if calls > 1
+      { "uploads" => 2 }
+    end
+    result = validate(klass, asset_preflight: ->(*) { raise SiloDiscourseMergeAdapter::Error, "PRIVATE ASSET" })
+    assert_equal "assets_unproven", result["reason"]
+    assert_equal 1, calls
+    assert_equal({ "uploads" => 2 }, result["audit"])
+    assert_equal "partial", result.dig("failure", "audit_status")
+    assert_equal [], result.dig("failure", "missing_keys")
+    refute_includes JSON.generate(result), "PRIVATE"
   end
 
   def test_system_exit_becomes_fixed_refusal

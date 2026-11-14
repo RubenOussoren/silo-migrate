@@ -9,8 +9,10 @@ require "yaml"
 require "pg"
 if File.file?(File.expand_path("../shared/merge_contract.rb", __dir__))
   require_relative "../shared/merge_contract"
+  require_relative "../shared/merge_refusal"
 else
   require_relative "merge_contract"
+  require_relative "merge_refusal"
 end
 require_relative "merge_adapter"
 require_relative "merge_asset_references"

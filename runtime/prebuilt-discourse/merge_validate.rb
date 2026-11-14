@@ -4,8 +4,10 @@ require "json"
 require "digest"
 if File.file?(File.expand_path("../shared/merge_contract.rb", __dir__))
   require_relative "../shared/merge_contract"
+  require_relative "../shared/merge_refusal"
 else
   require_relative "merge_contract"
+  require_relative "merge_refusal"
 end
 
 # Engine-specific class-only validator. All returned data is PRIVATE, including
@@ -105,6 +107,9 @@ module SiloMergeValidation
                "approved_ids" => [], "selected_ids_sha256" => Digest::SHA256.hexdigest("[]"), "audit" => {}, "checks" => [], "asset_preflight_sha256" => nil, "selection_sha256" => nil, "owner_preflight_sha256" => nil }
     old_policy = ENV["SILO_MERGE_UPLOAD_COPY_POLICY"]
     old_protocol = ENV["SILO_MERGE_ASSET_PROTOCOL"]
+    audit_ready = false
+    audit_snapshot = nil
+    failure_error = nil
     begin
       refuse!("validation_unproven") unless contract["engine"] == "discourse-merger-v1"
       policy = SiloMergeContract.validate_settings!(contract, settings).fetch("physical_policy")
@@ -113,6 +118,7 @@ module SiloMergeValidation
       request!(checks)
       hooks = %i[silo_merge_preflight! silo_merge_asset_ids silo_merge_audit]
       refuse!("hooks_missing") unless merger.is_a?(Class) && hooks.all? { |hook| merger.respond_to?(hook) }
+      audit_ready = true
       refuse!("preflight_refused") unless merger.silo_merge_preflight! == true
       ids = merger.silo_merge_asset_ids
       refuse!("asset_selection_invalid") unless ids.is_a?(Array) && ids.size <= MAX_ROWS && ids.all? { |id| id.is_a?(Integer) && id.between?(1, 2**63 - 1) } && ids.uniq == ids
@@ -120,6 +126,7 @@ module SiloMergeValidation
       result["approved_ids"] = ids
       result["selected_ids_sha256"] = Digest::SHA256.hexdigest(JSON.generate(ids))
       result["audit"] = SiloMergeContract.audit!(contract, "preflight", merger.silo_merge_audit("preflight"))
+      audit_snapshot = result["audit"]
       result["checks"] = existence(checks, query: query)
       refuse!("checks_invalid") if result["checks"].any? { |answer| answer["status"] == "unproven" }
       # Existence answers are facts, not universally required-found policy.
@@ -133,17 +140,36 @@ module SiloMergeValidation
       result["asset_preflight_sha256"], result["selection_sha256"], result["owner_preflight_sha256"] = digest, selection, owner_digest
       result["status"], result["reason"] = "passed", "ok"
     rescue Finding => error
+      failure_error = error
       result["reason"], result["key_path"] = error.reason, error.key_path
     rescue SiloMergeContract::Error => error
+      failure_error = error
       result["reason"], result["key_path"] = "audit_invalid", error.key_path
     rescue Refused => error
+      failure_error = error
       result["reason"] = error.message
     rescue Exception => error # A reviewed hook's SystemExit cannot skip a typed refusal.
+      failure_error = error
       # Adapter refusals are known asset failures, not boot/protocol failures.
       # Never relay their message, tag or paths into the public projection.
       asset_error = defined?(SiloDiscourseMergeAdapter::Error) && error.is_a?(SiloDiscourseMergeAdapter::Error)
       result["reason"] = asset_error ? "assets_unproven" : "validation_unproven"
     ensure
+      if audit_ready && result["status"] == "refused"
+        begin
+          # Inspect the same loaded class's declared counters after refusal. Never
+          # invoke selection, construction or transfers, and never parse its logs.
+          options = { contract: contract, merger: merger, phase: "preflight", context: "validation",
+            reason: result.fetch("reason"), error: failure_error }
+          options[:audit_value] = audit_snapshot unless audit_snapshot.nil?
+          failure = SiloMergeRefusal.capture(**options)
+          result["failure"] = failure
+          result["audit"] = failure.fetch("counts")
+        rescue Exception
+          # Optional diagnostics must not replace the primary refusal, including
+          # when the collector itself cannot produce a trustworthy envelope.
+        end
+      end
       old_policy.nil? ? ENV.delete("SILO_MERGE_UPLOAD_COPY_POLICY") : ENV["SILO_MERGE_UPLOAD_COPY_POLICY"] = old_policy
       old_protocol.nil? ? ENV.delete("SILO_MERGE_ASSET_PROTOCOL") : ENV["SILO_MERGE_ASSET_PROTOCOL"] = old_protocol
     end

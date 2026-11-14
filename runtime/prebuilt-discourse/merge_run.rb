@@ -108,6 +108,18 @@ begin
     rescue Exception => e # includes a layer's SystemExit; a hook cannot signal success by exiting
       # Never surface an exception message: it may contain a customer name/value.
       warn "SILO_MERGE: layer policy check failed (#{e.class})"
+      if process_contract
+        # Private diagnostics must never replace the policy refusal or its exit.
+        begin
+          phase = hook == :silo_merge_preflight! ? "preflight" : "postflight"
+          refusal = SiloMergeRefusal.capture(contract: process_contract.fetch(:contract), merger: merger,
+            phase: phase, context: "execution", reason: "#{phase}_refused", error: e)
+          STDOUT.write(SiloMergeRefusal::PREFIX + JSON.generate(refusal) + "\n")
+          STDOUT.flush
+        rescue Exception
+          # Settings restoration and the original exit remain authoritative.
+        end
+      end
       exit 3
     end
   end

@@ -6,6 +6,7 @@ require "json"
 require "securerandom"
 require "yaml"
 require_relative "../../../runtime/shared/merge_contract"
+require_relative "../../../runtime/shared/merge_refusal"
 require_relative "../merge_process"
 
 module SiloMigrate
@@ -223,7 +224,7 @@ module SiloMigrate
           %w[merge_validate.rb merge_validation_config.rb merge_adapter.rb merge_asset_references.rb merge_baseline_assets.rb].each do |name|
             mv_raw_write!(File.join(host_dir, name), File.binread(File.join(helper_root, "prebuilt-discourse", name)))
           end
-          %w[merge_contract.rb merge_assets.rb].each do |name|
+          %w[merge_contract.rb merge_assets.rb merge_refusal.rb].each do |name|
             mv_raw_write!(File.join(host_dir, name), File.binread(File.join(helper_root, "shared", name)))
           end
           work = File.join(host_dir, "work")
@@ -425,7 +426,7 @@ module SiloMigrate
 
       def mv_facts(context)
         context.slice("prepared_from", "generation", "settings", "layer", "runtime_sha256", "code_sha256", "settings_sha256", "contract_sha256", "physical_policy").merge(
-          "validation_code_sha256" => Digest::SHA256.hexdigest([__FILE__, "../../../runtime/prebuilt-discourse/merge_validate.rb", "../../../runtime/prebuilt-discourse/merge_validation_config.rb", "../../../runtime/prebuilt-discourse/merge_adapter.rb", "../../../runtime/prebuilt-discourse/merge_asset_references.rb", "../../../runtime/prebuilt-discourse/merge_baseline_assets.rb", "../../../runtime/shared/merge_assets.rb", "../../../runtime/shared/merge_contract.rb"].map { |file| File.binread(file == __FILE__ ? file : File.expand_path(file, __dir__)) }.join))
+          "validation_code_sha256" => Digest::SHA256.hexdigest([__FILE__, "../../../runtime/prebuilt-discourse/merge_validate.rb", "../../../runtime/prebuilt-discourse/merge_validation_config.rb", "../../../runtime/prebuilt-discourse/merge_adapter.rb", "../../../runtime/prebuilt-discourse/merge_asset_references.rb", "../../../runtime/prebuilt-discourse/merge_baseline_assets.rb", "../../../runtime/shared/merge_assets.rb", "../../../runtime/shared/merge_contract.rb", "../../../runtime/shared/merge_refusal.rb"].map { |file| File.binread(file == __FILE__ ? file : File.expand_path(file, __dir__)) }.join))
       end
 
       def mv_validate!(prepared_from:, generation:, settings:, checks:, deadline: nil)
@@ -492,7 +493,8 @@ module SiloMigrate
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless result.bytesize <= 4 * 1024 * 1024 && result.start_with?(VALIDATION_PREFIX) && result.lines.size == 1
           result = SiloMergeContract.parse(result.delete_prefix(VALIDATION_PREFIX).strip, max_bytes: 4 * 1024 * 1024)
         end
-        unless result.is_a?(Hash) && result.keys.sort == VALIDATION_RESULT_KEYS.sort && result["version"] == 1 && %w[passed refused].include?(result["status"]) && result["key_path"].is_a?(Array)
+        valid_keys = result.is_a?(Hash) && [VALIDATION_RESULT_KEYS.sort, (VALIDATION_RESULT_KEYS + ["failure"]).sort].include?(result.keys.sort)
+        unless valid_keys && result["version"] == 1 && %w[passed refused].include?(result["status"]) && result["key_path"].is_a?(Array)
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL")
         end
         begin
@@ -510,12 +512,46 @@ module SiloMigrate
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL")
         end
         if result["status"] == "passed"
+          mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") if result.key?("failure")
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless result["reason"] == "ok" && result["key_path"] == [] && VALIDATION_SHA.match?(result["asset_preflight_sha256"].to_s) && VALIDATION_SHA.match?(result["selection_sha256"].to_s) && VALIDATION_SHA.match?(result["owner_preflight_sha256"].to_s)
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") if answers.any? { |answer| answer["status"] == "unproven" }
           SiloMergeContract.audit!(context.fetch("contract"), "preflight", result["audit"])
         else
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless (%w[preflight_refused hooks_missing asset_selection_invalid audit_invalid checks_invalid assets_unproven validation_unproven] + SiloMergeValidation::FINDING_CODES).include?(result["reason"])
+          if result.key?("failure")
+            result = mv_failure_evidence(result.dup, context.fetch("contract"))
+          else
+            # Older guests have no failure envelope. Retain only declared
+            # numeric counters; never relay arbitrary legacy audit payloads.
+            begin
+              keys = SiloMergeRefusal.declarations!(context.fetch("contract")).fetch("preflight")
+              result = result.merge("audit" => SiloMergeRefusal.counts!(keys, result["audit"]))
+            rescue StandardError
+              result = result.merge("audit" => {})
+            end
+          end
         end
+        result
+      end
+
+      # Failure counters are optional diagnostics, not permission to pass. Bad
+      # diagnostics must neither leak undeclared values nor replace a valid
+      # primary refusal with an unrelated protocol/recovery failure.
+      def mv_failure_evidence(result, contract)
+        begin
+          failure = SiloMergeRefusal.validate!(contract, result.fetch("failure"), context: "validation")
+          unless failure.fetch("reason") == result.fetch("reason") && failure.fetch("counts") == result.fetch("audit")
+            raise ArgumentError, "refusal_evidence_invalid", cause: nil
+          end
+        rescue StandardError
+          failure = SiloMergeRefusal.capture(contract: contract, merger: nil, phase: "preflight",
+            context: "validation", reason: result.fetch("reason")).merge("audit_status" => "invalid")
+        end
+        result["failure"], result["audit"] = failure, failure.fetch("counts")
+        result
+      rescue StandardError
+        result.delete("failure")
+        result["audit"] = {}
         result
       end
 

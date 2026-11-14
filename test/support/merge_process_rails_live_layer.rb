@@ -11,7 +11,8 @@ class InventedProcessMerge < BulkImport::DiscourseMerger
     SiteSetting.authorized_extensions
     SiteSetting.client_settings_json
     2.times { ActiveRecord::Base.connection.select_rows("SELECT name, value, data_type FROM site_settings ORDER BY name") }
-    settings.fetch("semantic_ok") == true
+    @refused_policy = settings.fetch("semantic_ok") == true ? 0 : 1
+    @refused_policy.zero?
   end
 
   def self.silo_merge_postflight!
@@ -30,6 +31,8 @@ class InventedProcessMerge < BulkImport::DiscourseMerger
   end
 
   def self.silo_merge_audit(phase)
-    { "selected_uploads" => 1 }
+    result = { "selected_uploads" => 1 }
+    result["refused_policy"] = @refused_policy if phase == "preflight"
+    result
   end
 end

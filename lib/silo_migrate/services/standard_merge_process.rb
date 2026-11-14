@@ -3,6 +3,7 @@
 require "json"
 require "digest"
 require_relative "../../../runtime/shared/merge_assets"
+require_relative "../../../runtime/shared/merge_refusal"
 require_relative "../../../runtime/prebuilt-discourse/merge_baseline_assets"
 
 module SiloMigrate
@@ -38,6 +39,7 @@ module SiloMigrate
         process = plan_for(run_id).dig("body", "merge", "process")
         return unless process
         contract = plan_for(run_id).dig("body", "merge", "contract")
+        refusal = merge_refusal_collect!(run_id, result, contract)
         records = []
         result.stdout.to_s.each_line do |line|
           next unless line.start_with?(PROCESS_PREFIX)
@@ -71,6 +73,7 @@ module SiloMigrate
           @store.write_private(@store.run_dir(run_id, "private", "merge-process.json"), JSON.generate({ "version" => 1, "phases" => records }) + "\n")
         end
         return unless result.success?
+        raise StandardWorkflowError, "STANDARD_MERGE_EVIDENCE_INVALID" if refusal
         final = records.last
         unless records.size == 3 && final["complete"] == true && final["transfer"] && final.key?("upload_rows_inserted_without_references")
           raise StandardWorkflowError, "STANDARD_MERGE_EVIDENCE_INVALID"
@@ -101,19 +104,71 @@ module SiloMigrate
         manifest = SiloMergeContract.parse(File.binread(manifest_path), max_bytes: PROCESS_MANIFEST_LIMIT)
         SiloMergeAssets.validate!(manifest)
         raise StandardWorkflowError, "STANDARD_MERGE_EVIDENCE_INVALID" unless manifest["policy"] == process["physical_policy"]
-      rescue SiloMergeContract::Error, SiloMergeAssets::Error, SiloDiscourseBaselineAssets::Error, KeyError, JSON::ParserError
-        raise StandardWorkflowError, "STANDARD_MERGE_EVIDENCE_INVALID"
+      rescue SiloMergeContract::Error, SiloMergeAssets::Error, SiloDiscourseBaselineAssets::Error, KeyError, JSON::ParserError, StandardWorkflowError, SystemCallError, IOError
+        # Evidence parsing is secondary to an already-failed subprocess.
+        # Earlier individually validated process frames remain private evidence.
+        raise StandardWorkflowError, "STANDARD_MERGE_EVIDENCE_INVALID" if result.success?
+        nil
+      end
+
+      def merge_refusal_collect!(run_id, result, contract)
+        frames = []
+        result.stdout.to_s.each_line do |line|
+          next unless line.start_with?(SiloMergeRefusal::PREFIX)
+          frames << line
+          break if frames.size > 1
+        end
+        return nil if frames.empty? && result.success?
+        value = if frames.empty?
+          merge_refusal_unavailable("evidence_unavailable")
+        else
+          begin
+            raise SiloMergeRefusal::Error unless frames.size == 1
+            parsed = SiloMergeContract.parse(frames.first.delete_prefix(SiloMergeRefusal::PREFIX), max_bytes: SiloMergeRefusal::MAX_BYTES)
+            SiloMergeRefusal.validate!(contract, parsed, context: "execution")
+          rescue SiloMergeContract::Error, SiloMergeRefusal::Error
+            merge_refusal_unavailable("evidence_invalid")
+          end
+        end
+        @store.write_private(@store.run_dir(run_id, "private", "merge-refusal.json"), JSON.generate(value) + "\n")
+        value
+      end
+
+      def merge_refusal_unavailable(reason)
+        { "version" => 1, "available" => false, "complete" => false, "reason" => reason }
       end
 
       def merge_process_evidence(run_id)
         path = @store.run_dir(run_id, "private", "merge-process.json")
-        return { "version" => 1, "available" => false } unless File.file?(path)
-        value = JSON.parse(File.read(path))
-        final = value.fetch("phases").last || {}
-        { "version" => 1, "available" => true, "complete" => final["complete"] == true,
-          "physical_policy" => final["physical_policy"], "audit_aggregates" => final["audit_aggregates"],
-          "runner" => final["transfer"], "engine" => final.slice("upload_rows_inserted", "upload_rows_inserted_without_references", "bookkeeping_references"),
-          "phases" => value.fetch("phases").map { |phase| phase.slice("phase", "complete") } }
+        evidence = { "version" => 1, "available" => false }
+        if File.file?(path)
+          value = JSON.parse(File.read(path))
+          final = value.fetch("phases").last || {}
+          evidence = { "version" => 1, "available" => true, "complete" => final["complete"] == true,
+            "physical_policy" => final["physical_policy"], "audit_aggregates" => final["audit_aggregates"],
+            "runner" => final["transfer"], "engine" => final.slice("upload_rows_inserted", "upload_rows_inserted_without_references", "bookkeeping_references"),
+            "phases" => value.fetch("phases").map { |phase| phase.slice("phase", "complete") } }
+        end
+        refusal_path = @store.run_dir(run_id, "private", "merge-refusal.json")
+        if File.file?(refusal_path)
+          failure = SiloMergeContract.parse(File.binread(refusal_path, SiloMergeRefusal::MAX_BYTES + 1))
+          raise SiloMergeRefusal::Error unless failure.is_a?(Hash)
+          if failure.key?("audit_status")
+            contract = plan_for(run_id).dig("body", "merge", "contract")
+            SiloMergeRefusal.validate!(contract, failure, context: "execution")
+            evidence["available"] = true
+            # Keep earlier successful phase counts; add only trusted numeric
+            # counters for the refused phase, with missing values left unknown.
+            evidence["audit_aggregates"] = (evidence["audit_aggregates"] || {}).merge(failure["phase"] => failure["counts"])
+          else
+            failure = merge_refusal_unavailable(failure["reason"] == "evidence_invalid" ? "evidence_invalid" : "evidence_unavailable")
+          end
+          evidence["failure"] = failure
+          evidence["complete"] = false
+        end
+        evidence
+      rescue SiloMergeContract::Error, SiloMergeRefusal::Error
+        evidence.merge("complete" => false, "failure" => merge_refusal_unavailable("evidence_invalid"))
       end
 
       def merge_process_baseline(run_id)
@@ -155,6 +210,9 @@ module SiloMigrate
 
       def merge_process_manifest(run_id)
         return nil unless plan_for(run_id).dig("body", "merge", "process")
+        if File.exist?(@store.run_dir(run_id, "private", "merge-refusal.json"))
+          raise StandardWorkflowError, "STANDARD_BACKUP_FAILED"
+        end
         path = @store.run_dir(run_id, "private", "merge-asset-manifest.json")
         bytes = File.binread(path, PROCESS_MANIFEST_LIMIT + 1)
         raise StandardWorkflowError, "STANDARD_BACKUP_FAILED" if bytes.bytesize > PROCESS_MANIFEST_LIMIT

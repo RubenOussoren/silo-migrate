@@ -261,6 +261,76 @@ class StandardMergeValidationTest < Minitest::Test
     assert_equal "passed", @host.validate["status"]
   end
 
+  def test_refused_validation_retains_partial_private_audit_without_consuming_ready_state
+    before = JSON.generate(@host.store.state)
+    @host.guest_failure = true
+    result = @host.validate
+    assert_equal "preflight_refused", result["reason"]
+    assert_equal true, result["cleanup_confirmed"]
+    assert_equal({ "uploads" => 2 }, result["audit"])
+    assert_equal result["audit"], result.dig("failure", "counts")
+    assert_equal "partial", result.dig("failure", "audit_status")
+    assert_equal "read_only_clones", result.dig("failure", "write_boundary")
+    assert_equal false, result.dig("failure", "complete")
+    refute result.key?("binding")
+    assert_equal before, JSON.generate(@host.store.state)
+    path = File.join(@directory, "validations", "#{result.fetch('receipt_id')}.json")
+    assert_equal result["failure"], JSON.parse(File.binread(path)).fetch("failure")
+    assert_equal 0o600, File.stat(path).mode & 0o777
+  end
+
+  def test_bad_optional_audit_evidence_does_not_mask_a_valid_primary_refusal
+    @host.guest_failure = true
+    receipt = @host.validate
+    keys = SiloMigrate::Services::StandardMergeValidation::VALIDATION_RESULT_KEYS + ["failure"]
+    context = { "contract" => SiloMergeContract.load(@host.contract_bytes) }
+    [->(record) { record["failure"]["counts"] = { "PRIVATE_DYNAMIC_KEY" => 1 } },
+     ->(record) { record["failure"]["reason"] = "assets_unproven" },
+     ->(record) { record["audit"] = { "PRIVATE_DYNAMIC_KEY" => 1 } },
+     ->(record) { record["failure"] = nil }].each do |corrupt|
+      record = JSON.parse(JSON.generate(receipt.slice(*keys)))
+      corrupt.call(record)
+      checked = @host.send(:mv_result!, record, context, [])
+      assert_equal "refused", checked["status"]
+      assert_equal "preflight_refused", checked["reason"]
+      assert_equal "invalid", checked.dig("failure", "audit_status")
+      assert_equal({}, checked["audit"])
+      assert_equal ["uploads"], checked.dig("failure", "missing_keys")
+      refute_includes JSON.generate(checked), "PRIVATE_DYNAMIC_KEY"
+    end
+  end
+
+  def test_legacy_refusal_shape_remains_accepted_without_synthesizing_zero_metrics
+    @host.guest_failure = true
+    legacy = @host.validate.slice(*SiloMigrate::Services::StandardMergeValidation::VALIDATION_RESULT_KEYS)
+    checked = @host.send(:mv_result!, legacy, { "contract" => SiloMergeContract.load(@host.contract_bytes) }, [])
+    assert_equal legacy, checked
+    refute checked.key?("failure")
+  end
+
+  def test_legacy_refusal_audit_discards_undeclared_or_nonnumeric_values
+    @host.guest_failure = true
+    legacy = @host.validate.slice(*SiloMigrate::Services::StandardMergeValidation::VALIDATION_RESULT_KEYS)
+    context = { "contract" => SiloMergeContract.load(@host.contract_bytes) }
+    [{ "PRIVATE_KEY" => "PRIVATE_VALUE" }, { "uploads" => -1 }, { "uploads" => "PRIVATE_VALUE" }].each do |audit|
+      checked = @host.send(:mv_result!, legacy.merge("audit" => audit), context, [])
+      assert_equal "preflight_refused", checked["reason"]
+      assert_equal({}, checked["audit"])
+      refute checked.key?("failure")
+      refute_includes JSON.generate(checked), "PRIVATE"
+    end
+  end
+
+  def test_success_cannot_carry_a_refusal_envelope
+    passed = @host.validate.slice(*SiloMigrate::Services::StandardMergeValidation::VALIDATION_RESULT_KEYS)
+    contract = SiloMergeContract.load(@host.contract_bytes)
+    failure = SiloMergeRefusal.capture(contract: contract, merger: nil, phase: "preflight", context: "validation", reason: "preflight_refused")
+    error = assert_raises(SiloMigrate::StandardWorkflowError) do
+      @host.send(:mv_result!, passed.merge("failure" => failure), { "contract" => contract }, [])
+    end
+    assert_equal "STANDARD_MERGE_VALIDATION_PROTOCOL", error.code
+  end
+
   def test_cleanup_failure_blocks_further_validation_and_start_without_dirtying_template
     @host.runtime.cleanup_failure = true
     result = @host.validate
