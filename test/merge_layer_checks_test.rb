@@ -20,6 +20,51 @@ class MergeLayerChecksTest < SiloMigrateTest
     assert_equal 'clean', result.report['state']
   end
 
+  def test_preflight_constructor_copy_and_postflight_share_process_subclass_and_snapshot
+    layer = <<~'RUBY'
+      class InventedLayer < BulkImport::DiscourseMerger
+        def self.silo_merge_preflight!
+          @hook_pid = Process.pid
+          @hook_class = self
+          @baseline = { invented_staff: 7, invented_admins: 11 }.freeze
+          @baseline_id = @baseline.object_id
+          true
+        end
+
+        def initialize
+          super
+          raise "preflight process or class lost" unless self.class.instance_variable_get(:@hook_pid) == Process.pid &&
+                                                       self.class.instance_variable_get(:@hook_class).equal?(self.class)
+          @observations = self.class.instance_variable_get(:@baseline)
+          raise "preflight snapshot lost" unless @observations.object_id == self.class.instance_variable_get(:@baseline_id)
+        end
+
+        def start
+          raise "copy process changed" unless self.class.instance_variable_get(:@hook_pid) == Process.pid
+          raise "copy snapshot changed" unless @observations.equal?(self.class.instance_variable_get(:@baseline))
+          super
+          self.class.instance_variable_set(:@copy_finished, true)
+        end
+
+        def self.silo_merge_postflight!
+          raise "postflight process or class lost" unless @hook_pid == Process.pid && @hook_class.equal?(self)
+          raise "postflight snapshot changed" unless @baseline.object_id == @baseline_id &&
+                                                    @baseline == { invented_staff: 7, invented_admins: 11 }
+          raise "postflight preceded copying" unless @copy_finished
+          puts "EVENT:shared-process-and-snapshot"
+          true
+        end
+      end
+    RUBY
+    result = run_merge(layer: layer)
+    assert result.status.success?, result.err
+    assert_empty result.err
+    assert_equal 1, events(result).count('EVENT:shared-process-and-snapshot')
+    assert_operator events(result).index('EVENT:copy'), :<, events(result).index('EVENT:shared-process-and-snapshot')
+    assert_equal 'SILO_MERGE: done', result.out.lines.last.chomp
+    assert_untouched(result, SITE)
+  end
+
   def test_stock_value_is_kept_while_copying_and_the_prior_state_is_back_before_postflight
     [SITE, AUTH_PRESENT].each do |db|
       result = run_merge(db: db, layer: checked_layer)

@@ -55,8 +55,14 @@ Ruby files, 512 KiB together. Tests/docs are reviewed and committed but not sele
 for execution. Links/submodules/unsafe Git configuration or a remote refuse. One
 subclass of `BulkImport::DiscourseMerger`, stock classes unedited; prepared custom
 layers require class-level `silo_merge_preflight!` and `silo_merge_postflight!` hooks
-returning exactly true after policy validation. Stub tests do not prove private
-mapping correctness, actual core compatibility or resulting permissions.
+returning exactly true after policy validation. **Both class hooks, construction and
+copying (`start`) execute in the same Ruby process on the same loaded subclass.**
+Preflight can retain its observations in class-instance variables for postflight;
+constructor/copy overrides must not clear or replace that baseline. Preflight cannot
+store state on a merger instance that does not yet exist. No files are needed or
+permitted for these snapshots. The state does not survive this merge invocation or
+extend into later finalize/rebake processes. Stub tests do not prove private mapping
+correctness, actual core compatibility or resulting permissions.
 
 The plan binds a commit and content manifest; referenced commits are retained.
 Start rechecks/extracts those committed bytes into the run-private directory,

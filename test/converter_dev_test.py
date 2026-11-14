@@ -306,6 +306,13 @@ class ConverterDevTest(unittest.TestCase):
             for wrong in ('200 lines', '200-line', '100 entries', '100-entry'):
                 self.assertNotIn(wrong, text)
 
+    def test_merge_guide_guarantees_hook_process_and_class_snapshot_lifetime(self):
+        contract = self.dev._merge_contract
+        for text in (contract.MERGE_GUIDE, contract.STANDALONE_MERGE_GUIDE):
+            for phrase in ('SAME Ruby process', 'SAME loaded subclass', 'class-instance variables',
+                           'before new', 'not later finalize/rebake processes or another run'):
+                self.assertIn(phrase, text)
+
     def resolver_fixture(self):
         self.fetch_local_origin()
         patcher = mock.patch.object(self.dev, 'origin_repository', return_value=('discourse-org', 'discourse-converters'))

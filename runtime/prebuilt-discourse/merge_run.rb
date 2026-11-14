@@ -3,7 +3,7 @@
 # A merge run's entry point: Discourse's own merger (script/bulk_import/discourse_merger.rb,
 # loaded unedited), optionally with one project merge layer on top.
 #
-# A layer is a Ruby file from the project's converter checkout. It defines exactly one
+# A layer is a committed project Ruby file (standalone for prepared custom runs). It defines exactly one
 # subclass of BulkImport::DiscourseMerger and changes behaviour by overriding its methods
 # (and calling super). Customer values don't belong in the layer: it reads them from the
 # YAML file named by SILO_MERGE_SETTINGS, which only the run supplies.
@@ -83,6 +83,9 @@ begin
   # Prepared custom merges must validate destination policy before the stock constructor
   # writes settings, and validate the resulting ACLs before the host finalizes/backs up.
   # These hooks are reviewed project code, not proof by themselves that a policy is correct.
+  # Both hooks, construction and start execute in this Ruby process on the same loaded
+  # subclass. Class-instance variables set by preflight remain available to postflight;
+  # preflight runs before there is a merger instance. Finalization is a later process.
   required_checks = ENV["SILO_MERGE_REQUIRE_CHECKS"] == "1"
   checks = %i[silo_merge_preflight! silo_merge_postflight!]
   if required_checks && (!layer || checks.any? { |hook| !merger.respond_to?(hook) })

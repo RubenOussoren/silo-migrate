@@ -44,6 +44,11 @@ Discourse revision runs use, and the file is public, so reading it on the web is
 - Prepared custom merges MUST also define class methods self.silo_merge_preflight! and self.silo_merge_postflight!.
   Each returns exactly true only after validating the intended policy (raise or return anything else to refuse).
   The preflight runs BEFORE the stock constructor; postflight runs after copying and BEFORE finalize/backup/release.
+  Both hooks, construction and copying run in the SAME Ruby process, using the SAME loaded subclass.
+  Preflight may keep read-only observations in class-instance variables on that subclass; constructor/copy hooks
+  must preserve them so postflight can compare against the original observations. No file persistence is needed
+  or permitted. Instance variables on a merger instance cannot be used by preflight: it runs before new.
+  This in-memory state lasts only for this merge invocation, not later finalize/rebake processes or another run.
   Silo captures destination site settings before loading the layer. Only the stock constructor's temporary
   authorized_extensions assignment is allowed: Silo restores its exact prior stored override (or absence) and
   effective value BEFORE postflight. Finalize/rebake and backup run with the original destination policy.
