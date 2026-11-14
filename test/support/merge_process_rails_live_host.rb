@@ -17,7 +17,7 @@ class LiveProvision
   def mv_write!(*); end
   def mv_path(*); "fixture-only"; end
   def mv_error!(_code); raise "provision_refused"; end
-  def mv_sql!(_context, sql, database: "postgres")
+  def mv_sql!(_context, sql, database: "postgres", max_seconds: 120, step: "sql")
     STDOUT.puts(JSON.generate("sql" => sql, "database" => database))
     STDOUT.flush
     response = JSON.parse(STDIN.readline)

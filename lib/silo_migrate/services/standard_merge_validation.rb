@@ -32,6 +32,8 @@ module SiloMigrate
       VALIDATION_RESULT_KEYS = %w[version status reason key_path approved_ids selected_ids_sha256 audit checks asset_preflight_sha256 selection_sha256 owner_preflight_sha256].freeze
       VALIDATION_ID = /\A[0-9a-f]{32}\z/
       VALIDATION_SHA = /\A[0-9a-f]{64}\z/
+      VALIDATION_STEPS = %w[sql resources_absent create_role clone_source restrict_source clone_base restrict_base template_custody resource_identity guest_validation result_verification cleanup_resources cleanup_source cleanup_base cleanup_role cleanup_absence].freeze
+      VALIDATION_FAILURE_REASONS = %w[STANDARD_MERGE_VALIDATION_UNPROVEN STANDARD_MERGE_VALIDATION_PROTOCOL STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED STANDARD_MERGE_TEMPLATE_CUSTODY].freeze
 
       def merge_contract
         layer = merger_proposal_layer!
@@ -101,10 +103,13 @@ module SiloMigrate
             mv_write!(mv_path(id, "resources.json"), journal)
             uncertain = false
             result = nil
+            diagnostics = {}
             begin
               password = SecureRandom.hex(32)
               mv_provision!(context, journal, password)
+              mv_step!(context, "guest_validation")
               result = merge_validation_execute!(context.merge("password" => password), journal)
+              mv_step!(context, "result_verification")
               # Checks-only uses the same complete private envelope, without
               # claiming a semantic merge validation or issuing a Start binding.
               allowed = result.is_a?(Hash) && result.keys.sort == VALIDATION_RESULT_KEYS.sort && result["version"] == 1 && result["approved_ids"] == [] && result["audit"] == {} &&
@@ -117,7 +122,8 @@ module SiloMigrate
                 counts = { "found" => 1, "absent" => 0, "ambiguous" => 2, "unproven" => nil }
                 mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless answer.is_a?(Hash) && answer.keys.sort == %w[count status] && counts.key?(answer["status"]) && answer["count"] == counts[answer["status"]]
               end
-            rescue StandardError
+            rescue StandardError => error
+              diagnostics["work"] = mv_failure_diagnostic(context, error)
               uncertain = true
               result = { "version" => 1, "status" => "refused", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "key_path" => [] }
             ensure
@@ -128,10 +134,12 @@ module SiloMigrate
                 mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") if uncertain
                 journal.merge!("status" => "cleaned", "cleanup_confirmed" => true)
                 mv_write!(mv_path(id, "resources.json"), journal)
-              rescue StandardError
+              rescue StandardError => error
+                diagnostics["cleanup"] = mv_failure_diagnostic(cleanup_context, error)
                 result = { "version" => 1, "status" => "refused", "reason" => "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", "key_path" => [] }
               end
             end
+            result["diagnostics"] = diagnostics unless diagnostics.empty?
             result = result.merge("receipt_id" => id, "cleanup_confirmed" => journal["cleanup_confirmed"])
             mv_write!(mv_path(id, "json"), result.merge("templates" => templates, "generation" => generation, "prepared_from" => prepared_from))
             result
@@ -452,12 +460,16 @@ module SiloMigrate
         mv_write!(mv_path(id, "resources.json"), journal)
         result = nil
         uncertain = false
+        diagnostics = {}
         begin
           password = SecureRandom.hex(32)
           mv_provision!(context, journal, password)
+          mv_step!(context, "guest_validation")
           result = merge_validation_execute!(context.merge("password" => password, "checks" => checks), journal)
+          mv_step!(context, "result_verification")
           result = mv_result!(result, context, checks)
-        rescue StandardError
+        rescue StandardError => error
+          diagnostics["work"] = mv_failure_diagnostic(context, error)
           uncertain = true
           result = { "version" => 1, "status" => "refused", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "key_path" => [] }
         ensure
@@ -471,10 +483,12 @@ module SiloMigrate
             journal["status"] = "cleaned"
             journal["cleanup_confirmed"] = true
             mv_write!(mv_path(id, "resources.json"), journal)
-          rescue StandardError
+          rescue StandardError => error
+            diagnostics["cleanup"] = mv_failure_diagnostic(cleanup_context, error)
             result = { "version" => 1, "status" => "refused", "reason" => "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", "key_path" => [] }
           end
         end
+        result["diagnostics"] = diagnostics unless diagnostics.empty?
         receipt = result.merge("receipt_id" => id, "prepared_from" => prepared_from, "generation" => generation, "settings" => settings,
                                "layer" => context["layer"], "facts" => mv_facts(context), "templates" => templates, "cleanup_confirmed" => journal["cleanup_confirmed"])
         bytes = mv_write!(mv_path(id, "json"), receipt)
@@ -557,22 +571,52 @@ module SiloMigrate
 
       # SQL always arrives on stdin. Do NOT use the older merge_environment_sql:
       # it uses -c and logs its result (both unsafe for generated credentials).
-      def mv_sql!(context, sql, database: "postgres")
+      # All values here come from fixed host steps, never SQL, stderr or error text.
+      def mv_step!(context, step)
+        context["validation_step"] = step
+        context.delete("sql_outcome")
+        context.delete("sql_timeout_seconds")
+      end
+
+      def mv_failure_diagnostic(context, error)
+        step = context["validation_step"]
+        reason = error.code if error.is_a?(StandardWorkflowError)
+        record = { "step" => VALIDATION_STEPS.include?(step) ? step : "unknown",
+          "reason" => VALIDATION_FAILURE_REASONS.include?(reason) ? reason : "STANDARD_MERGE_VALIDATION_UNPROVEN",
+          "deadline_reached" => context["deadline"].is_a?(Numeric) ? mv_clock >= context["deadline"] : nil }
+        outcome, seconds = context.values_at("sql_outcome", "sql_timeout_seconds")
+        record["command_outcome"] = outcome if %w[failed timeout_or_interrupted unknown].include?(outcome)
+        record["command_timeout_seconds"] = seconds if seconds.is_a?(Integer) && seconds.between?(1, VALIDATION_BUDGET)
+        record
+      rescue StandardError
+        { "step" => "unknown", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "deadline_reached" => nil }
+      end
+
+      def mv_sql!(context, sql, database: "postgres", max_seconds: 120, step: "sql")
+        context = context.dup if context.frozen?
+        mv_step!(context, step)
         stack = if context["runtime_profile"]
           with_review_runtime(context.fetch("runtime_profile")) { stack_for(context.fetch("prepared_from"), "review") }
         else
           stack_for(context.fetch("prepared_from"), "review")
         end
+        seconds = mv_timeout(context, max_seconds)
+        context["sql_timeout_seconds"] = seconds
+        context["sql_outcome"] = "unknown"
         result = @runtime.run(["docker", "exec", "-i", stack.container("db"), "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database, "-At"],
-                              stdin_data: sql, capture: true, timeout: mv_timeout(context, 120))
-        mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless result.success?
+                              stdin_data: sql, capture: true, timeout: seconds)
+        unless result.success?
+          context["sql_outcome"] = result.respond_to?(:status) && result.status.is_a?(Integer) ? "failed" : "timeout_or_interrupted"
+          mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN")
+        end
+        context.delete("sql_outcome")
         result.stdout.to_s
       end
 
       def mv_custody!(context)
         names = %w[merge_source silo_clean_base]
         sql = "SELECT datname, oid, datdba, datallowconn, (SELECT count(*) FROM pg_stat_activity a WHERE a.datid=d.oid), pg_database_size(oid) FROM pg_database d WHERE datname IN ('merge_source','silo_clean_base') ORDER BY datname;"
-        rows = mv_sql!(context, sql).lines.map { |line| line.strip.split("|", -1) }
+        rows = mv_sql!(context, sql, step: "template_custody").lines.map { |line| line.strip.split("|", -1) }
         unless rows.size == 2 && rows.map(&:first).sort == names.sort && rows.all? { |row| row.size == 6 && row[1].match?(/\A[1-9][0-9]*\z/) && row[2].match?(/\A[1-9][0-9]*\z/) && row[3] == "f" && row[4] == "0" && row[5].match?(/\A[0-9]+\z/) }
           mv_error!("STANDARD_MERGE_TEMPLATE_CUSTODY")
         end
@@ -602,14 +646,14 @@ module SiloMigrate
         mv_journal!(journal)
         mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless password.is_a?(String) && password.valid_encoding? && password.bytesize == 64 && VALIDATION_SHA.match?(password)
         role = journal.fetch("role")
-        absent = mv_sql!(context, "SELECT count(*) FROM pg_database WHERE datname IN ('#{journal.fetch('source')}','#{journal.fetch('base')}');\nSELECT count(*) FROM pg_roles WHERE rolname='#{role}';\n")
+        absent = mv_sql!(context, "SELECT count(*) FROM pg_database WHERE datname IN ('#{journal.fetch('source')}','#{journal.fetch('base')}');\nSELECT count(*) FROM pg_roles WHERE rolname='#{role}';\n", step: "resources_absent")
         mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless absent.lines.map(&:strip) == %w[0 0]
-        mv_sql!(context, "CREATE ROLE #{role} LOGIN PASSWORD '#{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;\n")
+        mv_sql!(context, "CREATE ROLE #{role} LOGIN PASSWORD '#{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;\n", step: "create_role")
         { "source" => "merge_source", "base" => "silo_clean_base" }.each do |side, template|
           name = journal.fetch(side)
-          mv_sql!(context, "CREATE DATABASE #{name} TEMPLATE #{template} OWNER postgres;\nREVOKE ALL ON DATABASE #{name} FROM PUBLIC;\nGRANT CONNECT ON DATABASE #{name} TO #{role};\nREVOKE CREATE, TEMPORARY ON DATABASE #{name} FROM #{role};\nALTER ROLE #{role} IN DATABASE #{name} SET default_transaction_read_only = on;\n")
+          mv_sql!(context, "CREATE DATABASE #{name} TEMPLATE #{template} OWNER postgres;\nREVOKE ALL ON DATABASE #{name} FROM PUBLIC;\nGRANT CONNECT ON DATABASE #{name} TO #{role};\nREVOKE CREATE, TEMPORARY ON DATABASE #{name} FROM #{role};\nALTER ROLE #{role} IN DATABASE #{name} SET default_transaction_read_only = on;\n", max_seconds: VALIDATION_BUDGET, step: "clone_#{side}")
           # No owner/default/analyst grants: only the random role sees either clone.
-          mv_sql!(context, <<~SQL, database: name)
+          mv_sql!(context, <<~SQL, database: name, step: "restrict_#{side}")
             DO $silo_validation$
             DECLARE application_schema text;
             BEGIN
@@ -637,7 +681,7 @@ module SiloMigrate
       def mv_owned_identities!(context, journal)
         mv_journal!(journal)
         sql = "/* silo_validation_owned */ SELECT datname, oid, pg_get_userbyid(datdba) FROM pg_database WHERE datname IN ('#{journal.fetch('source')}','#{journal.fetch('base')}') ORDER BY datname;\nSELECT rolname, oid, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolbypassrls, rolreplication, rolcanlogin FROM pg_roles WHERE rolname='#{journal.fetch('role')}';\n"
-        rows = mv_sql!(context, sql).lines.map { |line| line.strip.split("|", -1) }
+        rows = mv_sql!(context, sql, step: "resource_identity").lines.map { |line| line.strip.split("|", -1) }
         unless rows.size == 3 && rows.first(2).map(&:first).sort == [journal.fetch("source"), journal.fetch("base")].sort &&
             rows.first(2).all? { |row| row.size == 3 && row[1].match?(/\A[1-9][0-9]*\z/) && row[2] == "postgres" } &&
             rows.last.size == 9 && rows.last[0] == journal.fetch("role") && rows.last[1].match?(/\A[1-9][0-9]*\z/) && rows.last[2..] == %w[f f f f f f t]
@@ -647,12 +691,15 @@ module SiloMigrate
       end
 
       def mv_cleanup!(context, journal)
+        context = context.dup if context.frozen?
+        mv_step!(context, "cleanup_resources")
         mv_journal!(journal)
         # No name-only destructive cleanup after a partial/unknown CREATE. Such
         # resources require explicit scoped recovery, not an automatic guess.
         unless journal["provision_complete"] == true && mv_owned_identities!(context, journal) == journal.fetch("owned_identities")
           mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED")
         end
+        mv_step!(context, "cleanup_resources")
         if journal["redis"]
           inspected = @runtime.run(["docker", "inspect", "--format", '{{.Id}}|{{index .Config.Labels "silo-migrate.validation"}}|{{index .Config.Labels "silo-migrate.managed"}}', journal.fetch("redis")], capture: true, timeout: mv_timeout(context, 30))
           mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless inspected.success? && inspected.stdout.to_s.strip.match?(/\A[0-9a-f]{64}\|#{journal.fetch('id')}\|true\z/)
@@ -668,10 +715,10 @@ module SiloMigrate
         %w[source base].each do |side|
           name = journal.fetch(side)
           # Only generated owned clones, never original templates or inspection DBs.
-          mv_sql!(context, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='#{name}' AND pid <> pg_backend_pid();\nDROP DATABASE IF EXISTS #{name};\n")
+          mv_sql!(context, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='#{name}' AND pid <> pg_backend_pid();\nDROP DATABASE IF EXISTS #{name};\n", step: "cleanup_#{side}")
         end
-        mv_sql!(context, "DROP ROLE IF EXISTS #{journal.fetch('role')};\n")
-        remaining = mv_sql!(context, "SELECT count(*) FROM pg_database WHERE datname IN ('#{journal.fetch('source')}','#{journal.fetch('base')}');\nSELECT count(*) FROM pg_roles WHERE rolname='#{journal.fetch('role')}';\n")
+        mv_sql!(context, "DROP ROLE IF EXISTS #{journal.fetch('role')};\n", step: "cleanup_role")
+        remaining = mv_sql!(context, "SELECT count(*) FROM pg_database WHERE datname IN ('#{journal.fetch('source')}','#{journal.fetch('base')}');\nSELECT count(*) FROM pg_roles WHERE rolname='#{journal.fetch('role')}';\n", step: "cleanup_absence")
         mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless remaining.lines.map(&:strip) == %w[0 0]
       end
 

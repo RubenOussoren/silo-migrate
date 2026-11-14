@@ -56,7 +56,7 @@ class StandardMergeValidationTest < Minitest::Test
         ""
       end
       okay = !(cleanup_failure && sql.include?("DROP DATABASE"))
-      OpenStruct.new(success?: okay, stdout: output, stderr: "PRIVATE NEVER LOG")
+      OpenStruct.new(success?: okay, stdout: output, stderr: "PRIVATE NEVER LOG", status: okay ? 0 : 1)
     end
   end
 
@@ -118,6 +118,169 @@ class StandardMergeValidationTest < Minitest::Test
     @host = Host.new(@directory)
   end
   def teardown = FileUtils.remove_entry(@directory)
+
+  # Simulate elapsed monotonic time without slow or oversized fixture databases.
+  def clock_runtime(&script)
+    clock = [0.0]
+    @host.define_singleton_method(:mv_clock) { clock.first }
+    original = @host.runtime.method(:run)
+    @host.runtime.define_singleton_method(:run) do |argv, **options|
+      result = original.call(argv, **options)
+      script.call(options.fetch(:stdin_data), options, clock, result) || result
+    end
+    clock
+  end
+
+  def test_clone_can_use_remaining_global_budget_past_the_old_sql_cap
+    clone_timeout = nil
+    clock_runtime do |sql, options, clock, _result|
+      clock[0] += 5 if sql.start_with?("CREATE DATABASE silo_val_s_")
+      if sql.start_with?("CREATE DATABASE silo_val_b_")
+        clone_timeout = options.fetch(:timeout)
+        if clone_timeout < 125
+          next OpenStruct.new(success?: false, status: nil, stdout: "PRIVATE", stderr: "PRIVATE")
+        end
+        clock[0] += 125
+      end
+      nil
+    end
+    result = @host.validate
+    assert_equal "passed", result["status"]
+    assert_equal 175, clone_timeout
+    refute result.key?("diagnostics")
+    assert_equal 180, SiloMigrate::Services::StandardMergeValidation::VALIDATION_BUDGET
+    assert_equal 45, SiloMigrate::Services::StandardMergeValidation::VALIDATION_CLEANUP_BUDGET
+    cleanup = @host.runtime.calls.select { |_, options| options[:stdin_data].include?("DROP ") }
+    refute_empty cleanup
+    assert cleanup.all? { |_, options| options.fetch(:timeout) <= 45 }
+  end
+
+  def test_clone_does_not_receive_a_fresh_budget_after_earlier_work
+    clone_timeout = nil
+    clock_runtime do |sql, options, clock, _result|
+      clock[0] += 130 if sql.start_with?("CREATE DATABASE silo_val_s_")
+      clone_timeout = options.fetch(:timeout) if sql.start_with?("CREATE DATABASE silo_val_b_")
+      nil
+    end
+    assert_equal "passed", @host.validate["status"]
+    assert_equal 50, clone_timeout
+  end
+
+  def test_expired_work_deadline_refuses_before_next_clone_command
+    clock_runtime do |sql, _options, clock, _result|
+      clock[0] += 60 if sql.start_with?("CREATE DATABASE silo_val_s_")
+      clock[0] += 120 if sql.include?("DO $silo_validation$")
+      nil
+    end
+    result = @host.validate
+    assert_equal "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", result["reason"]
+    assert_equal "clone_base", result.dig("diagnostics", "work", "step")
+    assert_equal true, result.dig("diagnostics", "work", "deadline_reached")
+    refute result.fetch("diagnostics").fetch("work").key?("command_timeout_seconds")
+    refute @host.runtime.calls.any? { |_, options| options[:stdin_data].start_with?("CREATE DATABASE silo_val_b_") }
+  end
+
+  def test_unknown_clone_outcome_retains_bounded_evidence_and_stays_quarantined
+    clock_runtime do |sql, options, clock, _result|
+      if sql.start_with?("CREATE DATABASE silo_val_b_")
+        clock[0] += options.fetch(:timeout)
+        next OpenStruct.new(success?: false, status: nil, stdout: "PRIVATE_OUTPUT", stderr: "PRIVATE_PASSWORD")
+      end
+      nil
+    end
+    result = @host.validate
+    assert_equal "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", result["reason"]
+    assert_equal false, result["cleanup_confirmed"]
+    assert_equal({ "step" => "clone_base", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN",
+      "deadline_reached" => true, "command_outcome" => "timeout_or_interrupted", "command_timeout_seconds" => 180 },
+      result.fetch("diagnostics").fetch("work"))
+    refute result.key?("binding")
+    refute @host.runtime.calls.any? { |_, options| options[:stdin_data].include?("DROP DATABASE") }
+    journal = JSON.parse(File.read(File.join(@directory, "validations", "#{result.fetch('receipt_id')}.resources.json")))
+    refute journal["provision_complete"]
+    refute journal.key?("owned_identities")
+    assert_equal false, journal["cleanup_confirmed"]
+    count = @host.runtime.calls.size
+    assert_equal "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", @host.validate["reason"]
+    assert_equal count, @host.runtime.calls.size
+    assert_equal "ready", @host.store.state.dig("runs", "prep", "merge_environment", "phase")
+    bytes = File.read(File.join(@directory, "validations", "#{result.fetch('receipt_id')}.json"))
+    refute_includes bytes, "PRIVATE"
+    refute_includes bytes, "CREATE DATABASE"
+    password = @host.runtime.calls.map { |_, options| options[:stdin_data][/PASSWORD '([^']+)'/, 1] }.compact.first
+    refute_includes bytes, password
+  end
+
+  def test_known_sql_failure_has_a_distinct_fixed_outcome
+    clock_runtime do |sql, _options, _clock, _result|
+      next OpenStruct.new(success?: false, status: 1, stdout: "PRIVATE", stderr: "PRIVATE") if sql.start_with?("CREATE DATABASE silo_val_b_")
+      nil
+    end
+    result = @host.validate
+    assert_equal "failed", result.dig("diagnostics", "work", "command_outcome")
+    assert_equal false, result.dig("diagnostics", "work", "deadline_reached")
+    assert_equal "clone_base", result.dig("diagnostics", "work", "step")
+    refute_includes JSON.generate(result), "PRIVATE"
+  end
+
+  def test_checks_only_setup_failure_uses_the_same_diagnostics_and_fence
+    @host.contract_bytes = nil
+    clock_runtime do |sql, _options, _clock, _result|
+      next OpenStruct.new(success?: false, status: nil, stdout: "PRIVATE", stderr: "PRIVATE") if sql.start_with?("CREATE DATABASE silo_val_b_")
+      nil
+    end
+    result = @host.merge_exact_existence(prepared_from: "prep", generation: "a" * 64, queries: [{ "kind" => "tag", "name" => "fixture" }])
+    assert_equal "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", result["reason"]
+    assert_equal "clone_base", result.dig("diagnostics", "work", "step")
+    assert_equal "timeout_or_interrupted", result.dig("diagnostics", "work", "command_outcome")
+    assert_equal false, result["cleanup_confirmed"]
+    refute result.key?("binding")
+  end
+
+  def test_guest_error_does_not_inherit_the_last_sql_timeout_metadata
+    @host.guest_exception = true
+    result = @host.validate
+    diagnostic = result.fetch("diagnostics").fetch("work")
+    assert_equal "guest_validation", diagnostic["step"]
+    assert_equal "STANDARD_MERGE_VALIDATION_UNPROVEN", diagnostic["reason"]
+    refute diagnostic.key?("command_outcome")
+    refute diagnostic.key?("command_timeout_seconds")
+    refute_includes JSON.generate(result), "secret"
+    assert_equal "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", result["reason"]
+  end
+
+  def test_cleanup_failure_is_separate_from_successful_work
+    @host.runtime.cleanup_failure = true
+    result = @host.validate
+    assert_equal ["cleanup"], result.fetch("diagnostics").keys
+    assert_equal "cleanup_source", result.dig("diagnostics", "cleanup", "step")
+    assert_equal "failed", result.dig("diagnostics", "cleanup", "command_outcome")
+    assert_operator result.dig("diagnostics", "cleanup", "command_timeout_seconds"), :<=, 45
+  end
+
+  def test_failure_diagnostics_never_copy_arbitrary_context_or_exception_text
+    value = @host.send(:mv_failure_diagnostic,
+      { "validation_step" => "PRIVATE", "sql_outcome" => "PRIVATE", "sql_timeout_seconds" => "PRIVATE", "deadline" => "PRIVATE" },
+      SiloMigrate::StandardWorkflowError.new("PRIVATE", "PRIVATE"))
+    assert_equal({ "step" => "unknown", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "deadline_reached" => nil }, value)
+  end
+
+  def test_nonclone_sql_keeps_the_default_120_second_cap
+    @host.define_singleton_method(:mv_clock) { 0.0 }
+    @host.send(:mv_sql!, { "prepared_from" => "prep", "deadline" => 180.0 }, "SELECT 1")
+    assert_equal 120, @host.runtime.calls.last.last.fetch(:timeout)
+    @host.send(:mv_sql!, { "prepared_from" => "prep", "deadline" => 45.0 }, "SELECT 1")
+    assert_equal 45, @host.runtime.calls.last.last.fetch(:timeout)
+  end
+
+  def test_direct_sql_adapter_accepts_an_immutable_context_without_mutating_it
+    @host.define_singleton_method(:mv_clock) { 0.0 }
+    context = { "prepared_from" => "prep", "deadline" => 180.0 }.freeze
+    original = context.dup
+    @host.send(:mv_sql!, context, "SELECT 1")
+    assert_equal original, context
+    assert_equal 120, @host.runtime.calls.last.last.fetch(:timeout)
+  end
 
   def test_passing_private_receipt_clone_sql_and_locks
     result = @host.validate

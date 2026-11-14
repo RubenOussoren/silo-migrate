@@ -316,9 +316,25 @@ silo-migrate-control standard workflow exists PROJECT --prepared-from RUN --gene
 
 These calls grant no Approve, Start, reset or deployment capability. Validation
 uses a 180-second monotonic work budget plus a separate 45-second cleanup budget,
-inside the trusted tool's 240-second backend timeout. A timeout or uncertain guest
-execution is a refusal with quarantined ownership evidence, not permission to reset
-or reuse the generation. Large data sets may exceed this conservative budget and
+inside the trusted tool's 240-second backend timeout. Database cloning may use
+that existing remaining work budget (at most 180 seconds), rather than the ordinary
+120-second per-SQL cap. Each clone shares the original deadline; it does not receive
+a fresh allowance. Other SQL keeps its 120-second cap, also bounded by the remaining
+deadline, and cleanup keeps its separate 45-second budget.
+
+Completed failed host calls add private `diagnostics.work` and/or
+`diagnostics.cleanup` to the receipt. They contain fixed-vocabulary `step`/`reason`,
+`deadline_reached`, and when available `command_outcome` and
+`command_timeout_seconds`. Work diagnostics are captured before cleanup, so a
+secondary cleanup failure cannot erase the original step. No SQL, command output,
+exception messages or credentials are copied. `timeout_or_interrupted` means an
+uncertain command outcome, not proof that PostgreSQL stopped. These host diagnostics
+are separate from the guest's policy-refusal counters and add no clean projection.
+Existing receipts/journals gain no retroactive evidence or recovery authorization.
+
+A timeout or uncertain guest execution is a refusal with quarantined ownership
+evidence, not permission to reset or reuse the generation. Large data sets may
+exceed this conservative budget and
 require an explicitly designed capacity change; the runner never silently retries.
 Start's engineer request budget is 295 seconds to accommodate fresh preclaim
 validation; this does not change the separate approval or asynchronous run model.
