@@ -26,6 +26,7 @@ require_relative "standard_run_inputs"
 require_relative "standard_convert_run"
 require_relative "standard_review_run"
 require_relative "standard_merge_run"
+require_relative "standard_merge_site_settings"
 require_relative "standard_merge_code"
 require_relative "standard_merge_preparation"
 require_relative "standard_merge_inspection"
@@ -45,6 +46,7 @@ module SiloMigrate
       include StandardConvertRun
       include StandardReviewRun
       include StandardMergeRun
+      include StandardMergeSiteSettings
       include StandardMergeCode
       include StandardMergePreparation
       include StandardMergeInspection
@@ -108,6 +110,7 @@ module SiloMigrate
         "STANDARD_MERGE_LAYER_INVALID" => "Correct and commit the merge layer (a prepared custom merge: merger.rb plus optional helpers/*.rb in the project's local merger repository, at most 32 Ruby files and 512 KiB; tests and README outside them), then re-plan. An older converter-layer plan: refresh the converter and re-plan.",
         "STANDARD_MERGER_CONFIG" => "The project's local merger repository has a remote, include, filter, URL rewrite, helper, alternate object store, link or other setting or layout that is not allowed. Inspect it as the service account, remove it (the store is local-only, with no remote), then re-plan.",
         "STANDARD_MERGER_DIRTY" => "The local merger repository has uncommitted changes. Commit (or discard) them so the plan binds exactly what was reviewed, then re-plan.",
+        "STANDARD_MERGE_SITE_SETTINGS_FAILED" => "The merge could not prove exact destination site-setting preservation. Keep the failed environment for private diagnosis; review the redacted names/counts and restoration status. Never suppress verification or reuse the dirty generation.",
         "STANDARD_MERGE_SETTINGS_INVALID" => "Register a valid merge settings mapping and re-plan.",
         "STANDARD_MERGE_SCHEMA" => "Inspect private schema evidence, correct the layer or runtime and re-plan.",
         "STANDARD_MERGE_FAILED" => "Inspect private merge evidence, reset the dirty run and re-plan.",
@@ -132,7 +135,7 @@ module SiloMigrate
       EXECUTE_LOCK_WAIT = 120
       # Longer than EXECUTE_LOCK_WAIT, so a queued executor isn't called never-started.
       CLAIM_GRACE_SECONDS = 180
-      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb review_access.rb review_state.rb merge_run.rb merge_source_config.rb merge_state.rb].freeze
+      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb review_access.rb review_state.rb merge_run.rb merge_source_config.rb merge_state.rb merge_site_settings.rb merge_rebake.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
       attr_reader :store
@@ -541,6 +544,7 @@ module SiloMigrate
             mark_instances_dirty(state, run)
             merge_environment_failed(state, run)
           end
+          merge_site_settings_failure_cleanup(run_id, phase: "recovery")
           merge_failure_fence(run_id)
           public_run(@store.load.fetch("runs").fetch(run_id), held: true)
         end
@@ -956,6 +960,14 @@ module SiloMigrate
             return
           end
         end
+        if merge_plan?(plan_for(run_id))
+          begin
+            merge_site_settings_check!(run_id, stack_for(run_id, "review"), phase: "completion")
+          rescue StandardWorkflowError
+            fail_run(run_id, stages_for(plan_for(run_id)).last, "STANDARD_MERGE_SITE_SETTINGS_FAILED", "final settings verification failed")
+            return
+          end
+        end
         @store.update do |state|
           run = state.fetch("runs").fetch(run_id)
           run["status"] = "completed"
@@ -998,6 +1010,7 @@ module SiloMigrate
         end
         # The failure is recorded first; then (still under the executor's op lock, outside the
         # state lock) no inspection access may outlive it.
+        merge_site_settings_failure_cleanup(run_id)
         merge_failure_fence(run_id)
       end
 

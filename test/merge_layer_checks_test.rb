@@ -1,75 +1,283 @@
 # frozen_string_literal: true
 
 require_relative 'test_helper'
-require 'open3'
-require 'rbconfig'
-require 'tmpdir'
+require_relative 'support/merge_settings_runner'
 
+# merge_run.rb end to end against a stand-in Rails: layer contract, policy-check order, and the
+# site-setting snapshot every run is bound to.
 class MergeLayerChecksTest < SiloMigrateTest
-  SCRIPT = File.expand_path('../runtime/prebuilt-discourse/merge_run.rb', __dir__)
-  HARNESS = <<~RUBY
-    module PG
-      def self.connect(*args, **kwargs); end
-    end
-    module BulkImport
-      class DiscourseMerger
-        def initialize
-          puts 'EVENT:constructor'
-        end
-        def start
-          puts 'EVENT:copy'
-        end
-      end
-    end
-    module Kernel
-      alias silo_original_require require
-      def require(path)
-        return true if path == 'pg' || path == '/var/www/discourse/script/bulk_import/discourse_merger.rb'
-        silo_original_require(path)
-      end
-    end
-  RUBY
+  include MergeSettingsRunner
 
-  def invoke(layer: nil, required: true)
-    Dir.mktmpdir('merge-policy-') do |dir|
-      harness = File.join(dir, 'harness.rb')
-      File.write(harness, HARNESS)
-      env = { 'DB_NAME' => 'merge_source', 'SILO_MERGE_REQUIRE_CHECKS' => required ? '1' : nil, 'SILO_MERGE_LAYER' => nil }
-      if layer
-        entry = File.join(dir, 'layer.rb')
-        File.write(entry, layer)
-        env['SILO_MERGE_LAYER'] = entry
-      end
-      Open3.capture3(env, RbConfig.ruby, '-r', harness, SCRIPT)
+  AUTH_PRESENT = SITE.merge('authorized_extensions' => ['pdf|txt|PRIVATE-EXT', 8])
+
+  def test_required_checks_run_before_constructor_and_after_copy
+    result = run_merge(layer: checked_layer)
+    assert result.status.success?, result.err
+    assert_empty result.err
+    assert_equal %w[EVENT:preflight EVENT:constructor EVENT:copy], events(result).first(3)
+    assert_equal 'EVENT:postflight', events(result)[4]
+    assert_equal 'SILO_MERGE: done', result.out.lines.last.chomp
+    assert_equal 'clean', result.report['state']
+  end
+
+  def test_stock_value_is_kept_while_copying_and_the_prior_state_is_back_before_postflight
+    [SITE, AUTH_PRESENT].each do |db|
+      result = run_merge(db: db, layer: checked_layer)
+      assert result.status.success?, result.err
+      assert_includes events(result), 'EVENT:copy-sees=jpg|jpeg|png|gif'
+      prior = db.key?('authorized_extensions') ? 'pdf|txt|PRIVATE-EXT' : 'jpg|jpeg|png|gif|heic|heif|webp|avif'
+      assert_includes events(result), "EVENT:postflight-sees=#{prior}"
+      # Absence is absence again; a present override has its exact raw value and type back.
+      assert_untouched(result, db)
+      assert_equal({ 'version' => 1, 'state' => 'clean', 'restoration_failed' => [], 'unexpected_names' => [],
+                     'remaining_differences' => 0, 'effective_matches' => true }, result.report)
+      assert_no_private_values(result)
     end
   end
 
-  def test_required_checks_run_before_constructor_and_after_copy
-    out, err, status = invoke(layer: <<~RUBY)
-      class InventedLayer < BulkImport::DiscourseMerger
-        def self.silo_merge_preflight!
-          puts 'EVENT:preflight'
-          true
-        end
-        def self.silo_merge_postflight!
-          puts 'EVENT:postflight'
-          true
+  def test_a_prior_row_already_holding_the_stock_value_is_never_rewritten
+    db = SITE.merge('authorized_extensions' => ['jpg|jpeg|png|gif', 8])
+    result = run_merge(db: db, layer: checked_layer)
+    assert result.status.success?, result.err
+    assert_untouched(result, db)
+  end
+
+  def test_missing_or_unbound_snapshot_refuses_before_rails_or_layer
+    Dir.mktmpdir do |dir|
+      good = File.join(dir, 'good.json')
+      File.write(good, '{"version":1}')
+      malformed = File.join(dir, 'bad.json')
+      File.write(malformed, '{"version":1,"settings":[]}')
+      cases = {
+        'snapshot-digest-missing' => { 'TEST_SNAPSHOT_FILE' => good, 'SILO_MERGE_SITE_SETTINGS_SHA256' => nil },
+        'snapshot-missing' => { 'TEST_SNAPSHOT_FILE' => File.join(dir, 'absent'), 'SILO_MERGE_SITE_SETTINGS_SHA256' => 'a' * 64 },
+        'snapshot-digest-mismatch' => { 'TEST_SNAPSHOT_FILE' => good, 'SILO_MERGE_SITE_SETTINGS_SHA256' => 'a' * 64 },
+        'snapshot-invalid' => { 'TEST_SNAPSHOT_FILE' => malformed,
+                                'SILO_MERGE_SITE_SETTINGS_SHA256' => Digest::SHA256.file(malformed).hexdigest }
+      }
+      cases.each do |tag, env|
+        [true, false].each do |required|
+          result = run_merge(layer: checked_layer("puts 'EVENT:layer-loaded'"), required: required, snapshot: env)
+          assert_equal 4, result.status.exitstatus, tag
+          assert_equal "SILO_MERGE: settings #{tag}\n", result.err
+          assert_empty events(result)
+          refute_includes result.out, 'SILO_MERGE: done'
         end
       end
+    end
+  end
+
+  def test_a_snapshot_that_no_longer_matches_the_site_refuses_before_the_layer_loads
+    result = run_merge(layer: checked_layer, env: { 'TEST_DB_JSON' => JSON.generate(SITE.merge('title' => ['other', 1])) })
+    assert_equal 4, result.status.exitstatus
+    assert_includes result.err, 'SILO_MERGE: settings changed-before-layer'
+    assert_empty events(result)
+    assert_equal ['title'], result.report['unexpected_names']
+    assert_no_private_values(result)
+  end
+
+  def test_settings_written_while_loading_the_layer_or_in_preflight_are_refused
+    writes = {
+      'changed-by-layer-load' => ["SiteSetting.authorized_extensions = 'jpg|jpeg|png|gif'", ''],
+      'changed-by-preflight' => ['', "SiteSetting.authorized_extensions = 'jpg|jpeg|png|gif'"]
+    }
+    writes.each do |tag, (at_load, in_preflight)|
+      layer = <<~RUBY
+        #{at_load}
+        class InventedLayer < BulkImport::DiscourseMerger
+          def self.silo_merge_preflight!
+            #{in_preflight}
+            true
+          end
+          def self.silo_merge_postflight!; true; end
+        end
+      RUBY
+      [SITE, AUTH_PRESENT].each do |db|
+        result = run_merge(db: db, layer: layer)
+        assert_equal 4, result.status.exitstatus
+        assert_includes result.err, "SILO_MERGE: settings #{tag}"
+        refute_includes result.out, 'EVENT:constructor'
+        # Even the stock value is refused there; it is put back, nothing else is touched.
+        assert_untouched(result, db)
+        assert_equal 'restored', result.report['state']
+      end
+    end
+  end
+
+  def test_another_setting_changed_by_a_layer_is_refused_and_left_as_found
+    hooks = {
+      'changed-by-preflight' => ["def self.silo_merge_preflight!; SiteSetting.write_other('title', 'PRIVATE-NEW'); true; end", false],
+      'changed-by-constructor' => ["def initialize; super; SiteSetting.write_other('brand_new', 'PRIVATE-NEW'); end", true],
+      'changed-during-copy' => ["def start; super; SiteSetting.write_other('title', 'PRIVATE-NEW'); end", true],
+      'changed-by-postflight' => ["def self.silo_merge_postflight!; SiteSetting.write_other('title', 'PRIVATE-NEW'); true; end", true]
+    }
+    hooks.each do |tag, (body, constructed)|
+      layer = <<~RUBY
+        class InventedLayer < BulkImport::DiscourseMerger
+          def self.silo_merge_preflight!; true; end
+          def self.silo_merge_postflight!; true; end
+          #{body}
+        end
+      RUBY
+      result = run_merge(db: AUTH_PRESENT, layer: layer)
+      assert_equal 4, result.status.exitstatus, tag
+      assert_includes result.err, "SILO_MERGE: settings #{tag}"
+      assert_includes result.err, 'SILO_MERGE: settings restore-unproven'
+      refute_includes result.out, 'SILO_MERGE: done'
+      assert_equal constructed, result.out.include?('EVENT:constructor'), tag
+      changed = tag == 'changed-by-constructor' ? 'brand_new' : 'title'
+      assert_equal 'PRIVATE-NEW', result.db.dig(changed, 0), 'never repaired'
+      # The allowed setting is back exactly; the report names the other one, never values.
+      assert_equal ['pdf|txt|PRIVATE-EXT', 8], result.db['authorized_extensions']
+      assert_equal({ 'version' => 1, 'state' => 'unproven', 'restoration_failed' => [], 'unexpected_names' => [changed],
+                     'remaining_differences' => 1, 'effective_matches' => true }, result.report)
+      assert_no_private_values(result)
+    end
+  end
+
+  def test_a_constructor_value_other_than_the_stock_one_is_refused_and_restored
+    layer = checked_layer("def initialize; super; SiteSetting.authorized_extensions = 'exe'; end")
+    [SITE, AUTH_PRESENT].each do |db|
+      result = run_merge(db: db, layer: layer)
+      assert_equal 4, result.status.exitstatus
+      assert_includes result.err, 'SILO_MERGE: settings changed-by-constructor'
+      refute_includes result.out, 'EVENT:copy'
+      assert_untouched(result, db)
+      assert_equal 'restored', result.report['state']
+    end
+  end
+
+  def test_constructor_failure_before_or_after_the_assignment_is_restored_and_not_done
+    %w[before after].each do |point|
+      [SITE, AUTH_PRESENT].each do |db|
+        result = run_merge(db: db, layer: checked_layer, env: { 'TEST_CONSTRUCTOR_FAIL' => point })
+        assert_equal 1, result.status.exitstatus
+        assert_equal "SILO_MERGE: merger failed (RuntimeError)\n", result.err
+        refute_includes result.out, 'EVENT:copy'
+        refute_includes result.out, 'SILO_MERGE: done'
+        assert_untouched(result, db)
+        assert_equal 'restored', result.report['state']
+        assert_no_private_values(result)
+      end
+    end
+  end
+
+  def test_a_failed_copy_prints_the_class_only_and_still_restores
+    { '1' => 'ArgumentError', 'schema' => 'PG::UndefinedColumn',
+      'wrapped' => 'ActiveRecord::StatementInvalid caused by PG::UndefinedColumn' }.each do |mode, klass|
+      [SITE, AUTH_PRESENT].each do |db|
+        result = run_merge(db: db, layer: checked_layer, env: { 'TEST_START_FAIL' => mode })
+        assert_equal 1, result.status.exitstatus
+        # The host's schema classifier still sees the class name.
+        assert_equal "SILO_MERGE: merger failed (#{klass})\n", result.err
+        refute_includes result.out, 'EVENT:postflight'
+        refute_includes result.out, 'SILO_MERGE: done'
+        assert_equal 'SILO_SETTINGS_REPORT:', result.out.lines.last[0, 21]
+        assert_untouched(result, db)
+        assert_equal 'restored', result.report['state']
+        assert_no_private_values(result)
+      end
+    end
+  end
+
+  def test_a_failed_copy_whose_restore_also_fails_stays_private_and_unproven
+    result = run_merge(db: AUTH_PRESENT, layer: checked_layer, env: { 'TEST_START_FAIL' => '1', 'TEST_FAIL_RESTORE' => '1' })
+    assert_equal 1, result.status.exitstatus
+    assert_equal "SILO_MERGE: merger failed (ArgumentError)\nSILO_MERGE: settings restore-unproven\n", result.err
+    refute_includes result.out, 'SILO_MERGE: done'
+    assert_equal 'unproven', result.report['state']
+    assert_equal ['authorized_extensions'], result.report['restoration_failed']
+    assert_no_private_values(result)
+  end
+
+  def test_a_stock_file_that_fails_to_load_is_a_private_failure
+    result = run_merge(db: AUTH_PRESENT, layer: checked_layer, env: { 'TEST_STOCK_LOAD_FAIL' => '1' })
+    assert_equal 1, result.status.exitstatus
+    assert_equal "SILO_MERGE: merger failed (LoadError)\n", result.err
+    assert_empty events(result)
+    refute_includes result.out, 'SILO_MERGE: done'
+    assert_equal 'restored', result.report['state']
+    assert_untouched(result, AUTH_PRESENT)
+    assert_no_private_values(result)
+  end
+
+  def test_restoring_puts_the_exact_raw_value_back_even_when_the_setter_normalises
+    %w[value type].each do |normalised|
+      result = run_merge(db: AUTH_PRESENT, layer: checked_layer, env: { 'TEST_NORMALIZE' => normalised })
+      assert result.status.success?, result.err
+      assert_untouched(result, AUTH_PRESENT)
+    end
+  end
+
+  def test_the_stock_window_needs_the_exact_stock_value_and_type
+    layer = checked_layer(<<~RUBY)
+      def initialize
+        super
+        SiteSetting.provider.save('authorized_extensions', 'jpg|jpeg|png|gif', 9)
+      end
     RUBY
-    assert status.success?, err
-    assert_empty err
-    assert_equal %w[EVENT:preflight EVENT:constructor EVENT:copy EVENT:postflight], out.lines.map(&:strip).grep(/^EVENT:/)
-    assert_includes out, 'SILO_MERGE: done'
+    [SITE, AUTH_PRESENT].each do |db|
+      result = run_merge(db: db, layer: layer)
+      assert_equal 4, result.status.exitstatus
+      assert_includes result.err, 'SILO_MERGE: settings changed-by-constructor'
+      refute_includes result.out, 'EVENT:copy'
+      assert_untouched(result, db)
+      assert_equal 'restored', result.report['state']
+    end
+  end
+
+  # The checks read the table, not ActiveRecord's query cache: here the cache is warm from the
+  # earlier checks and a write through another connection never clears it.
+  def test_writes_that_bypass_the_query_cache_are_still_seen
+    { "SiteSetting.write_raw('title', 'PRIVATE-RAW', 1)" => ['title'],
+      "SiteSetting.write_raw('authorized_extensions', 'exe', 8)" => [] }.each do |write, unexpected|
+      result = run_merge(db: AUTH_PRESENT, layer: checked_layer("def start; super; #{write}; end"))
+      assert_equal 4, result.status.exitstatus, write
+      assert_includes result.err, 'SILO_MERGE: settings changed-during-copy'
+      refute_includes result.out, 'EVENT:postflight'
+      assert_equal unexpected, result.report['unexpected_names']
+      assert_equal ['pdf|txt|PRIVATE-EXT', 8], result.db['authorized_extensions']
+      assert_equal unexpected.empty?, result.report['state'] == 'restored'
+      assert_no_private_values(result)
+    end
+  end
+
+  def test_one_report_and_done_reach_real_stdout_even_when_a_layer_swaps_stdout
+    result = run_merge(layer: checked_layer("def start; super; require %q[stringio]; $stdout = StringIO.new; end"))
+    assert result.status.success?, result.err
+    assert_equal 1, result.out.lines.count { |line| line.start_with?('SILO_SETTINGS_REPORT:') }
+    assert_equal ['SILO_MERGE: done'], result.out.lines.map(&:chomp).last(1)
+    assert result.out.lines[-2].start_with?('SILO_SETTINGS_REPORT:')
+  end
+
+  def test_a_failed_restore_never_claims_done
+    [SITE, AUTH_PRESENT].each do |db|
+      result = run_merge(db: db, layer: checked_layer, env: { 'TEST_FAIL_RESTORE' => '1' })
+      assert_equal 4, result.status.exitstatus
+      assert_includes result.err, 'SILO_MERGE: settings restore-unproven'
+      refute_includes result.out, 'EVENT:postflight'
+      refute_includes result.out, 'SILO_MERGE: done'
+      assert_equal 'unproven', result.report['state']
+      assert_equal ['authorized_extensions'], result.report['restoration_failed']
+      assert_no_private_values(result)
+    end
+  end
+
+  def test_leaving_early_with_status_zero_is_a_failure_and_still_restores
+    result = run_merge(db: AUTH_PRESENT, layer: checked_layer('def start; super; exit 0; end'))
+    assert_equal 4, result.status.exitstatus
+    assert_includes result.err, 'SILO_MERGE: settings early-exit'
+    refute_includes result.out, 'SILO_MERGE: done'
+    assert_untouched(result, AUTH_PRESENT)
   end
 
   def test_missing_checks_fail_before_constructor
     [nil, "class InventedLayer < BulkImport::DiscourseMerger; end\n"].each do |layer|
-      out, err, status = invoke(layer: layer)
-      assert_equal 3, status.exitstatus
-      refute_includes out, 'EVENT:constructor'
-      refute_includes out, 'EVENT:copy'
-      assert_includes err, 'layer must define'
+      result = run_merge(layer: layer)
+      assert_equal 3, result.status.exitstatus
+      refute_includes result.out, 'EVENT:constructor'
+      assert_includes result.err, 'layer must define'
+      assert_untouched(result, SITE)
     end
   end
 
@@ -82,12 +290,13 @@ class MergeLayerChecksTest < SiloMigrateTest
           def self.#{failed}; raise 'PRIVATE-POLICY-VALUE'; end
         end
       RUBY
-      out, err, status = invoke(layer: layer)
-      assert_equal 3, status.exitstatus
-      refute_includes out, 'SILO_MERGE: done'
-      refute_includes out + err, 'PRIVATE-POLICY-VALUE'
-      assert_includes err, 'layer policy check failed (RuntimeError)'
-      assert_equal failed == :silo_merge_postflight!, out.include?('EVENT:copy')
+      result = run_merge(db: AUTH_PRESENT, layer: layer)
+      assert_equal 3, result.status.exitstatus
+      refute_includes result.out, 'SILO_MERGE: done'
+      assert_includes result.err, 'layer policy check failed (RuntimeError)'
+      assert_equal failed == :silo_merge_postflight!, result.out.include?('EVENT:copy')
+      assert_untouched(result, AUTH_PRESENT)
+      assert_no_private_values(result)
     end
   end
 
@@ -100,45 +309,48 @@ class MergeLayerChecksTest < SiloMigrateTest
           def self.#{failed}; exit 0; end
         end
       RUBY
-      out, err, status = invoke(layer: layer)
-      assert_equal 3, status.exitstatus
-      assert_includes err, 'layer policy check failed (SystemExit)'
-      refute_includes out, 'SILO_MERGE: done'
-      assert_equal failed == :silo_merge_postflight!, out.include?('EVENT:constructor')
+      result = run_merge(layer: layer)
+      assert_equal 3, result.status.exitstatus
+      assert_includes result.err, 'layer policy check failed (SystemExit)'
+      refute_includes result.out, 'SILO_MERGE: done'
+      assert_equal failed == :silo_merge_postflight!, result.out.include?('EVENT:constructor')
     end
   end
 
   def test_instance_methods_do_not_satisfy_the_class_contract
-    out, err, status = invoke(layer: <<~RUBY)
+    result = run_merge(layer: <<~RUBY)
       class InventedLayer < BulkImport::DiscourseMerger
         def silo_merge_preflight!; true; end
         def silo_merge_postflight!; true; end
       end
     RUBY
-    assert_equal 3, status.exitstatus
-    assert_includes err, 'layer must define'
-    refute_includes out, 'EVENT:constructor'
+    assert_equal 3, result.status.exitstatus
+    assert_includes result.err, 'layer must define'
+    refute_includes result.out, 'EVENT:constructor'
   end
 
   def test_only_explicit_true_passes
-    out, err, status = invoke(layer: <<~RUBY)
+    result = run_merge(layer: <<~RUBY)
       class InventedLayer < BulkImport::DiscourseMerger
         def self.silo_merge_preflight!; nil; end
         def self.silo_merge_postflight!; true; end
       end
     RUBY
-    assert_equal 3, status.exitstatus
-    refute_includes out, 'EVENT:constructor'
-    assert_includes err, 'layer policy check failed'
+    assert_equal 3, result.status.exitstatus
+    refute_includes result.out, 'EVENT:constructor'
+    assert_includes result.err, 'layer policy check failed'
   end
 
-  def test_legacy_stock_and_layer_keep_prior_behavior
+  def test_legacy_stock_and_layer_keep_prior_behavior_and_are_protected_too
     [nil, "class InventedLayer < BulkImport::DiscourseMerger; end\n"].each do |layer|
-      out, err, status = invoke(layer: layer, required: false)
-      assert status.success?, err
-      assert_empty err
-      assert_includes out, 'EVENT:copy'
-      assert_includes out, 'SILO_MERGE: done'
+      [SITE, AUTH_PRESENT].each do |db|
+        result = run_merge(db: db, layer: layer, required: false)
+        assert result.status.success?, result.err
+        assert_empty result.err
+        assert_includes result.out, 'EVENT:copy'
+        assert_equal 'SILO_MERGE: done', result.out.lines.last.chomp
+        assert_untouched(result, db)
+      end
     end
   end
 end

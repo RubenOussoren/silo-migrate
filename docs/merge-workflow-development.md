@@ -72,6 +72,80 @@ Settings are a safely loaded YAML root mapping, at most **256 KiB**, aliases dis
 There is no 200-line/100-entry execution cap. The layer's documented key/value shapes
 use invented examples; migration-data supplies private values.
 
+## Destination site-setting preservation
+
+The layer calls `super` first in `initialize`, imports no source site settings and
+introduces no site-setting changes of its own. This is **not a zero-write claim**:
+the pinned stock constructor assigns `authorized_extensions`. Class-level preflight
+runs before that constructor and can validate destination state; code after `super`
+in the layer's initializer cannot run before it.
+
+Silo, not the layer, owns the narrow exception. Before loading any layer it captures
+all destination stored raw values/types privately, plus the permitted setting's
+explicit-override presence or absence and effective value. Row IDs and timestamps
+are not restored or used as policy identity. A SHA-256 binds
+the capture copied into the run. After copying it restores only
+`authorized_extensions`, refreshes and re-reads it, and checks every other stored
+setting without repairing differences. **Postflight, finalization/rebaking and the
+deliverable backup run only after restoration.** Host checks independently compare
+stored rows after merge, around finalization, before backup and before completion;
+the Rails verify stage also checks the effective extension value. Masked connector
+values are never the comparison source. These boundary checks do not prove that
+reviewed layer code made no transient write between checks; code review still
+forbids all layer-owned setting writes.
+
+Silo uses the supported `Post#rebake!(priority: :ultra_low)` API for every post,
+rather than the stock `posts:rebake` wrapper: that wrapper writes a second setting,
+`disable_system_edit_notifications`, and swallows individual rebake failures.
+Silo permits neither another temporary-setting exception nor silent partial success.
+Cooking and baked-version updates finish synchronously; follow-up jobs remain
+queued as in the stock task, not forced inline. This is not proof that all queued
+post-processing, customer plugins or external content have been validated.
+
+Failures attempt only the permitted restoration and report names/counts privately,
+not values in logs, totals or agent output. An unknown execution outcome or failed
+verification is unproven, never success. When guest termination is unknown
+(timeout, interrupted executor or recovery), the guarded restoration attempt is
+read-only: it reports observed differences but refuses a write that could race the
+still-running merger. This may leave the permitted setting unrestored; no automatic
+repair or reuse is claimed. The engineer diagnoses/resets the failed environment.
+Recovery does not make a failed/dirty consumed generation ready. `STANDARD_MERGE_SITE_SETTINGS_FAILED` is a hard gate,
+not permission to patch stock core, skip `super`, broaden setting writes or weaken
+checks. Invented helper/runtime tests are not proof of the customer's complete
+layer, policy or actual Merge. Keep its adapter, `merger.rb` and required hooks as
+separate completion/review work.
+
+### Source basis and local regression checks
+
+The integration was checked against public core
+[`2769139d59ca8284ff148fdc54094d414092700e`](https://github.com/discourse/discourse/tree/2769139d59ca8284ff148fdc54094d414092700e):
+[`discourse_merger.rb`](https://github.com/discourse/discourse/blob/2769139d59ca8284ff148fdc54094d414092700e/script/bulk_import/discourse_merger.rb)
+(constructor assignment and direct file/SQL upload copying),
+[`posts.rake`](https://github.com/discourse/discourse/blob/2769139d59ca8284ff148fdc54094d414092700e/lib/tasks/posts.rake)
+(the second setting write and swallowed rebake exceptions), and
+[`Post#rebake!`](https://github.com/discourse/discourse/blob/2769139d59ca8284ff148fdc54094d414092700e/app/models/post.rb)
+(synchronous cooking and queued follow-up work). The supported temporary stock value
+is `jpg|jpeg|png|gif`; a different value/type is refused, not silently permitted.
+A new selected runtime still requires its own compatibility checks.
+
+Focused Ruby checks are `test/merge_site_settings_test.rb`,
+`test/merge_layer_checks_test.rb`, `test/merge_rebake_test.rb` and
+`test/standard_merge_site_settings_test.rb`. The last also proves that an existing
+completed Prepare survives a code-identity change without rewriting its recorded
+plan, digest, generation or seals; old Merge approvals must be re-proposed.
+
+The optional real Rails/PostgreSQL check is:
+
+```sh
+SILO_MERGE_SITE_SETTINGS_LIVE=1 python3 -I -B test/merge_site_settings_live_test.py
+```
+
+It requires cached images, uses only an invented disposable site, never pulls or
+builds images, and checks its labelled-resource cleanup. Opting in with missing
+prerequisites fails rather than silently skips. It records the actual cached app
+revision: this is not a customer-ready runtime or an end-to-end custom Merge test.
+Default Python discovery skips these checks explicitly.
+
 ## Revise an unreleased finding
 
 In migration-data:

@@ -91,7 +91,7 @@ module SiloMigrate
           "operation" => MERGE_OPERATION, "workspace_id" => named.fetch("workspace_id"), "dataset_id" => delivery.fetch("dataset_id"),
           "delivery" => delivery, "platform" => "discourse", "roles" => roles, "base_site" => base,
           "merge" => { "source" => { "input_id" => source, "delivery" => delivery.slice("kind", "version") }.merge(source_versions),
-                       "layer" => layer, "settings" => !!settings,
+                       "layer" => layer, "settings" => !!settings, "site_settings_preservation" => StandardMergeSiteSettings::MERGE_SITE_SETTINGS_POLICY.dup,
                        "options" => { "ignore_global_pins" => !!ignore_global_pins, "separate_same_named_groups" => !!separate_same_named_groups } },
           "input_binding" => ids.map { |id| inputs.values.find { |i| i["id"] == id }.slice("id", "sha256", "bytes", "type") },
           "input_stat_binding" => @store.named.input_binding(named, ids), "code_identity" => code_identity,
@@ -115,6 +115,7 @@ module SiloMigrate
                                "return the sealed prepared databases to their working names, then merge the prepared source into the prepared Base",
                                "take a full backup before creating the local review admin and before any new inspection access", "keep the review site until reset"]
         end
+        body["mutations"] << "permit only the stock authorized_extensions assignment temporarily; restore exact prior state before postflight and verify all settings before backup"
         body["file_role_binding"] = role_binding if role_binding
         if preparation
           readiness = { "kind" => "merge_layer", "present" => layer["present"] == true }.merge(layer.slice("path", "revision", "sha256", "files"))
@@ -208,6 +209,9 @@ module SiloMigrate
 
       def merge_stale_reason(plan, state)
         body = plan.fetch("body")
+        # Historical Merge approvals must be re-proposed, not consume a ready
+        # generation before discovering they never approved this preservation policy.
+        return "code" unless body.dig("merge", "site_settings_preservation") == StandardMergeSiteSettings::MERGE_SITE_SETTINGS_POLICY
         return "delivery" if !body["file_role_binding"] && body["base_site_generation"] && body["base_site_generation"] != review_base_generation
 
         named = @store.named_state
@@ -477,6 +481,7 @@ module SiloMigrate
 
       def merge_failure(result)
         text = (result.stdout.to_s + "\n" + result.stderr.to_s).b
+        return "STANDARD_MERGE_SITE_SETTINGS_FAILED" if text.match?(/^SILO_MERGE: settings /)
         return "STANDARD_MERGE_LAYER_INVALID" if result.status == 3 && text.match?(/^SILO_MERGE: layer/)
         return "STANDARD_MERGE_SCHEMA" if text.include?("PG::UndefinedColumn")
         "STANDARD_MERGE_FAILED"
@@ -505,11 +510,18 @@ module SiloMigrate
           env << "SILO_MERGE_SETTINGS=/shared/merge/settings.yml"
         end
         merge_checked(run_id, "merge-permissions", stack.web_exec(["sh", "-c", "chown -R root:root /shared/merge && chmod -R a+rX,go-w /shared/merge"]))
+        unless plan.dig("body", "merge", "site_settings_preservation") == StandardMergeSiteSettings::MERGE_SITE_SETTINGS_POLICY
+          raise StandardWorkflowError, "STANDARD_MERGE_SITE_SETTINGS_FAILED"
+        end
+        settings_binding = merge_site_settings_capture!(run_id, stack)
+        env << "SILO_MERGE_SITE_SETTINGS_SHA256=#{settings_binding.fetch('sha256')}"
         options = plan.dig("body", "merge", "options")
         env << "IGNORE_GLOBAL_PINS=1" if options["ignore_global_pins"]
         env << "SEPARATE_SAME_NAMED_GROUPS=1" if options["separate_same_named_groups"]
+        merge_site_settings_execution!(run_id, "running")
         result = stack.discourse_shell(["sh", "-c", 'SOURCE_BASE_URL="$(cat /shared/merge/source-base-url)" exec "$@"', "sh",
                                         "env", *env, "bundle", "exec", "ruby", "/tmp/merge_run.rb"], timeout: 6 * 3600)
+        merge_site_settings_execution!(run_id, result.status.nil? ? "uncertain" : "finished")
         log(run_id, "merge", result)
         # The shared logger keeps a bounded prefix; retain the actual end as well.
         File.open(@store.run_dir(run_id, "logs", "merge.log"), "ab") do |file|
@@ -522,6 +534,7 @@ module SiloMigrate
         declared = plan.dig("body", "merge", "layer", "present") ? merge_layer_source(run_id) : ""
         merge_result(run_id, layer_totals: merge_totals(result.stdout.to_s + "\n" + result.stderr.to_s, declared))
         raise StandardWorkflowError, merge_failure(result) unless result.success?
+        merge_site_settings_check!(run_id, stack, phase: "after-merge")
         return unless prepared
 
         # Exit status alone can be forged by an early exit: the entry point's own last line,
@@ -534,16 +547,41 @@ module SiloMigrate
 
       def stage_finalize(run_id)
         stack = stack_for(run_id, "review")
+        merge_site_settings_check!(run_id, stack, phase: "before-finalize")
         %w[import:ensure_consistency posts:rebake search:reindex].each do |task|
-          merge_checked(run_id, "merge-finalize", stack.discourse_shell(["bundle", "exec", "rake", task], timeout: 7200), "STANDARD_MERGE_FAILED")
+          args = if task == "posts:rebake"
+            # The stock rake wrapper writes disable_system_edit_notifications. Use
+            # the supported rebake API without a second temporary setting exception.
+            _, binding = merge_site_settings_snapshot!(run_id)
+            merge_site_settings_install!(run_id, stack, binding)
+            ["env", "SILO_MERGE_SITE_SETTINGS_SHA256=#{binding.fetch('sha256')}", "bundle", "exec", "rails", "runner", "/tmp/merge_rebake.rb"]
+          else
+            ["bundle", "exec", "rake", task]
+          end
+          merge_site_settings_execution!(run_id, "running")
+          result = stack.discourse_shell(args, timeout: 7200)
+          merge_site_settings_execution!(run_id, result.status.nil? ? "uncertain" : "finished")
+          settings_failed = (result.stdout.to_s + "\n" + result.stderr.to_s).match?(/^SILO_MERGE_REBAKE: settings /)
+          code = settings_failed ? "STANDARD_MERGE_SITE_SETTINGS_FAILED" : "STANDARD_MERGE_FAILED"
+          merge_checked(run_id, "merge-finalize", result, code)
+          raise StandardWorkflowError, code if settings_failed
+          if task == "posts:rebake"
+            lines = result.stdout.to_s.lines.map(&:chomp).reject(&:empty?)
+            markers = lines.grep(/\ASILO_MERGE_REBAKE: posts=[0-9]+\z/)
+            unless markers.size == 1 && lines.last == markers.first
+              raise StandardWorkflowError.new("STANDARD_MERGE_FAILED", "rebake did not report completion")
+            end
+          end
         end
         merge_checked(run_id, "merge-start", stack.web_exec(%w[sv start unicorn]), "STANDARD_MERGE_FAILED")
         wait_restored_web(stack, internal: true)
+        merge_site_settings_check!(run_id, stack, phase: "after-finalize")
       end
 
       def merge_verify(run_id)
         stack = stack_for(run_id, "review")
         state = merge_state(stack, run_id: run_id)
+        merge_site_settings_verify_state!(run_id, state)
         before = JSON.parse(File.read(@store.run_dir(run_id, "evidence", "merge-before.json")))
         changed = (before.fetch("settings").keys | state.fetch("settings").keys).count { |key| before["settings"][key] != state["settings"][key] }
         merge_result(run_id, after: state.fetch("counts"), site_settings_changed: changed)
@@ -555,6 +593,7 @@ module SiloMigrate
 
       def merge_backup(run_id)
         stack = stack_for(run_id, "review")
+        merge_site_settings_check!(run_id, stack, phase: "before-backup")
         extracted = JSON.parse(File.read(@store.run_dir(run_id, "evidence", "merge-uploads.json")))
         # The merger renames the upload site root to the target's default root.
         required = extracted.fetch("uploads").map { |name| name.sub(%r{\Auploads/[^/]+/}, "uploads/default/") }

@@ -38,5 +38,6 @@ puts "SILO_JSON:" + JSON.generate(
   "migrations" => c.select_values("SELECT version FROM schema_migrations ORDER BY version"),
   "columns" => c.select_rows("SELECT table_name, column_name, CASE WHEN data_type IN ('ARRAY', 'USER-DEFINED') THEN data_type || ':' || udt_name ELSE data_type END FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, column_name"),
   "merger" => { "available" => !merger_tables.nil?, "layer_scanned" => scanned.size > 1, "tables" => merger_tables || [] },
+  "effective_authorized_extensions" => SiteSetting.authorized_extensions.to_s,
   "settings" => c.select_rows("SELECT name, value, data_type FROM site_settings ORDER BY name").to_h { |name, value, type| [name, [value, type]] },
 )

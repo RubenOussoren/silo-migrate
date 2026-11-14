@@ -44,6 +44,16 @@ Discourse revision runs use, and the file is public, so reading it on the web is
 - Prepared custom merges MUST also define class methods self.silo_merge_preflight! and self.silo_merge_postflight!.
   Each returns exactly true only after validating the intended policy (raise or return anything else to refuse).
   The preflight runs BEFORE the stock constructor; postflight runs after copying and BEFORE finalize/backup/release.
+  Silo captures destination site settings before loading the layer. Only the stock constructor's temporary
+  authorized_extensions assignment is allowed: Silo restores its exact prior stored override (or absence) and
+  effective value BEFORE postflight. Finalize/rebake and backup run with the original destination policy.
+  The layer must import no source site settings and introduce no site-setting changes (including in hooks).
+  Do not skip super, patch stock core, write settings to work around the constructor, or suppress verification.
+  Unexpected changes to any other setting fail the run; Silo never silently repairs them. Failure restoration
+  is best-effort and cannot make a failed/dirty run successful. If guest termination is unknown, restoration
+  refuses unsafe concurrent writes and reports unproven; engineer diagnosis/reset is required.
+  Setting values stay private, not in totals/errors. Silo rebakes through the supported Post API without
+  the stock rake wrapper's second setting write; synchronous cooking completes, follow-up jobs stay queued.
   Use Rails target models and SILO_MERGE_SETTINGS to verify exact destination identities and resulting permissions;
   a grant count, read_restricted flag or parent placement alone does not prove the intended audience.
   These reviewed checks do not run for an explicitly stock merge. Legacy one-shot layers retain their prior contract.
@@ -56,6 +66,7 @@ Testing without a Discourse app
   the engineer starts it, and you read the outcome under recent_runs here (call this tool again) and in any released finding.
   failure_code STANDARD_MERGE_LAYER_INVALID at stage merge means the layer didn't load or didn't define exactly one subclass;
   STANDARD_MERGE_SCHEMA means the merger met a column it doesn't know; STANDARD_MERGE_FAILED means it raised while merging.
+  STANDARD_MERGE_SITE_SETTINGS_FAILED means exact destination settings preservation could not be proven.
   What it raised is in the private log: ask the engineer to have migration-data look and release a finding.
 - Format, lint and commit as for converter code. A run uses the checkout's committed head: commit before asking for a run.
 """

@@ -3,10 +3,126 @@ require_relative 'standard_base_site_review_test'
 
 class MergeScriptedRuntime < BaseSiteScriptedRuntime
   attr_accessor :layer_entries, :layer_blobs, :merger_result, :target_state, :source_state, :quiesce_result
+  # Site-setting preservation. Left alone, these model a faithful helper and database; a test
+  # sets one to script a broken helper, a changed setting or a container that isn't the run's.
+  #   settings_hook      called with each command line before it is answered (change stored_settings there)
+  #   capture_result     the capture helper's whole result
+  #   restore_result     the restore helper's whole result
+  #   restore_fails      the restore helper can't put the temporary setting back
+  #   settings_query_result  the fixed settings query's whole result
+  #   effective_extensions   the effective value when it no longer follows the stored row (a stale cache)
+  #   finalize_results   { finalize step => result }: import:ensure_consistency, posts:rebake
+  #                      (the step merge_rebake.rb now does), search:reindex
+  #   container_identity ->(id) { result } for the ownership inspect
+  attr_accessor :settings_hook, :capture_result, :restore_result, :restore_fails, :settings_query_result,
+                :effective_extensions, :finalize_results, :container_identity
+  attr_writer :stored_settings
 
   MERGE_TABLES = %w[users topics posts categories groups tags uploads].freeze
+  SETTINGS_SQL = SiloMigrate::Services::StandardMergeSiteSettings::MERGE_SITE_SETTINGS_SQL
+  SETTINGS_GUEST = '/shared/merge/site-settings.json'
+  SETTINGS_HELPER = 'rails runner /tmp/merge_site_settings.rb'
+  REBAKE_HELPER = 'rails runner /tmp/merge_rebake.rb'
+  # The stock rebake task's own setting write, which is why the host must not run that task.
+  REBAKE_SETTING = 'disable_system_edit_notifications'
+  SETTINGS_NAME = 'authorized_extensions'
+  DEFAULT_EXTENSIONS = 'jpg|jpeg|png|gif|heic|heif|webp|avif'
+  OWNERSHIP_FORMAT = "{{.Id}}\n{{.Name}}\n{{json .Config.Labels}}"
 
   def commands = (@commands ||= [])
+
+  # The destination's stored site_settings rows, {name => [raw value or nil, data type]}: what
+  # merge_state.rb, the capture helper and the fixed query all read. It starts as the target
+  # state's settings, so a capture agrees with the state recorded before the merge.
+  def stored_settings
+    @stored_settings ||= JSON.parse(JSON.generate((target_state || {}).fetch('settings', {})))
+  end
+
+  def effective_authorized_extensions
+    effective_extensions || stored_settings.dig(SETTINGS_NAME, 0) || DEFAULT_EXTENSIONS
+  end
+
+  # The snapshot file as last copied into the stack (nil until the host installs one). A test
+  # assigns it to stand for something in the stack having replaced the file.
+  attr_accessor :guest_snapshot
+
+  # Whether the merger was constructed and ran (it refuses to without its bound snapshot).
+  def merged? = @merged == true
+
+  def settings_failed(tag, stdout = '')
+    SiloMigrate::Runtime::CommandResult.new(success?: false, status: 4, stdout: stdout, stderr: "SILO_SETTINGS_ERROR: #{tag}\n")
+  end
+
+  # merge_site_settings.rb capture: every stored row raw (a setting with no row has no entry)
+  # and the temporary setting's effective value. Nothing else: no row identity, no timestamps.
+  def settings_snapshot
+    { 'version' => 1, 'settings' => JSON.parse(JSON.generate(stored_settings)),
+      'authorized_extensions_effective' => effective_authorized_extensions }
+  end
+
+  # merge_site_settings.rb validate!: exactly the snapshot's three fields, rows as raw pairs.
+  def snapshot_valid?(snapshot)
+    snapshot.is_a?(Hash) && snapshot.keys.sort == %w[authorized_extensions_effective settings version] && snapshot['version'] == 1 &&
+      snapshot['authorized_extensions_effective'].is_a?(String) && snapshot['settings'].is_a?(Hash) &&
+      snapshot['settings'].all? { |name, pair| name.is_a?(String) && pair.is_a?(Array) && pair.size == 2 && (pair[0].nil? || pair[0].is_a?(String)) && pair[1].is_a?(Integer) }
+  end
+
+  # The digest the command names must be the installed snapshot's, as load_snapshot requires.
+  def bound_snapshot(line)
+    # The stack's shell quoting writes NAME\=value.
+    digest = line[/SILO_MERGE_SITE_SETTINGS_SHA256\\?=([^\s\\]+)/, 1]
+    return 'snapshot-digest-missing' unless digest.to_s.match?(/\A[0-9a-f]{64}\z/)
+    return 'snapshot-missing' unless guest_snapshot
+    return 'snapshot-digest-mismatch' unless Digest::SHA256.hexdigest(guest_snapshot) == digest
+
+    snapshot = JSON.parse(guest_snapshot)
+    snapshot_valid?(snapshot) ? snapshot : 'snapshot-invalid'
+  rescue JSON::ParserError
+    'snapshot-invalid'
+  end
+
+  # merge_site_settings.rb restore: puts back the temporary setting (its row or its absence) and
+  # nothing else; any other differing setting is named, never repaired. Exit 0 only when restored.
+  # Told the execution is uncertain, it writes nothing at all: it reports what it reads, and
+  # that is "unproven" (and a nonzero exit) even when nothing differs.
+  def settings_restore(line)
+    snapshot = bound_snapshot(line)
+    return settings_failed(snapshot) if snapshot.is_a?(String)
+
+    expected = snapshot.fetch('settings')
+    read_only = line.match?(/SILO_MERGE_SITE_SETTINGS_EXECUTION_UNCERTAIN\\?=1(?=[\s\\])/)
+    in_place = lambda do
+      expected[SETTINGS_NAME] == stored_settings[SETTINGS_NAME] && effective_authorized_extensions == snapshot.fetch('authorized_extensions_effective')
+    end
+    unless read_only || restore_fails || in_place.call
+      expected.key?(SETTINGS_NAME) ? stored_settings[SETTINGS_NAME] = expected[SETTINGS_NAME] : stored_settings.delete(SETTINGS_NAME)
+      self.effective_extensions = nil
+    end
+    unexpected = (expected.keys | stored_settings.keys).reject { |name| name == SETTINGS_NAME || expected[name] == stored_settings[name] }.sort
+    matches = effective_authorized_extensions == snapshot.fetch('authorized_extensions_effective')
+    restored = in_place.call
+    clean = restored && unexpected.empty? && !read_only
+    report = { 'version' => 1, 'state' => clean ? 'restored' : 'unproven', 'restoration_failed' => restored ? [] : [SETTINGS_NAME],
+               'unexpected_names' => unexpected, 'remaining_differences' => unexpected.size + (restored ? 0 : 1), 'effective_matches' => matches }
+    line = "SILO_SETTINGS_REPORT:#{JSON.generate(report)}\n"
+    clean ? review_ok(line) : settings_failed('restore-unproven', line)
+  end
+
+  # Which finalize step a command runs, by the name finalize_results uses for it.
+  def finalize_step(line)
+    return 'posts:rebake' if line.include?(REBAKE_HELPER)
+
+    line[/bundle exec rake (import:ensure_consistency|search:reindex)(?!\S)/, 1]
+  end
+
+  # The ownership inspect of one recorded container: its exact ID, name and managed labels.
+  def owned_container(id)
+    record = service.store.load.fetch('instances').values.find { |instance| instance.fetch('containers', {}).value?(id) }
+    return review_fail('Error: No such object') unless record
+
+    labels = { 'silo-migrate.managed' => 'true', 'silo-migrate.instance' => record.fetch('name') }
+    review_ok("#{id}\n/#{record.fetch('name')}-#{record.fetch('containers').key(id)}\n#{JSON.generate(labels)}\n")
+  end
 
   def run(cmd, **options)
     commands << cmd.join(' ')
@@ -18,6 +134,38 @@ class MergeScriptedRuntime < BaseSiteScriptedRuntime
       return review_ok((layer_blobs || {}).fetch(cmd.last.split(':', 2).last, ''))
     end
     line = cmd.join(' ')
+    settings_hook&.call(line)
+    if cmd[0, 4] == ['docker', 'inspect', '--format', OWNERSHIP_FORMAT] && cmd.size == 5
+      return container_identity ? container_identity.call(cmd.last) : owned_container(cmd.last)
+    elsif cmd[0, 2] == %w[docker cp] && cmd[3].to_s.end_with?(":#{SETTINGS_GUEST}")
+      @guest_snapshot = File.binread(cmd[2])
+    elsif cmd[0, 2] == %w[docker exec] && line.include?(SETTINGS_HELPER) && !cmd.include?('chown')
+      # Only the two actions the host may ask for; anything else is the helper's own refusal.
+      case line[/SILO_MERGE_SITE_SETTINGS_ACTION\\?=([^\s\\]+)/, 1]
+      when 'capture' then return capture_result || review_ok("noise\nSILO_SETTINGS_SNAPSHOT:#{JSON.generate(settings_snapshot)}\n")
+      when 'restore' then return restore_result || settings_restore(line)
+      else return settings_failed('action-invalid')
+      end
+    elsif cmd[0, 2] == %w[docker exec] && cmd.include?('psql') && cmd.last == SETTINGS_SQL
+      # psql -At prints the one aggregate and nothing else.
+      return settings_query_result || review_ok(JSON.generate(stored_settings) + "\n")
+    elsif cmd[0, 2] == %w[docker exec] && !cmd.include?('chown') && line.match?(/bundle exec rake posts:rebake(?!\S)/)
+      # The stock task assigns its own setting and puts the old value back through the setter,
+      # which leaves a row where there was none. Running it is what the host no longer does.
+      stored_settings[REBAKE_SETTING] ||= ['f', 5]
+    elsif cmd[0, 2] == %w[docker exec] && !cmd.include?('chown') && (step = finalize_step(line))
+      return finalize_results.fetch(step) if (finalize_results || {}).key?(step)
+
+      if step == 'posts:rebake'
+        # merge_rebake.rb works under the same bound snapshot as the merger, or not at all.
+        # Its completion marker is its last line; a settings refusal has its own fixed prefix.
+        snapshot = bound_snapshot(line)
+        if snapshot.is_a?(String)
+          return SiloMigrate::Runtime::CommandResult.new(success?: false, status: 4, stdout: '', stderr: "SILO_MERGE_REBAKE: settings #{snapshot}\n")
+        end
+        return review_ok("SILO_MERGE_REBAKE: posts=1\n")
+      end
+    end
     if line.include?('merge_state.rb') && !cmd.include?('chown') && cmd[1] == 'exec'
       source = line.include?('SILO_MERGE_CONFIG')
       state = { 'database' => source ? 'merge_source' : 'discourse', 'pending' => false,
@@ -25,12 +173,22 @@ class MergeScriptedRuntime < BaseSiteScriptedRuntime
                 'migrations' => ['20261104011110'],
                 'columns' => (MERGE_TABLES + %w[schema_migrations]).map { |table| [table, table == 'schema_migrations' ? 'version' : 'id', 'bigint'] },
                 'merger' => { 'available' => true, 'layer_scanned' => false, 'tables' => MERGE_TABLES }, 'settings' => {} }
-      return site_json(state.merge((source ? source_state : target_state) || {}))
+      # The destination reports its stored rows and effective value as they are now.
+      return site_json(state.merge(source_state || {})) if source
+
+      state.merge!('settings' => stored_settings, 'effective_authorized_extensions' => effective_authorized_extensions)
+      return site_json(state.merge((target_state || {}).reject { |key, _| key == 'settings' }))
     elsif line.include?('SILO_QUIESCED')
       return quiesce_result || review_ok("ok: down: unicorn: 0s, normally up\nSILO_QUIESCED\n")
     elsif line.include?('ruby /tmp/merge_run.rb')
+      # The runner refuses to start without the snapshot the host bound: it never runs unprotected.
+      snapshot = bound_snapshot(line)
+      if snapshot.is_a?(String)
+        return SiloMigrate::Runtime::CommandResult.new(success?: false, status: 4, stdout: '', stderr: "SILO_MERGE: settings #{snapshot}\n")
+      end
       @merged = true
-      return merger_result || review_ok("SILO_MERGE_TOTAL: routed=1\nSILO_MERGE: done\n")
+      report = { 'version' => 1, 'state' => 'restored', 'restoration_failed' => [], 'unexpected_names' => [], 'remaining_differences' => 0, 'effective_matches' => true }
+      return merger_result || review_ok("SILO_MERGE_TOTAL: routed=1\nSILO_SETTINGS_REPORT:#{JSON.generate(report)}\nSILO_MERGE: done\n")
     elsif line.include?('find /shared/silo-migrate-backup-')
       id = service.store.load.fetch('runs').keys.last
       return review_ok("merged-#{id}-v2026-11-0-latest-20261109000000.tar.gz\n")
