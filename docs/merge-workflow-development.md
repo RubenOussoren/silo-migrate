@@ -339,8 +339,7 @@ bounded property-name/index components; reason must be one of
 `selection_unproven`, or `schema_unsupported`. Do not put customer values in the
 exception message; clean stdout projection excludes the private path.
 
-Existing
-`data_merge_propose` fields stay unchanged; the host automatically requires passing
+Existing `data_merge_propose` fields stay unchanged; the host automatically requires passing
 process validation for prepared custom proposals. A refusal must not silently
 switch to one-shot execution. Validation is bound to the exact prepared baseline,
 settings, contract and code; generation alone does not prove a mutable inspection
@@ -354,3 +353,43 @@ manual fallback to success. Neither private schema paths/settings nor audit valu
 are automatically projected into clean project info. Clean developer/reviewer
 agents receive no new runtime or raw-data tools; release remains a separate,
 engineer-reviewed decision.
+
+### Real Rails acceptance and operator rollout
+
+The separately opted-in, invented-data acceptance test is:
+
+```sh
+SILO_MERGE_PROCESS_RAILS_LIVE=1 python3 -I -B test/merge_process_rails_live_test.py
+```
+
+It requires cached pinned Docker images and about 4 GiB available RAM, creates only
+owned disposable resources on an internal network, and never pulls/builds images,
+publishes ports or mounts customer data. A missing prerequisite fails when opted in.
+It uses real Rails, production read-only provisioning/custody checks, isolated Redis,
+stock merger `start`, selective physical transfer, T2 preservation, reference checks
+and an actual Discourse backup checked by the host archive validator and engine gate.
+Negative cases cover semantic/physical refusal, an execution-digest mismatch before
+stock writes, corrupt archive CRC, missing/tampered carried bytes and an excluded
+member appearing in the archive. Known typed adapter errors return the fixed
+`assets_unproven` reason without relaying private messages or paths; unrelated
+exceptions still return `validation_unproven`.
+
+This is **guest composition, not complete host Prepare/claim/release acceptance**.
+Host locks, durable validation journal/receipt orchestration, rebake and restore of a
+released backup are outside this test. It deliberately constructs an original-only
+supported subset, removing inherited boot upload metadata through core APIs before
+seeding two source PNGs and a destination baseline. It does not prove support for
+synthetic upload identities or unclassified source optimized assets. Never remove
+customer records/files or weaken a gate to imitate this fixture.
+
+After the tested commit is published to the installation's tracked delivery branch,
+the engineer may use an approved idle window for `sudo silo update`, then
+`sudo silo doctor`. Update restarts the web service and interrupts chats: retain
+previous-release receipts and a consistent private session/configuration backup.
+Verify the installed commit, reload the UI and start a new migration-data chat.
+First discover the actual committed contract and validate exact registered settings
+against the current ready run/generation. A missing contract/hooks belongs to the
+layer owner; unsupported assets need an engine-support decision, not manual repair.
+Do not reset/re-Prepare merely for a tooling update, and do not revive an old custom
+approval. A customer Merge still requires a new exact proposal, review/approval and
+separate Start; neither this test nor source publication grants those permissions.

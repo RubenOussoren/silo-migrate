@@ -138,8 +138,11 @@ module SiloMergeValidation
       result["reason"], result["key_path"] = "audit_invalid", error.key_path
     rescue Refused => error
       result["reason"] = error.message
-    rescue Exception # A reviewed hook's SystemExit cannot skip a typed refusal.
-      result["reason"] = "validation_unproven"
+    rescue Exception => error # A reviewed hook's SystemExit cannot skip a typed refusal.
+      # Adapter refusals are known asset failures, not boot/protocol failures.
+      # Never relay their message, tag or paths into the public projection.
+      asset_error = defined?(SiloDiscourseMergeAdapter::Error) && error.is_a?(SiloDiscourseMergeAdapter::Error)
+      result["reason"] = asset_error ? "assets_unproven" : "validation_unproven"
     ensure
       old_policy.nil? ? ENV.delete("SILO_MERGE_UPLOAD_COPY_POLICY") : ENV["SILO_MERGE_UPLOAD_COPY_POLICY"] = old_policy
       old_protocol.nil? ? ENV.delete("SILO_MERGE_ASSET_PROTOCOL") : ENV["SILO_MERGE_ASSET_PROTOCOL"] = old_protocol

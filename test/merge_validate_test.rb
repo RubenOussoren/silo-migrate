@@ -3,6 +3,7 @@ require "minitest/autorun"
 require "ostruct"
 require "tmpdir"
 require_relative "../runtime/prebuilt-discourse/merge_validate"
+require_relative "../runtime/prebuilt-discourse/merge_adapter"
 ENV["SILO_MERGE_VALIDATION_CONFIG_TEST"] = "1"
 require_relative "../runtime/prebuilt-discourse/merge_validation_config"
 ENV.delete("SILO_MERGE_VALIDATION_CONFIG_TEST")
@@ -107,6 +108,18 @@ class MergeValidateTest < Minitest::Test
     klass = merger
     klass.define_singleton_method(:silo_merge_audit) { |_| {} }
     assert_equal "audit_invalid", validate(klass)["reason"]
+  end
+
+  def test_typed_adapter_refusal_is_assets_unproven_without_relaying_private_details
+    private_detail = "private asset path or metadata"
+    result = validate(asset_preflight: ->(*) { raise SiloDiscourseMergeAdapter::Error, private_detail })
+    assert_equal "refused", result["status"]
+    assert_equal "assets_unproven", result["reason"]
+    refute_includes JSON.generate(result), private_detail
+    assert_nil result["asset_preflight_sha256"]
+    result = validate(asset_preflight: ->(*) { raise private_detail })
+    assert_equal "validation_unproven", result["reason"]
+    refute_includes JSON.generate(result), private_detail
   end
 
   def test_adapter_is_required_and_policy_is_set_only_after_contract_validation
