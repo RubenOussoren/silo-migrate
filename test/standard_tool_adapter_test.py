@@ -182,7 +182,7 @@ CONTEXT_KEYS = {'_private_session', '_session_id', '_uploads'}
 DATA_TOOLS = ('data_guide', 'data_status', 'data_supporting_list', 'data_supporting_read',
               'data_supporting_prepare', 'data_list', 'data_peek', 'data_create', 'data_take', 'data_register', 'data_script',
               'data_extract', 'data_job', 'data_db_up', 'data_db_load', 'data_db_status', 'data_db_reset', 'data_run_evidence',
-              'data_run_count', 'data_plan_propose', 'data_master_lists_propose', 'data_merge_prepare', 'data_merge_inspection',
+              'data_run_count', 'data_plan_propose', 'data_master_lists_propose', 'data_workflow_contract', 'data_workflow_validate', 'data_workflow_exists', 'data_merge_prepare', 'data_merge_inspection',
               'data_merge_propose', 'data_finding_proposal', 'data_revise_finding', 'data_propose_finding',
               'data_notes', 'data_decide', 'data_decisions', 'data_notes_write')
 BRANCH_TOOLS = ('data_branch_resolve', 'data_branches', 'data_branch_diff', 'data_branch_read')
@@ -249,9 +249,9 @@ else:
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
         blocks = re.split(r'(?m)^    - name: ', definition)[1:]
         # The four branch tools use a separate reader-role adapter, tested in converter_dev_adapter_test.
-        self.assertEqual(35, len(blocks))
+        self.assertEqual(38, len(blocks))
         declared = [block.splitlines()[0] for block in blocks if 'script: scripts/data_tool.py' in block]
-        self.assertEqual(31, len(declared))
+        self.assertEqual(34, len(declared))
         self.assertEqual(list(DATA_TOOLS), declared)
         self.assertEqual(list(BRANCH_TOOLS), [block.splitlines()[0] for block in blocks if 'script: scripts/dev_tool.py' in block])
         import importlib.util
@@ -261,12 +261,28 @@ else:
         self.assertEqual(set(DATA_TOOLS), set(adapter.TOOLS))
         for tool in declared:
             with self.subTest(tool=tool):
-                self.call(tool, {'path': 'x', 'unexpected': 'dropped'})
+                self.call(tool, {} if tool.startswith('data_workflow_') else {'path': 'x', 'unexpected': 'dropped'})
                 (argv, request), = self.calls()
                 self.assertEqual(['data', 'arc'], argv)
                 self.assertNotIn('unexpected', request)
                 self.assertNotIn('workspace', request)
                 self.assertEqual('chat', request['via'])
+
+    def test_workflow_tools_are_trusted_only_and_reject_unknown_fields(self):
+        fields = {'run': self.run_id, 'generation': 'b' * 64, 'settings': 'input-' + 'c' * 32}
+        for tool, args in (('data_workflow_contract', {}), ('data_workflow_validate', fields),
+                           ('data_workflow_exists', {k: v for k, v in dict(fields, queries=[{'kind': 'tag', 'name': 'Invented'}]).items() if k != 'settings'})):
+            self.call(tool, args)
+            ((argv, request),) = self.calls()
+            self.assertEqual(['data', 'arc'], argv)
+            self.assertEqual(dict(args, op=tool.removeprefix('data_'), via='chat'), request)
+            result, _ = self.call(tool, dict(args, sql='SELECT 1'))
+            self.assertEqual('STANDARD_ARGUMENTS_INVALID', result['error'])
+            self.assertEqual([], self.calls())
+            for agent in (ROOT / 'integrations/term-llm').iterdir():
+                definition = agent / 'agent.yaml'
+                if agent.name != 'migration-data' and definition.exists():
+                    self.assertNotIn('- name: ' + tool, definition.read_text())
 
     def test_requests_carry_only_allowed_keys(self):
         cases = {
@@ -352,7 +368,7 @@ else:
         # Stock term-llm sets no session marker: every tool reaches the backend unchanged.
         for tool in DATA_TOOLS:
             with self.subTest(tool=tool):
-                result, _raw = self.call(tool, {'id': 'support-' + 'a' * 32})
+                result, _raw = self.call(tool, {} if tool.startswith('data_workflow_') else {'id': 'support-' + 'a' * 32})
                 self.assertEqual('ok', result['status'])
                 ((argv, request),) = self.calls()
                 self.assertEqual(['data', 'arc'], argv)
@@ -366,6 +382,10 @@ else:
             for env in envs:
                 with self.subTest(tool=tool, env=env):
                     result, _raw = self.call(tool, dict(FORGED_ARGS, path='x', id='support-' + 'a' * 32), **env)
+                    if tool.startswith('data_workflow_'):
+                        self.assertEqual('STANDARD_ARGUMENTS_INVALID', result['error'])
+                        self.assertEqual([], self.calls())
+                        continue
                     self.assertEqual('ok', result['status'])
                     ((argv, request),) = self.calls()
                     self.assertEqual(['data', 'arc'], argv)  # the chat's project, not 'other'

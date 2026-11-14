@@ -455,6 +455,8 @@ export function runsView(ctx) {
       ['Exporter', master && data.master_lists ? `${safe(data.master_lists.script || '')} · list ${safe(data.master_lists.list || 'all')}` : null, true],
       ['Merge layer', merge ? (layer.present ? `${safe(layer.path)} @ ${short(layer.revision, 12)} · ${layer.files} file${layer.files === 1 ? '' : 's'}` : 'None: Discourse’s own merger only') : null, true],
       ['Merge settings', merge ? ((data.roles || {}).settings ? 'A settings file: shown under Details' : 'None') : null],
+      ['Workflow validation', merging.process ? `${safe(merging.process.engine)} · validated before proposal; Start checks the bound inputs again before activation` : null],
+      ['Physical assets', merging.process ? (merging.process.physical_policy === 'carried' ? 'Carried content only · required media must be verified' : 'All source files · explicitly selected policy') : null],
       ['Options', merge ? ([(merging.options || {}).ignore_global_pins ? 'ignore globally pinned topics' : null, (merging.options || {}).separate_same_named_groups ? 'keep same-named groups separate' : null].filter(Boolean).join(', ') || 'Discourse’s defaults') : null],
       ['Converter', review || merge || prepare ? null : `${converter.branch || ''} @ ${short(data.converter_revision, 12)}`, true],
       ['Proposed', ago(data.created_at)],
@@ -485,6 +487,12 @@ export function runsView(ctx) {
       more.push(block('Merge', facts([['Source site', `Discourse ${safe((merging.source || {}).discourse_version || '')} · schema ${safe((merging.source || {}).schema_version || '')}`],
         ['Merge layer', layer.present ? layer.path : 'none', true], ['Layer commit', layer.present ? layer.revision : null, true], ['Layer size', layer.present ? `${layer.files} file(s), ${layer.bytes} bytes` : null],
         ['Layer SHA-256', layer.present ? layer.sha256 : null, true], ['Checkout branch', converter.branch, true], ['Loopback port', ((data.instances || {}).review || {}).port]])));
+      if (merging.process) more.push(block('Workflow contract and validation',
+        facts([['Engine', merging.process.engine, true], ['Contract SHA-256', merging.process.contract_sha256, true],
+          ['Validation receipt', merging.process.receipt_id, true], ['Receipt SHA-256', merging.process.receipt_sha256, true],
+          ['Physical policy', merging.process.physical_policy]]),
+        el('p', { class: 'hint' }, 'The schema below belongs to the committed layer. Unknown keys, unsupported policies and unproven identities refuse; validation is not approval or Start.'),
+        merging.contract ? el('pre', {}, safe(JSON.stringify(merging.contract, null, 2))) : el('p', { class: 'quiet' }, 'Contract not available; use the trusted workflow discovery tool.')));
       if ((data.roles || {}).settings) more.push(block('Merge settings (customer values the merge layer reads)', texts.settings == null ? el('p', { class: 'quiet' }, '(not readable, or changed since the plan)') : el('pre', {}, safe(texts.settings))));
     }
     if (convert || master) more.push(block('Converter settings (the run fills in ${SILO_DB_*})', texts.settings == null ? el('p', { class: 'quiet' }, '(not readable, or changed since the plan)') : el('pre', {}, safe(texts.settings))));

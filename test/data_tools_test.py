@@ -1728,6 +1728,72 @@ class DataToolsTest(unittest.TestCase):
         self.assertNotIn(MARKER, json.dumps(result))
         self.assertEqual({'source': {'input_id': source, 'schema_version': '20261104011110'}}, result['merge'])
 
+    def test_workflow_tools_forward_exact_bindings_and_private_stdin(self):
+        self.create()
+        calls = []
+        receipt = {'version': 1, 'status': 'refused', 'reason': 'invalid_type', 'key_path': ['invented', 2]}
+        def control(argv, input=None, timeout=120):
+            calls.append((argv, input, timeout))
+            return json.dumps(receipt)
+        self.control = control
+        run, generation, settings = 'run-' + 'a' * 32, 'b' * 64, 'input-' + 'c' * 32
+        self.assertEqual(receipt, self.op('workflow_contract'))
+        self.assertEqual((['standard', 'workflow', 'describe', 'arc'], None, 240), calls[-1])
+        self.assertEqual(receipt['key_path'], self.op('workflow_validate', run=run, generation=generation, settings=settings)['key_path'])
+        queries = [{'kind': 'category', 'path': ['Invented Root', 'Invented Child']}, {'kind': 'tag', 'name': 'Invented'}]
+        self.op('workflow_exists', run=run, generation=generation, queries=queries)
+        argv, payload, timeout = calls[-1]
+        self.assertEqual(['standard', 'workflow', 'exists', 'arc', '--prepared-from', run, '--generation', generation, '--queries-file', '-'], argv)
+        self.assertEqual(queries, json.loads(payload))
+        self.assertEqual(240, timeout)
+        self.assertNotIn('Invented', ' '.join(argv))
+        calls.clear()
+        invalid = [[], [{}], [{'kind': 'category', 'name': 'Invented'}],
+                   [{'kind': 'category', 'path': ['Invented'], 'sql': 'SELECT 1'}],
+                   [{'kind': 'group', 'name': 'x' * 257}], [{'kind': 'group', 'name': 'x\n'}],
+                   [{'kind': 'tag', 'name': 'Invented'}] * 101,
+                   [{'kind': 'category', 'path': ['x' * 256] * 32}] * 9]
+        for queries in invalid:
+            with self.subTest(queries=str(queries)[:100]):
+                with self.assertRaises(self.d.Refusal):
+                    self.op('workflow_exists', run=run, generation=generation, queries=queries)
+        for fields in ({'run': run, 'generation': generation, 'settings': settings, 'extra': True},
+                       {'run': 'bad', 'generation': generation, 'settings': settings},
+                       {'run': run, 'generation': generation, 'settings': '/private/path'}):
+            with self.assertRaises(self.d.Refusal):
+                self.op('workflow_validate', **fields)
+        self.assertEqual([], calls)
+
+    def test_workflow_large_contract_uses_paged_derivative_without_truncation(self):
+        self.create()
+        contract = {'settings_schema': {'description': 'x' * (42 * 1024)}}
+        descriptor = {'area': 'work', 'path': 'workflow-contracts/' + 'a' * 64 + '.json',
+                      'sha256': 'a' * 64, 'bytes': 44 * 1024}
+        self.control = lambda *args, **kwargs: json.dumps({'contract': contract, 'contract_file': descriptor})
+        result = self.op('workflow_contract')
+        self.assertNotIn('contract', result)
+        self.assertTrue(result['contract_omitted'])
+        self.assertEqual(descriptor, result['contract_file'])
+        self.assertIn('byte offsets', result['next'])
+
+    def test_workflow_validation_keeps_selection_ids_in_private_host_receipt(self):
+        self.create()
+        receipt = {'status': 'passed', 'reason': 'ok', 'approved_ids': list(range(100000)),
+                   'selected_ids_sha256': 'a' * 64}
+        self.control = lambda *args, **kwargs: json.dumps(receipt)
+        result = self.op('workflow_validate', run='run-' + 'a' * 32, generation='b' * 64,
+                         settings='input-' + 'c' * 32)
+        self.assertNotIn('approved_ids', result)
+        self.assertEqual(100000, result['approved_assets_count'])
+        self.assertEqual(receipt['selected_ids_sha256'], result['selected_ids_sha256'])
+        self.assertLess(len(json.dumps(result)), 1024)
+
+    def test_workflow_results_are_never_silently_truncated(self):
+        self.create()
+        self.control = lambda *args, **kwargs: json.dumps({'results': [{'name': 'x' * 1024}] * 100})
+        with self.assertRaisesRegex(self.d.Refusal, 'STANDARD_OUTPUT_TOO_LARGE'):
+            self.op('workflow_contract')
+
     def test_prepared_merge_binds_observed_generation_without_selecting_a_newest_base(self):
         self.merge_project()
         calls = []

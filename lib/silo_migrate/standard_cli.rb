@@ -22,6 +22,9 @@ module SiloMigrate
         runtime show NAME
         merger init WORKSPACE                       (standalone local Git; no remote, no customer settings)
         merger status WORKSPACE                     (actual local review path and committed layer)
+        workflow describe WORKSPACE                  (private committed contract and engine facts)
+        workflow validate WORKSPACE --prepared-from RUN --generation SHA --settings INPUT
+        workflow exists WORKSPACE --prepared-from RUN --generation SHA --queries-file -
         converter status WORKSPACE
         converter refresh WORKSPACE [--if-changed]    (--if-changed: keep plans valid when nothing changed)
         fixture register WORKSPACE --fixture-dir DIR --snapshot NAME [--label LABEL]
@@ -172,6 +175,7 @@ module SiloMigrate
           else invalid!
           end
         end
+      when "workflow" then workflow(args)
       when "fixture" then fixture(args)
       when "status" then single_workspace(args) { |workspace| service(workspace).status }
       when "plan" then plan(args)
@@ -182,6 +186,51 @@ module SiloMigrate
       when "agent" then agent(args)
       else invalid!
       end
+    end
+
+    # Trusted/engineer surface only, never part of `standard agent`.
+    def workflow(args)
+      action = args.shift
+      workspace = positional!(args)
+      if action == "describe"
+        no_more!(args)
+        return service(workspace).merge_contract
+      end
+      invalid! unless %w[validate exists].include?(action)
+      extra = action == "validate" ? "--settings" : "--queries-file"
+      opts = options!(args, "--prepared-from", "--generation", extra)
+      run = opts.fetch("--prepared-from")
+      generation = opts.fetch("--generation")
+      invalid! unless run.match?(/\Arun-[0-9a-f]{32}\z/) && generation.match?(/\A[0-9a-f]{64}\z/)
+      if action == "validate"
+        settings = opts.fetch("--settings")
+        invalid! unless settings.match?(/\Ainput-[0-9a-f]{32}\z/)
+        return service(workspace).validate_merge_settings(prepared_from: run, generation: generation, settings: settings)
+      end
+      invalid! unless opts.fetch("--queries-file") == "-"
+      bytes = $stdin.read(64 * 1024 + 1).to_s
+      invalid! if bytes.bytesize > 64 * 1024
+      begin
+        queries = JSON.parse(bytes, max_nesting: 8)
+      rescue JSON::ParserError
+        invalid!
+      end
+      invalid! unless queries.is_a?(Array) && queries.size.between?(1, 100)
+      queries.each do |query|
+        invalid! unless query.is_a?(Hash)
+        kind = query["kind"]
+        if kind == "category"
+          path = query["path"]
+          invalid! unless query.keys.sort == %w[kind path] && path.is_a?(Array) && path.size.between?(1, 32) && path.all? { |name| workflow_name?(name) }
+        else
+          invalid! unless %w[group tag].include?(kind) && query.keys.sort == %w[kind name] && workflow_name?(query["name"])
+        end
+      end
+      service(workspace).merge_exact_existence(prepared_from: run, generation: generation, queries: queries)
+    end
+
+    def workflow_name?(name)
+      name.is_a?(String) && name.valid_encoding? && name.bytesize.between?(1, 256) && !name.match?(/[[:cntrl:]]/)
     end
 
     def init(args)
@@ -453,7 +502,7 @@ module SiloMigrate
         option = args.shift
         invalid! unless allowed.include?(option) && !result.key?(option)
         value = args.shift
-        invalid! if value.nil? || (value.start_with?("-") && !(value == "-" && %w[--file --sql-file].include?(option)))
+        invalid! if value.nil? || (value.start_with?("-") && !(value == "-" && %w[--file --sql-file --queries-file].include?(option)))
         result[option] = value
       end
       invalid! unless (allowed - optional - result.keys).empty?

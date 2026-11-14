@@ -12,21 +12,24 @@ module SiloMigrate
     #     helpers/**.rb    optional Ruby files it requires
     #     test/            invented fixtures/tests: never executed by a merge
     #     README.md        generic contract/review notes: never executed
+    #     workflow-contract.json optional host-read contract: never executed
     #
     # The path is derived from the managed workspace, never given. Nothing is ever fetched or
     # pushed: every Git call runs with hooks, protocols, replace objects, inherited Git
     # environment and global/system config disabled, after a gate that refuses any repository
     # config or layout that could redirect objects or run a command. A merge plan binds one
-    # commit and the SHA-256 manifest of its executable files; Start extracts exactly those
+    # commit and the SHA-256 manifest of its Ruby files and optional contract; Start extracts those
     # committed bytes again (never the working tree) and a per-plan ref keeps the commit.
     module StandardMergeCode
       MERGER_DIRECTORY = "merger"
       MERGER_ENTRY = "merger.rb"
       MERGER_STORE = "merger"
       MERGER_PLAN_REF = "refs/silo/merge-plans/"
+      MERGER_CONTRACT = "workflow-contract.json"
+      MERGER_CONTRACT_BYTES = 128 * 1024
       MERGER_LAYER_FILES = 32
       # Top-level entries a merger commit may hold; only merger.rb and helpers/ are executable.
-      MERGER_TOP_LEVEL = %w[merger.rb helpers test README.md .gitignore].freeze
+      MERGER_TOP_LEVEL = %w[merger.rb helpers test README.md .gitignore workflow-contract.json].freeze
       MERGER_CONFIG_KEYS = /\A(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)|user\.(?:name|email))\z/
       MERGER_LAYER_PATH = %r{\A[A-Za-z0-9_][A-Za-z0-9_.-]*\.rb\z}
 
@@ -167,7 +170,7 @@ module SiloMigrate
         !merger_git!("--no-optional-locks", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all").empty?
       end
 
-      # The executable layer of one commit, read from objects only. Every blob's bytes are
+      # Ruby layer and optional inert contract, read from objects only. Every blob's bytes are
       # rehashed against its object ID, so the extracted files are exactly the committed ones.
       def merger_layer!(commit)
         raise StandardWorkflowError, "STANDARD_MERGE_LAYER_INVALID" unless commit.is_a?(String) && commit.match?(/\A[0-9a-f]{40}\z/)
@@ -176,6 +179,7 @@ module SiloMigrate
         listing = merger_git!("ls-tree", "-r", "-l", "-z", "--full-tree", commit, binary: true).b
         files = {}
         manifest = []
+        ruby_count = ruby_bytes = 0
         listing.split("\0").each do |entry|
           match = entry.match(/\A(\d{6}) (\w+) ([0-9a-f]{40}) +(-|\d+)\t(.+)\z/mn)
           raise StandardWorkflowError, "STANDARD_MERGE_LAYER_INVALID" unless match
@@ -187,24 +191,44 @@ module SiloMigrate
                  parts.none? { |part| part.empty? || %w[. ..].include?(part) } && !name.match?(/[\x00-\x1f\\]/n)
             raise StandardWorkflowError, "STANDARD_MERGE_LAYER_INVALID"
           end
-          next unless name == MERGER_ENTRY || parts.first == "helpers"
-
-          unless mode == "100644" && parts.all? { |part| part.match?(/\A[A-Za-z0-9_][A-Za-z0-9_.-]*\z/) } && parts.last.match?(MERGER_LAYER_PATH) &&
-                 files.size < MERGER_LAYER_FILES &&
-                 size.to_i + files.values.sum(&:bytesize) <= StandardMergeRun::MERGE_LAYER_BYTES
+          is_contract = name == MERGER_CONTRACT
+          if parts.first == MERGER_CONTRACT && !is_contract
             raise StandardWorkflowError, "STANDARD_MERGE_LAYER_INVALID"
           end
+          next unless is_contract || name == MERGER_ENTRY || parts.first == "helpers"
+
+          valid = if is_contract
+            mode == "100644" && size.to_i <= MERGER_CONTRACT_BYTES
+          else
+            mode == "100644" && parts.all? { |part| part.match?(/\A[A-Za-z0-9_][A-Za-z0-9_.-]*\z/) } && parts.last.match?(MERGER_LAYER_PATH) &&
+              ruby_count < MERGER_LAYER_FILES && size.to_i + ruby_bytes <= StandardMergeRun::MERGE_LAYER_BYTES
+          end
+          raise StandardWorkflowError, "STANDARD_MERGE_LAYER_INVALID" unless valid
+
           bytes = merger_git!("cat-file", "blob", sha, binary: true).b
           unless bytes.bytesize == size.to_i && Digest::SHA1.hexdigest("blob #{bytes.bytesize}\0".b + bytes) == sha
             raise StandardWorkflowError, "STANDARD_MERGE_LAYER_INVALID"
+          end
+          unless is_contract
+            ruby_count += 1
+            ruby_bytes += bytes.bytesize
           end
           files[name] = bytes
           manifest << "#{Digest::SHA256.hexdigest(bytes)} #{name}\n"
         end
         raise StandardWorkflowError, "STANDARD_MERGE_LAYER_INVALID" unless files.key?(MERGER_ENTRY)
 
-        [{ "present" => true, "store" => MERGER_STORE, "path" => MERGER_ENTRY, "revision" => commit, "files" => files.size,
-           "bytes" => files.values.sum(&:bytesize), "sha256" => Digest::SHA256.hexdigest(manifest.sort.join) }, files]
+        metadata = { "present" => true, "store" => MERGER_STORE, "path" => MERGER_ENTRY, "revision" => commit, "files" => ruby_count,
+                     "bytes" => ruby_bytes, "sha256" => Digest::SHA256.hexdigest(manifest.sort.join) }
+        metadata["contract_sha256"] = Digest::SHA256.hexdigest(files.fetch(MERGER_CONTRACT)) if files.key?(MERGER_CONTRACT)
+        [metadata, files]
+      end
+
+      # Committed inert artifact bytes only; schema/capability validation belongs to the host.
+      # nil preserves legacy stores without a contract. Never load/require project JSON as code.
+      def merger_contract!(revision)
+        assert_merger_store!
+        merger_layer!(revision).last[MERGER_CONTRACT]
       end
 
       # Proposal: the store's clean, committed HEAD. Anything uncommitted would be reviewed

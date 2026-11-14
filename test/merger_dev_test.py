@@ -109,8 +109,12 @@ class MergerDevTest(unittest.TestCase):
     def bound(commit, files):
         """What StandardMergeCode#merger_layer! binds, computed independently."""
         manifest = sorted(hashlib.sha256(data.encode()).hexdigest() + ' ' + name + '\n' for name, data in files.items())
-        return {'present': True, 'store': 'merger', 'path': 'merger.rb', 'revision': commit, 'files': len(files),
-                'bytes': sum(len(data.encode()) for data in files.values()), 'sha256': hashlib.sha256(''.join(manifest).encode()).hexdigest()}
+        ruby = {name: data for name, data in files.items() if name != 'workflow-contract.json'}
+        metadata = {'present': True, 'store': 'merger', 'path': 'merger.rb', 'revision': commit, 'files': len(ruby),
+                    'bytes': sum(len(data.encode()) for data in ruby.values()), 'sha256': hashlib.sha256(''.join(manifest).encode()).hexdigest()}
+        if 'workflow-contract.json' in files:
+            metadata['contract_sha256'] = hashlib.sha256(files['workflow-contract.json'].encode()).hexdigest()
+        return metadata
 
     # -- no repository yet ---------------------------------------------------------------
 
@@ -277,6 +281,30 @@ class MergerDevTest(unittest.TestCase):
         self.assertEqual('', self.call('diff', scope='commit')['diff'])
         self.assertEqual([], self.call('search', pattern='CANARY')['matches'])
 
+    def test_optional_contract_clean_tools_and_committed_identity(self):
+        legacy = self.ready()['layer']
+        path, text = 'workflow-contract.json', '{"version":1}\n'
+        self.assertNotIn('error', self.call('write', path=path, content=text))
+        self.assertEqual(text, self.call('read', path=path)['text'])
+        self.assertEqual([path], [m['path'] for m in self.call('search', pattern='version')['matches']])
+        self.assertIn('+{"version":1}', self.call('diff', path=path)['diff'])
+        committed = self.call('commit', message='Add contract')
+        expected = self.bound(committed['commit'], {'merger.rb': ENTRY, path: text})
+        self.assertEqual(expected, committed['layer'])
+        self.assertEqual((legacy['files'], legacy['bytes']), (expected['files'], expected['bytes']))
+        self.assertNotEqual(legacy['sha256'], expected['sha256'])
+        self.assertNotIn('contract', committed['layer'])
+        self.assertNotIn(text, json.dumps(self.call('status')))
+        self.assertIn('+{"version":1}', self.call('diff', scope='commit', path=path)['diff'])
+        self.assertNotIn('error', self.call('edit', path=path, old_text='1', new_text='2'))
+        changed = self.call('commit', message='Change contract')['layer']
+        self.assertNotEqual(expected['sha256'], changed['sha256'])
+        self.assertNotEqual(expected['contract_sha256'], changed['contract_sha256'])
+        self.write(self.store / path, 'outside tools')
+        self.assertEqual('STANDARD_DEV_PATH_NOT_VISIBLE', self.call('read', path=path)['error'])
+        self.assertEqual([], self.call('search', pattern='outside tools')['matches'])
+        self.assertEqual('', self.call('diff', path=path)['diff'])
+
     def test_layer_rules_match_the_service(self):
         self.ready()
         head = git(self.store, 'rev-parse', 'HEAD')
@@ -295,14 +323,25 @@ class MergerDevTest(unittest.TestCase):
             git(self.store, 'reset', '-q', '--hard', head)
             return result
         invalid = (None, 'STANDARD_MERGE_LAYER_INVALID')
+        self.assertEqual(invalid, committed({'workflow-contract.json': '{}'}, mode=0o755))
+        self.assertEqual(invalid, committed({'workflow-contract.json': 'x' * (128 * 1024 + 1)}))
+        self.assertIsNone(committed({'workflow-contract.json': 'x' * (128 * 1024)})[1])
+        self.assertEqual(invalid, committed({'workflow-contract.json/child.json': '{}'}))
         self.assertEqual(invalid, committed({'helpers/notes.txt': 'x\n'}))            # executable files are Ruby only
         self.assertEqual(invalid, committed({'helpers/run.rb': 'x\n'}, mode=0o755))   # and not executable-bit files
         self.assertEqual(invalid, committed({'lib/x.rb': 'x\n'}))                     # unknown top-level entry
         self.assertEqual(invalid, committed({'helpers/a b.rb': 'x\n'}))
         self.assertEqual(invalid, committed({'helpers/big.rb': '#' * (512 * 1024)}))
         self.assertEqual(invalid, committed({'helpers/h%02d.rb' % n: 'x\n' for n in range(32)}))  # 33 with merger.rb
-        self.assertIsNone(committed({'helpers/h%02d.rb' % n: 'x\n' for n in range(31)})[1])
+        self.assertIsNone(committed({'helpers/h%02d.rb' % n: 'x\n' for n in range(31)} |
+                                    {'workflow-contract.json': 'x' * (128 * 1024)})[1])
         self.assertIsNone(committed({'test/run.sh': 'x\n', 'test/.gitignore': 'tmp\n', '.gitignore': 'tmp/\n'}, mode=0o755)[1])
+        (self.store / 'workflow-contract.json').symlink_to('merger.rb')
+        git(self.store, 'add', '-A')
+        git(self.store, 'commit', '-q', '-m', 'Linked contract')
+        self.assertEqual('STANDARD_MERGER_CONFIG', self.call('status')['error'])
+        self.assertEqual(invalid, self.merger.layer(checkout, git(self.store, 'rev-parse', 'HEAD')))
+        git(self.store, 'reset', '-q', '--hard', head)
         git(self.store, 'rm', '-q', 'merger.rb')
         git(self.store, 'commit', '-q', '-m', 'No entry')
         self.assertEqual('STANDARD_MERGE_LAYER_INVALID', self.call('status')['layer_error'])

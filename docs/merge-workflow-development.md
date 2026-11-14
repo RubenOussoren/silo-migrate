@@ -215,3 +215,142 @@ operator recovery is required, not a successful-cleanup claim. Computed stalenes
 is also checked before analyst registration; it is not automatic revocation of an
 already-running connector. Merge activation/reset use the exclusive fence and
 remove owned launchers. Nothing here automatically resets a project.
+
+## Prepared custom workflow discovery and validation
+
+A prepared custom layer commits `workflow-contract.json` beside `merger.rb`.
+The host reads the actual committed bytes; the layer must not read that file.
+This is a clean code artifact, not private settings or model credentials. The
+version-1 contract has exactly these fields (illustrative policy, no customer schema):
+
+```json
+{
+  "version": 1,
+  "engine": "discourse-merger-v1",
+  "settings_schema": {
+    "type": "object",
+    "properties": {"upload_policy": {"type": "string", "enum": ["carried_live_posts"]}},
+    "required": ["upload_policy"],
+    "additionalProperties": false
+  },
+  "asset_policy_key": "upload_policy",
+  "asset_policies": {"carried_live_posts": "carried"},
+  "audit_aggregates": {"preflight": [], "postflight": []}
+}
+```
+
+Discover **actual** enum values, declared audit keys and engine facts from the
+committed contract, not this example. Only shipped supported engine adapters may
+execute; a contract cannot register a production engine. `settings_schema` is the
+strict bounded subset implemented by `runtime/shared/merge_contract.rb`: type,
+properties, required, additionalProperties, items, minItems/maxItems, uniqueItems,
+minLength/maxLength, minimum/maximum, enum, const, anyOf/oneOf/allOf, description.
+The root is a closed object. Nested objects must be closed or have a schema for
+dynamic values. No `$ref`, patterns, coercion, defaults, executable checks or IO.
+Contract bounds are 128 KiB, depth 16 and 4096 tree nodes; settings retain the
+256 KiB safe YAML limit. Unknown keys/keywords refuse rather than being ignored.
+
+Read-only class hooks `self.silo_merge_asset_ids` and
+`self.silo_merge_audit(phase)` supply required source asset IDs and fixed declared
+nonnegative integer aggregates. Audit phases are `preflight` and `postflight`;
+keys are clean code-defined identifiers, never names built from private rows.
+The existing preflight/constructor/copy/postflight same-process contract remains.
+Required media cannot be independently deselected. Actual file transfers and stock
+compatibility belong to the host adapter: no layer file IO, upstream core changes
+or global `FileUtils` patch.
+
+The first shipped adapter is deliberately pinned to the verified stock Discourse
+merger implementation; a changed stock method refuses until separately supported.
+It duplicates that method into a scoped adapter, defers only its physical `cp_r`,
+and retains the stock source/destination upload mapping. This is not a universal
+merge algorithm. A separate test-only adapter exercises the shared contract,
+registry, gate, transfer and evidence seams without Discourse assumptions.
+
+`carried` means the layer's required IDs, not a separately editable file allowlist;
+`all` must be explicitly declared and selected. The stock merger can still insert
+upload ownership/bookkeeping rows that are not content references. Private evidence
+therefore distinguishes upload rows inserted, bookkeeping references, content
+references, and rows without content references instead of calling them all
+"uploads copied". Required bytes must be either verified copies or verified
+same-content destination reuse. Excluded files, dangling mappings and unsupported
+content-reference tables fail closed. Secure-upload identity uses the real
+`original_sha1` when present; an unverifiable synthetic identity cannot establish
+content equality. Unclassified source `optimized/` assets are currently unsupported,
+not silently copied or dropped.
+
+Destination original-file inventory is captured independently before transfer,
+bound into validation, rechecked after merging and verified against the backup.
+`optimized/` destination derivatives are explicitly counted as regenerable, not
+promised bit-for-bit preservation. Descriptor-based traversal rejects unsafe paths,
+symlinks and special files; the one known pinned image upload mountpoint symlink is
+normalized by the adapter, not enabled as a general follow-symlinks option. Capacity
+bounds (including at most 100,000 inventory entries) refuse oversized work. These
+checks supplement, rather than replace, existing T2 site-setting preservation.
+
+Trusted migration-data alone receives:
+
+- `data_workflow_contract({})`: actual committed contract and supported engine facts.
+- `data_workflow_validate({run, generation, settings})`: registered merge-settings
+  input ID, prepared run ID and exact generation; typed private result receipt,
+  including offending key path/reason on failure, not scraped freeform logs.
+- `data_workflow_exists({run, generation, queries})`: 1–100 exact queries, at most
+  64 KiB serialized JSON. A category query is
+  `{"kind":"category","path":["Invented Root","Invented Child"]}` with the full
+  root-to-leaf path (1–32 components). Group/tag queries use
+  `{"kind":"group","name":"Invented"}` or kind `tag`. Each name/component is
+  1–256 UTF-8 bytes without control characters. No extra fields or arbitrary SQL.
+  Results distinguish `found`, `absent`, `ambiguous`, `unproven`; incomplete
+  listings never prove absence. Names use whole-name, case-insensitive matching,
+  consistent with core creation uniqueness (including each category ancestor),
+  not fuzzy search. `count: 2` means at least two matches, not an exhaustive count.
+  Oversized structured output refuses, not truncates.
+
+Engineer equivalents (private output):
+
+```sh
+silo-migrate-control standard workflow describe PROJECT
+silo-migrate-control standard workflow validate PROJECT --prepared-from RUN --generation SHA --settings INPUT
+# Send the queries array on stdin, never private names in argv:
+silo-migrate-control standard workflow exists PROJECT --prepared-from RUN --generation SHA --queries-file -
+```
+
+These calls grant no Approve, Start, reset or deployment capability. Validation
+uses a 180-second monotonic work budget plus a separate 45-second cleanup budget,
+inside the trusted tool's 240-second backend timeout. A timeout or uncertain guest
+execution is a refusal with quarantined ownership evidence, not permission to reset
+or reuse the generation. Large data sets may exceed this conservative budget and
+require an explicitly designed capacity change; the runner never silently retries.
+Start's engineer request budget is 295 seconds to accommodate fresh preclaim
+validation; this does not change the separate approval or asynchronous run model.
+
+For a large contract, `data_workflow_contract` supplies `contract_file` (area `work`,
+relative path, byte length and SHA-256) and, when needed, `contract_omitted: true`.
+Read the complete derivative using `data_peek` and its byte-offset pagination;
+never invent omitted schema keys. The derivative is private, immutable by digest
+and byte-identical to the bound contract. Validation responses expose
+`approved_assets_count` rather than a potentially oversized approved-ID list; the
+full list remains in the private, digest-bound host receipt.
+
+A reviewed layer may raise `SiloMergeValidation::Finding.new(key_path, reason)`
+from preflight for a semantic settings error. The private key path contains only
+bounded property-name/index components; reason must be one of
+`unknown_source_id`, `destination_exists`, `destination_missing`,
+`destination_ambiguous`, `policy_conflict`, `permission_unproven`,
+`selection_unproven`, or `schema_unsupported`. Do not put customer values in the
+exception message; clean stdout projection excludes the private path.
+
+Existing
+`data_merge_propose` fields stay unchanged; the host automatically requires passing
+process validation for prepared custom proposals. A refusal must not silently
+switch to one-shot execution. Validation is bound to the exact prepared baseline,
+settings, contract and code; generation alone does not prove a mutable inspection
+copy is authoritative. Stale/unsupported/unproven validation blocks execution.
+
+`data_run_evidence` continues to return backend private merge evidence, including
+new audit records when present; it does not scrape logs to invent counters.
+T7 source counts are authoritative through audit, not widened source connector
+grants. T2 preservation already exists: dirty/unproven remains failure, never a
+manual fallback to success. Neither private schema paths/settings nor audit values
+are automatically projected into clean project info. Clean developer/reviewer
+agents receive no new runtime or raw-data tools; release remains a separate,
+engineer-reviewed decision.

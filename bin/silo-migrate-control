@@ -234,6 +234,20 @@ def host_merge_lifecycle_cleanup(args, values, base, repo, host):
         return
     if args[2] == "reset" and (run or {}).get("status") in ("claimed", "running"):
         return  # let the backend refuse busy, without disrupting an active environment
+    # Pre-claim/pre-activation validation can refuse while leaving the generation
+    # ready. Never remove its connector registrations merely because Start or an
+    # executor was requested. Ruby atomically closes the private manifest and
+    # credentials at activation; stale registrations then fail closed. Reset
+    # removes registrations, as do later calls observing a post-activation phase.
+    if args[2] in ("start", "execute"):
+        prepared = body.get("prepared_from") or {}
+        if prepared and (not isinstance(prepared, dict) or not isinstance(prepared.get("run_id"), str)
+                         or not data.RUN.fullmatch(prepared["run_id"])):
+            refuse("STANDARD_MERGE_INSPECTION_INVALID")
+        owner = runs.get(prepared.get("run_id")) or {}
+        phase = (owner.get("merge_environment") or {}).get("phase")
+        if not prepared or phase in (None, "ready", "consumed"):
+            return
     ids = set()
     bound = body.get("prepared_from")
     if isinstance(bound, dict):

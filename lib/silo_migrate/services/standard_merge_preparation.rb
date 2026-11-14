@@ -764,6 +764,7 @@ module SiloMigrate
       # A prepared merge materializes only what the preparation doesn't already hold.
       def prepared_merge_preflight(run_id, plan)
         body = plan.fetch("body")
+        merge_validation_gate!(body, claimed_run_id: run_id) if body["intent"] == "custom"
         binding = body.fetch("prepared_from")
         resolved = lock.fetch("images").transform_values { |image| ImageIdentity.resolve(@runtime, image) }
         prepared = @store.load.fetch("runs").fetch(binding.fetch("run_id"))

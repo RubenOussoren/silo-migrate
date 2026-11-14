@@ -30,6 +30,10 @@ require_relative "standard_merge_site_settings"
 require_relative "standard_merge_code"
 require_relative "standard_merge_preparation"
 require_relative "standard_merge_inspection"
+require_relative "standard_merge_validation"
+require_relative "standard_merge_process"
+require_relative "../merge_process"
+require_relative "../../../runtime/shared/merge_contract"
 
 module SiloMigrate
   module Services
@@ -50,6 +54,8 @@ module SiloMigrate
       include StandardMergeCode
       include StandardMergePreparation
       include StandardMergeInspection
+      include StandardMergeValidation
+      include StandardMergeProcess
 
       STAGES = %w[preflight convert site_up baseline uploads import verify_site final_backup review_url restore verify_restore].freeze
       # Host-defined operation labels only: never filenames, SQL, or exception text.
@@ -112,6 +118,20 @@ module SiloMigrate
         "STANDARD_MERGER_DIRTY" => "The local merger repository has uncommitted changes. Commit (or discard) them so the plan binds exactly what was reviewed, then re-plan.",
         "STANDARD_MERGE_SITE_SETTINGS_FAILED" => "The merge could not prove exact destination site-setting preservation. Keep the failed environment for private diagnosis; review the redacted names/counts and restoration status. Never suppress verification or reuse the dirty generation.",
         "STANDARD_MERGE_SETTINGS_INVALID" => "Register a valid merge settings mapping and re-plan.",
+        "STANDARD_MERGE_CONTRACT_REQUIRED" => "Have the layer owner commit its clean workflow-contract.json and required read-only hooks. Discover and validate that exact contract before proposing a new custom merge; do not consume or reset the ready generation merely to author settings.",
+        "STANDARD_MERGE_CONTRACT_INVALID" => "Correct and commit the declared workflow contract, then discover, validate and re-propose. Unknown schema features are refused, never ignored.",
+        "STANDARD_MERGE_ENGINE_UNSUPPORTED" => "Use a shipped, tested engine adapter. A project contract cannot invent capabilities or choose arbitrary executable plugins.",
+        "STANDARD_MERGE_VALIDATION_REQUIRED" => "Validate the exact settings, layer and prepared generation before proposing and approving a new custom merge. An older approval without this receipt cannot run.",
+        "STANDARD_MERGE_VALIDATION_FAILED" => "Read the trusted workflow validation result for the offending key or fixed refusal. Correct the input or unresolved decision and validate again; do not bypass the gate or automatically re-Prepare.",
+        "STANDARD_MERGE_VALIDATION_STALE" => "The approved validation no longer matches its code, settings, assets or prepared generation. Preserve the environment, revalidate and propose a new exact plan only if it remains ready and unused.",
+        "STANDARD_MERGE_VALIDATION_UNPROVEN" => "Validation could not prove its outcome. Inspect private evidence and owned-resource status; do not consume the generation, guess success or race an uncertain guest process.",
+        "STANDARD_MERGE_VALIDATION_PROTOCOL" => "The validator returned incomplete or malformed machine evidence. Diagnose the runner privately; do not substitute log scraping or missing counts with zero.",
+        "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED" => "An owned validation resource or guest outcome is uncertain. Preserve its journal and obtain scoped engineer recovery; do not activate, reset the prepared environment or delete resources by guessed names.",
+        "STANDARD_MERGE_VALIDATION_UNSUPPORTED" => "The selected runtime cannot supply the required read-only validation capability. Use an explicitly supported adapter or report the blocker; do not weaken permissions or reopen sealed databases.",
+        "STANDARD_MERGE_CHECKS_INVALID" => "Correct the bounded exact category-path, group or tag query. Partial search results are not absence proof.",
+        "STANDARD_MERGE_TEMPLATE_CUSTODY" => "The sealed checkpoint identity, ownership, connection state or session custody could not be proven. Stop and inspect private evidence; do not reopen, rename or repair the template to pass validation.",
+        "STANDARD_MERGE_EVIDENCE_INVALID" => "The merge process or asset manifest could not be verified. Keep failed/dirty outputs private and unusable; diagnose the typed evidence, never suppress the check.",
+        "STANDARD_MERGE_ASSETS_FAILED" => "Required media or final reference scope could not be verified. Keep the run failed/dirty and its backup unreleasable; do not switch to whole-tree copying or silently skip required files.",
         "STANDARD_MERGE_SCHEMA" => "Inspect private schema evidence, correct the layer or runtime and re-plan.",
         "STANDARD_MERGE_FAILED" => "Inspect private merge evidence, reset the dirty run and re-plan.",
         "STANDARD_MERGE_INCOMPATIBLE" => "The source and Base schemas or migrations are not ones the pinned merger supports together; nothing was merged and no migration marker was edited. Inspect the private compatibility evidence, align the Base/runtime or supply a compatible source, reset this run, then re-plan.",
@@ -135,7 +155,7 @@ module SiloMigrate
       EXECUTE_LOCK_WAIT = 120
       # Longer than EXECUTE_LOCK_WAIT, so a queued executor isn't called never-started.
       CLAIM_GRACE_SECONDS = 180
-      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb review_access.rb review_state.rb merge_run.rb merge_source_config.rb merge_state.rb merge_site_settings.rb merge_rebake.rb].freeze
+      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb review_access.rb review_state.rb merge_run.rb merge_source_config.rb merge_state.rb merge_site_settings.rb merge_rebake.rb merge_adapter.rb merge_validate.rb merge_validation_config.rb merge_asset_references.rb merge_baseline_assets.rb merge_process_run.rb merge_assets.rb merge_contract.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
       attr_reader :store
@@ -342,7 +362,7 @@ module SiloMigrate
 
       # Identity of the code that will execute. Any source edit invalidates approval.
       def code_identity
-        files = Dir.glob(%w[lib/**/*.rb bin/silo-migrate bin/silo-migrate-control bin/discourse_version.py bin/review_runtime.py bin/review_runtime_job.py Gemfile.lock silo-migrate.gemspec runtime/prebuilt-discourse/*], base: @code_root).select { |rel| File.file?(File.join(@code_root, rel)) }.sort
+        files = Dir.glob(%w[lib/**/*.rb bin/silo-migrate bin/silo-migrate-control bin/discourse_version.py bin/review_runtime.py bin/review_runtime_job.py Gemfile.lock silo-migrate.gemspec runtime/prebuilt-discourse/* runtime/shared/*.rb], base: @code_root).select { |rel| File.file?(File.join(@code_root, rel)) }.sort
         digest = Digest::SHA256.new
         files.each do |rel|
           digest.update(rel)
@@ -826,6 +846,18 @@ module SiloMigrate
       # Consumes the approved plan before any mutation. A crash after this point
       # is visible and cannot run the same plan twice.
       def claim_plan!(plan_id)
+        # Semantic policy refusal must precede the durable plan/generation claim,
+        # not merely the later constructor. The caller holds host + operation
+        # locks; never hold state.lock while an engine performs bounded reads.
+        candidate = @store.load.fetch("plans")[plan_id]
+        if candidate && candidate["status"] == "approved" && prepared_merge_plan?(candidate) && candidate.dig("body", "intent") == "custom"
+          unless candidate.dig("approval", "digest") == candidate["digest"] && Digest::SHA256.hexdigest(canonical_json(candidate["body"])) == candidate["digest"]
+            raise StandardWorkflowError, "STANDARD_APPROVAL_MISMATCH"
+          end
+          reason = stale_reason(candidate, @store.load)
+          raise StandardWorkflowError.new("STANDARD_STALE_PLAN", reason) if reason
+          merge_validation_gate!(candidate.fetch("body"))
+        end
         run_id = @store.new_id("run")
         @store.update do |state|
           plan = state.fetch("plans")[plan_id]
@@ -1172,7 +1204,11 @@ module SiloMigrate
       def snapshot_helpers(run_id)
         target = @store.run_dir(run_id, "work", "helpers")
         FileUtils.mkdir_p(target, mode: 0o700)
-        HELPERS.each { |helper| FileUtils.cp(File.join(helper_dir, helper), File.join(target, helper)) }
+        HELPERS.each do |helper|
+          source = File.join(helper_dir, helper)
+          source = File.join(@code_root, "runtime", "shared", helper) unless File.file?(source)
+          FileUtils.cp(source, File.join(target, helper))
+        end
       end
 
       def snapshot_site_settings(run_id, body)
@@ -1955,6 +1991,13 @@ module SiloMigrate
       # Fixed fields only. Logs, private evidence, paths, passwords and raw failure
       # detail never appear here; failures are a fixed code plus fixed recovery.
 
+      def public_merge_plan(merge, detail:)
+        return merge unless merge.is_a?(Hash) && merge["process"]
+        return merge if detail
+        merge.reject { |key, _| %w[contract process].include?(key) }.merge(
+          "process" => merge.fetch("process").slice("version", "engine", "physical_policy").merge("validated" => true))
+      end
+
       def public_plan(plan, state, summary: false, detail: false)
         body = plan.fetch("body")
         result = { plan_id: plan["id"], digest: plan["digest"], status: plan_status(plan, state), run_id: plan["run_id"], created_at: plan["created_at"], approved_by: plan.dig("approval", "reviewer"), delivery: body["delivery"],
@@ -1966,7 +2009,7 @@ module SiloMigrate
           runtime_qualified: body["runtime_qualified"], allow_unqualified_runtime: body["allow_unqualified_runtime"], converter: body["converter"],
           file_role_binding: body["file_role_binding"], source_file_role_binding: body["source_file_role_binding"],
           file_role_selection: file_roles.selection(file_roles.load, body["file_role_binding"]),
-          merge: body["merge"], review_runtime: body["review_runtime"], operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
+          merge: public_merge_plan(body["merge"], detail: detail), review_runtime: body["review_runtime"], operation: body["operation"], dataset_id: body["dataset_id"], baseline: body["baseline"]&.slice("mode", "baseline_id"),
           platform: body["platform"], roles: body["roles"], source_charset: body["source_charset"], converter_deps: body.dig("converter_deps", "key"),
           reconciliation_policy: body["reconciliation_policy"], base_site: body["base_site"]&.slice("input_id", "delivery", "discourse_version", "schema_version", "site_schema_version", "ahead"),
           from_run: body["from_run"]&.slice("run_id", "plan_id", "converter_revision", "intermediate_sha256", "intermediate_bytes"), limits: body["limits"],

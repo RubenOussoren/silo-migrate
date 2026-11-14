@@ -128,6 +128,7 @@ class StandardConvertRunTest < SiloMigrateTest
       @code_root = File.join(dir, 'code')
       FileUtils.mkdir_p(File.join(@code_root, 'runtime'))
       FileUtils.cp_r(File.expand_path('../runtime/prebuilt-discourse', __dir__), File.join(@code_root, 'runtime'))
+      FileUtils.cp_r(File.expand_path('../runtime/shared', __dir__), File.join(@code_root, 'runtime'))
       FileUtils.cp_r(File.expand_path('../runtime/profiles', __dir__), File.join(@code_root, 'runtime'))
       profile_path = File.join(@code_root, 'runtime/profiles', SiloMigrate::RuntimeProfiles::DEFAULT + '.json')
       profile = JSON.parse(File.read(profile_path))

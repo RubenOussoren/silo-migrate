@@ -164,6 +164,50 @@ class StandardMergeCodeTest < StandardMergePreparationTest
     end
   end
 
+  def test_merger_optional_contract_is_bound_but_not_ruby
+    with_prepare do
+      use_layer
+      legacy = @service.merger_status[:layer]
+      assert_nil @service.send(:merger_contract!, legacy['revision'])
+      contract = '{"version":1}' + "\n"
+      commit = commit_merger('workflow-contract.json' => contract)
+      metadata, files = @service.send(:merger_layer!, commit)
+      assert_equal contract, @service.send(:merger_contract!, commit)
+      assert_equal contract, files['workflow-contract.json']
+      assert_equal legacy.values_at('files', 'bytes'), metadata.values_at('files', 'bytes')
+      assert_equal Digest::SHA256.hexdigest(contract), metadata['contract_sha256']
+      manifest = files.map { |name, bytes| "#{Digest::SHA256.hexdigest(bytes)} #{name}\n" }.sort.join
+      assert_equal Digest::SHA256.hexdigest(manifest), metadata['sha256']
+      refute_equal legacy['sha256'], metadata['sha256']
+      refute metadata.key?('contract')
+      File.write(File.join(merger_dir, 'workflow-contract.json'), '{}')
+      assert_equal contract, @service.send(:merger_contract!, commit)
+      assert_equal metadata, @service.merger_status[:layer]
+      commit_merger('workflow-contract.json' => '{"version":2}')
+      changed = @service.merger_status[:layer]
+      refute_equal metadata['sha256'], changed['sha256']
+      refute_equal metadata['contract_sha256'], changed['contract_sha256']
+      refute @service.send(:merger_layer_current?, metadata.merge('revision' => changed['revision']))
+      File.chmod(0o755, File.join(merger_dir, 'workflow-contract.json'))
+      commit_merger({})
+      assert_equal 'STANDARD_MERGE_LAYER_INVALID', @service.merger_status[:layer_error]
+      fresh_store
+      commit_merger('merger.rb' => LAYER_SOURCE, 'workflow-contract.json' => 'x' * (128 * 1024))
+      assert_nil @service.merger_status[:layer_error]
+      commit_merger('workflow-contract.json' => 'x' * (128 * 1024 + 1))
+      assert_equal 'STANDARD_MERGE_LAYER_INVALID', @service.merger_status[:layer_error]
+      fresh_store
+      commit_merger('merger.rb' => LAYER_SOURCE, 'workflow-contract.json/child.json' => '{}')
+      assert_equal 'STANDARD_MERGE_LAYER_INVALID', @service.merger_status[:layer_error]
+      fresh_store
+      commit_merger('merger.rb' => LAYER_SOURCE)
+      File.symlink('merger.rb', File.join(merger_dir, 'workflow-contract.json'))
+      commit = commit_merger({})
+      merger_error('STANDARD_MERGER_CONFIG') { @service.merger_status }
+      merger_error('STANDARD_MERGE_LAYER_INVALID') { @service.send(:merger_layer!, commit) }
+    end
+  end
+
   def test_merger_layer_limits
     layer = "class InventedMerger < BulkImport::DiscourseMerger; end\n"
     bad = {
@@ -206,7 +250,8 @@ class StandardMergeCodeTest < StandardMergePreparationTest
       merger_error('STANDARD_MERGER_CONFIG') { @service.merger_status }
       # At the limits, nested helpers and executable test scripts are accepted.
       fresh_store
-      commit_merger({ 'merger.rb' => layer, 'helpers/a/b.rb' => "module B; end\n", 'test/run.sh' => "#!/bin/sh\n" }
+      commit_merger({ 'merger.rb' => layer, 'helpers/a/b.rb' => "module B; end\n", 'test/run.sh' => "#!/bin/sh\n",
+                      'workflow-contract.json' => 'x' * (128 * 1024) }
                     .merge((1..30).to_h { |n| ["helpers/h#{n}.rb", "module H#{n}; end\n"] }))
       File.chmod(0o755, File.join(merger_dir, 'test/run.sh'))
       commit_merger({})
@@ -307,7 +352,8 @@ class StandardMergeCodeTest < StandardMergePreparationTest
       use_layer
       standalone = prepared_plan(prep, intent: 'custom', settings: @merge_settings)
       stock = prepared_plan(prep)
-      [legacy, standalone, stock].each { |plan| assert_equal 'proposed', @service.show_plan(plan[:plan_id])[:status] }
+      assert_equal 'stale', @service.show_plan(legacy[:plan_id])[:status]
+      [standalone, stock].each { |plan| assert_equal 'proposed', @service.show_plan(plan[:plan_id])[:status] }
       assert_equal 'ready', environment(prep[:run_id])['phase']
       # An approved Merge whose Silo code identity changed cannot run; the Prepare stays ready.
       approved = approve(stock)
@@ -337,11 +383,21 @@ class StandardMergeCodeTest < StandardMergePreparationTest
       state = @service.store.load
       assert_equal prepare_run, JSON.generate(state['runs'][prep[:run_id]])
       assert_equal prepare_plan_record, JSON.generate(state['plans'][prep[:plan_id]])
-      # The older converter-held custom plan still runs its converter-held bytes.
-      run = @service.run_plan(plan_id: approve(legacy))
+      # Old custom approvals lack the new process contract/receipt and must be
+      # re-proposed. The completed Prepare itself still works with a newly bound
+      # standalone plan; no reset/re-Prepare is needed merely for this code change.
+      merger_error('STANDARD_STALE_PLAN') { approve(legacy) }
+      # Restoring equal bytes does not restore the registered stat identity.
+      # Register a fresh immutable input, then propose again; never revive an
+      # approval or silently rewrite a registration after intentional tampering.
+      original_dataset, @dataset = @dataset, input.fetch('dataset_id')
+      refreshed_settings = add_input('refreshed-private-settings.yml', saved, 'merge-settings')
+      @dataset = original_dataset
+      refreshed = prepared_plan(prep, intent: 'custom', settings: refreshed_settings)
+      run = @service.run_plan(plan_id: approve(refreshed))
       assert_equal 'completed', run[:status], failure_detail(run)
       assert_equal LAYER_SOURCE, File.read(@service.store.run_dir(run[:run_id], 'private', 'merge', 'layer', 'merger.rb'))
-      refute File.exist?(@service.store.run_dir(run[:run_id], 'private', 'merge', 'layer', 'helpers'))
+      assert File.file?(@service.store.run_dir(run[:run_id], 'private', 'merge', 'layer', 'helpers', 'routes.rb'))
       assert_equal generation, record(prep[:run_id])['generation']
       assert_equal prepare_plan_record, JSON.generate(@service.store.load['plans'][prep[:plan_id]])
     end

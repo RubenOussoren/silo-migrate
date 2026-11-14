@@ -63,6 +63,12 @@ begin
   guard.call("changed-before-layer")
 
   merger = BulkImport::DiscourseMerger
+  # Declare the supported physical policy before loading project code, so its
+  # class checks never have to infer whether scoped transfer is available.
+  process_contract = if ENV["SILO_MERGE_CONTRACT"]
+    require_relative "merge_process_run"
+    SiloMergeProcessRuntime.load_contract
+  end
   if (layer = ENV["SILO_MERGE_LAYER"])
     begin
       require layer
@@ -86,7 +92,7 @@ begin
   # Both hooks, construction and start execute in this Ruby process on the same loaded
   # subclass. Class-instance variables set by preflight remain available to postflight;
   # preflight runs before there is a merger instance. Finalization is a later process.
-  required_checks = ENV["SILO_MERGE_REQUIRE_CHECKS"] == "1"
+  required_checks = ENV["SILO_MERGE_REQUIRE_CHECKS"] == "1" || !process_contract.nil?
   checks = %i[silo_merge_preflight! silo_merge_postflight!]
   if required_checks && (!layer || checks.any? { |hook| !merger.respond_to?(hook) })
     warn "SILO_MERGE: layer must define preflight and postflight policy checks"
@@ -108,16 +114,21 @@ begin
 
   run_check.call(:silo_merge_preflight!)
   guard.call("changed-by-preflight")
+  process_state = SiloMergeProcessRuntime.prepare(merger, process_contract) if process_contract
+  guard.call("changed-by-process-preflight") if process_state
   puts "SILO_MERGE: start layer=#{layer ? 'yes' : 'no'}"
   instance = merger.new
   # Only the stock assignment may differ now, and it stays while uploads are copied.
   guard.call("changed-by-constructor", window: true)
   instance.start
+  SiloMergeProcessRuntime.transfer(process_state, instance) if process_state
   guard.call("changed-during-copy", window: true)
   report = SiloMergeSiteSettings.restore(snapshot)
   refuse.call("restore-unproven") unless report["state"] == "restored"
   run_check.call(:silo_merge_postflight!)
   guard.call("changed-by-postflight")
+  SiloMergeProcessRuntime.finish(process_state, merger) if process_state
+  guard.call("changed-by-process-postflight") if process_state
   finished = true
 rescue StandardError, ScriptError => e
   # The stock merger's (or a layer's) message can quote setting or customer values: classes

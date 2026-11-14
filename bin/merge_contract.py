@@ -95,7 +95,8 @@ for _old, _new in (
   the engineer reviews it right there. Entry file: merger.rb at its root. Ruby files under helpers/ may be loaded with
   require_relative. The layer must not load or read anything else.
 - A merge runs merger.rb and helpers/**/*.rb only: regular .rb files, at most {files} files, {kib} KiB together. Tests and
-  invented fixtures go under test/ and notes in README.md: committed and reviewed, never run by a merge. Any other top-level
+  invented fixtures go under test/ and notes in README.md: committed and reviewed, never run by a merge.
+  workflow-contract.json is the clean host-read contract artifact, not layer-readable runtime input. Any other top-level
   entry, a link or a submodule refuses the plan.
 """),
     ("anywhere in the folder's files.", "in merger.rb or helpers/."),
@@ -111,3 +112,29 @@ for _old, _new in (
 """),
 ):
     STANDALONE_MERGE_GUIDE = _swap(STANDALONE_MERGE_GUIDE, _old, _new)
+
+
+# Prepared standalone workflow discovery is distinct from legacy one-shot layers.
+STANDALONE_MERGE_GUIDE += """
+Prepared custom workflow contract (version 1)
+- Commit workflow-contract.json beside merger.rb; the host reads this artifact, not the layer. The clean contract has
+  exactly version, engine, settings_schema, asset_policy_key, asset_policies and audit_aggregates. Version is 1;
+  the current shipped engine is discourse-merger-v1, not an arbitrary executable plugin.
+- settings_schema is a strict bounded subset, not full JSON Schema: closed root object, nested typed properties/items,
+  required, additionalProperties false or a schema, enum/const, anyOf/oneOf/allOf, lengths/counts/numeric bounds,
+  uniqueItems and description. No references, patterns, defaults, coercion or IO. Declare every nested shape.
+- Example policy declaration: asset_policy_key upload_policy; asset_policies maps carried_live_posts to carried.
+  Declare that key required with the matching enum in settings_schema. This is an invented example, not a universal
+  customer schema. Discover actual policy enums and supported physical modes from the committed contract/engine facts.
+- audit_aggregates declares preflight and postflight arrays of fixed code-defined metric keys, never customer names.
+  Add read-only class hooks self.silo_merge_asset_ids and self.silo_merge_audit(phase). The former returns the complete
+  required source asset IDs for selected entities; the latter returns the declared bounded nonnegative integer counters.
+  Preflight, constructor, copying and postflight still share one Ruby process and the same loaded subclass.
+- Physical transfer belongs to the host engine adapter. No layer file IO, core modification or global FileUtils patch.
+- Trusted migration-data uses data_workflow_contract, data_workflow_validate and data_workflow_exists; validation returns
+  typed private key paths/receipts. A prepared-custom proposal requires passing process validation automatically, with
+  unchanged proposal request fields. It never falls back to a one-shot merge. Changed bindings need a fresh proposal.
+- T2 preservation already exists; dirty/unproven is failure, with no manual repair-to-success fallback. T7 authoritative
+  source counts come from private audit evidence, not wider connector grants. Audit values and private schemas/settings
+  do not become clean project info; only engineer-reviewed released findings may carry safe derivatives.
+"""

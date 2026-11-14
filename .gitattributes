@@ -1,2 +1,4 @@
 # Unified diffs contain context-prefix whitespace; check the native source itself.
 *.patch -whitespace
+# Preserve the byte-exact upstream method fixture, including its separator line.
+test/support/stock_copy_uploads_fixture.rb whitespace=-blank-at-eof

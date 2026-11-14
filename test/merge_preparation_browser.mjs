@@ -118,6 +118,25 @@ try {
   assert.match(merge, /Stock: Discourse’s own merger only/);
   assert.match(merge, /activates the environment’s clean prepared checkpoint \(it does not restore the backups anew\)/);
   assert.match(merge, /it never switches to a fresh restore/);
+  // Engine-neutral contract details are engineer-only data, rendered as text.
+  plans[mergePlan].intent = 'custom';
+  plans[mergePlan].merge.process = { version: 1, engine: 'discourse-merger-v1', physical_policy: 'carried',
+    receipt_id: '2'.repeat(32), receipt_sha256: '3'.repeat(64), contract_sha256: '4'.repeat(64) };
+  plans[mergePlan].merge.contract = { version: 1, engine: 'discourse-merger-v1',
+    settings_schema: { type: 'object', additionalProperties: false, required: ['asset_mode'],
+      properties: { asset_mode: { type: 'string', enum: ['selected'] } }, description: '<img src=x onerror=alert(1)>' },
+    asset_policy_key: 'asset_mode', asset_policies: { selected: 'carried' }, audit_aggregates: { preflight: [], postflight: [] } };
+  await page.getByRole('navigation', { name: 'Sections' }).getByRole('button', { name: 'Runs', exact: false }).click();
+  await page.getByRole('button', { name: /^Pass 2 / }).click();
+  await page.locator('.step').filter({ hasText: 'Merge run' }).click();
+  await page.getByText('Carried content only · required media must be verified', { exact: true }).waitFor();
+  await page.locator('details').evaluateAll(items => items.forEach(item => { item.open = true; }));
+  const contractView = await page.locator('#content').innerText();
+  assert.match(contractView, /Workflow contract and validation/i);
+  assert.match(contractView, /\"asset_mode\"/);
+  assert.match(contractView, /\"selected\"/);
+  assert.match(contractView, /Start checks the bound inputs again before activation/);
+  assert.equal(await page.locator('pre img').count(), 0, 'schema text cannot become active HTML');
   if (process.env.MERGE_PREPARATION_SCREENSHOT) await page.screenshot({ path: process.env.MERGE_PREPARATION_SCREENSHOT, fullPage: true });
   assert.equal(posts.length, 2, 'nothing starts automatically');
   assert.deepEqual(errors, []);

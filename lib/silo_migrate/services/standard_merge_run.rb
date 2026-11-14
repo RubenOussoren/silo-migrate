@@ -70,6 +70,10 @@ module SiloMigrate
                 else merge_layer!(config.fetch("converter_worktree"), config.fetch("converter_revision"), @workspace).first
                 end
         raise StandardWorkflowError, "STANDARD_MERGE_INTENT_MISMATCH" if prepared && intent == "custom" && layer["present"] != true
+        process = if standalone
+          merge_process_binding!(prepared_from: prepared.fetch("run_id"), generation: prepared.fetch("generation"), settings: settings, layer: layer)
+        end
+        contract = merge_process_contract_for(layer) if process
         plan_id = @store.new_id("plan")
         if prepared
           prepared_body = prepared.fetch("body")
@@ -115,6 +119,17 @@ module SiloMigrate
                                "return the sealed prepared databases to their working names, then merge the prepared source into the prepared Base",
                                "take a full backup before creating the local review admin and before any new inspection access", "keep the review site until reset"]
         end
+        if process
+          body.fetch("merge")["process"] = process
+          body.fetch("merge")["contract"] = contract
+          body["mutations"] << "transfer only the explicitly declared physical asset policy using a verified private manifest; fail on unresolved required media"
+        end
+        # Recheck the selected committed code and immutable inputs after potentially
+        # expensive read-only validation, before persisting the exact proposal.
+        if standalone
+          raise StandardWorkflowError, "STANDARD_MERGE_LAYER_INVALID" unless merger_proposal_layer! == layer
+          raise StandardWorkflowError, "STANDARD_INPUT_CHANGED" unless inputs_unchanged?(inputs.values)
+        end
         body["mutations"] << "permit only the stock authorized_extensions assignment temporarily; restore exact prior state before postflight and verify all settings before backup"
         body["file_role_binding"] = role_binding if role_binding
         if preparation
@@ -149,6 +164,12 @@ module SiloMigrate
           end
         end
         { "totals" => run.fetch("results").fetch("merge", {}),
+          "audit_aggregates" => merge_process_evidence(run_id),
+          "validation" => merge_process_validation_evidence(run_id),
+          "site_settings_preservation" => %w[after-merge before-finalize after-finalize verify before-backup completion failure recovery].filter_map do |phase|
+            path = @store.run_dir(run_id, "private", "merge-site-settings-#{phase}.json")
+            JSON.parse(File.read(path)) if File.file?(path)
+          end,
           "target_only_columns" => File.file?(columns) ? JSON.parse(File.read(columns)) : [], "log_tail" => tail }
       end
 
@@ -212,6 +233,7 @@ module SiloMigrate
         # Historical Merge approvals must be re-proposed, not consume a ready
         # generation before discovering they never approved this preservation policy.
         return "code" unless body.dig("merge", "site_settings_preservation") == StandardMergeSiteSettings::MERGE_SITE_SETTINGS_POLICY
+        return "code" if body["prepared_from"] && body["intent"] == "custom" && !body.dig("merge", "process")
         return "delivery" if !body["file_role_binding"] && body["base_site_generation"] && body["base_site_generation"] != review_base_generation
 
         named = @store.named_state
@@ -513,6 +535,7 @@ module SiloMigrate
         unless plan.dig("body", "merge", "site_settings_preservation") == StandardMergeSiteSettings::MERGE_SITE_SETTINGS_POLICY
           raise StandardWorkflowError, "STANDARD_MERGE_SITE_SETTINGS_FAILED"
         end
+        merge_process_install!(run_id, stack, env)
         settings_binding = merge_site_settings_capture!(run_id, stack)
         env << "SILO_MERGE_SITE_SETTINGS_SHA256=#{settings_binding.fetch('sha256')}"
         options = plan.dig("body", "merge", "options")
@@ -531,6 +554,7 @@ module SiloMigrate
             file.write(bytes.byteslice([bytes.bytesize - 65_536, 0].max, 65_536).to_s)
           end
         end
+        merge_process_collect!(run_id, stack, result)
         declared = plan.dig("body", "merge", "layer", "present") ? merge_layer_source(run_id) : ""
         merge_result(run_id, layer_totals: merge_totals(result.stdout.to_s + "\n" + result.stderr.to_s, declared))
         raise StandardWorkflowError, merge_failure(result) unless result.success?
@@ -576,6 +600,7 @@ module SiloMigrate
         merge_checked(run_id, "merge-start", stack.web_exec(%w[sv start unicorn]), "STANDARD_MERGE_FAILED")
         wait_restored_web(stack, internal: true)
         merge_site_settings_check!(run_id, stack, phase: "after-finalize")
+        merge_process_references_check!(run_id, stack)
       end
 
       def merge_verify(run_id)
@@ -594,16 +619,35 @@ module SiloMigrate
       def merge_backup(run_id)
         stack = stack_for(run_id, "review")
         merge_site_settings_check!(run_id, stack, phase: "before-backup")
+        merge_process_references_check!(run_id, stack)
         extracted = JSON.parse(File.read(@store.run_dir(run_id, "evidence", "merge-uploads.json")))
-        # The merger renames the upload site root to the target's default root.
-        required = extracted.fetch("uploads").map { |name| name.sub(%r{\Auploads/[^/]+/}, "uploads/default/") }
+        manifest = merge_process_manifest(run_id)
+        # The adapter interprets its backup layout. The shared manifest binds
+        # approved physical bytes, including verified reuse, rather than every
+        # source file regardless of business selection.
+        selected = manifest && manifest.fetch("entries").reject { |entry| entry["disposition"] == "exclude" }
+        required = if selected
+          selected.map { |entry| "uploads/default/#{entry.fetch('destination')}" }.uniq
+        else
+          extracted.fetch("uploads").map { |name| name.sub(%r{\Auploads/[^/]+/}, "uploads/default/") }
+        end
         artifact = make_backup(run_id, stack, "merged-#{run_id}.tar.gz", "merge", required_uploads: required)
         versions = merge_source_versions!(artifact.fetch("filename"))
         record_results(run_id, backup_discourse_version: versions["discourse_version"], backup_schema_version: versions["schema_version"])
         checked = validate_full_archive!(artifact.fetch("path"), required)
-        extracted.fetch("sha256").each do |name, sha256|
-          member = name.sub(%r{\Auploads/[^/]+/}, "uploads/default/")
-          raise StandardWorkflowError, "STANDARD_BACKUP_FAILED" unless checked.fetch("upload_sha256")[member] == sha256
+        if selected
+          begin
+            MergeProcess::Gate.new(MergeProcess.registry).verify_output(
+              engine: plan_for(run_id).dig("body", "merge", "process", "engine"),
+              context: { upload_sha256: checked.fetch("upload_sha256"), baseline_assets: merge_process_baseline(run_id) }, manifest: manifest)
+          rescue MergeProcess::Refused, KeyError
+            raise StandardWorkflowError, "STANDARD_BACKUP_FAILED"
+          end
+        else
+          extracted.fetch("sha256").each do |name, sha256|
+            member = name.sub(%r{\Auploads/[^/]+/}, "uploads/default/")
+            raise StandardWorkflowError, "STANDARD_BACKUP_FAILED" unless checked.fetch("upload_sha256")[member] == sha256
+          end
         end
         merge_result(run_id, archive_upload_files: checked.fetch("upload_sha256").size)
         # A prepared merge's backup names the one environment generation it came from, so result

@@ -237,6 +237,20 @@ else:
         path.write_text(SETTINGS + '# edited\n')
         self.assertIsNone(self.get('/api/plan?workspace=arc&id=' + pid(1))[1]['texts']['settings'])
 
+    def test_engineer_plan_detail_exposes_bound_schema_not_arbitrary_merge_fields(self):
+        path = self.base / 'arc/.silo-migrate/named/standard/state.json'
+        state = json.loads(path.read_text())
+        contract = {'version': 1, 'engine': 'toy-records-v1', 'settings_schema': {'type': 'object'}}
+        process = {'version': 1, 'receipt_id': 'a' * 32, 'physical_policy': 'carried'}
+        state['plans'][pid(1)]['body']['merge'] = {'contract': contract, 'process': process,
+                                                     'arbitrary_private_field': 'not copied'}
+        path.write_text(json.dumps(state))
+        status, data = self.get('/api/plan?workspace=arc&id=' + pid(1))
+        self.assertEqual(200, status)
+        self.assertEqual(contract, data['merge']['contract'])
+        self.assertEqual(process, data['merge']['process'])
+        self.assertNotIn('arbitrary_private_field', data['merge'])
+
     def test_run_and_push_details(self):
         status, run = self.get('/api/run?workspace=arc&id=' + rid(1))
         self.assertEqual(200, status)

@@ -136,13 +136,18 @@ module SiloMigrate
         JSON.parse(lines.first.delete_prefix("SILO_JSON:"))
       end
 
-      def copy_in(host_path, guest_path, owner: "discourse:discourse")
-        command!(["docker", "cp", host_path, "#{container('web')}:#{guest_path}"], timeout: 300)
-        command!(["docker", "exec", container("web"), "chown", "-R", owner, guest_path], timeout: 60)
+      def copy_in(host_path, guest_path, owner: "discourse:discourse", timeout: nil)
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        command!(["docker", "cp", host_path, "#{container('web')}:#{guest_path}"], timeout: timeout || 300)
+        # An explicit validation budget covers both subprocesses, not one fresh
+        # timeout per command. Preserve the legacy 300 + 60 defaults otherwise.
+        remaining = timeout ? timeout - (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) : 60
+        raise StandardWorkflowError.new("STANDARD_STACK_FAILED", "copy timeout") unless remaining.positive?
+        command!(["docker", "exec", container("web"), "chown", "-R", owner, guest_path], timeout: [remaining, 60].min)
       end
 
-      def copy_out(guest_path, host_path)
-        command!(["docker", "cp", "#{container('web')}:#{guest_path}", host_path], timeout: 600)
+      def copy_out(guest_path, host_path, timeout: 600)
+        command!(["docker", "cp", "#{container('web')}:#{guest_path}", host_path], timeout: timeout)
       end
 
       def discourse_shell(args, env_password: true, timeout: 900, pin_cpu: false)

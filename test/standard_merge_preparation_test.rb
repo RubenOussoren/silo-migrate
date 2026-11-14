@@ -78,7 +78,19 @@ class PrepareScriptedRuntime < MergeScriptedRuntime
   end
 end
 
+# Keep the private fake code checkout complete as helpers move into runtime/shared.
+# This copies shipped bytes, rather than replacing any production helper behavior.
+module LegacyMergeSharedHelperFixture
+  def with_merge(**options)
+    super(**options) do
+      FileUtils.cp_r(File.expand_path('../runtime/shared', __dir__), File.join(@code_root, 'runtime'))
+      yield
+    end
+  end
+end
+
 class StandardMergePreparationTest < StandardMergeRunTest
+  include LegacyMergeSharedHelperFixture
   PREPARATION = SiloMigrate::Services::StandardMergePreparation
   SEALED = { 'discourse' => true, 'merge_source' => false, 'silo_clean_base' => false, 'silo_inspect_source' => true }.freeze
   ACTIVE = { 'discourse' => true, 'merge_source' => true }.freeze
@@ -195,8 +207,93 @@ class StandardMergePreparationTest < StandardMergeRunTest
 
   def use_layer
     @service.merger_init
-    commit_merger('merger.rb' => LAYER_SOURCE, 'helpers/routes.rb' => "module InventedRoutes; end\n",
-                  'test/merger_test.rb' => "raise 'invented tests are never executed by a merge'\n", 'README.md' => "Invented contract notes.\n")
+    revision = commit_merger('merger.rb' => LAYER_SOURCE, 'helpers/routes.rb' => "module InventedRoutes; end\n",
+                             'test/merger_test.rb' => "raise 'invented tests are never executed by a merge'\n", 'README.md' => "Invented contract notes.\n")
+    scripted_legacy_merge_process
+    revision
+  end
+
+  # These old lifecycle fixtures have real Git custody but no validation-clone or process
+  # output protocol. Model that boundary explicitly on THIS service, not in test_helper or
+  # the runtime. The real generic/validation suites use their own services and gates.
+  def scripted_legacy_merge_process
+    freeze_tree = lambda do |value|
+      value.each { |key, child| freeze_tree.call(key); freeze_tree.call(child) } if value.is_a?(Hash)
+      value.each { |child| freeze_tree.call(child) } if value.is_a?(Array)
+      value.freeze
+    end
+    contract = freeze_tree.call(SiloMergeContract.load(JSON.generate({
+      'version' => 1, 'engine' => 'discourse-merger-v1',
+      'settings_schema' => { 'type' => 'object', 'additionalProperties' => false, 'required' => ['asset_mode'],
+                             'properties' => { 'asset_mode' => { 'type' => 'string', 'enum' => ['all'] } } },
+      'asset_policy_key' => 'asset_mode', 'asset_policies' => { 'all' => 'all' },
+      'audit_aggregates' => { 'preflight' => [], 'postflight' => [] }
+    })))
+    bindings = {}
+    gate_calls = @scripted_process_gate_calls = []
+    @service.define_singleton_method(:merge_process_binding!) do |prepared_from:, generation:, settings:, layer:|
+      input = settings && @store.named_state.fetch('inputs').fetch(settings)
+      facts = { 'prepared_from' => { 'run_id' => prepared_from, 'generation' => generation },
+                'settings' => settings, 'layer' => layer, 'code_identity' => code_identity,
+                'settings_sha256' => input && input.fetch('sha256') }
+      facts = freeze_tree.call(JSON.parse(JSON.generate(facts)))
+      digest = Digest::SHA256.hexdigest(JSON.generate(facts))
+      binding = freeze_tree.call({ 'version' => 1, 'receipt_id' => digest[0, 32], 'receipt_sha256' => digest,
+                                  'engine' => contract.fetch('engine'), 'physical_policy' => 'all',
+                                  'contract_sha256' => Digest::SHA256.hexdigest(JSON.generate(contract)),
+                                  'settings_sha256' => facts['settings_sha256'], 'selection_sha256' => digest })
+      bindings[binding] = facts
+      binding
+    end
+    @service.define_singleton_method(:merge_process_contract_for) do |layer|
+      raise 'scripted contract requested for an unbound layer' unless bindings.values.any? { |facts| facts['layer'] == layer }
+      contract
+    end
+    @service.define_singleton_method(:merge_validation_gate!) do |body, claimed_run_id: nil|
+      binding = body.dig('merge', 'process')
+      facts = bindings[binding]
+      input = body.fetch('input_binding').find { |item| item['id'] == body.dig('roles', 'settings') }
+      unless facts && body['prepared_from'] == facts['prepared_from'] &&
+             body.dig('roles', 'settings') == facts['settings'] && body.dig('merge', 'layer') == facts['layer'] &&
+             body['code_identity'] == facts['code_identity'] && code_identity == facts['code_identity'] &&
+             body.dig('merge', 'contract') == contract && (input && input['sha256']) == facts['settings_sha256']
+        raise SiloMigrate::StandardWorkflowError, 'STANDARD_MERGE_VALIDATION_STALE'
+      end
+      environment = @store.load.fetch('runs').fetch(facts.fetch('prepared_from').fetch('run_id')).fetch('merge_environment')
+      unless environment['generation'] == facts.dig('prepared_from', 'generation') &&
+             (claimed_run_id ? environment['consumed_by'] == claimed_run_id : environment['phase'] == 'ready' && environment['consumed_by'].nil?)
+        raise SiloMigrate::StandardWorkflowError, 'STANDARD_MERGE_ENVIRONMENT_STALE'
+      end
+      gate_calls << claimed_run_id
+      true
+    end
+    # The legacy MergeScriptedRuntime emits only SILO_MERGE, not process evidence.
+    @service.define_singleton_method(:merge_process_install!) { |_run_id, _stack, _env| nil }
+    @service.define_singleton_method(:merge_process_collect!) { |_run_id, _stack, _result| nil }
+    @service.define_singleton_method(:merge_process_manifest) { |_run_id| nil }
+    @service.define_singleton_method(:merge_process_references_check!) { |_run_id, _stack| nil }
+    @service.define_singleton_method(:merge_process_validation_evidence) { |_run_id| nil }
+  end
+
+  def test_prepare_custom_without_contract_uses_real_gate_and_preserves_environment
+    with_prepare do
+      prep = prepared
+      use_layer
+      %i[merge_process_binding! merge_process_contract_for merge_validation_gate!
+         merge_process_install! merge_process_collect! merge_process_manifest merge_process_references_check! merge_process_validation_evidence].each do |name|
+        @service.singleton_class.remove_method(name)
+      end
+      before = @service.store.load
+      commands = @runtime.commands.size
+      # This is deliberately NOT the scripted lifecycle adapter: the invented layer has
+      # no workflow-contract.json, so production validation must refuse before consumption.
+      standard_error('STANDARD_MERGE_CONTRACT_REQUIRED') { @service.merge_contract }
+      standard_error('STANDARD_MERGE_VALIDATION_FAILED') { prepared_plan(prep, intent: 'custom', settings: @merge_settings) }
+      assert_equal before, @service.store.load
+      assert_equal [], @runtime.commands.drop(commands).grep(/\Adocker /)
+      assert_equal 'ready', environment(prep[:run_id])['phase']
+      assert_equal SEALED, @runtime.databases
+    end
   end
 
   # -- the production quiesce script against real processes (no scripted runtime) ----------
@@ -764,6 +861,7 @@ class StandardMergePreparationTest < StandardMergeRunTest
       before = merge_lines.size
       run = @service.run_plan(plan_id: approve(plan))
       assert_equal 'completed', run[:status], run[:failure].inspect + failure_detail(run)
+      assert_equal [nil, run[:run_id]], @scripted_process_gate_calls
       # Exactly the executable committed files; tests and README are never extracted.
       extracted = Dir.glob('**/*', base: @service.store.run_dir(run[:run_id], 'private', 'merge', 'layer')).sort
       assert_equal %w[helpers helpers/routes.rb merger.rb], extracted

@@ -3175,6 +3175,80 @@ def merge_layer_contract(ws):
                                                 kib=module.MERGE_LAYER_MAX_BYTES // 1024)
 
 
+def workflow_request(request, fields):
+    """Exact bounded trusted request schema, before any backend invocation."""
+    if set(request) - (set(fields) | {"op", "via"}) or not set(fields) <= set(request):
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    if "run" in fields and (not isinstance(request["run"], str) or not RUN.fullmatch(request["run"])):
+        refuse("STANDARD_ARGUMENTS_INVALID: run")
+    if "generation" in fields and (not isinstance(request["generation"], str) or not DIGEST.fullmatch(request["generation"])):
+        refuse("STANDARD_ARGUMENTS_INVALID: generation")
+
+
+def workflow_result(raw):
+    result = json.loads(raw)
+    if not isinstance(result, dict):
+        refuse("STANDARD_OPERATION_FAILED")
+    # data's envelope supplies version; backend receipts may already carry it.
+    return {key: value for key, value in result.items() if key != "version"}
+
+
+def op_workflow_contract(ws, request):
+    workflow_request(request, ())
+    ws.require()
+    result = workflow_result(ws.control(["standard", "workflow", "describe", ws.name], timeout=240))
+    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > 40 * 1024:
+        if not isinstance(result.get("contract_file"), dict):
+            refuse("STANDARD_OUTPUT_TOO_LARGE")
+        result.pop("contract", None)
+        result["contract_omitted"] = True
+        result["next"] = "Read the complete digest-bound contract_file with data_peek area=work, following byte offsets; do not infer missing schema keys."
+    return result
+
+
+def op_workflow_validate(ws, request):
+    workflow_request(request, ("run", "generation", "settings"))
+    if not isinstance(request["settings"], str) or not INPUT_ID.fullmatch(request["settings"]):
+        refuse("STANDARD_ARGUMENTS_INVALID: settings")
+    ws.require()
+    result = workflow_result(ws.control(["standard", "workflow", "validate", ws.name, "--prepared-from", request["run"],
+                                  "--generation", request["generation"], "--settings", request["settings"]], timeout=240))
+    # Selection IDs remain in the immutable private host receipt. The analyst
+    # needs its binding/counts, not a potentially oversized row-ID list.
+    selected = result.pop("approved_ids", None)
+    if result.get("status") == "passed" and isinstance(selected, list):
+        result["approved_assets_count"] = len(selected)
+    return result
+
+
+def op_workflow_exists(ws, request):
+    workflow_request(request, ("run", "generation", "queries"))
+    queries = request["queries"]
+    if not isinstance(queries, list) or not 1 <= len(queries) <= 100:
+        refuse("STANDARD_ARGUMENTS_INVALID: queries")
+    def name_ok(value):
+        return (isinstance(value, str) and 1 <= len(value.encode("utf-8")) <= 256
+                and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value))
+    for query in queries:
+        if not isinstance(query, dict):
+            refuse("STANDARD_ARGUMENTS_INVALID: queries")
+        if query.get("kind") == "category":
+            path = query.get("path")
+            valid = (set(query) == {"kind", "path"} and isinstance(path, list) and 1 <= len(path) <= 32
+                     and all(name_ok(name) for name in path))
+        else:
+            valid = (query.get("kind") in ("group", "tag") and set(query) == {"kind", "name"}
+                     and name_ok(query.get("name")))
+        if not valid:
+            refuse("STANDARD_ARGUMENTS_INVALID: queries")
+    payload = json.dumps(queries, ensure_ascii=False)
+    if len(payload.encode("utf-8")) > 64 * 1024:
+        refuse("STANDARD_ARGUMENTS_INVALID: queries")
+    ws.require()
+    return workflow_result(ws.control(["standard", "workflow", "exists", ws.name, "--prepared-from", request["run"],
+                                  "--generation", request["generation"], "--queries-file", "-"], input=payload, timeout=240))
+
+
 def op_merge_prepare(ws, request):
     """Restore/prepare a native merge pair, never refresh or require a converter/layer."""
     ws.require()
@@ -3969,7 +4043,7 @@ def op_supporting(ws, request):
     return module.handle(ws, request, api)
 
 
-OPS = {"status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
+OPS = {"workflow_contract": op_workflow_contract, "workflow_validate": op_workflow_validate, "workflow_exists": op_workflow_exists, "status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
        "file_roles_preview": op_file_roles_preview, "file_roles_commit": op_file_roles_commit,
        "supporting_list": op_supporting, "supporting_take": op_supporting, "supporting_read": op_supporting,
        "supporting_prepare": op_supporting_prepare,
@@ -4063,6 +4137,11 @@ def main(args, values, base, repo, host, stdin, control):
                     result["roles_omitted"] = True
                 if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > ENGINEER_OUTPUT_LIMIT:
                     refuse("STANDARD_OUTPUT_TOO_LARGE")
+            return result
+        if op in ("workflow_contract", "workflow_validate", "workflow_exists"):
+            # Never turn a complete exact result/receipt/contract into a partial one.
+            if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > OUTPUT_LIMIT:
+                refuse("STANDARD_OUTPUT_TOO_LARGE")
             return result
         return fit(result)
     except Refusal as refusal:

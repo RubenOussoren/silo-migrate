@@ -430,6 +430,63 @@ tools:
             additionalProperties: false
         required: [source, settings]
         additionalProperties: false
+    - name: data_workflow_contract
+      description: "Read the actual committed workflow-contract.json and supported engine facts privately. Do not infer schema or enums from examples."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 295
+      input:
+        type: object
+        properties: {}
+        additionalProperties: false
+    - name: data_workflow_validate
+      description: "Validate registered merge-settings against the committed contract and sealed prepared generation. Returns a typed private receipt with offending key paths; no approval or Start."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 295
+      input:
+        type: object
+        properties:
+          run: {type: string, pattern: "^run-[0-9a-f]{32}$"}
+          generation: {type: string, pattern: "^[0-9a-f]{64}$"}
+          settings: {type: string, pattern: "^input-[0-9a-f]{32}$"}
+        required: [run, generation, settings]
+        additionalProperties: false
+    - name: data_workflow_exists
+      description: "Resolve exact destination identities against the prepared generation. Results are found, absent, ambiguous or unproven; partial listings never prove absence. No arbitrary SQL."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 295
+      input:
+        type: object
+        properties:
+          run: {type: string, pattern: "^run-[0-9a-f]{32}$"}
+          generation: {type: string, pattern: "^[0-9a-f]{64}$"}
+          queries:
+            type: array
+            minItems: 1
+            maxItems: 100
+            description: "At most 64 KiB serialized JSON. Category path is the full root-to-leaf identity; names are exact, not search strings."
+            items:
+              oneOf:
+                - type: object
+                  properties:
+                    kind: {type: string, enum: [category]}
+                    path:
+                      type: array
+                      minItems: 1
+                      maxItems: 32
+                      items: {type: string, minLength: 1, maxLength: 256}
+                  required: [kind, path]
+                  additionalProperties: false
+                - type: object
+                  properties:
+                    kind: {type: string, enum: [group, tag]}
+                    name: {type: string, minLength: 1, maxLength: 256}
+                  required: [kind, name]
+                  additionalProperties: false
+        required: [run, generation, queries]
+        additionalProperties: false
     - name: data_merge_prepare
       description: "Discourse merge only: propose restoring the current registered Base and full source backup into a disposable prepared merge environment. The host auto-sizes containers from detected CPU/RAM and bound backup sizes, checks service shutdown before the expensive Base restore, performs source schema migration with the selected Base runtime, validates compatibility and preserves clean checkpoints plus inspection copies. No merge, converter, layer or settings are required. Engineer Approve and separate Start are required. After completion use the returned run ID and generation for inspection and the exact merge plan; do not extract either backup yourself. runtime_preparing means poll this proposal, not a customer run."
       script: scripts/data_tool.py

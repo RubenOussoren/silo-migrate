@@ -30,6 +30,9 @@ WORKSPACE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 MAX_OUTPUT_BYTES = 48 * 1024
 # tool -> (data op, allowed request keys, timeout seconds; term-llm allows at most 300)
 TOOLS = {
+    "data_workflow_contract": ("workflow_contract", set(), 290),
+    "data_workflow_validate": ("workflow_validate", {"run", "generation", "settings"}, 290),
+    "data_workflow_exists": ("workflow_exists", {"run", "generation", "queries"}, 290),
     "data_guide": ("guide", set(), 60),
     "data_status": ("status", set(), 60),
     "data_list": ("list", {"area", "path"}, 60),
@@ -141,6 +144,8 @@ def main():
     except ValueError:
         return fail("STANDARD_ARGUMENTS_INVALID")
     if not isinstance(args, dict):
+        return fail("STANDARD_ARGUMENTS_INVALID")
+    if tool.startswith("data_workflow_") and set(args) - TOOLS[tool][1]:
         return fail("STANDARD_ARGUMENTS_INVALID")
     # One customer per chat: the chat's web UI project decides the workspace, and the model has no say.
     project = chat_project()

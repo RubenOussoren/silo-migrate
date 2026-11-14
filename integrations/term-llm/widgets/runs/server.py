@@ -54,7 +54,9 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js",
 HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
            "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"}
 # Seconds per control call: a push talks to GitHub (git push has 300 s); the rest is local.
-TIMEOUTS = {"push": 330, "start": 120, "reset": 300}
+# Start includes bounded read-only revalidation before it can claim a prepared
+# generation; leave room for that gate and synchronous cleanup before background execution.
+TIMEOUTS = {"push": 330, "start": 295, "reset": 300}
 DEFAULT_TIMEOUT = 90
 
 
@@ -352,7 +354,15 @@ def plan_detail(store, control, workspace, plan_id):
             paths[input_id] = base64.b64decode(named[input_id]["path"]).decode("utf-8", "replace")
         except (KeyError, ValueError, TypeError):
             paths[input_id] = None
-    return dict(shown, workspace=workspace, limits=body.get("limits"), input_paths=paths, texts=texts,
+    # Engineer-only detail already shows bound private settings. Keep the clean
+    # service projection narrow, but show the exact committed workflow schema and
+    # receipt identity here so approval is not based on relayed key names.
+    merge = dict(shown.get("merge") or {})
+    bound_merge = body.get("merge") if isinstance(body.get("merge"), dict) else {}
+    for key in ("contract", "process"):
+        if isinstance(bound_merge.get(key), dict):
+            merge[key] = bound_merge[key]
+    return dict(shown, workspace=workspace, merge=merge or shown.get("merge"), limits=body.get("limits"), input_paths=paths, texts=texts,
                 discarded=plan.get("discarded") if isinstance(plan.get("discarded"), dict) else None)
 
 

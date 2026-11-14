@@ -49,13 +49,17 @@ class MergeControlDispatchTest(unittest.TestCase):
     def invoke(self, args):
         self.control.host_merge_lifecycle_cleanup(args, {}, self.base, ROOT, object())
 
-    def test_execute_cleans_exact_preparation_and_consuming_run(self):
+    def test_ready_start_and_consumed_execute_preserve_inspection(self):
+        for phase in ('ready', 'consumed'):
+            self.state['runs'][self.prepared] = {'merge_environment': {'phase': phase}}
+            self.invoke(['standard', 'run', 'start', 'invented', self.plan])
+            self.invoke(['standard', 'run', 'execute', 'invented', self.merged])
+        self.connector.cleanup.assert_not_called()
+
+    def test_post_activation_execute_cleans_exact_owned_registrations(self):
+        self.state['runs'][self.prepared] = {'merge_environment': {'phase': 'merging'}}
         self.invoke(['standard', 'run', 'execute', 'invented', self.merged])
         self.assertEqual([self.prepared, self.merged], [call.kwargs['run_id'] for call in self.connector.cleanup.call_args_list])
-
-    def test_start_cleans_only_the_plan_bound_preparation(self):
-        self.invoke(['standard', 'run', 'start', 'invented', self.plan])
-        self.connector.cleanup.assert_called_once_with(self.workspace, self.data, run_id=self.prepared)
 
     def test_read_commands_never_load_state_or_cleanup(self):
         self.data.standard_state = mock.Mock(side_effect=AssertionError('read mutated'))

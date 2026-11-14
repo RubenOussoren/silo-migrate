@@ -200,6 +200,7 @@ module MergeSiteSettingsHostChecks
 end
 
 class StandardMergeSiteSettingsTest < StandardMergeRunTest
+  include LegacyMergeSharedHelperFixture
   include MergeSiteSettingsHostChecks
 
   # This file's own tests (an inherited class has unrelated tests under the same prefix).

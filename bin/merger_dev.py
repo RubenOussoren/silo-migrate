@@ -5,6 +5,7 @@
       helpers/**.rb              Ruby files it requires
       test/                      invented tests and fixtures: never run by a merge
       README.md                  notes: never run
+      workflow-contract.json     optional host-read contract: never run
 
 The path is derived from the managed workspace, never given, and there is no other place
 these tools look: without the repository every operation but the guide and init refuses.
@@ -53,15 +54,17 @@ ROLES = {
 MUTATING = {"write", "edit", "delete", "format", "commit", "init"}
 DIRECTORY = "merger"
 ENTRY = "merger.rb"
+CONTRACT = "workflow-contract.json"
+CONTRACT_MAX_BYTES = 128 * 1024
 STORE = "merger"
 PLAN_REFS = "refs/silo/merge-plans/"
 # As the Ruby twin: MERGER_TOP_LEVEL, MERGER_CONFIG_KEYS, and its redirect list.
-TOP_LEVEL = ("merger.rb", "helpers", "test", "README.md", ".gitignore")
+TOP_LEVEL = ("merger.rb", "helpers", "test", "README.md", ".gitignore", CONTRACT)
 CONFIG_KEYS = re.compile(r"(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)|user\.(?:name|email))\Z")
 REDIRECTS = ("commondir", "gitdir", "config.worktree", "shallow", "objects/info/alternates", "objects/info/http-alternates", "info/grafts")
 PART = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 TEST_FILES = (".rb", ".yml", ".yaml", ".json", ".md", ".txt")
-REVIEWED = ("merger.rb", "helpers", "test", "README.md")
+REVIEWED = ("merger.rb", "helpers", "test", "README.md", CONTRACT)
 MISSING = ("STANDARD_MERGER_MISSING: this project has no local merger repository yet; a developer creates it with dev_merger_init "
            "(the engineer: silo-migrate-control standard merger init WORKSPACE)")
 SANDBOX_NOTE = ("pinned converter image's Ruby and minitest, no network, read-only root, only the merger files your tools can see; "
@@ -184,7 +187,7 @@ class MergerCheckout(dev.Checkout):
         parts = relative.split("/")
         if not all(PART.fullmatch(part) for part in parts):
             return False
-        if relative in (ENTRY, "README.md"):
+        if relative in (ENTRY, "README.md", CONTRACT):
             return True
         if parts[0] == "helpers":
             return len(parts) > 1 and relative.endswith(".rb")
@@ -202,6 +205,7 @@ def layer(checkout, commit):
     invalid = (None, "STANDARD_MERGE_LAYER_INVALID")
     listing = checkout.git("ls-tree", "-r", "-l", "-z", "--full-tree", commit).stdout
     manifest, files, total = [], 0, 0
+    contract_sha256 = None
     for entry in filter(None, listing.split(b"\0")):
         match = re.fullmatch(rb"(\d{6}) (\w+) ([0-9a-f]{40}) +(-|\d+)\t(.+)", entry, re.S)
         if not match:
@@ -211,20 +215,33 @@ def layer(checkout, commit):
         if not (kind == b"blob" and mode in (b"100644", b"100755") and parts[0] in [item.encode() for item in TOP_LEVEL]
                 and not any(part in (b"", b".", b"..") for part in parts) and not re.search(rb"[\x00-\x1f\\]", name)):
             return invalid
-        if not (name == ENTRY.encode() or parts[0] == b"helpers"):
+        is_contract = name == CONTRACT.encode()
+        if parts[0] == CONTRACT.encode() and not is_contract:
+            return invalid
+        if not (is_contract or name == ENTRY.encode() or parts[0] == b"helpers"):
             continue
-        if not (mode == b"100644" and all(PART.fullmatch(part.decode("ascii", "replace")) for part in parts) and name.endswith(b".rb")
-                and files < contract.MERGE_LAYER_MAX_FILES and int(size) + total <= contract.MERGE_LAYER_MAX_BYTES):
+        if is_contract:
+            valid = mode == b"100644" and int(size) <= CONTRACT_MAX_BYTES
+        else:
+            valid = (mode == b"100644" and all(PART.fullmatch(part.decode("ascii", "replace")) for part in parts) and name.endswith(b".rb")
+                     and files < contract.MERGE_LAYER_MAX_FILES and int(size) + total <= contract.MERGE_LAYER_MAX_BYTES)
+        if not valid:
             return invalid
         data = checkout.git("cat-file", "blob", sha.decode()).stdout
         if len(data) != int(size) or hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() != sha.decode():
             return invalid
-        files, total = files + 1, total + len(data)
+        if is_contract:
+            contract_sha256 = hashlib.sha256(data).hexdigest()
+        else:
+            files, total = files + 1, total + len(data)
         manifest.append(hashlib.sha256(data).hexdigest().encode() + b" " + name + b"\n")
     if not any(line.endswith(b" " + ENTRY.encode() + b"\n") for line in manifest):
         return invalid
-    return {"present": True, "store": STORE, "path": ENTRY, "revision": commit, "files": files, "bytes": total,
-            "sha256": hashlib.sha256(b"".join(sorted(manifest))).hexdigest()}, None
+    metadata = {"present": True, "store": STORE, "path": ENTRY, "revision": commit, "files": files, "bytes": total,
+                "sha256": hashlib.sha256(b"".join(sorted(manifest))).hexdigest()}
+    if contract_sha256 is not None:
+        metadata["contract_sha256"] = contract_sha256
+    return metadata, None
 
 
 def store(checkout):
