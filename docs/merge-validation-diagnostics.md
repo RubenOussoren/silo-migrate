@@ -64,6 +64,67 @@ this attempt reference and diagnostics. Pre-attempt refusals have a null attempt
 ID rather than fabricating a receipt. Existing consumers that only use the outer
 fixed refusal remain compatible. Read the JSON rather than parsing private logs.
 
+## Legacy attempt: current read-only observations (not recovery)
+
+After saved status identifies an unresolved **version-1** attempt, an engineer may
+explicitly inspect its current preparation-bound runtime:
+
+```sh
+"$CONTROL" standard workflow validation-reconcile-inspect PROJECT --attempt ATTEMPT_ID
+```
+
+This takes an exact 32-hex attempt ID, never `latest`, and is **engineer-only**;
+it adds no conversational adapter/data-tool capability. Return only its JSON,
+not private files, process lists, Docker inspect documents or SQL output.
+
+The observer:
+
+- Opens only **existing** host/op lock files read-only and acquires nonblocking
+  exclusive locks in normal host-before-op order. Missing, unsafe or held locks
+  mean `execution_lock_unavailable`; no directories or lock files are created.
+- Reads the bounded private receipt/journal and binds their preparation ID and
+  generation to a completed, unconsumed, persisted-ready preparation record.
+  It does not load settings/custom code, hash inputs, revisit delivery registries
+  or assert that the usual proposal/Start readiness checks would pass.
+- Verifies the current Docker daemon, preparation-recorded DB/web IDs, running
+  state, ownership labels and start observations. The legacy journal has no
+  original runtime binding: `matches_current_preparation_record` explicitly does
+  **not** invent one. Endpoints are rechecked during and after observation.
+- Runs only fixed catalogue/session SELECTs in `BEGIN READ ONLY` transactions,
+  with a 5-second statement timeout, 1-second lock timeout and a shared 120-second
+  command budget. It never reads application rows/settings or terminates sessions.
+- Projects scratch database/role presence and comparisons with the fields actually
+  saved. `matches_saved_fields` for old database rows means their saved OID and
+  owner **name**, not a newly asserted owner OID or full v2 custody proof.
+- Compares protected template custody without opening the templates, reports only
+  metadata presence of the exact attempt's host staging directory (never opens
+  its credential/settings files), and inspects the exact recorded sidecar/path
+  without reading guest files. A short-lived Ruby
+  process samples guest `/proc/*/cmdline` privately for exact-attempt references;
+  it reads no process environment and emits only `present`, `none_observed` or
+  `unknown`. Permission, size, transport and budget failures stay unknown. It
+  cannot establish host-side producer completion or detect every detached child.
+
+`inspection: observed` means the bounded observations returned; it is **not**
+validation success, ownership adoption, producer completion or permission to
+retry/clean. `partial`/`unproven` preserve missing observations; transport failures
+are never absence. Resources can differ from saved identities even when inspection
+is `observed`. `historical_producer` and `current_host_producer` always remain
+`unproven`, and **`cleanup_authorized` is always false**, even if all resources and
+process references are currently absent. Evidence, workflow, approvals and the
+prepared generation are not rewritten. The normal installed launcher still does
+its control-image checks and may prepare its ordinary dependency-cache mount;
+this is not a claim that Docker/launcher startup has no incidental host effects.
+
+**Reset is not legacy reconciliation.** Supported run reset removes recorded
+run-owned stacks and exact-run-labeled resources, changes the owned environment
+phase and removes selected run-private working files. It preserves validation
+receipts/journals; validation sidecars have separate attempt labels. An unresolved
+legacy journal still blocks subsequent validation after reset. Do not manually
+mark it cleaned, delete it, bypass the gate, rename the workspace to evade it or
+run v2 recovery-apply on it. Review the safe observations first; any reset and
+legacy retirement need a separate, exact, authorized action and proof of scope.
+
 ## Incremental ownership and exact-attempt recovery (new attempts)
 
 New attempts save version-2 resource journals. Each CREATE intent is written before

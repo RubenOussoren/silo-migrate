@@ -12,6 +12,7 @@ require_relative "../merge_process"
 require_relative "../image_identity"
 require_relative "standard_merge_validation_status"
 require_relative "standard_merge_validation_lifecycle"
+require_relative "standard_merge_validation_reconciliation"
 
 module SiloMigrate
   module Services
@@ -28,6 +29,7 @@ module SiloMigrate
     module StandardMergeValidation
       include StandardMergeValidationStatus
       include StandardMergeValidationLifecycle
+      include StandardMergeValidationReconciliation
       VALIDATION_MAX_SETTINGS = 256 * 1024
       VALIDATION_ALLOWANCE = 512 * 1024 * 1024
       # Chat calls retain their bounded 180s work budget. A deliberate foreground
@@ -769,6 +771,9 @@ module SiloMigrate
             "silo-validation-sql", database, sql_token]
         else
           command += [stack.container("db"), "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database, "-At"]
+        end
+        if context["reconciliation_read_only"]
+          sql = "BEGIN READ ONLY;\nSET LOCAL statement_timeout = '5s';\nSET LOCAL lock_timeout = '1s';\n#{sql}\nCOMMIT;\n"
         end
         result = @runtime.run(command, stdin_data: sql, capture: true, timeout: seconds)
         output = result.stdout.to_s

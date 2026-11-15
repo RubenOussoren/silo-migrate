@@ -90,6 +90,11 @@ class OperatorValidationTest(unittest.TestCase):
                                      env={'PATH': os.environ['PATH']})
         self.assertEqual(0, read_result.returncode, read_result.stderr)
         self.assertEqual({'config': str(config), 'args': read_args}, json.loads(read_result.stdout))
+        inspect_args = ['standard', 'workflow', 'validation-reconcile-inspect', 'invented', '--attempt', 'a' * 32]
+        inspected = subprocess.run([str(launcher), *inspect_args], capture_output=True, text=True, timeout=10,
+                                   env={'PATH': os.environ['PATH']})
+        self.assertEqual(0, inspected.returncode, inspected.stderr)
+        self.assertEqual({'config': str(config), 'args': inspect_args}, json.loads(inspected.stdout))
         with mock.patch.dict(os.environ, {'SILO_CONTROL_CONFIG': observed['config']}, clear=True):
             values, configured = self.control.settings()
         self.assertTrue(configured)
@@ -102,6 +107,21 @@ class OperatorValidationTest(unittest.TestCase):
         self.assertEqual('1', command[command.index('--cpus') + 1])
         self.assertIn('SILO_MERGE_VALIDATION_MODE=chat', command)
         self.assertIn('--read-only', command)
+        with self.assertRaisesRegex(ValueError, '^STANDARD_ARGUMENTS_INVALID$'):
+            self.control.merge_validation_options([self.flag, *args])
+
+    def test_legacy_inspector_uses_read_dispatch_without_long_mode_or_cleanup(self):
+        args = ['standard', 'workflow', 'validation-reconcile-inspect', 'invented', '--attempt', 'a' * 32]
+        with mock.patch.object(self.control, 'host_merge_lifecycle_cleanup', wraps=self.control.host_merge_lifecycle_cleanup) as hook:
+            command = self.launch(args)
+        self.assertEqual(command[-len(args):], args)
+        self.assertEqual('1', command[command.index('--cpus') + 1])
+        self.assertIn('SILO_MERGE_VALIDATION_MODE=chat', command)
+        self.assertIn('--read-only', command)
+        hook.assert_called_once()
+        # The real hook exits before loading state/data tools for a read command.
+        with mock.patch.object(self.control, 'data_tools', side_effect=AssertionError('unexpected state access')):
+            self.control.host_merge_lifecycle_cleanup(args, self.values, self.root, ROOT, self.control)
         with self.assertRaisesRegex(ValueError, '^STANDARD_ARGUMENTS_INVALID$'):
             self.control.merge_validation_options([self.flag, *args])
 

@@ -113,6 +113,14 @@ module SiloMigrate
       exclusive(File.join(File.dirname(@named.root), ".silo-standard-execution.lock"), wait, &block)
     end
 
+    # Diagnostic-only locking: never create a missing directory/lock or touch
+    # workflow state. An absent or unsafe lock cannot prove an idle executor.
+    def with_read_only_execution_locks(&block)
+      read_only_exclusive(File.join(File.dirname(@named.root), ".silo-standard-execution.lock")) do
+        read_only_exclusive(op_lock_path, &block)
+      end
+    end
+
     # A shared probe only overlaps a real holder's exclusive lock; a brief collision
     # with another probe is absorbed by the short retry in `exclusive`.
     def op_lock_held?
@@ -156,6 +164,22 @@ module SiloMigrate
     end
 
     private
+
+    def read_only_exclusive(path)
+      File.open(path, File::RDONLY | File::NOFOLLOW | File::NONBLOCK) do |lock|
+        stat = lock.stat
+        unless stat.file? && stat.uid == Process.uid && (stat.mode & 0o077).zero?
+          raise StandardWorkflowError, "STANDARD_STATE_INVALID"
+        end
+        raise StandardWorkflowError, "STANDARD_BUSY" unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+
+        begin
+          yield
+        ensure
+          lock.flock(File::LOCK_UN)
+        end
+      end
+    end
 
     def exclusive(path, wait)
       File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |lock|

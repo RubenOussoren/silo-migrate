@@ -144,6 +144,7 @@ class MergeValidationPostgresLiveTest(unittest.TestCase):
             self.assertTrue(report["clone_identity_window_closed"])
             self.assertTrue(report["nonpublic_function_denied"])
             self.assertTrue(report["original_privileges_unchanged"])
+            self.assertTrue(report["legacy_reconciliation_read_only"])
             evidence["acceptance"] = report
 
             # Separate empty client DBs: production clone acceptance above remains

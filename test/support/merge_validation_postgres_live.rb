@@ -130,6 +130,40 @@ class LiveValidation
     raise "custody accepted an open or active template"
   end
 
+  def review_runtime_for(_body) = {}
+  def merge_environment_phase(_state, environment) = environment.fetch("phase")
+
+  # Real catalogue/SQL observations with invented saved state. This does not
+  # pretend the shared PG endpoint is an actual web runtime or host producer.
+  def reconciliation_acceptance!(journal)
+    run_id = "run-#{journal.fetch('id')}"
+    generation = "a" * 64
+    legacy = journal.merge("version" => 1, "prepared_from" => run_id, "generation" => generation,
+      "owned_identities" => journal.fetch("owned_identities").map { |row| row.size == 4 ? row.values_at(0, 1, 3) : row })
+    %w[resources producers runtime_binding runtime_profile].each { |key| legacy.delete(key) }
+    state = { "runs" => { run_id => { "status" => "completed", "plan_id" => "invented",
+      "merge_environment" => { "preparation_run_id" => run_id, "phase" => "ready", "generation" => generation } } },
+      "plans" => { "invented" => { "body" => { "operation" => "standard_merge_prepare" } } } }
+    @store.define_singleton_method(:load) { state }
+    @store.define_singleton_method(:with_read_only_execution_locks) { |&block| block.call }
+    mv_write!(mv_path(journal.fetch("id"), "resources.json"), legacy)
+    mv_write!(mv_path(journal.fetch("id"), "json"), { "version" => 1, "receipt_id" => journal.fetch("id"),
+      "status" => "refused", "prepared_from" => run_id, "generation" => generation, "templates" => legacy.fetch("templates") })
+    paths = Dir.glob(File.join(@store.root, "validations", "*"))
+    before = paths.to_h { |path| [path, [File.binread(path), File.stat(path).mtime]] }
+    state_before = JSON.generate(state)
+    report = merge_validation_reconcile_inspect(attempt_id: journal.fetch("id"))
+    assert(report["inspection"] == "observed", "legacy inspection incomplete")
+    assert(report["resources"].values.all? { |row| row == { "presence" => "present", "identity" => "matches_saved_fields" } }, "legacy saved-field comparison failed")
+    assert(report["templates"] == "matches_saved_custody" && report["sessions"] == "none_observed", "legacy catalogue observations failed")
+    assert(report["cleanup_authorized"] == false && report["historical_producer"] == "unproven" && report["current_host_producer"] == "unproven", "legacy observation granted authority")
+    assert(before == paths.to_h { |path| [path, [File.binread(path), File.stat(path).mtime]] } && paths.sort == Dir.glob(File.join(@store.root, "validations", "*")).sort && state_before == JSON.generate(state), "inspection changed saved evidence/state")
+    context = mv_reconcile_context!(legacy)
+    context["lifecycle_journal"] = legacy.merge("runtime_binding" => mv_runtime_snapshot!(context))
+    settings = mv_sql!(context, "SELECT current_setting('transaction_read_only'), current_setting('statement_timeout'), current_setting('lock_timeout');\n")
+    assert(settings.strip == "on|5s|1s", "diagnostic SQL not bounded/read-only")
+  end
+
   def acceptance!
     originals = {}
     original_privileges = {}
@@ -202,6 +236,7 @@ class LiveValidation
     begin
       # CREATE DATABASE TEMPLATE must work with datallowconn=false throughout.
       mv_provision!(CONTEXT.dup, journal, SecureRandom.hex(32))
+      reconciliation_acceptance!(journal)
       { "source" => "merge_source", "base" => "silo_clean_base" }.each do |side, template|
         database = journal.fetch(side)
         assert(snapshot(database) == originals.fetch(template), "clone used drifted inspection contents")
@@ -248,7 +283,7 @@ class LiveValidation
     end
     { "status" => "passed", "postgres_id" => @id, "templates_unchanged" => true,
       "cleanup_confirmed" => true, "clone_identity_window_closed" => true, "active_session_refused" => true,
-      "inspection_drift_ignored" => true, "readonly_acl_verified" => true,
+      "inspection_drift_ignored" => true, "readonly_acl_verified" => true, "legacy_reconciliation_read_only" => true,
       "nonpublic_function_denied" => true, "original_privileges_unchanged" => true }
   end
 end

@@ -799,7 +799,7 @@ def main(args):
     host_merge_lifecycle_cleanup(args, values, base, repo, sys.modules.get(__name__))
     # Short UI reads need not throttle Ruby startup to a quarter CPU. Mutation/executor ceilings
     # stay unchanged, as do memory, mounts, identity checks and every other isolation setting.
-    read_only = args[:2] == ["standard", "status"] or args[:3] in (["standard", "plan", "show"], ["standard", "run", "show"], ["standard", "workflow", "validation-status"])
+    read_only = args[:2] == ["standard", "status"] or args[:3] in (["standard", "plan", "show"], ["standard", "run", "show"], ["standard", "workflow", "validation-status"], ["standard", "workflow", "validation-reconcile-inspect"])
     cpus = "1" if read_only else "0.25"
     command = ["docker", "run", *mode, "--pull=never", "--restart", "no", "--network", "host", "--read-only",
                "--user", f"{os.getuid()}:{os.getgid()}", "--group-add", str(Path("/var/run/docker.sock").stat().st_gid),
