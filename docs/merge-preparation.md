@@ -133,6 +133,62 @@ The legacy one-shot `--operation merge --source … --base-site …` engineer pa
 remains for compatibility, but does not give a pre-merge analyst pause. Do not use
 it to skip needed decision support or bypass a refused compatibility check.
 
+## Large restored databases: explicit operator validation
+
+A compressed backup's size is not the size of its restored database. Custom Merge
+proposal validation and Start's mandatory fresh validation each clone the sealed
+Source and Base databases. A large Base can take longer to copy than chat's shared
+180-second validation work budget. A proposal timeout is not a Merge failure or
+proof that settings/layer rules passed. Do not blindly retry after a
+`STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED` refusal: a new attempt can have its
+own quarantined resources even if an earlier attempt was recovered successfully.
+
+For this case, the engineer may deliberately use the foreground host launcher
+option `--long-merge-validation`. It allows **one shared 1,800-second (30-minute)
+validation work budget**, not 30 minutes for each clone. The normal 120-second
+non-clone SQL cap, 150-second guest call cap and separate 45-second cleanup budget
+are unchanged. It does not make slow storage fast, guarantee capacity, skip a
+policy check, recover resources, change settings or re-Prepare the environment.
+
+This is an invocation-only operator path, not a persistent configuration setting
+or a migration-data tool option. Normal chat tools keep their existing limits;
+do not run the long command through a chat wrapper with a 300-second timeout.
+The launcher overrides inherited validation-mode environment variables. A shell
+under the service account remains trusted host access, not a security sandbox.
+
+After separately authorized recovery of any outstanding validation attempt, enter
+`silo shell` as the operator. From that service-account shell, propose **once**:
+
+```sh
+CONTROL=/srv/silo-migrate/current/bin/silo-migrate-control
+"$CONTROL" --long-merge-validation standard plan propose PROJECT --operation merge \
+  --prepared-from PREPARATION_RUN_ID --generation GENERATION_SHA256 \
+  --intent custom --settings SETTINGS_INPUT_ID
+```
+
+Use the actual installation prefix if not `/srv/silo-migrate`. Keep the terminal
+open; this is foreground work and the command may be quiet while copying. Do not
+interrupt it just because no text appears, run a second proposal in parallel, or
+perform a separate validate-then-propose cycle. Read the returned exact plan and
+complete normal engineer approval; layer review acceptance remains independent.
+A failed/unknown result is not authorization to repeat cleanup or retry.
+
+**Only after exact plan approval and a separate engineer Start decision**, use:
+
+```sh
+"$CONTROL" --long-merge-validation start-run PROJECT APPROVED_PLAN_ID
+```
+
+The foreground claim retains its mandatory freshness/validation gates and has a
+33-minute outer bound to accommodate work, cleanup and launcher headroom. A
+refused claim does not launch the merger. Only a successful claim launches the
+existing detached run executor; this is not a new scheduler or automatic Start.
+The long option is not retained for unrelated commands or persisted in a plan.
+Do not use the ordinary Runs-tab Start for a workload known to need the long
+validation path: it retains the normal short budget. Observe the resulting run
+through the usual Runs page and trusted run-evidence tools. Result verification,
+backup release and restricted hosted-review handoff remain unchanged.
+
 ## What source upgrading means
 
 The merger reads a database and an uploads directory, not a newly exported source

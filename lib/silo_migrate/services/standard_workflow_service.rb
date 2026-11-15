@@ -122,6 +122,7 @@ module SiloMigrate
         "STANDARD_MERGE_CONTRACT_INVALID" => "Correct and commit the declared workflow contract, then discover, validate and re-propose. Unknown schema features are refused, never ignored.",
         "STANDARD_MERGE_ENGINE_UNSUPPORTED" => "Use a shipped, tested engine adapter. A project contract cannot invent capabilities or choose arbitrary executable plugins.",
         "STANDARD_MERGE_VALIDATION_REQUIRED" => "Validate the exact settings, layer and prepared generation before proposing and approving a new custom merge. An older approval without this receipt cannot run.",
+        "STANDARD_MERGE_VALIDATION_MODE_INVALID" => "Use the normal chat path or the explicit operator long-validation command; do not configure an arbitrary or unbounded validation mode.",
         "STANDARD_MERGE_VALIDATION_FAILED" => "Read the trusted workflow validation result for the offending key or fixed refusal. Correct the input or unresolved decision and validate again; do not bypass the gate or automatically re-Prepare.",
         "STANDARD_MERGE_VALIDATION_STALE" => "The approved validation no longer matches its code, settings, assets or prepared generation. Preserve the environment, revalidate and propose a new exact plan only if it remains ready and unused.",
         "STANDARD_MERGE_VALIDATION_UNPROVEN" => "Validation could not prove its outcome. Inspect private evidence and owned-resource status; do not consume the generation, guess success or race an uncertain guest process.",

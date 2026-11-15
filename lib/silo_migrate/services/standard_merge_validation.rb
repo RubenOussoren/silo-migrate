@@ -24,9 +24,12 @@ module SiloMigrate
     module StandardMergeValidation
       VALIDATION_MAX_SETTINGS = 256 * 1024
       VALIDATION_ALLOWANCE = 512 * 1024 * 1024
-      # Stock custom tools have a 300-second ceiling. Leave time for cleanup and
-      # returning typed refusal instead of letting the outer wrapper kill us.
+      # Chat calls retain their bounded 180s work budget. A deliberate foreground
+      # operator invocation may allow larger restored databases 30 minutes, without
+      # changing any policy, non-clone SQL, guest or cleanup limit.
       VALIDATION_BUDGET = 180
+      OPERATOR_VALIDATION_BUDGET = 1800
+      VALIDATION_MODE_ENV = "SILO_MERGE_VALIDATION_MODE"
       VALIDATION_CLEANUP_BUDGET = 45
       VALIDATION_PREFIX = "SILO_MERGE_VALIDATION:"
       VALIDATION_RESULT_KEYS = %w[version status reason key_path approved_ids selected_ids_sha256 audit checks asset_preflight_sha256 selection_sha256 owner_preflight_sha256].freeze
@@ -93,7 +96,7 @@ module SiloMigrate
             end
             body = state.fetch("plans").fetch(run.fetch("plan_id")).fetch("body")
             context = { "prepared_from" => prepared_from, "generation" => generation, "mode" => "checks", "checks" => queries,
-                        "runtime_profile" => review_runtime_for(body), "deadline" => mv_clock + VALIDATION_BUDGET }
+                        "runtime_profile" => review_runtime_for(body), "deadline" => mv_clock + mv_work_budget }
             templates = mv_custody!(context)
             disk_headroom!(templates.values.sum { |row| row.fetch("bytes") } + VALIDATION_ALLOWANCE)
             id = SecureRandom.hex(16)
@@ -181,7 +184,7 @@ module SiloMigrate
       end
 
       def merge_validation_execute!(context, journal)
-        context = context.merge("deadline" => context.fetch("deadline", mv_clock + VALIDATION_BUDGET))
+        context = context.merge("deadline" => context.fetch("deadline", mv_clock + mv_work_budget))
         host_dir = nil
         mv_journal!(journal)
         with_review_runtime(context.fetch("runtime_profile")) do
@@ -360,7 +363,7 @@ module SiloMigrate
         mv_error!("STANDARD_MERGE_VALIDATION_STALE") unless receipt["status"] == "passed" && receipt["cleanup_confirmed"] == true && binding == mv_binding(receipt, bytes)
         prepared = body.fetch("prepared_from")
         mv_error!("STANDARD_MERGE_VALIDATION_STALE") unless prepared["run_id"] == receipt["prepared_from"] && prepared["generation"] == receipt["generation"] && body.dig("roles", "settings") == receipt["settings"] && body.dig("merge", "layer") == receipt["layer"]
-        context = mv_context!(prepared_from: receipt["prepared_from"], generation: receipt["generation"], settings: receipt["settings"], layer: receipt["layer"], claimed_run_id: claimed_run_id, claimed_body: body).merge("deadline" => mv_clock + VALIDATION_BUDGET)
+        context = mv_context!(prepared_from: receipt["prepared_from"], generation: receipt["generation"], settings: receipt["settings"], layer: receipt["layer"], claimed_run_id: claimed_run_id, claimed_body: body).merge("deadline" => mv_clock + mv_work_budget)
         mv_error!("STANDARD_MERGE_VALIDATION_STALE") unless mv_facts(context) == receipt.fetch("facts")
         unless body["code_identity"] == context.fetch("code_sha256") && body["runtime_lock_sha256"] == context.fetch("runtime_sha256") && body.dig("merge", "contract") == context.fetch("contract")
           mv_error!("STANDARD_MERGE_VALIDATION_STALE")
@@ -439,7 +442,7 @@ module SiloMigrate
 
       def mv_validate!(prepared_from:, generation:, settings:, checks:, deadline: nil)
         mv_no_resources!
-        context = mv_context!(prepared_from: prepared_from, generation: generation, settings: settings).merge("deadline" => deadline || mv_clock + VALIDATION_BUDGET)
+        context = mv_context!(prepared_from: prepared_from, generation: generation, settings: settings).merge("deadline" => deadline || mv_clock + mv_work_budget)
         mv_error!("STANDARD_MERGE_VALIDATION_UNSUPPORTED") unless respond_to?(:merge_validation_execute!, true)
         # Validate the bounded request shape before any provision, not in Rails.
         SiloMergeContract.tree!(checks)
@@ -578,6 +581,14 @@ module SiloMigrate
         context.delete("sql_timeout_seconds")
       end
 
+      def mv_work_budget
+        case ENV.fetch(VALIDATION_MODE_ENV, "chat")
+        when "chat" then VALIDATION_BUDGET
+        when "operator" then OPERATOR_VALIDATION_BUDGET
+        else mv_error!("STANDARD_MERGE_VALIDATION_MODE_INVALID")
+        end
+      end
+
       def mv_failure_diagnostic(context, error)
         step = context["validation_step"]
         reason = error.code if error.is_a?(StandardWorkflowError)
@@ -586,7 +597,7 @@ module SiloMigrate
           "deadline_reached" => context["deadline"].is_a?(Numeric) ? mv_clock >= context["deadline"] : nil }
         outcome, seconds = context.values_at("sql_outcome", "sql_timeout_seconds")
         record["command_outcome"] = outcome if %w[failed timeout_or_interrupted unknown].include?(outcome)
-        record["command_timeout_seconds"] = seconds if seconds.is_a?(Integer) && seconds.between?(1, VALIDATION_BUDGET)
+        record["command_timeout_seconds"] = seconds if seconds.is_a?(Integer) && seconds.between?(1, OPERATOR_VALIDATION_BUDGET)
         record
       rescue StandardError
         { "step" => "unknown", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "deadline_reached" => nil }
@@ -651,7 +662,7 @@ module SiloMigrate
         mv_sql!(context, "CREATE ROLE #{role} LOGIN PASSWORD '#{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;\n", step: "create_role")
         { "source" => "merge_source", "base" => "silo_clean_base" }.each do |side, template|
           name = journal.fetch(side)
-          mv_sql!(context, "CREATE DATABASE #{name} TEMPLATE #{template} OWNER postgres;\nREVOKE ALL ON DATABASE #{name} FROM PUBLIC;\nGRANT CONNECT ON DATABASE #{name} TO #{role};\nREVOKE CREATE, TEMPORARY ON DATABASE #{name} FROM #{role};\nALTER ROLE #{role} IN DATABASE #{name} SET default_transaction_read_only = on;\n", max_seconds: VALIDATION_BUDGET, step: "clone_#{side}")
+          mv_sql!(context, "CREATE DATABASE #{name} TEMPLATE #{template} OWNER postgres;\nREVOKE ALL ON DATABASE #{name} FROM PUBLIC;\nGRANT CONNECT ON DATABASE #{name} TO #{role};\nREVOKE CREATE, TEMPORARY ON DATABASE #{name} FROM #{role};\nALTER ROLE #{role} IN DATABASE #{name} SET default_transaction_read_only = on;\n", max_seconds: mv_work_budget, step: "clone_#{side}")
           # No owner/default/analyst grants: only the random role sees either clone.
           mv_sql!(context, <<~SQL, database: name, step: "restrict_#{side}")
             DO $silo_validation$

@@ -14,6 +14,10 @@ import sys
 CONTROL_REF = "ruby@sha256:32ca6f94a3ffe387eb1b9d34edc4be8e9308da1c80a3dce8b7b8310d84949240"
 # Same qualified control payload as runtime/profiles/discourse-2026.11.0-latest-3158c750.json.
 DEFAULT_PROFILE = "discourse-2026.11.0-latest-3158c750"
+LONG_MERGE_VALIDATION_FLAG = "--long-merge-validation"
+# Only the foreground operator path can exceed chat's 300-second ceiling.
+# The 30-minute work budget still needs cleanup and launcher/headroom time.
+LONG_MERGE_CLAIM_TIMEOUT = 1980
 KEYS = {"SILO_MIGRATE_BASE_PATH", "SILO_CONTROL_GEMS", "SILO_CONTROL_SITE_CACHE",
         "SILO_RUNTIME_PROFILES_DIR", "SILO_CONTROL_IMAGE_REF", "SILO_PROTECTED_SESSIONS"}
 
@@ -22,7 +26,7 @@ def refuse(code):
     raise ValueError(code)
 
 
-def capture(args, extra_env=None, passthrough=False):
+def capture(args, extra_env=None, passthrough=False, timeout=600):
     # No inherited GIT_* settings (e.g. GIT_CONFIG_PARAMETERS) reach host Git, and
     # every call is bounded: an include pointing at a FIFO must not hang a held lock.
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
@@ -30,7 +34,7 @@ def capture(args, extra_env=None, passthrough=False):
     env.update(extra_env or {})
     try:
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-                                stdin=subprocess.DEVNULL, timeout=600)
+                                stdin=subprocess.DEVNULL, timeout=timeout)
     except subprocess.TimeoutExpired:
         refuse("STANDARD_OPERATION_FAILED")
     if result.returncode:
@@ -596,7 +600,31 @@ def prepare_review_runtime(args, values, base, repo):
     values["SILO_REVIEW_RUNTIME_PROFILES_DIR"] = str(base.parent / "state/review-runtimes/profiles")
 
 
+def merge_validation_options(args):
+    """An invocation-only operator option; never a persistent or model JSON knob."""
+    if LONG_MERGE_VALIDATION_FLAG not in args:
+        return args, False
+    if args[0] != LONG_MERGE_VALIDATION_FLAG or args.count(LONG_MERGE_VALIDATION_FLAG) != 1:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    args = args[1:]
+    supported = ((args[:1] == ["start-run"] and len(args) == 3) or
+                 (args[:2] == ["standard", "workflow"] and args[2:3] in (["validate"], ["exists"])) or
+                 (args[:2] == ["standard", "run"] and args[2:3] in (["claim"], ["start"]) and len(args) == 5))
+    if args[:3] == ["standard", "plan", "propose"]:
+        def option(key):
+            if args.count(key) != 1:
+                return None
+            index = args.index(key) + 1
+            return args[index] if index < len(args) else None
+        supported = (option("--operation") == "merge" and option("--intent") == "custom" and
+                     all(option(key) is not None for key in ("--prepared-from", "--generation", "--settings")))
+    if not supported:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    return args, True
+
+
 def main(args):
+    args, long_validation = merge_validation_options(args)
     self = Path(__file__).resolve()
     repo = self.parent.parent
     values, configured = settings()
@@ -660,7 +688,9 @@ def main(args):
     if args[:1] == ["start-run"]:
         if len(args) != 3:
             refuse("STANDARD_ARGUMENTS_INVALID")
-        claimed = json.loads(capture([str(self), "standard", "run", "claim", *args[1:]], passthrough=True))
+        claim_args = ([LONG_MERGE_VALIDATION_FLAG] if long_validation else []) + ["standard", "run", "claim", *args[1:]]
+        claim_options = {"timeout": LONG_MERGE_CLAIM_TIMEOUT} if long_validation else {}
+        claimed = json.loads(capture([str(self), *claim_args], passthrough=True, **claim_options))
         run_id = claimed["run_id"]
         print(json.dumps(claimed), flush=True)
         result = subprocess.run([str(self), "--detach", "standard", "run", "execute", args[1], run_id], stdout=subprocess.DEVNULL)
@@ -704,7 +734,10 @@ def main(args):
                    "GEM_HOME": "/gems", "GEM_PATH": "/gems:/gems/ruby/3.3.0", "BUNDLE_PATH": "/gems",
                    "BUNDLE_FROZEN": "true", "BUNDLE_APP_CONFIG": "/tmp/bundle-config", "BUNDLE_AUTO_INSTALL": "false",
                    "BUNDLE_DISABLE_VERSION_CHECK": "true", "RUBYOPT": "-W0", "SILO_MIGRATE_BASE_PATH": str(base),
-                   "SILO_MIGRATE_USER_CONFIG": "/tmp/user-config.env", "GIT_CONFIG_NOSYSTEM": "1"}
+                   "SILO_MIGRATE_USER_CONFIG": "/tmp/user-config.env", "GIT_CONFIG_NOSYSTEM": "1",
+                   # Never inherit this from process env or silo-control.env. Chat
+                   # tools cannot forward the operator flag or change their limits.
+                   "SILO_MERGE_VALIDATION_MODE": "operator" if long_validation else "chat"}
     for key, value in environment.items():
         command.extend(["-e", key + "=" + value])
     command.extend(["-w", str(repo), image, "bundle", "_2.6.9_", "exec", "ruby", "bin/silo-migrate", *args])

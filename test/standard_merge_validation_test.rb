@@ -114,10 +114,104 @@ class StandardMergeValidationTest < Minitest::Test
   end
 
   def setup
+    @validation_mode = ENV.delete(SiloMigrate::Services::StandardMergeValidation::VALIDATION_MODE_ENV)
     @directory = Dir.mktmpdir
     @host = Host.new(@directory)
   end
-  def teardown = FileUtils.remove_entry(@directory)
+  def teardown
+    key = SiloMigrate::Services::StandardMergeValidation::VALIDATION_MODE_ENV
+    @validation_mode.nil? ? ENV.delete(key) : ENV[key] = @validation_mode
+    FileUtils.remove_entry(@directory)
+  end
+
+  def operator_validation!
+    ENV[SiloMigrate::Services::StandardMergeValidation::VALIDATION_MODE_ENV] = "operator"
+  end
+
+  def test_operator_copy_can_exceed_chat_budget_without_changing_other_sql_or_cleanup_caps
+    operator_validation!
+    base_timeouts = []
+    clock_runtime do |sql, options, clock, _result|
+      clock[0] += 5 if sql.start_with?("CREATE DATABASE silo_val_s_")
+      if sql.start_with?("CREATE DATABASE silo_val_b_")
+        base_timeouts << options.fetch(:timeout)
+        clock[0] += 300
+      end
+      nil
+    end
+    receipt = @host.validate
+    assert_equal "passed", receipt["status"]
+    assert_equal [1795], base_timeouts
+    refute receipt.key?("diagnostics")
+    # Start must perform its original fresh validation, not skip or auto-rebind it.
+    assert @host.gate(@host.body(receipt))
+    assert_equal [1795, 1795], base_timeouts
+    @host.runtime.calls.each do |_, options|
+      sql = options.fetch(:stdin_data)
+      next if sql.start_with?("CREATE DATABASE silo_val_")
+      assert_operator options.fetch(:timeout), :<=, sql.include?("DROP ") ? 45 : 120
+    end
+    assert_equal 180, SiloMigrate::Services::StandardMergeValidation::VALIDATION_BUDGET
+    assert_equal 1800, SiloMigrate::Services::StandardMergeValidation::OPERATOR_VALIDATION_BUDGET
+  end
+
+  def test_operator_clones_share_one_budget_not_a_new_allowance_per_clone
+    operator_validation!
+    base_timeout = nil
+    clock_runtime do |sql, options, clock, _result|
+      clock[0] += 1400 if sql.start_with?("CREATE DATABASE silo_val_s_")
+      if sql.start_with?("CREATE DATABASE silo_val_b_")
+        base_timeout = options.fetch(:timeout)
+        clock[0] += 300
+      end
+      nil
+    end
+    assert_equal "passed", @host.validate["status"]
+    assert_equal 400, base_timeout
+  end
+
+  def test_operator_timeout_keeps_full_bounded_diagnostics_and_quarantine
+    operator_validation!
+    clock_runtime do |sql, options, clock, _result|
+      if sql.start_with?("CREATE DATABASE silo_val_b_")
+        clock[0] += options.fetch(:timeout)
+        next OpenStruct.new(success?: false, status: nil, stdout: "PRIVATE", stderr: "PRIVATE")
+      end
+      nil
+    end
+    receipt = @host.validate
+    assert_equal "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", receipt["reason"]
+    assert_equal 1800, receipt.dig("diagnostics", "work", "command_timeout_seconds")
+    assert_equal true, receipt.dig("diagnostics", "work", "deadline_reached")
+    assert_equal false, receipt["cleanup_confirmed"]
+    refute receipt.key?("binding")
+    refute @host.runtime.calls.any? { |_, options| options[:stdin_data].include?("DROP DATABASE") }
+    refute_includes JSON.generate(receipt), "PRIVATE"
+  end
+
+  def test_invalid_validation_mode_fails_before_sql_or_new_journal
+    ENV[SiloMigrate::Services::StandardMergeValidation::VALIDATION_MODE_ENV] = "unbounded"
+    assert_equal "STANDARD_MERGE_VALIDATION_MODE_INVALID", @host.validate["reason"]
+    assert_empty @host.runtime.calls
+    assert_empty Dir.glob(File.join(@directory, "validations", "*"))
+  end
+
+  def test_operator_exact_existence_checks_use_the_same_long_work_budget
+    operator_validation!
+    @host.contract_bytes = nil
+    timeout = nil
+    clock_runtime do |sql, options, clock, _result|
+      if sql.start_with?("CREATE DATABASE silo_val_b_")
+        timeout = options.fetch(:timeout)
+        clock[0] += 300
+      end
+      nil
+    end
+    result = @host.merge_exact_existence(prepared_from: "prep", generation: "a" * 64, queries: [{ "kind" => "tag", "name" => "fixture" }])
+    assert_equal "passed", result["status"]
+    assert_equal 1800, timeout
+    refute result.key?("binding")
+  end
 
   # Simulate elapsed monotonic time without slow or oversized fixture databases.
   def clock_runtime(&script)
