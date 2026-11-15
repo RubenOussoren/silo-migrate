@@ -36,7 +36,7 @@ class StandardMergeValidationTest < Minitest::Test
 
   class Runtime
     attr_reader :calls
-    attr_accessor :cleanup_failure, :custody_changed
+    attr_accessor :cleanup_failure, :custody_changed, :base_bytes, :template_owner, :template_open, :template_sessions
     def initialize
       @calls = []
     end
@@ -49,7 +49,7 @@ class StandardMergeValidationTest < Minitest::Test
         role = sql[/silo_val_r_[0-9a-f]{32}/]
         "#{base}|101|postgres\n#{source}|102|postgres\n#{role}|201|f|f|f|f|f|f|t\n"
       elsif sql.include?("pg_database_size")
-        "merge_source|#{custody_changed ? 99 : 11}|10|f|0|100\nsilo_clean_base|12|10|f|0|200\n"
+        "merge_source|#{custody_changed ? 99 : 11}|#{template_owner || 10}|#{template_open ? 't' : 'f'}|#{template_sessions || 0}|100\nsilo_clean_base|12|#{template_owner || 10}|#{template_open ? 't' : 'f'}|#{template_sessions || 0}|#{base_bytes || 200}\n"
       elsif sql.include?("SELECT count(*) FROM pg_database")
         "0\n0\n"
       else
@@ -617,6 +617,133 @@ class StandardMergeValidationTest < Minitest::Test
     @host.settings_bytes = "policy: carried\n"
     @host.code_sha = "9" * 64
     assert_raises(SiloMigrate::StandardWorkflowError) { @host.gate(body) }
+  end
+
+  def test_size_change_during_clone_keeps_original_capacity_snapshot_and_completes_cleanup
+    runtime = @host.runtime
+    clock_runtime do |sql, _options, _clock, _result|
+      runtime.base_bytes = 8392 if sql.start_with?("CREATE DATABASE silo_val_b_")
+      nil
+    end
+    result = @host.validate
+    assert_equal "passed", result["status"]
+    assert_equal true, result["cleanup_confirmed"]
+    refute result.key?("diagnostics")
+    receipt = JSON.parse(File.read(File.join(@directory, "validations", "#{result.fetch('receipt_id')}.json")))
+    assert_equal 200, receipt.dig("templates", "silo_clean_base", "bytes")
+    assert_equal 300 + SiloMigrate::Services::StandardMergeValidation::VALIDATION_ALLOWANCE, @host.capacity
+    journal = JSON.parse(File.read(File.join(@directory, "validations", "#{result.fetch('receipt_id')}.resources.json")))
+    assert_equal 200, journal.dig("templates", "silo_clean_base", "bytes")
+    assert_equal true, journal["provision_complete"]
+    assert_equal true, journal["cleanup_confirmed"]
+  end
+
+  def test_size_change_after_guest_does_not_make_confirmed_cleanup_a_failure
+    original = @host.method(:merge_validation_execute!)
+    @host.define_singleton_method(:merge_validation_execute!) do |context, journal|
+      result = original.call(context, journal)
+      runtime.base_bytes = 192
+      result
+    end
+    result = @host.validate
+    assert_equal "passed", result["status"]
+    assert_equal true, result["cleanup_confirmed"]
+    assert_equal 200, result.dig("templates", "silo_clean_base", "bytes")
+    refute result.key?("diagnostics")
+  end
+
+  def test_preclaim_size_changes_revalidate_without_rebinding_or_rewriting_approved_receipt
+    result = @host.validate
+    body = @host.body(result)
+    binding = Marshal.load(Marshal.dump(body.dig("merge", "process")))
+    path = File.join(@directory, "validations", "#{result.fetch('receipt_id')}.json")
+    bytes = File.binread(path)
+    @host.runtime.base_bytes = 8392
+    assert @host.gate(body)
+    assert_equal binding, body.dig("merge", "process")
+    assert_equal bytes, File.binread(path)
+    receipts = Dir.glob(File.join(@directory, "validations", "*.json")).reject { |file| file.end_with?(".resources.json") }.map { |file| JSON.parse(File.read(file)) }
+    assert_equal [200, 8392], receipts.map { |receipt| receipt.dig("templates", "silo_clean_base", "bytes") }.sort
+    assert_equal 4, @host.runtime.calls.count { |_, options| options[:stdin_data].start_with?("CREATE DATABASE") }
+    assert_equal "ready", @host.store.state.dig("runs", "prep", "merge_environment", "phase")
+  end
+
+  def test_checks_only_size_drift_still_completes_and_issues_no_start_binding
+    runtime = @host.runtime
+    clock_runtime do |sql, _options, _clock, _result|
+      runtime.base_bytes = 8392 if sql.start_with?("CREATE DATABASE silo_val_b_")
+      nil
+    end
+    result = @host.merge_exact_existence(prepared_from: "prep", generation: "a" * 64, queries: [{ "kind" => "tag", "name" => "fixture" }])
+    assert_equal "passed", result["status"]
+    assert_equal true, result["cleanup_confirmed"]
+    refute result.key?("binding")
+    refute result.key?("diagnostics")
+  end
+
+  def test_identity_change_during_clone_still_quarantines_without_finalized_ownership
+    runtime = @host.runtime
+    clock_runtime do |sql, _options, _clock, _result|
+      runtime.custody_changed = true if sql.start_with?("CREATE DATABASE silo_val_b_")
+      nil
+    end
+    result = @host.validate
+    assert_equal "STANDARD_MERGE_TEMPLATE_CUSTODY", result.dig("diagnostics", "work", "reason")
+    assert_equal "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", result["reason"]
+    assert_equal false, result["cleanup_confirmed"]
+    journal = JSON.parse(File.read(File.join(@directory, "validations", "#{result.fetch('receipt_id')}.resources.json")))
+    refute journal["provision_complete"]
+    refute journal.key?("owned_identities")
+    refute @host.runtime.calls.any? { |_, options| options[:stdin_data].include?("DROP DATABASE") }
+  end
+
+  def test_owner_open_connection_and_active_session_changes_still_refuse_gate
+    result = @host.validate
+    body = @host.body(result)
+    before = @host.runtime.calls.count { |_, options| options[:stdin_data].start_with?("CREATE DATABASE") }
+    { template_owner: 11, template_open: true, template_sessions: 1 }.each do |key, value|
+      @host.runtime.public_send("#{key}=", value)
+      assert_raises(SiloMigrate::StandardWorkflowError) { @host.gate(body) }
+      @host.runtime.public_send("#{key}=", nil)
+    end
+    assert_equal before, @host.runtime.calls.count { |_, options| options[:stdin_data].start_with?("CREATE DATABASE") }
+    assert_equal "ready", @host.store.state.dig("runs", "prep", "merge_environment", "phase")
+  end
+
+  def test_custody_comparison_validates_complete_typed_snapshots_and_never_mutates_them
+    original = @host.send(:mv_custody!, { "prepared_from" => "prep" })
+    changed = Marshal.load(Marshal.dump(original))
+    changed.fetch("silo_clean_base")["bytes"] += 8192
+    assert @host.send(:mv_same_template_custody?, changed, original)
+    assert_equal 200, original.dig("silo_clean_base", "bytes")
+    assert_equal 8392, changed.dig("silo_clean_base", "bytes")
+    [nil, {}, original.reject { |name, _| name == "merge_source" }, original.merge("extra" => {})].each do |bad|
+      refute @host.send(:mv_same_template_custody?, bad, original)
+      refute @host.send(:mv_same_template_custody?, original, bad)
+    end
+    { "oid" => [nil, 0, "12", true], "owner" => [nil, 0, 10.0, false], "bytes" => [nil, -1, "200", 200.0, true] }.each do |key, values|
+      values.each do |value|
+        bad = Marshal.load(Marshal.dump(original))
+        bad.fetch("silo_clean_base")[key] = value
+        refute @host.send(:mv_same_template_custody?, bad, original)
+      end
+    end
+    bad = Marshal.load(Marshal.dump(original)); bad.fetch("silo_clean_base")["extra"] = true
+    refute @host.send(:mv_same_template_custody?, bad, original)
+  end
+
+  def test_size_change_does_not_bypass_asset_freshness_or_policy_refusal
+    result = @host.validate
+    @host.runtime.base_bytes = 8392
+    @host.asset_digest = "8" * 64
+    error = assert_raises(SiloMigrate::StandardWorkflowError) { @host.gate(@host.body(result)) }
+    assert_equal "STANDARD_MERGE_VALIDATION_STALE", error.code
+    @host.asset_digest = "e" * 64
+    @host.guest_failure = true
+    refused = @host.validate
+    assert_equal "refused", refused["status"]
+    assert_equal true, refused["cleanup_confirmed"]
+    refute refused.key?("binding")
   end
 
   def test_custody_change_refuses_gate

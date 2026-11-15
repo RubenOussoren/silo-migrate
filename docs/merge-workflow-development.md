@@ -320,7 +320,39 @@ inside the trusted tool's 240-second backend timeout. Database cloning may use
 that existing remaining work budget (at most 180 seconds), rather than the ordinary
 120-second per-SQL cap. Each clone shares the original deadline; it does not receive
 a fresh allowance. Other SQL keeps its 120-second cap, also bounded by the remaining
-deadline, and cleanup keeps its separate 45-second budget.
+deadline, and cleanup keeps its separate 45-second budget. These are the chat/default
+limits; the explicit foreground operator long-validation path and its separate
+Start invocation are documented in [merge preparation](merge-preparation.md#large-restored-databases-explicit-operator-validation).
+
+Template custody checks the exact database names, stable OID/owner identities,
+closed connection flags and zero sessions on every fresh sample. Physical byte
+size is retained for capacity planning and private evidence, **not compared as an
+immutable identity or logical-content checksum**. PostgreSQL background maintenance
+can visit a database despite `ALLOW_CONNECTIONS false`: its
+[autovacuum worker explicitly overrides that flag](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/postmaster/autovacuum.c).
+[`pg_database_size` sums physical directory-entry sizes](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/adt/dbsize.c),
+which can change while logical rows stay the same. Exact-size equality could
+therefore refuse a valid protected template after cloning or at Start.
+
+There is no size tolerance or special 8 KiB exception. Both snapshots must retain
+complete, typed metadata; identity/owner changes and any open/active template still
+refuse. Recorded sizes, journals and approved receipt hashes are never rewritten
+or rebound to hide drift. Start still performs fresh validation and compares all
+settings/code/runtime/selection/asset/owner-feasibility bindings. Asset, policy,
+output, backup and baseline-preservation checks are unchanged; a physical-size
+observation alone proves neither content integrity nor corruption. Quarantined
+resources still require separate exact-scope recovery, never automatic cleanup.
+
+Opt-in invented-data regression on the cached pinned PostgreSQL18 image:
+
+```sh
+SILO_MERGE_CUSTODY_SIZE_LIVE=1 python3 -I -B test/merge_template_custody_live_test.py
+```
+
+It demonstrates background-maintenance size drift with closed/idle templates,
+matching identities/owners and unchanged logical rows, then exercises the actual
+production comparator and rejects identity/owner changes. It does not exercise the
+complete host claim/approval lifecycle or prove a particular customer's drift cause.
 
 Completed failed host calls add private `diagnostics.work` and/or
 `diagnostics.cleanup` to the receipt. They contain fixed-vocabulary `step`/`reason`,

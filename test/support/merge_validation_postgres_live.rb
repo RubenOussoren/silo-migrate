@@ -194,7 +194,7 @@ class LiveValidation
         end
         assert(snapshot(database) == originals.fetch(template), "attempted writes changed clone")
       end
-      assert(mv_custody!(CONTEXT) == journal.fetch("templates"), "templates changed during grants")
+      assert(mv_same_template_custody?(mv_custody!(CONTEXT), journal.fetch("templates")), "template identity/owner changed during grants")
     ensure
       mv_cleanup!(CONTEXT, journal)
     end
@@ -202,7 +202,7 @@ class LiveValidation
     # dependencies. Cleanup is identity-bound, not repeatable name-only deletion.
     assert(sql("SELECT count(*) FROM pg_shdepend WHERE refobjid=(SELECT oid FROM pg_roles WHERE rolname='#{role}');").strip == "0", "role dependencies survived")
     assert(sql("SELECT datname, oid, datdba FROM pg_database WHERE datname IN ('merge_source','silo_clean_base') ORDER BY datname;") == identities, "template identities changed")
-    assert(mv_custody!(CONTEXT) == journal.fetch("templates"), "custody changed after cleanup")
+    assert(mv_same_template_custody?(mv_custody!(CONTEXT), journal.fetch("templates")), "custody changed after cleanup")
     # Reopen ONLY after the complete cloning/grants/cleanup phase to compare all
     # original invented rows against the snapshot recorded before closure.
     originals.each do |name, expected|

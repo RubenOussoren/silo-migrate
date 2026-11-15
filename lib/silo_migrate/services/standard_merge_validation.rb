@@ -133,7 +133,7 @@ module SiloMigrate
               begin
                 cleanup_context = context.merge("deadline" => mv_clock + VALIDATION_CLEANUP_BUDGET)
                 mv_cleanup!(cleanup_context, journal)
-                mv_error!("STANDARD_MERGE_TEMPLATE_CUSTODY") unless mv_custody!(cleanup_context) == templates
+                mv_error!("STANDARD_MERGE_TEMPLATE_CUSTODY") unless mv_same_template_custody?(mv_custody!(cleanup_context), templates)
                 mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") if uncertain
                 journal.merge!("status" => "cleaned", "cleanup_confirmed" => true)
                 mv_write!(mv_path(id, "resources.json"), journal)
@@ -372,14 +372,14 @@ module SiloMigrate
         unless setting && setting["type"] == "merge-settings" && setting["sha256"] == context.fetch("settings_sha256") && setting["bytes"] == context.fetch("settings_bytes").bytesize
           mv_error!("STANDARD_MERGE_VALIDATION_STALE")
         end
-        mv_error!("STANDARD_MERGE_VALIDATION_STALE") unless mv_custody!(context) == receipt.fetch("templates")
+        mv_error!("STANDARD_MERGE_VALIDATION_STALE") unless mv_same_template_custody?(mv_custody!(context), receipt.fetch("templates"))
         unless claimed_run_id
           # Sealed DB custody alone says nothing about mutable upload bytes or
           # destination reuse. Re-prove assets on fresh SELECT-only views BEFORE
           # claim/fencing; retain the approved receipt binding, never auto-rebind.
           current = mv_validate!(prepared_from: receipt.fetch("prepared_from"), generation: receipt.fetch("generation"), settings: receipt.fetch("settings"), checks: [], deadline: context.fetch("deadline"))
-          compared = %w[selected_ids_sha256 selection_sha256 asset_preflight_sha256 owner_preflight_sha256 facts templates]
-          unless current["status"] == "passed" && current["cleanup_confirmed"] == true && compared.all? { |key| current[key] == receipt[key] }
+          compared = %w[selected_ids_sha256 selection_sha256 asset_preflight_sha256 owner_preflight_sha256 facts]
+          unless current["status"] == "passed" && current["cleanup_confirmed"] == true && compared.all? { |key| current[key] == receipt[key] } && mv_same_template_custody?(current["templates"], receipt["templates"])
             mv_error!("STANDARD_MERGE_VALIDATION_STALE")
           end
         end
@@ -480,7 +480,7 @@ module SiloMigrate
           begin
             cleanup_context = context.merge("deadline" => mv_clock + VALIDATION_CLEANUP_BUDGET)
             mv_cleanup!(cleanup_context, journal)
-            unchanged = mv_custody!(cleanup_context) == templates
+            unchanged = mv_same_template_custody?(mv_custody!(cleanup_context), templates)
             mv_error!("STANDARD_MERGE_TEMPLATE_CUSTODY") unless unchanged
             mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") if uncertain
             journal["status"] = "cleaned"
@@ -624,6 +624,24 @@ module SiloMigrate
         result.stdout.to_s
       end
 
+      # pg_database_size is a capacity observation, not a custody identity.
+      # PostgreSQL autovacuum can visit closed databases and change physical
+      # storage without changing their logical rows. Retain both observations
+      # verbatim; never rebind an approved receipt or allow a numeric tolerance.
+      # The caller still obtains current state through mv_custody!, which proves
+      # the exact names, closed connections and zero sessions on every sample.
+      def mv_same_template_custody?(current, recorded)
+        names = %w[merge_source silo_clean_base]
+        valid = [current, recorded].all? do |snapshot|
+          snapshot.is_a?(Hash) && snapshot.keys.sort == names && snapshot.values.all? do |row|
+            row.is_a?(Hash) && row.keys.sort == %w[bytes oid owner] &&
+              %w[oid owner].all? { |key| row[key].is_a?(Integer) && row[key].positive? } &&
+              row["bytes"].is_a?(Integer) && row["bytes"] >= 0
+          end
+        end
+        valid && names.all? { |name| current[name].values_at("oid", "owner") == recorded[name].values_at("oid", "owner") }
+      end
+
       def mv_custody!(context)
         names = %w[merge_source silo_clean_base]
         sql = "SELECT datname, oid, datdba, datallowconn, (SELECT count(*) FROM pg_stat_activity a WHERE a.datid=d.oid), pg_database_size(oid) FROM pg_database d WHERE datname IN ('merge_source','silo_clean_base') ORDER BY datname;"
@@ -683,7 +701,7 @@ module SiloMigrate
             GRANT SELECT ON ALL TABLES IN SCHEMA public TO #{role};
           SQL
         end
-        mv_error!("STANDARD_MERGE_TEMPLATE_CUSTODY") unless mv_custody!(context) == journal.fetch("templates")
+        mv_error!("STANDARD_MERGE_TEMPLATE_CUSTODY") unless mv_same_template_custody?(mv_custody!(context), journal.fetch("templates"))
         journal["owned_identities"] = mv_owned_identities!(context, journal)
         journal["provision_complete"] = true
         mv_write!(mv_path(journal.fetch("id"), "resources.json"), journal)

@@ -150,6 +150,17 @@ non-clone SQL cap, 150-second guest call cap and separate 45-second cleanup budg
 are unchanged. It does not make slow storage fast, guarantee capacity, skip a
 policy check, recover resources, change settings or re-Prepare the environment.
 
+The protected-template custody check still requires the same database identities
+and owners, closed connections and zero sessions. Physical size is kept for
+capacity planning and private evidence, not treated as an immutable identity:
+PostgreSQL background maintenance can change disk usage without changing logical
+rows, even on a closed database. This is not an 8 KiB tolerance or permission to
+ignore other custody failures. Recorded receipt/journal snapshots are preserved;
+Start still performs fresh validation and all existing asset/policy checks. See
+[the custody invariants and regression](merge-workflow-development.md).
+An already-quarantined validation attempt is not automatically recovered by an
+update; only separately scoped recovery can reconcile its temporary resources.
+
 This is an invocation-only operator path, not a persistent configuration setting
 or a migration-data tool option. Normal chat tools keep their existing limits;
 do not run the long command through a chat wrapper with a 300-second timeout.
