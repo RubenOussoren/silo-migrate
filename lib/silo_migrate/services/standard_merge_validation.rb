@@ -8,6 +8,7 @@ require "yaml"
 require_relative "../../../runtime/shared/merge_contract"
 require_relative "../../../runtime/shared/merge_refusal"
 require_relative "../merge_process"
+require_relative "standard_merge_validation_status"
 
 module SiloMigrate
   module Services
@@ -22,6 +23,7 @@ module SiloMigrate
     # Neither hook may mutate templates, grant analyst access or start an application.
     # Fixture success is not a claim of live PostgreSQL/Discourse acceptance.
     module StandardMergeValidation
+      include StandardMergeValidationStatus
       VALIDATION_MAX_SETTINGS = 256 * 1024
       VALIDATION_ALLOWANCE = 512 * 1024 * 1024
       # Chat calls retain their bounded 180s work budget. A deliberate foreground
@@ -164,7 +166,13 @@ module SiloMigrate
 
       def merge_process_binding!(prepared_from:, generation:, settings:, layer:)
         result = validate_merge_settings(prepared_from: prepared_from, generation: generation, settings: settings)
-        mv_error!("STANDARD_MERGE_VALIDATION_FAILED") unless result["status"] == "passed"
+        unless result["status"] == "passed"
+          id = result["receipt_id"]
+          id = nil unless id.is_a?(String) && VALIDATION_ID.match?(id)
+          projection = mv_saved_projection(id, result, nil, id ? "saved" : "missing", "missing")
+          projection = merge_validation_status(attempt: id) if id
+          raise StandardMergeValidationFailure.new(projection), cause: nil
+        end
         mv_error!("STANDARD_MERGE_VALIDATION_STALE") unless result.fetch("layer") == layer
         result.fetch("binding")
       end

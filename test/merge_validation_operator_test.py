@@ -84,10 +84,26 @@ class OperatorValidationTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         observed = json.loads(result.stdout)
         self.assertEqual({'config': str(config), 'args': args}, observed)
+        # The installed shim forwards the read-only saved-attempt path too.
+        read_args = ['standard', 'workflow', 'validation-status', 'invented', '--attempt', 'latest']
+        read_result = subprocess.run([str(launcher), *read_args], capture_output=True, text=True, timeout=10,
+                                     env={'PATH': os.environ['PATH']})
+        self.assertEqual(0, read_result.returncode, read_result.stderr)
+        self.assertEqual({'config': str(config), 'args': read_args}, json.loads(read_result.stdout))
         with mock.patch.dict(os.environ, {'SILO_CONTROL_CONFIG': observed['config']}, clear=True):
             values, configured = self.control.settings()
         self.assertTrue(configured)
         self.assertEqual(self.values['SILO_CONTROL_GEMS'], values['SILO_CONTROL_GEMS'])
+
+    def test_saved_status_uses_read_dispatch_without_long_mode_or_cleanup(self):
+        args = ['standard', 'workflow', 'validation-status', 'invented', '--attempt', 'latest']
+        command = self.launch(args)
+        self.assertEqual(command[-len(args):], args)
+        self.assertEqual('1', command[command.index('--cpus') + 1])
+        self.assertIn('SILO_MERGE_VALIDATION_MODE=chat', command)
+        self.assertIn('--read-only', command)
+        with self.assertRaisesRegex(ValueError, '^STANDARD_ARGUMENTS_INVALID$'):
+            self.control.merge_validation_options([self.flag, *args])
 
     def test_only_explicit_operator_flag_changes_container_budget(self):
         for flag, mode in (([], 'chat'), ([self.flag], 'operator')):

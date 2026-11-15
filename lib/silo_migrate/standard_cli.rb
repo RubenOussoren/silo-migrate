@@ -23,6 +23,7 @@ module SiloMigrate
         merger init WORKSPACE                       (standalone local Git; no remote, no customer settings)
         merger status WORKSPACE                     (actual local review path and committed layer)
         workflow describe WORKSPACE                  (private committed contract and engine facts)
+        workflow validation-status WORKSPACE --attempt latest|ID  (saved evidence only; never reruns validation)
         workflow validate WORKSPACE --prepared-from RUN --generation SHA --settings INPUT
         workflow exists WORKSPACE --prepared-from RUN --generation SHA --queries-file -
         converter status WORKSPACE
@@ -108,6 +109,9 @@ module SiloMigrate
         result = dispatch(argv.dup)
         write_json(result)
         failed_run?(argv, result) ? 1 : 0
+      rescue StandardMergeValidationFailure => e
+        write_json({ "version" => 1, "error" => e.code, "validation" => e.validation })
+        write_error(e.code)
       rescue StandardWorkflowError => e
         if %w[STANDARD_CONVERTER_DIRTY STANDARD_CONVERTER_CONFIG STANDARD_MERGER_DIRTY STANDARD_MERGER_CONFIG STANDARD_MERGE_PREPARATION_REQUIRED].include?(e.code)
           @error.write("Error: #{e.code}. #{Services::StandardWorkflowService::RECOVERY.fetch(e.code)}\n")
@@ -192,6 +196,12 @@ module SiloMigrate
     def workflow(args)
       action = args.shift
       workspace = positional!(args)
+      if action == "validation-status"
+        opts = options!(args, "--attempt")
+        attempt = opts.fetch("--attempt")
+        invalid! unless attempt == "latest" || attempt.match?(/\A[0-9a-f]{32}\z/)
+        return service(workspace).merge_validation_status(attempt: attempt)
+      end
       if action == "describe"
         no_more!(args)
         return service(workspace).merge_contract
