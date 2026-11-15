@@ -160,11 +160,19 @@ After separately authorized recovery of any outstanding validation attempt, ente
 `silo shell` as the operator. From that service-account shell, propose **once**:
 
 ```sh
-CONTROL=/srv/silo-migrate/current/bin/silo-migrate-control
+CONTROL=/srv/silo-migrate/bin/silo-migrate-control
 "$CONTROL" --long-merge-validation standard plan propose PROJECT --operation merge \
   --prepared-from PREPARATION_RUN_ID --generation GENERATION_SHA256 \
   --intent custom --settings SETTINGS_INPUT_ID
 ```
+
+Use the installed `<prefix>/bin/silo-migrate-control` launcher shown above, **not**
+`<prefix>/current/bin/silo-migrate-control` directly. The installed launcher exports
+`SILO_CONTROL_CONFIG` before forwarding the arguments to the release. `silo shell`
+selects the service account but does not itself set that configuration variable.
+Bypassing the launcher can select development fallback paths (such as a nonexistent
+`.runtime-cache/gems`) and fail at Docker mount validation before validation starts.
+Do not create those fallback directories or redo recovery to work around this error.
 
 Use the actual installation prefix if not `/srv/silo-migrate`. Keep the terminal
 open; this is foreground work and the command may be quiet while copying. Do not

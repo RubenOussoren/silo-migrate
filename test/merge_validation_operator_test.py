@@ -1,10 +1,15 @@
 """Operator long validation dispatch; all Docker/process calls are intercepted."""
+import ast
 import contextlib
 import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import shlex
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -44,6 +49,45 @@ class OperatorValidationTest(unittest.TestCase):
                 mock.patch.object(self.control.os, 'execvp') as execute:
             self.control.main(args)
         return execute.call_args.args[1]
+
+    def test_installed_shim_loads_config_and_forwards_the_documented_long_command(self):
+        doc = (ROOT / 'docs/merge-preparation.md').read_text()
+        self.assertIn('CONTROL=/srv/silo-migrate/bin/silo-migrate-control', doc)
+        self.assertNotIn('CONTROL=/srv/silo-migrate/current/bin/silo-migrate-control', doc)
+        # Evaluate only the installer's literal shim-construction assignment,
+        # never its installer or any host/container operation.
+        source = (ROOT / 'script/metal').read_text().split(": <<'PYTHON'\n", 1)[1].rsplit('\nPYTHON', 1)[0]
+        assignments = [node for node in ast.walk(ast.parse(source))
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == 'shim' for target in node.targets)
+                       and 'SILO_CONTROL_CONFIG' in ast.get_source_segment(source, node)]
+        self.assertEqual(1, len(assignments))
+        namespace = {'P': self.root, 'shlex': shlex}
+        exec(compile(ast.Module(body=assignments, type_ignores=[]), '<installed shim fixture>', 'exec'), namespace)
+        (self.root / 'etc').mkdir()
+        config = self.root / 'etc/silo-control.env'
+        config.write_text(''.join(key + '=' + self.values[key] + '\n'
+                                 for key in ('SILO_MIGRATE_BASE_PATH', 'SILO_CONTROL_GEMS'))
+                          + 'SILO_CONTROL_SITE_CACHE=' + str(self.root / 'site.yml') + '\n')
+        target = self.root / 'current/bin/silo-migrate-control'
+        target.parent.mkdir(parents=True)
+        target.write_text('#!' + sys.executable + '\nimport json, os, sys\n'
+                          'print(json.dumps({"config": os.environ.get("SILO_CONTROL_CONFIG"), "args": sys.argv[1:]}))\n')
+        target.chmod(0o750)
+        launcher = self.root / 'bin/silo-migrate-control'
+        launcher.parent.mkdir()
+        launcher.write_text(namespace['shim'])
+        launcher.chmod(0o750)
+        args = [self.flag, *self.proposal]
+        result = subprocess.run([str(launcher), *args], capture_output=True, text=True, timeout=10,
+                                env={'PATH': os.environ['PATH'], 'SILO_CONTROL_CONFIG': '/invented/wrong-config'})
+        self.assertEqual(0, result.returncode, result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertEqual({'config': str(config), 'args': args}, observed)
+        with mock.patch.dict(os.environ, {'SILO_CONTROL_CONFIG': observed['config']}, clear=True):
+            values, configured = self.control.settings()
+        self.assertTrue(configured)
+        self.assertEqual(self.values['SILO_CONTROL_GEMS'], values['SILO_CONTROL_GEMS'])
 
     def test_only_explicit_operator_flag_changes_container_budget(self):
         for flag, mode in (([], 'chat'), ([self.flag], 'operator')):
