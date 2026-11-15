@@ -45,7 +45,10 @@ module SiloMigrate
         || ',' || (SELECT COUNT(*) FROM groups) || ',' || (SELECT COUNT(*) FROM tags) || ',' || (SELECT COUNT(*) FROM uploads)
         || '|' || (SELECT COALESCE(MAX(id), 0) FROM users) || ',' || (SELECT COALESCE(MAX(id), 0) FROM topics) || ',' || (SELECT COALESCE(MAX(id), 0) FROM posts) || ',' || (SELECT COALESCE(MAX(id), 0) FROM uploads)
       SQL
-      MERGE_SEAL = /\A[0-9a-f]{32}\|[0-9a-f]{32}:\d{1,9}\|\d{1,12}(?:,\d{1,12}){6}\|\d{1,18}(?:,\d{1,18}){3}\z/
+      # Core system users can have negative IDs, including the maximum in a
+      # tiny site with no positive human user. Preserve their exact signs in the
+      # seal; counts stay unsigned and the existing 18-digit ID bound is retained.
+      MERGE_SEAL = /\A[0-9a-f]{32}\|[0-9a-f]{32}:\d{1,9}\|\d{1,12}(?:,\d{1,12}){6}\|(?:0|-?[1-9]\d{0,17})(?:,(?:0|-?[1-9]\d{0,17})){3}\z/
       # Unicorn and every Sidekiq process (forked by unicorn in this image, or its own service)
       # must be gone before a database is sealed, cloned, dropped or renamed.
       #

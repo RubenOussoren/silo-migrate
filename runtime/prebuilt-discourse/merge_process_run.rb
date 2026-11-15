@@ -60,7 +60,7 @@ module SiloMergeProcessRuntime
     result
   end
 
-  def destination_rows(ids: nil, sha1s: nil)
+  def destination_rows(ids: nil, sha1s: nil, seeded_sha1s: [])
     # Restrict destination reads to relevant IDs/digests. A large existing site
     # must not require a second in-memory copy of its entire uploads table.
     values = ids || sha1s
@@ -71,7 +71,7 @@ module SiloMergeProcessRuntime
         batch.map { |value| Integer(value).to_s }
       else
         batch.map do |value|
-          raise "asset_digest_invalid" unless value.is_a?(String) && value.match?(/\A[0-9a-f]{40}\z/)
+          raise "asset_digest_invalid" unless value.is_a?(String) && (value.match?(/\A[0-9a-f]{40}\z/) || seeded_sha1s.include?(value))
           ActiveRecord::Base.connection.quote(value)
         end
       end
@@ -93,7 +93,8 @@ module SiloMergeProcessRuntime
                         port: Integer(ENV.fetch("DISCOURSE_DB_PORT", "5432")), user: "discourse",
                         password: ENV.fetch("DISCOURSE_DB_PASSWORD"))
     source_rows = rows(source)
-    before = destination_rows(sha1s: source_rows.map { |row| row.fetch("sha1") }.compact)
+    seeded = SiloDiscourseMergeAdapter::SeededReuse.new(source_rows)
+    before = destination_rows(sha1s: source_rows.map { |row| row.fetch("sha1") }.compact, seeded_sha1s: seeded.sha1s)
     approved_ids = merger.silo_merge_asset_ids
     context = SiloDiscourseMergeAdapter.prepare!(merger, source_rows: source_rows, destination_rows: before,
       approved_ids: approved_ids, policy: state.fetch(:policy),

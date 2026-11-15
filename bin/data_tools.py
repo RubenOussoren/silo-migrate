@@ -78,6 +78,152 @@ def refuse(code):
     raise Refusal(code)
 
 
+# Mirror the fixed saved-status projection in StandardMergeValidationStatus. This
+# is a wire allowlist, not permission to read receipts/settings or run validation.
+VALIDATION_FAILURE = "STANDARD_MERGE_VALIDATION_FAILED"
+VALIDATION_ATTEMPT = re.compile(r"[0-9a-f]{32}\Z")
+VALIDATION_REASONS = set("""unknown ok STANDARD_MERGE_VALIDATION_UNPROVEN
+STANDARD_MERGE_VALIDATION_PROTOCOL STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED
+STANDARD_MERGE_TEMPLATE_CUSTODY STANDARD_MERGE_SETTINGS_INVALID
+STANDARD_MERGE_CONTRACT_REQUIRED STANDARD_MERGE_CONTRACT_INVALID STANDARD_MERGE_ENGINE_UNSUPPORTED
+STANDARD_MERGE_ENVIRONMENT_STALE STANDARD_MERGE_VALIDATION_STALE STANDARD_MERGE_VALIDATION_UNSUPPORTED
+STANDARD_MERGE_CHECKS_INVALID STANDARD_CAPACITY STANDARD_BUSY STANDARD_MERGE_VALIDATION_MODE_INVALID
+preflight_refused postflight_refused hooks_missing asset_selection_invalid audit_invalid checks_invalid
+assets_unproven validation_unproven unknown_source_id destination_exists destination_missing
+destination_ambiguous policy_conflict permission_unproven selection_unproven schema_unsupported""".split())
+VALIDATION_STAGES = set("""unknown sql resources_absent create_role clone_source restrict_source
+clone_base restrict_base template_custody resource_identity guest_validation result_verification
+cleanup_resources cleanup_source cleanup_base cleanup_role cleanup_absence executor_preflight
+sidecar_image sidecar_create sidecar_ready private_staging guest_copy guest_launch guest_result""".split())
+
+
+def validation_diagnostic_allowlists():
+    # One fixed shipped-source allowlist, shared with the guest. Never parse a
+    # customer-selected file or evaluate Ruby to discover diagnostic enums.
+    source = Path(__file__).resolve().parents[1] / "runtime/shared/merge_validation_diagnostic.rb"
+    try:
+        with source.open("rb") as stream:
+            raw = stream.read(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            refuse("STANDARD_OPERATION_FAILED")
+        raw = raw.decode("utf-8")
+        allowed = {}
+        for key in ("STAGES", "ERROR_CLASSES", "COMPONENTS"):
+            match = re.search(r"^  " + key + r" = %w\[(.*?)^  \]\.freeze", raw, re.M | re.S)
+            words = match[1].split() if match else []
+            if (not words or len(words) > 512 or len(set(words)) != len(words) or
+                    any(len(word) > 128 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:]*", word) for word in words)):
+                refuse("STANDARD_OPERATION_FAILED")
+            allowed[key] = set(words)
+    except (OSError, UnicodeError):
+        refuse("STANDARD_OPERATION_FAILED")
+    return allowed
+
+
+def validation_guest_diagnostic(value):
+    allowed = validation_diagnostic_allowlists()
+    if (not isinstance(value, dict) or set(value) != {"version", "stage", "error_class", "component", "line"} or
+            type(value["version"]) is not int or value["version"] != 1):
+        refuse("STANDARD_OPERATION_FAILED")
+    for field, key in (("stage", "STAGES"), ("error_class", "ERROR_CLASSES"), ("component", "COMPONENTS")):
+        if not isinstance(value[field], str) or value[field] not in allowed[key]:
+            refuse("STANDARD_OPERATION_FAILED")
+    line = value["line"]
+    if line is not None and (type(line) is not int or not 1 <= line <= 1_000_000):
+        refuse("STANDARD_OPERATION_FAILED")
+    if value["component"] in ("custom_layer", "unknown") and line is not None:
+        refuse("STANDARD_OPERATION_FAILED")
+    return dict(value)
+
+
+def validation_projection(value):
+    """Reject unknown fields/types/enums; never relay arbitrary CLI JSON or stderr."""
+    def shape(obj, keys):
+        if not isinstance(obj, dict) or set(obj) != set(keys.split()):
+            refuse("STANDARD_OPERATION_FAILED")
+
+    def enum(item, allowed):
+        if not isinstance(item, str) or item not in allowed:
+            refuse("STANDARD_OPERATION_FAILED")
+
+    keys = "version attempt_id evidence status reason work producer_outcome cleanup last_recorded_stage events key_path_segments next_action"
+    if isinstance(value, dict) and "guest_diagnostic" in value:
+        keys += " guest_diagnostic"
+        validation_guest_diagnostic(value["guest_diagnostic"])
+    shape(value, keys)
+    if type(value["version"]) is not int or value["version"] != 1:
+        refuse("STANDARD_OPERATION_FAILED")
+    attempt = value["attempt_id"]
+    if attempt is not None and (not isinstance(attempt, str) or not VALIDATION_ATTEMPT.fullmatch(attempt)):
+        refuse("STANDARD_OPERATION_FAILED")
+    shape(value["evidence"], "receipt journal")
+    for state in value["evidence"].values():
+        enum(state, ("saved", "missing", "invalid", "ambiguous"))
+    enum(value["status"], ("passed", "refused", "unknown"))
+    enum(value["reason"], VALIDATION_REASONS)
+    enum(value["producer_outcome"], ("completed", "unknown", "not_started"))
+    enum(value["last_recorded_stage"], VALIDATION_STAGES)
+    for key in ("work", "cleanup"):
+        diagnostic = value[key]
+        diagnostic_keys = "reason stage deadline_reached command_outcome status"
+        if isinstance(diagnostic, dict) and "error_class" in diagnostic:
+            diagnostic_keys += " error_class"
+            enum(diagnostic["error_class"], validation_diagnostic_allowlists()["ERROR_CLASSES"])
+        shape(diagnostic, diagnostic_keys)
+        enum(diagnostic["reason"], VALIDATION_REASONS)
+        enum(diagnostic["stage"], VALIDATION_STAGES)
+        if diagnostic["deadline_reached"] is not None and type(diagnostic["deadline_reached"]) is not bool:
+            refuse("STANDARD_OPERATION_FAILED")
+        enum(diagnostic["command_outcome"], ("completed", "failed", "timeout_or_interrupted", "unknown"))
+        enum(diagnostic["status"], ("passed", "refused", "running", "unknown") if key == "work" else ("confirmed", "unconfirmed", "unknown"))
+    events = value["events"]
+    if not isinstance(events, list) or len(events) > 128:
+        refuse("STANDARD_OPERATION_FAILED")
+    for event in events:
+        shape(event, "stage phase elapsed_ms outcome")
+        enum(event["stage"], VALIDATION_STAGES)
+        enum(event["phase"], ("start", "finish"))
+        enum(event["outcome"], ("completed", "failed", "unknown", "boundary"))
+        if type(event["elapsed_ms"]) is not int or not 0 <= event["elapsed_ms"] <= 86_400_000:
+            refuse("STANDARD_OPERATION_FAILED")
+    segments = value["key_path_segments"]
+    if segments is not None and (type(segments) is not int or not 0 <= segments <= 32):
+        refuse("STANDARD_OPERATION_FAILED")
+    enum(value["next_action"], ("reconcile_saved_evidence", "no_saved_attempt", "review_exact_plan_before_separate_start",
+                                "inspect_private_evidence_and_correct_cause", "preview_exact_attempt_recovery",
+                                "reconcile_legacy_attempt", "reconcile_unknown_producer"))
+    # Construct a detached copy only after every nested field has been checked.
+    return json.loads(json.dumps(value))
+
+
+def validation_json(raw, failure=False):
+    if not isinstance(raw, (str, bytes)) or len(raw) > OUTPUT_LIMIT:
+        refuse("STANDARD_OPERATION_FAILED")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                refuse("STANDARD_OPERATION_FAILED")
+            result[key] = value
+        return result
+    try:
+        value = json.loads(raw, object_pairs_hook=unique)
+    except (ValueError, UnicodeError, RecursionError):
+        refuse("STANDARD_OPERATION_FAILED")
+    if failure:
+        if (not isinstance(value, dict) or set(value) != {"version", "error", "validation"}
+                or type(value["version"]) is not int or value["version"] != 1 or value["error"] != VALIDATION_FAILURE):
+            refuse("STANDARD_OPERATION_FAILED")
+        return {"version": 1, "error": VALIDATION_FAILURE, "validation": validation_projection(value["validation"])}
+    return validation_projection(value)
+
+
+class ValidationFailure(Refusal):
+    def __init__(self, envelope):
+        super().__init__(VALIDATION_FAILURE)
+        self.envelope = envelope
+
+
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -3206,6 +3352,18 @@ def op_workflow_contract(ws, request):
     return result
 
 
+def op_workflow_validation_status(ws, request):
+    workflow_request(request, ("attempt",) if "attempt" in request else ())
+    attempt = request.get("attempt", "latest")
+    if not isinstance(attempt, str) or (attempt != "latest" and not VALIDATION_ATTEMPT.fullmatch(attempt)):
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    ws.require()
+    result = validation_json(ws.control(["standard", "workflow", "validation-status", ws.name, "--attempt", attempt], timeout=30))
+    if attempt != "latest" and result["attempt_id"] not in (None, attempt):
+        refuse("STANDARD_OPERATION_FAILED")
+    return {key: value for key, value in result.items() if key != "version"}
+
+
 def op_workflow_validate(ws, request):
     workflow_request(request, ("run", "generation", "settings"))
     if not isinstance(request["settings"], str) or not INPUT_ID.fullmatch(request["settings"]):
@@ -3352,7 +3510,10 @@ def op_merge_propose(ws, request):
     converter = {} if prepared else json.loads(ws.control(["standard", "converter", "refresh", ws.name, "--if-changed"], timeout=30))
     # checks the registered inputs (a backup can be GBs)
     with PlanDocuments(ws, {"--preparation": ("STANDARD_PREPARATION_INVALID", preparation)}) as extra:
-        plan = json.loads(ws.control(argv + extra, timeout=240))
+        try:
+            plan = json.loads(ws.control(argv + extra, timeout=240))
+        except ValidationFailure as failure:
+            return {key: value for key, value in failure.envelope.items() if key != "version"}
     if pending := runtime_preparing(plan):
         return pending
     if "merge_environment" in plan:
@@ -4043,7 +4204,7 @@ def op_supporting(ws, request):
     return module.handle(ws, request, api)
 
 
-OPS = {"workflow_contract": op_workflow_contract, "workflow_validate": op_workflow_validate, "workflow_exists": op_workflow_exists, "status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
+OPS = {"workflow_validation_status": op_workflow_validation_status, "workflow_contract": op_workflow_contract, "workflow_validate": op_workflow_validate, "workflow_exists": op_workflow_exists, "status": op_status, "list": op_list, "peek": op_peek, "create": op_create, "take": op_take, "register": op_register,
        "file_roles_preview": op_file_roles_preview, "file_roles_commit": op_file_roles_commit,
        "supporting_list": op_supporting, "supporting_take": op_supporting, "supporting_read": op_supporting,
        "supporting_prepare": op_supporting_prepare,
@@ -4054,7 +4215,7 @@ OPS = {"workflow_contract": op_workflow_contract, "workflow_validate": op_workfl
        "notes": op_notes, "notes_write": op_notes_write, "guide": op_guide, "decide": op_decide, "decisions": op_decisions, "deliveries": op_deliveries, "delivery_label": op_delivery_label,
        "finding_done": op_finding_done, "site_process": op_site_process, "site_review": op_site_review}
 # Logged with their arguments (minus script code, finding text, count SQL and decisions, logged by hash).
-QUIET = {"status", "list", "job", "db_status", "notes", "guide", "decisions", "deliveries", "site_process", "finding_proposal"}
+QUIET = {"workflow_validation_status", "status", "list", "job", "db_status", "notes", "guide", "decisions", "deliveries", "site_process", "finding_proposal"}
 
 
 def fit(result):
@@ -4099,9 +4260,21 @@ def control_runner(path):
         except subprocess.TimeoutExpired:
             refuse("STANDARD_OPERATION_TIMEOUT")
         if result.returncode:
+            # Only a merge proposal can carry this typed failure. Never turn
+            # arbitrary failure stdout into a successful operation result.
+            if (argv[:3] == ["standard", "plan", "propose"] and "--operation" in argv
+                    and argv[argv.index("--operation") + 1:][:1] == ["merge"]
+                    and result.stderr.strip() == "Error: " + VALIDATION_FAILURE):
+                try:
+                    envelope = validation_json(result.stdout, failure=True)
+                except Refusal:
+                    refuse(VALIDATION_FAILURE)
+                raise ValidationFailure(envelope)
             match = re.search(r"Error: ((?:STANDARD|NAMED)_[A-Z_]+)([^\n]*)", result.stderr)
             if not match:
                 refuse("STANDARD_OPERATION_FAILED")
+            if match[1] == VALIDATION_FAILURE:
+                refuse(VALIDATION_FAILURE)
             # The code, plus the short detail some refusals add ("check 3: source_sql"): the text
             # after ": " up to the recovery sentence, kept only when it is short.
             detail = re.fullmatch(r": (.{1,200}?)(?:\. .*|\.)?", match[2])
@@ -4128,6 +4301,8 @@ def main(args, values, base, repo, host, stdin, control):
     error = None
     try:
         result = dict(version=1, **OPS[op](ws, request))
+        if op == "merge_propose" and result.get("error") == VALIDATION_FAILURE:
+            error = VALIDATION_FAILURE
         if op in ("deliveries", "file_roles_preview", "file_roles_commit") and not ws.chat:
             # Never silently slice structured identities/digests. Commit may omit
             # the refreshable inventory, but must not report failure after apply.
@@ -4138,7 +4313,7 @@ def main(args, values, base, repo, host, stdin, control):
                 if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > ENGINEER_OUTPUT_LIMIT:
                     refuse("STANDARD_OUTPUT_TOO_LARGE")
             return result
-        if op in ("workflow_contract", "workflow_validate", "workflow_exists"):
+        if op in ("workflow_contract", "workflow_validate", "workflow_exists", "workflow_validation_status"):
             # Never turn a complete exact result/receipt/contract into a partial one.
             if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > OUTPUT_LIMIT:
                 refuse("STANDARD_OUTPUT_TOO_LARGE")

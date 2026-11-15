@@ -395,6 +395,27 @@ class ReviewRuntimeHostTest(unittest.TestCase):
     def args(self, base=True):
         return ['standard','plan','propose','invented','--operation','review','--from-run',self.run] + (['--base-site',self.input] if base else [])
 
+    def test_cached_only_admission_uses_actual_base_binding_without_starting_worker(self):
+        values = {}
+        admitted = {'status': 'ready', 'name': 'baseline', 'comparison': {
+            'core_comparison_complete': True, 'missing_known_core_migrations': 0}}
+        with patch.object(control, 'cached_review_runtime', return_value=admitted) as admit:
+            self.assertIsNone(control.prepare_review_runtime(self.args(), values, self.base, self.repo, cached_only=True))
+        args = admit.call_args.args
+        self.assertEqual((self.repo, 'baseline', '2026.11.0-latest.1', '20261109000000', ['20261109000000']),
+                         (args[0], *args[2:]))
+        self.assertFalse((self.repo / 'bin/observed.json').exists())
+        self.assertFalse((self.named.parent / 'data/review-runtime-jobs').exists())
+        self.assertEqual('baseline', values['SILO_REVIEW_RUNTIME_PROFILE'])
+        self.assertEqual(admitted['comparison'], json.loads(values['SILO_REVIEW_RUNTIME_COMPARISON']))
+        self.assertNotIn('SILO_REVIEW_RUNTIME_PROFILES_DIR', values)
+
+    def test_cached_only_refusal_never_falls_back_to_preparation(self):
+        with patch.object(control, 'cached_review_runtime', side_effect=ValueError('STANDARD_REVIEW_RUNTIME_UNRESOLVED')):
+            with self.assertRaisesRegex(ValueError, '^STANDARD_REVIEW_RUNTIME_UNRESOLVED$'):
+                control.prepare_review_runtime(self.args(), {}, self.base, self.repo, cached_only=True)
+        self.assertFalse((self.repo / 'bin/observed.json').exists())
+
     def test_preparation_receives_workspace_private_job_directory(self):
         values = {}
         self.assertEqual({'status':'runtime_preparing'}, control.prepare_review_runtime(self.args(),values,self.base,self.repo))

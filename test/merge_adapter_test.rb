@@ -155,14 +155,16 @@ class MergeAdapterTest < Minitest::Test
     error
   end
 
-  def test_shipped_method_is_exact_fixture_with_only_copy_line_changed
+  def test_shipped_method_has_only_explicit_copy_and_positive_allocation_changes
     stock = File.binread(METHOD_FIXTURE)
     assert_equal Adapter::FILE_SHA256, Digest::SHA256.file(PINNED_FIXTURE).hexdigest
     assert_equal Adapter::METHOD_SHA256, Digest::SHA256.hexdigest(stock)
     file, line = Adapter::DeferredUploads.instance_method(:copy_uploads).source_location
     lines = File.readlines(file)
     shipped = lines[(line - 1), stock.lines.size].join
-    assert_equal stock.sub(Adapter::COPY_LINE, "    @silo_uploads_deferred = (@silo_uploads_deferred || 0) + 1"), shipped
+    expected = stock.sub(Adapter::COPY_LINE, "    @silo_uploads_deferred = (@silo_uploads_deferred || 0) + 1")
+      .sub("    last_id = Upload.unscoped.maximum(:id) || 1", "    last_id = [Upload.unscoped.maximum(:id) || 1, 0].max")
+    assert_equal expected, shipped
     cached = File.expand_path("../../../.runtime-cache/generic-merge-20261114/discourse_merger-2769139d.rb", __dir__)
     if File.file?(cached)
       assert_equal Adapter::FILE_SHA256, Digest::SHA256.file(cached).hexdigest
@@ -526,6 +528,115 @@ class MergeAdapterTest < Minitest::Test
     refusal("optimized_classification_unproven") { prepare(rows) }
     assert_equal 0, @klass.constructions
     assert_empty Dir.children(@destination)
+  end
+
+  def with_packaged_seeds
+    root = File.join(@workspace, "public-packaged-images")
+    FileUtils.mkdir_p(root)
+    seeds = Adapter::SeededReuse::FILES.map do |id, filename|
+      body = "Invented packaged image #{id}"
+      File.binwrite(File.join(root, filename), body)
+      row(id, body: body, user: -1, identity: "_#{Digest::SHA1.hexdigest(body)}"[0, 40]).merge("url" => "/images/#{filename}")
+    end
+    original = File.method(:open)
+    reader = lambda do |path, *args, **options, &block|
+      fixed = Adapter::SeededReuse::IMAGE_ROOT + "/"
+      mapped = path.is_a?(String) && path.start_with?(fixed) ? File.join(root, path.delete_prefix(fixed)) : path
+      original.call(mapped, *args, **options, &block)
+    end
+    File.stub(:open, reader) { yield seeds, root }
+  end
+
+  def test_exact_packaged_seeds_remain_in_stock_mappings_without_physical_transfer
+    with_packaged_seeds do |seeds, _|
+      sources = seeds + [source_row(1)]
+      Upload.rows = seeds + [row(20)]
+      context = prepare(sources, [1], destination_rows: seeds)
+      instance = @klass.new(@source, sources)
+      instance.copy_uploads
+      mapping = instance.instance_variable_get(:@uploads)
+      seeds.each { |seed| assert_equal seed.fetch("id"), mapping.fetch(seed.fetch("id")) }
+      actual = seeds + instance.inserted
+      assert context.verify_mapping!(instance, destination_rows: actual)
+      assert_equal [], context.dangling_destination_ids(instance)
+      result = context.transfer!(instance, destination_rows: actual)
+      assert_equal 1, result.fetch(:aggregates).fetch(:copied)
+      assert_equal "image 1", File.binread(File.join(@destination, "original/1.png"))
+      assert seeds.all? { |seed| !File.exist?(File.join(@destination, seed.fetch("url"))) }
+      assert_equal seeds.map { |r| r["id"] }.sort, mapping.keys.reject(&:positive?).sort
+    end
+  end
+
+  def test_seeded_only_destination_never_allocates_user_upload_zero_or_negative
+    with_packaged_seeds do |seeds, _|
+      sources = seeds + [source_row(1)]
+      Upload.rows = seeds
+      context = prepare(sources, [1], destination_rows: seeds)
+      instance = @klass.new(@source, sources)
+      instance.copy_uploads
+      assert_operator instance.instance_variable_get(:@uploads).fetch(1), :>, 0
+      assert context.verify_mapping!(instance, destination_rows: seeds + instance.inserted)
+    end
+  end
+
+  def test_packaged_reuse_never_accepts_unknown_negative_rows_or_changed_metadata
+    with_packaged_seeds do |seeds, _|
+      base = seeds.first
+      [{ "id" => 0 }, { "id" => -99 }, { "url" => "/uploads/source/private.png" },
+       { "sha1" => "a" * 40 }, { "filesize" => base["filesize"] + 1 },
+       { "filesize" => base["filesize"].to_f }, { "original_sha1" => "b" * 40 },
+       { "secure" => true }].each do |change|
+        refusal("unsupported_source_id") { Adapter::SeededReuse.new([base.merge(change)]) }
+      end
+      refusal("unsupported_source_id") { Adapter::SeededReuse.new([base, base.dup]) }
+      refusal("invalid_rows") { prepare([row(1).merge("sha1" => base["sha1"])], [1]) }
+      assert_equal 0, @klass.constructions
+      assert_empty Dir.children(@destination)
+    end
+  end
+
+  def test_packaged_reuse_requires_exact_unambiguous_existing_destination
+    with_packaged_seeds do |seeds, _|
+      proof = Adapter::SeededReuse.new(seeds)
+      [seeds.drop(1), seeds + [seeds.first.dup],
+       seeds.map { |r| r["id"] == -1 ? r.merge("sha1" => "a" * 40) : r },
+       seeds + [seeds.first.merge("id" => 100)]].each do |destination|
+        refusal("seeded_reuse_unproven") { proof.physical_rows!(destination) }
+      end
+      assert_equal [], proof.physical_rows!(seeds.map { |r| r.transform_keys(&:to_sym) })
+      assert_equal seeds.size, proof.facts.size
+      assert proof.sha1s.frozen?
+    end
+  end
+
+  def test_packaged_reuse_keeps_symlink_and_missing_file_refusals
+    with_packaged_seeds do |seeds, root|
+      path = File.join(root, Adapter::SeededReuse::FILES.fetch(-1))
+      File.unlink(path)
+      refusal("unsupported_source_id") { Adapter::SeededReuse.new([seeds.first]) }
+      File.symlink(File.join(root, Adapter::SeededReuse::FILES.fetch(-2)), path)
+      refusal("unsupported_source_id") { Adapter::SeededReuse.new([seeds.first]) }
+    end
+  end
+
+  def test_packaged_reuse_is_bound_in_selection_and_rechecked_after_stock
+    with_packaged_seeds do |seeds, _|
+      source = source_row(1)
+      plain = Adapter::Context.new(@klass, [source], [1], "carried", @source, @destination, [])
+      packaged = Adapter::Context.new(@klass, seeds + [source], [1], "carried", @source, @destination, seeds)
+      refute_equal plain.selection_digest, packaged.selection_digest
+      assert_equal plain.preflight_manifest_digest, packaged.preflight_manifest_digest
+      Upload.rows = seeds + [row(20)]
+      context = prepare(seeds + [source], [1], destination_rows: seeds)
+      instance = @klass.new(@source, seeds + [source])
+      instance.copy_uploads
+      actual = seeds + instance.inserted
+      instance.instance_variable_get(:@uploads)[-1] = 20
+      refusal("missing_mapping") { context.verify_mapping!(instance, destination_rows: actual) }
+      instance.instance_variable_get(:@uploads)[-1] = -1
+      refusal("seeded_reuse_unproven") { context.verify_mapping!(instance, destination_rows: actual.reject { |r| r["id"] == -1 }) }
+      assert_empty Dir.children(@destination)
+    end
   end
 
   def test_nonpositive_source_ids_are_explicitly_unsupported_before_constructor

@@ -1,11 +1,35 @@
 # frozen_string_literal: true
 
-# RUBYOPT=-r hook for ONE isolated validation process, not a running app. It
-# refuses missing private context rather than falling back to the owner's config.
+# ruby -r hook for ONE isolated, bundle-activated validation process.
+# It refuses missing private context rather than falling back to the owner's config.
 require "json"
+if File.file?(File.expand_path("../shared/merge_validation_diagnostic.rb", __dir__))
+  require_relative "../shared/merge_validation_diagnostic"
+else
+  require_relative "merge_validation_diagnostic"
+end
 
 module SiloMergeValidationConfig
+  BOOTSTRAP_DIAGNOSTIC_PREFIX = SiloMergeValidationDiagnostic::PREFIX
+
+  class Refused < RuntimeError
+    attr_reader :guest_diagnostic
+
+    def initialize(guest_diagnostic)
+      @guest_diagnostic = SiloMergeValidationDiagnostic.validate!(guest_diagnostic).dup.freeze
+      super("STANDARD_MERGE_VALIDATION_CONFIG")
+    end
+  end
+
   module_function
+
+  def refuse!(error = nil, stage: "bootstrap")
+    if error.is_a?(Refused)
+      raise Refused.new(error.guest_diagnostic), cause: nil
+    end
+    diagnostic = SiloMergeValidationDiagnostic.capture(stage: stage, error: error)
+    raise Refused.new(diagnostic), cause: nil
+  end
 
   def read_context(path)
     File.open(path, File::RDONLY | File::NOFOLLOW) do |file|
@@ -25,8 +49,8 @@ module SiloMergeValidationConfig
       raise "invalid" unless value["redis_isolated"] == true && value["redis_host"].is_a?(String) && value["redis_host"].match?(/\A[a-zA-Z0-9_.-]{1,128}\z/) && value["redis_port"].is_a?(Integer) && value["redis_port"].between?(1, 65535)
       value
     end
-  rescue StandardError
-    raise "STANDARD_MERGE_VALIDATION_CONFIG", cause: nil
+  rescue StandardError => error
+    refuse!(error, stage: "bootstrap")
   end
 
   def build!(context)
@@ -53,8 +77,8 @@ module SiloMergeValidationConfig
       File.open(target, File::WRONLY | File::CREAT | File::EXCL | File::NOFOLLOW, 0o600) { |file| file.write(bytes); file.flush; file.fsync }
     end
     target
-  rescue StandardError
-    raise "STANDARD_MERGE_VALIDATION_CONFIG", cause: nil
+  rescue StandardError => error
+    refuse!(error, stage: "bootstrap")
   end
 
   # Keep this override testable against the pinned core's exact keyword API.
@@ -84,8 +108,8 @@ module SiloMergeValidationConfig
       raise "STANDARD_MERGE_VALIDATION_CONFIG", cause: nil
     end
     options.merge(host: context.fetch("host"), port: context.fetch("port"), user: context.fetch("role"), password: context.fetch("password"))
-  rescue StandardError
-    raise "STANDARD_MERGE_VALIDATION_CONFIG", cause: nil
+  rescue StandardError => error
+    refuse!(error, stage: "connections")
   end
 
   def install_connection_guards!(pg, context)
@@ -96,8 +120,8 @@ module SiloMergeValidationConfig
         guard.define_method(name) do |*args, **kwargs, &block|
           options = SiloMergeValidationConfig.connection_options!(args, kwargs, context)
           super(**options, &block)
-        rescue StandardError
-          raise "STANDARD_MERGE_VALIDATION_CONFIG", cause: nil
+        rescue StandardError => error
+          SiloMergeValidationConfig.refuse!(error, stage: "connections")
         end
       end
       target.singleton_class.prepend(guard)
@@ -116,7 +140,18 @@ module SiloMergeValidationConfig
     install_connection_guards!(PG, context)
     require "/var/www/discourse/app/models/global_setting"
     GlobalSetting.singleton_class.prepend(GlobalSettingOverride)
-  rescue Exception
+  rescue Exception => error
+    begin
+      diagnostic = if error.is_a?(Refused)
+        SiloMergeValidationDiagnostic.validate!(error.guest_diagnostic).merge("stage" => "bootstrap")
+      else
+        SiloMergeValidationDiagnostic.capture(stage: "bootstrap", error: error)
+      end
+      STDERR.puts(BOOTSTRAP_DIAGNOSTIC_PREFIX + JSON.generate(SiloMergeValidationDiagnostic.validate!(diagnostic)))
+      STDERR.flush
+    rescue Exception
+      nil
+    end
     # Fixed text only. Exception causes/PG messages may contain credentials.
     abort "STANDARD_MERGE_VALIDATION_CONFIG"
   end

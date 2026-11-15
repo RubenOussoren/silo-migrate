@@ -7,8 +7,11 @@ require "securerandom"
 require "yaml"
 require_relative "../../../runtime/shared/merge_contract"
 require_relative "../../../runtime/shared/merge_refusal"
+require_relative "../../../runtime/shared/merge_validation_diagnostic"
 require_relative "../merge_process"
+require_relative "../image_identity"
 require_relative "standard_merge_validation_status"
+require_relative "standard_merge_validation_lifecycle"
 
 module SiloMigrate
   module Services
@@ -24,6 +27,7 @@ module SiloMigrate
     # Fixture success is not a claim of live PostgreSQL/Discourse acceptance.
     module StandardMergeValidation
       include StandardMergeValidationStatus
+      include StandardMergeValidationLifecycle
       VALIDATION_MAX_SETTINGS = 256 * 1024
       VALIDATION_ALLOWANCE = 512 * 1024 * 1024
       # Chat calls retain their bounded 180s work budget. A deliberate foreground
@@ -34,10 +38,12 @@ module SiloMigrate
       VALIDATION_MODE_ENV = "SILO_MERGE_VALIDATION_MODE"
       VALIDATION_CLEANUP_BUDGET = 45
       VALIDATION_PREFIX = "SILO_MERGE_VALIDATION:"
+      VALIDATION_GUEST_WRAPPER = '"$@"; rc=$?; printf "\nSILO_VALIDATION_GUEST_DONE:%s:%s\n" "$0" "$rc"; exit "$rc"'.freeze
       VALIDATION_RESULT_KEYS = %w[version status reason key_path approved_ids selected_ids_sha256 audit checks asset_preflight_sha256 selection_sha256 owner_preflight_sha256].freeze
       VALIDATION_ID = /\A[0-9a-f]{32}\z/
       VALIDATION_SHA = /\A[0-9a-f]{64}\z/
-      VALIDATION_STEPS = %w[sql resources_absent create_role clone_source restrict_source clone_base restrict_base template_custody resource_identity guest_validation result_verification cleanup_resources cleanup_source cleanup_base cleanup_role cleanup_absence].freeze
+      VALIDATION_EXECUTOR_STEPS = %w[executor_preflight sidecar_image sidecar_create sidecar_ready private_staging guest_copy guest_launch guest_result].freeze
+      VALIDATION_STEPS = (VALIDATION_EXECUTOR_STEPS + %w[sql resources_absent create_role clone_source restrict_source clone_base restrict_base template_custody resource_identity guest_validation result_verification cleanup_resources cleanup_source cleanup_base cleanup_role cleanup_absence]).freeze
       VALIDATION_FAILURE_REASONS = %w[STANDARD_MERGE_VALIDATION_UNPROVEN STANDARD_MERGE_VALIDATION_PROTOCOL STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED STANDARD_MERGE_TEMPLATE_CUSTODY].freeze
 
       def merge_contract
@@ -106,21 +112,23 @@ module SiloMigrate
                         "source" => "silo_val_s_#{id}", "base" => "silo_val_b_#{id}", "role" => "silo_val_r_#{id}",
                         "templates" => templates, "status" => "owned_unknown", "cleanup_confirmed" => false }
             mv_write!(mv_path(id, "resources.json"), journal)
-            uncertain = false
             result = nil
             diagnostics = {}
             begin
               password = SecureRandom.hex(32)
               mv_provision!(context, journal, password)
               mv_step!(context, "guest_validation")
-              result = merge_validation_execute!(context.merge("password" => password), journal)
+              executor_token = mv_executor_begin!(journal)
+              result = merge_validation_execute!(context.merge("password" => password, "builtin_executor_tracking" => method(:merge_validation_execute!).owner == StandardMergeValidation), journal)
+              mv_producer!(journal, "executor", "completed", token: executor_token)
               mv_step!(context, "result_verification")
               # Checks-only uses the same complete private envelope, without
               # claiming a semantic merge validation or issuing a Start binding.
-              allowed = result.is_a?(Hash) && result.keys.sort == VALIDATION_RESULT_KEYS.sort && result["version"] == 1 && result["approved_ids"] == [] && result["audit"] == {} &&
+              allowed = result.is_a?(Hash) && (result.keys - ["guest_diagnostic"]).sort == VALIDATION_RESULT_KEYS.sort && result["version"] == 1 && result["approved_ids"] == [] && result["audit"] == {} &&
                 result["checks"].is_a?(Array) && result["checks"].size == queries.size && result["key_path"] == [] &&
                 %w[passed refused].include?(result["status"]) && %w[ok checks_invalid].include?(result["reason"]) && result["selection_sha256"].nil? && result["asset_preflight_sha256"].nil? && result["owner_preflight_sha256"].nil? && result["selected_ids_sha256"] == Digest::SHA256.hexdigest("[]")
               mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless allowed
+              mv_guest_diagnostic!(result.fetch("guest_diagnostic")) if result.key?("guest_diagnostic")
               proven = result["checks"].none? { |answer| answer["status"] == "unproven" }
               mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless result["status"] == (proven ? "passed" : "refused") && result["reason"] == (proven ? "ok" : "checks_invalid")
               result["checks"].each do |answer|
@@ -129,14 +137,13 @@ module SiloMigrate
               end
             rescue StandardError => error
               diagnostics["work"] = mv_failure_diagnostic(context, error)
-              uncertain = true
               result = { "version" => 1, "status" => "refused", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "key_path" => [] }
             ensure
               begin
+                mv_work_outcome!(journal, result, diagnostics["work"])
                 cleanup_context = context.merge("deadline" => mv_clock + VALIDATION_CLEANUP_BUDGET)
                 mv_cleanup!(cleanup_context, journal)
                 mv_error!("STANDARD_MERGE_TEMPLATE_CUSTODY") unless mv_same_template_custody?(mv_custody!(cleanup_context), templates)
-                mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") if uncertain
                 journal.merge!("status" => "cleaned", "cleanup_confirmed" => true)
                 mv_write!(mv_path(id, "resources.json"), journal)
               rescue StandardError => error
@@ -145,7 +152,7 @@ module SiloMigrate
               end
             end
             result["diagnostics"] = diagnostics unless diagnostics.empty?
-            result = result.merge("receipt_id" => id, "cleanup_confirmed" => journal["cleanup_confirmed"])
+            result = result.merge(journal.slice("work_status", "primary_reason", "producer_outcome", "guest_diagnostic"), "receipt_id" => id, "cleanup_confirmed" => journal["cleanup_confirmed"])
             mv_write!(mv_path(id, "json"), result.merge("templates" => templates, "generation" => generation, "prepared_from" => prepared_from))
             result
           end
@@ -194,11 +201,22 @@ module SiloMigrate
       def merge_validation_execute!(context, journal)
         context = context.merge("deadline" => context.fetch("deadline", mv_clock + mv_work_budget))
         host_dir = nil
+        host_identity = nil
         mv_journal!(journal)
+        # Only a direct call to the shipped implementation may hand off the
+        # opaque-producer guard. An override that delegates here remains opaque
+        # until that override itself returns to the owning wrapper.
+        mv_executor_handoff!(journal) if context["builtin_executor_tracking"] == true
         with_review_runtime(context.fetch("runtime_profile")) do
           stack = stack_for(context.fetch("prepared_from"), "review")
+          mv_step!(context, "executor_preflight")
+          mv_runtime_verify!(context, journal)
+          binding = journal.fetch("runtime_binding")
+          stack.define_singleton_method(:container) { |service| binding.fetch("#{service}_id") }
           host_dir = File.join(@store.root, "validations", journal.fetch("id"))
           Dir.mkdir(host_dir, 0o700)
+          host_stat = File.lstat(host_dir)
+          host_identity = [host_stat.dev, host_stat.ino]
           # The child runs with only these generated paths in argv. Passwords
           # exist solely in 0600 host files and 0400 guest context files.
           guest = "/shared/silo-validation-#{journal.fetch('id')}"
@@ -209,13 +227,22 @@ module SiloMigrate
           unless context["mode"] == "checks"
           network = stack.record.fetch("networks").first
           mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless network.is_a?(String) && !network.empty?
-          image = context.fetch("runtime_profile").fetch("images").fetch("redis").fetch("id")
+          mv_step!(context, "sidecar_image")
+          image = ImageIdentity.resolve(@runtime, context.fetch("runtime_profile").fetch("images").fetch("redis"))
+          mv_step!(context, "sidecar_create")
+          redis_seconds = mv_timeout(context, 60)
+          redis_token = mv_producer!(journal, "redis", "unknown")
+          # The pinned entrypoint drops root via gosu, which cannot run with ALL
+          # capabilities dropped. Start as its existing non-root account instead;
+          # keep every capability dropped and the root filesystem read-only.
           created = @runtime.run(["docker", "create", "--pull=never", "--restart=no", "--name", journal.fetch("redis"), "--label", "silo-migrate.managed=true", "--label", "silo-migrate.validation=#{journal.fetch('id')}",
-                                  "--network", network, "--memory", "128m", "--memory-swap", "128m", "--pids-limit", "64", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "0.5", "--read-only", "--tmpfs", "/data:rw,noexec,nosuid,size=16m", image,
-                                  "redis-server", "--save", "", "--appendonly", "no"], capture: true, timeout: mv_timeout(context, 60))
+                                  "--network", network, "--user", "redis:redis", "--memory", "128m", "--memory-swap", "128m", "--pids-limit", "64", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "0.5", "--read-only", "--tmpfs", "/data:rw,noexec,nosuid,size=16m", image,
+                                  "redis-server", "--save", "", "--appendonly", "no"], capture: true, timeout: redis_seconds)
+          mv_producer!(journal, "redis", created.success? && created.status == 0 && created.stdout.to_s.strip.match?(/\A[0-9a-f]{64}\z/) ? "completed" : "unknown", token: redis_token)
           mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless created.success? && created.stdout.to_s.strip.match?(/\A[0-9a-f]{64}\z/)
           journal["redis_id"] = created.stdout.strip
           mv_write!(mv_path(journal.fetch("id"), "resources.json"), journal)
+          mv_step!(context, "sidecar_ready")
           mv_command!(["docker", "start", journal.fetch("redis_id")], context: context)
           redis_ready = false
           10.times do
@@ -228,6 +255,7 @@ module SiloMigrate
           end
           mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless redis_ready
           end
+          mv_step!(context, "private_staging")
           # Immutable committed bytes, never the working tree.
           unless context["mode"] == "checks"
           current, files = merger_layer!(context.fetch("layer").fetch("revision"))
@@ -243,7 +271,7 @@ module SiloMigrate
           %w[merge_validate.rb merge_validation_config.rb merge_adapter.rb merge_asset_references.rb merge_baseline_assets.rb].each do |name|
             mv_raw_write!(File.join(host_dir, name), File.binread(File.join(helper_root, "prebuilt-discourse", name)))
           end
-          %w[merge_contract.rb merge_assets.rb merge_refusal.rb].each do |name|
+          %w[merge_contract.rb merge_assets.rb merge_refusal.rb merge_validation_diagnostic.rb].each do |name|
             mv_raw_write!(File.join(host_dir, name), File.binread(File.join(helper_root, "shared", name)))
           end
           work = File.join(host_dir, "work")
@@ -257,18 +285,56 @@ module SiloMigrate
             "original_config_path" => "/var/www/discourse/config/discourse.conf", "validation_config_path" => "#{guest}/work/discourse-validation.conf",
             "settings_path" => "#{guest}/work/settings.yml", "contract_path" => "#{guest}/work/contract.json", "layer_path" => "#{guest}/layer/merger.rb")
           mv_raw_write!(File.join(work, "context.json"), JSON.generate(private_context))
-          stack.copy_in(host_dir, guest, owner: "discourse:discourse", timeout: [mv_timeout(context, 60) / 2, 1].max)
+          # Docker cp into an existing directory has different semantics. Never
+          # adopt a pre-existing generated path or a symlink as our credential dir.
+          mv_step!(context, "guest_copy")
+          mv_recovery_refuse! unless mv_guest_identity!(context, journal) == "absent"
+          journal["guest_preflight_absent"] = true
+          mv_save_journal!(journal)
+          copy_seconds = [mv_timeout(context, 60) / 2, 1].max
+          copy_token = mv_producer!(journal, "guest_copy", "unknown")
+          stack.copy_in(host_dir, guest, owner: "discourse:discourse", timeout: copy_seconds)
+          journal["guest_identity"] = mv_guest_identity!(context, journal)
+          mv_producer!(journal, "guest_copy", "completed", token: copy_token)
           mv_web!(stack, ["sh", "-c", "find #{guest} -type f -exec chmod 400 {} + && find #{guest} -type d -exec chmod 700 {} +"], context: context)
-          ruby_options = context["mode"] == "checks" ? [] : ["RUBYOPT=-r#{guest}/merge_validation_config.rb"]
-          result = stack.discourse_shell(["env", *ruby_options, "SILO_MERGE_VALIDATION_CONTEXT=#{guest}/work/context.json",
+          ruby_options = context["mode"] == "checks" ? [] : ["-r#{guest}/merge_validation_config.rb"]
+          mv_step!(context, "guest_launch")
+          guest_seconds = mv_timeout(context, 150)
+          journal["guest_timeout_seconds"] = guest_seconds
+          guest_token = mv_producer!(journal, "guest", "unknown")
+          # The shell waits for the exact child and returns a nonce-bound final
+          # frame, including bootstrap failures before Ruby can emit its envelope.
+          # A Docker client exit code alone is never producer-completion proof.
+          # Load the guard only in the bundled Ruby child. RUBYOPT here would
+          # also preload it into the bundle launcher, before its native pg gem
+          # is activated; no PG constructor or Rails code runs before this hook.
+          result = stack.discourse_shell(["sh", "-c", VALIDATION_GUEST_WRAPPER, guest_token, "env",
+                                          "SILO_MERGE_VALIDATION_CONTEXT=#{guest}/work/context.json",
                                           "SILO_MERGE_SETTINGS=#{guest}/work/settings.yml", "SILO_MERGE_VALIDATION_RESULT=#{guest}/work/result.json",
-                                          "bundle", "exec", "ruby", "#{guest}/merge_validate.rb"], env_password: false, timeout: mv_timeout(context, 150))
-          # A timeout may leave docker exec running. Never remove its evidence or
-          # certify cleanup based on a merely empty catalogue at this instant.
-          mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless [0, 4].include?(result.status)
-          line = result.stdout.to_s
-          mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless line.bytesize <= 2048 && line.lines.size == 1 && line.start_with?(VALIDATION_PREFIX)
+                                          "bundle", "exec", "ruby", *ruby_options, "#{guest}/merge_validate.rb"], env_password: false, timeout: guest_seconds)
+          line = result.stdout.to_s.b
+          suffix = /\nSILO_VALIDATION_GUEST_DONE:#{guest_token}:([0-9]{1,3})\n\z/n.match(line)
+          terminal = suffix && result.status.is_a?(Integer) && result.status == suffix[1].to_i && result.status.between?(0, 255)
+          journal["guest_command_outcome"] = terminal ? ([0, 4].include?(result.status) ? "completed" : "failed") : (result.status.nil? ? "timeout_or_interrupted" : "unknown")
+          if terminal
+            line = line[0...suffix.begin(0)]
+            mv_producer!(journal, "guest", "completed", token: guest_token)
+            unless [0, 4].include?(result.status)
+              journal["guest_diagnostic"] = mv_bootstrap_diagnostic(result.stderr.to_s)
+            end
+          end
+          mv_save_journal!(journal)
+          # Unknown execution remains quarantined; a known failed child remains
+          # failed work but can clean its exact-owned scratch resources normally.
+          mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless terminal && [0, 4].include?(result.status)
+          mv_step!(context, "guest_result")
+          line.force_encoding(Encoding::UTF_8)
+          mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless line.valid_encoding? && line.bytesize <= 2048 && line.lines.size == 1 && line.start_with?(VALIDATION_PREFIX)
           projection = SiloMergeContract.parse(line.delete_prefix(VALIDATION_PREFIX).strip, max_bytes: 2048)
+          if projection.is_a?(Hash) && projection.key?("guest_diagnostic")
+            journal["guest_diagnostic"] = mv_guest_diagnostic!(projection.fetch("guest_diagnostic"))
+            mv_save_journal!(journal)
+          end
           # Bound guest result BEFORE docker cp, not after a potentially huge copy.
           size = stack.web_exec(["stat", "-c", "%s", "#{guest}/work/result.json"], timeout: mv_timeout(context, 30))
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless size.success? && size.stdout.to_s.strip.match?(/\A[0-9]+\z/) && size.stdout.to_i <= 4 * 1024 * 1024
@@ -277,11 +343,14 @@ module SiloMigrate
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") if File.symlink?(private_result) || !File.file?(private_result)
           File.chmod(0o600, private_result)
           record = SiloMergeContract.parse(mv_read!(private_result, 4 * 1024 * 1024), max_bytes: 4 * 1024 * 1024)
-          expected = record.slice("version", "status", "reason", "selected_ids_sha256", "asset_preflight_sha256", "selection_sha256").merge("key_path" => [])
+          expected = record.slice("version", "status", "reason", "selected_ids_sha256", "asset_preflight_sha256", "selection_sha256", "guest_diagnostic").merge("key_path" => [])
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless projection == expected
           # Known exited child: remove private credentials synchronously. Anything
           # failing here leaves an owned journal and blocks subsequent activation.
-          mv_web!(stack, ["rm", "-rf", "--", guest], context: context)
+          mv_recovery_refuse! unless mv_guest_identity!(context, journal) == journal.fetch("guest_identity")
+          journal["guest_cleanup_intent"] = true
+          mv_save_journal!(journal)
+          mv_command!(["docker", "exec", journal.fetch("runtime_binding").fetch("web_id"), "rm", "-rf", "--", guest], context: context)
           journal["guest_cleaned"] = true
           mv_write!(mv_path(journal.fetch("id"), "resources.json"), journal)
           record
@@ -289,7 +358,11 @@ module SiloMigrate
       ensure
         # Private host credentials are never receipt material. Unknown guest exec
         # retains its guest copy under the owned journal for scoped recovery.
-        FileUtils.remove_entry(host_dir) if host_dir && File.directory?(host_dir)
+        if host_identity && (File.exist?(host_dir) || File.symlink?(host_dir))
+          stat = File.lstat(host_dir)
+          mv_recovery_refuse! unless stat.directory? && !stat.symlink? && [stat.dev, stat.ino] == host_identity
+          FileUtils.remove_entry(host_dir)
+        end
       end
 
       def mv_clock
@@ -304,7 +377,12 @@ module SiloMigrate
       end
 
       def mv_command!(argv, context: {})
-        result = @runtime.run(argv, capture: true, timeout: mv_timeout(context, 60))
+        journal = context["lifecycle_journal"]
+        mv_runtime_verify!(context, journal) if journal
+        seconds = mv_timeout(context, 60)
+        command_token = mv_producer!(journal, "auxiliary", "unknown") if journal
+        result = @runtime.run(argv, capture: true, timeout: seconds)
+        mv_producer!(journal, "auxiliary", result.success? && result.status == 0 ? "completed" : "unknown", token: command_token) if journal
         mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless result.success?
         result
       end
@@ -445,7 +523,7 @@ module SiloMigrate
 
       def mv_facts(context)
         context.slice("prepared_from", "generation", "settings", "layer", "runtime_sha256", "code_sha256", "settings_sha256", "contract_sha256", "physical_policy").merge(
-          "validation_code_sha256" => Digest::SHA256.hexdigest([__FILE__, "../../../runtime/prebuilt-discourse/merge_validate.rb", "../../../runtime/prebuilt-discourse/merge_validation_config.rb", "../../../runtime/prebuilt-discourse/merge_adapter.rb", "../../../runtime/prebuilt-discourse/merge_asset_references.rb", "../../../runtime/prebuilt-discourse/merge_baseline_assets.rb", "../../../runtime/shared/merge_assets.rb", "../../../runtime/shared/merge_contract.rb", "../../../runtime/shared/merge_refusal.rb"].map { |file| File.binread(file == __FILE__ ? file : File.expand_path(file, __dir__)) }.join))
+          "validation_code_sha256" => Digest::SHA256.hexdigest([__FILE__, "../../../runtime/prebuilt-discourse/merge_validate.rb", "../../../runtime/prebuilt-discourse/merge_validation_config.rb", "../../../runtime/prebuilt-discourse/merge_adapter.rb", "../../../runtime/prebuilt-discourse/merge_asset_references.rb", "../../../runtime/prebuilt-discourse/merge_baseline_assets.rb", "../../../runtime/shared/merge_assets.rb", "../../../runtime/shared/merge_contract.rb", "../../../runtime/shared/merge_refusal.rb", "../../../runtime/shared/merge_validation_diagnostic.rb"].map { |file| File.binread(file == __FILE__ ? file : File.expand_path(file, __dir__)) }.join))
       end
 
       def mv_validate!(prepared_from:, generation:, settings:, checks:, deadline: nil)
@@ -470,27 +548,27 @@ module SiloMigrate
         # This fsynced private intent MUST precede CREATE, including CREATE ROLE.
         mv_write!(mv_path(id, "resources.json"), journal)
         result = nil
-        uncertain = false
         diagnostics = {}
         begin
           password = SecureRandom.hex(32)
           mv_provision!(context, journal, password)
           mv_step!(context, "guest_validation")
-          result = merge_validation_execute!(context.merge("password" => password, "checks" => checks), journal)
+          executor_token = mv_executor_begin!(journal)
+          result = merge_validation_execute!(context.merge("password" => password, "checks" => checks, "builtin_executor_tracking" => method(:merge_validation_execute!).owner == StandardMergeValidation), journal)
+          mv_producer!(journal, "executor", "completed", token: executor_token)
           mv_step!(context, "result_verification")
           result = mv_result!(result, context, checks)
         rescue StandardError => error
           diagnostics["work"] = mv_failure_diagnostic(context, error)
-          uncertain = true
           result = { "version" => 1, "status" => "refused", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "key_path" => [] }
         ensure
           # Cleanup failure/timeout is never swallowed into a passing receipt.
           begin
+            mv_work_outcome!(journal, result, diagnostics["work"])
             cleanup_context = context.merge("deadline" => mv_clock + VALIDATION_CLEANUP_BUDGET)
             mv_cleanup!(cleanup_context, journal)
             unchanged = mv_same_template_custody?(mv_custody!(cleanup_context), templates)
             mv_error!("STANDARD_MERGE_TEMPLATE_CUSTODY") unless unchanged
-            mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") if uncertain
             journal["status"] = "cleaned"
             journal["cleanup_confirmed"] = true
             mv_write!(mv_path(id, "resources.json"), journal)
@@ -500,11 +578,36 @@ module SiloMigrate
           end
         end
         result["diagnostics"] = diagnostics unless diagnostics.empty?
-        receipt = result.merge("receipt_id" => id, "prepared_from" => prepared_from, "generation" => generation, "settings" => settings,
+        receipt = result.merge(journal.slice("work_status", "primary_reason", "producer_outcome", "guest_diagnostic"), "receipt_id" => id, "prepared_from" => prepared_from, "generation" => generation, "settings" => settings,
                                "layer" => context["layer"], "facts" => mv_facts(context), "templates" => templates, "cleanup_confirmed" => journal["cleanup_confirmed"])
         bytes = mv_write!(mv_path(id, "json"), receipt)
         receipt["binding"] = mv_binding(receipt, bytes) if receipt["status"] == "passed" && receipt["cleanup_confirmed"]
         receipt
+      end
+
+      def mv_bootstrap_diagnostic(stderr)
+        # Only called after nonce-proven nonzero child termination. Read exactly
+        # the safe shipped diagnostic prefix; never relay an arbitrary stderr line.
+        bytes = stderr.b
+        bounded = bytes.byteslice(0, 64 * 1024)
+        component = bounded.match?(/\bSTANDARD_MERGE_VALIDATION_CONFIG\b/n) ? "validation_config" : "unknown"
+        fallback = { "version" => 1, "stage" => component == "validation_config" ? "bootstrap" : "unknown", "error_class" => "other", "component" => component, "line" => nil }
+        return fallback if bytes.bytesize > 64 * 1024
+        prefix = SiloMergeValidationDiagnostic::PREFIX
+        rows = bounded.lines.select { |line| line.start_with?(prefix) }
+        return fallback unless rows.size == 1 && rows.first.bytesize <= prefix.bytesize + 1024 + 1
+        value = SiloMergeContract.parse(rows.first.delete_prefix(prefix).strip, max_bytes: 1024)
+        SiloMergeValidationDiagnostic.validate!(value)
+        value.dup
+      rescue SiloMergeContract::Error, SiloMergeValidationDiagnostic::Error, EncodingError
+        fallback
+      end
+
+      def mv_guest_diagnostic!(value)
+        SiloMergeValidationDiagnostic.validate!(value)
+        value.dup
+      rescue SiloMergeValidationDiagnostic::Error
+        mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL")
       end
 
       def mv_binding(receipt, bytes)
@@ -518,10 +621,15 @@ module SiloMigrate
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL") unless result.bytesize <= 4 * 1024 * 1024 && result.start_with?(VALIDATION_PREFIX) && result.lines.size == 1
           result = SiloMergeContract.parse(result.delete_prefix(VALIDATION_PREFIX).strip, max_bytes: 4 * 1024 * 1024)
         end
-        valid_keys = result.is_a?(Hash) && [VALIDATION_RESULT_KEYS.sort, (VALIDATION_RESULT_KEYS + ["failure"]).sort].include?(result.keys.sort)
+        valid_keys = result.is_a?(Hash) && (result.keys - %w[failure guest_diagnostic]).sort == VALIDATION_RESULT_KEYS.sort
         unless valid_keys && result["version"] == 1 && %w[passed refused].include?(result["status"]) && result["key_path"].is_a?(Array)
           mv_error!("STANDARD_MERGE_VALIDATION_PROTOCOL")
         end
+        # Duplicate-key detection belongs to parsing, not later host updates.
+        # The real wire parser returns UniqueObject; normalize its outer Hash
+        # before replacing optional refusal evidence (without relaxing ingestion).
+        result = result.to_h
+        mv_guest_diagnostic!(result.fetch("guest_diagnostic")) if result.key?("guest_diagnostic")
         begin
           SiloMergeValidation::Finding.new(result["key_path"], "schema_unsupported")
         rescue ArgumentError
@@ -584,6 +692,23 @@ module SiloMigrate
       # it uses -c and logs its result (both unsafe for generated credentials).
       # All values here come from fixed host steps, never SQL, stderr or error text.
       def mv_step!(context, step)
+        step = VALIDATION_STEPS.include?(step) ? step : "unknown"
+        journal = context["lifecycle_journal"]
+        if journal && !context["read_only_lifecycle"]
+          now = mv_clock
+          previous = journal.delete("active_stage")
+          events = journal["events"] ||= []
+          if previous
+            events << { "step" => previous.fetch("step"), "phase" => "finish",
+              "elapsed_ms" => [[((now - previous.fetch("started")) * 1000).round, 0].max, 86_400_000].min,
+              "outcome" => "boundary" }
+          end
+          events << { "step" => step, "phase" => "start", "elapsed_ms" => 0 }
+          journal["events"] = events.last(128)
+          journal["active_stage"] = { "step" => step, "started" => now }
+          journal["last_stage"] = step
+          mv_save_journal!(journal)
+        end
         context["validation_step"] = step
         context.delete("sql_outcome")
         context.delete("sql_timeout_seconds")
@@ -598,12 +723,20 @@ module SiloMigrate
       end
 
       def mv_failure_diagnostic(context, error)
+        mv_finish_stage!(context, context.dig("lifecycle_journal", "producer_outcome") == "unknown" ? "unknown" : "failed")
         step = context["validation_step"]
+        journal = context["lifecycle_journal"]
+        step = journal["last_stage"] if step == "guest_validation" && journal.is_a?(Hash) && VALIDATION_EXECUTOR_STEPS.include?(journal["last_stage"])
         reason = error.code if error.is_a?(StandardWorkflowError)
         record = { "step" => VALIDATION_STEPS.include?(step) ? step : "unknown",
+          "error_class" => SiloMergeValidationDiagnostic.classify_error_class(error),
           "reason" => VALIDATION_FAILURE_REASONS.include?(reason) ? reason : "STANDARD_MERGE_VALIDATION_UNPROVEN",
           "deadline_reached" => context["deadline"].is_a?(Numeric) ? mv_clock >= context["deadline"] : nil }
         outcome, seconds = context.values_at("sql_outcome", "sql_timeout_seconds")
+        journal = context["lifecycle_journal"]
+        if %w[guest_validation guest_launch guest_result].include?(step) && journal.is_a?(Hash) && journal.key?("guest_command_outcome")
+          outcome, seconds = journal.values_at("guest_command_outcome", "guest_timeout_seconds")
+        end
         record["command_outcome"] = outcome if %w[failed timeout_or_interrupted unknown].include?(outcome)
         record["command_timeout_seconds"] = seconds if seconds.is_a?(Integer) && seconds.between?(1, OPERATOR_VALIDATION_BUDGET)
         record
@@ -619,17 +752,44 @@ module SiloMigrate
         else
           stack_for(context.fetch("prepared_from"), "review")
         end
+        journal = context["lifecycle_journal"]
+        if journal
+          mv_runtime_verify!(context, journal)
+          context["producer_command"] = "sql"
+        end
         seconds = mv_timeout(context, max_seconds)
+        tracking = journal && !context["read_only_lifecycle"]
+        sql_token = tracking ? mv_producer!(journal, "sql", "unknown") : SecureRandom.hex(16)
         context["sql_timeout_seconds"] = seconds
         context["sql_outcome"] = "unknown"
-        result = @runtime.run(["docker", "exec", "-i", stack.container("db"), "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database, "-At"],
-                              stdin_data: sql, capture: true, timeout: seconds)
+        command = ["docker", "exec", "-i"]
+        if journal
+          command += ["-e", "PGAPPNAME=silo_validation_#{journal.fetch('id')}", journal.fetch("runtime_binding").fetch("db_id"),
+            "sh", "-c", 'psql -X -q -v ON_ERROR_STOP=1 -U postgres -d "$1" -At; rc=$?; printf "\\nSILO_VALIDATION_SQL_DONE:%s:%s\\n" "$2" "$rc"; exit "$rc"',
+            "silo-validation-sql", database, sql_token]
+        else
+          command += [stack.container("db"), "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database, "-At"]
+        end
+        result = @runtime.run(command, stdin_data: sql, capture: true, timeout: seconds)
+        output = result.stdout.to_s
+        terminal = !journal
+        if journal
+          suffix = /\nSILO_VALIDATION_SQL_DONE:#{sql_token}:([0-9]{1,3})\n\z/.match(output)
+          terminal = suffix && result.status.is_a?(Integer) && result.status == suffix[1].to_i && result.status.between?(0, 255)
+          output = output[0...suffix.begin(0)] if terminal
+          mv_producer!(journal, "sql", terminal ? "completed" : "unknown", token: sql_token) if tracking
+        end
+        mv_finish_stage!(context, terminal ? (result.success? ? "completed" : "failed") : "unknown")
+        unless terminal
+          context["sql_outcome"] = "timeout_or_interrupted"
+          mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN")
+        end
         unless result.success?
           context["sql_outcome"] = result.respond_to?(:status) && result.status.is_a?(Integer) ? "failed" : "timeout_or_interrupted"
           mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN")
         end
         context.delete("sql_outcome")
-        result.stdout.to_s
+        output
       end
 
       # pg_database_size is a capacity observation, not a custody identity.
@@ -682,14 +842,23 @@ module SiloMigrate
       def mv_provision!(context, journal, password)
         mv_journal!(journal)
         mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless password.is_a?(String) && password.valid_encoding? && password.bytesize == 64 && VALIDATION_SHA.match?(password)
+        mv_lifecycle_start!(context, journal)
         role = journal.fetch("role")
         absent = mv_sql!(context, "SELECT count(*) FROM pg_database WHERE datname IN ('#{journal.fetch('source')}','#{journal.fetch('base')}');\nSELECT count(*) FROM pg_roles WHERE rolname='#{role}';\n", step: "resources_absent")
-        mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless absent.lines.map(&:strip) == %w[0 0]
-        mv_sql!(context, "CREATE ROLE #{role} LOGIN PASSWORD '#{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;\n", step: "create_role")
+        mv_recovery_refuse! unless absent.lines.map(&:strip) == %w[0 0]
+        %w[source base role].each { |key| journal.fetch("resources")[key] = { "outcome" => "absent" } }
+        mv_save_journal!(journal)
+        mv_create_resource!(context, journal, "role") do
+          mv_sql!(context, "CREATE ROLE #{role} LOGIN PASSWORD '#{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;\n", step: "create_role")
+        end
         { "source" => "merge_source", "base" => "silo_clean_base" }.each do |side, template|
           name = journal.fetch(side)
-          mv_sql!(context, "CREATE DATABASE #{name} TEMPLATE #{template} OWNER postgres;\nREVOKE ALL ON DATABASE #{name} FROM PUBLIC;\nGRANT CONNECT ON DATABASE #{name} TO #{role};\nREVOKE CREATE, TEMPORARY ON DATABASE #{name} FROM #{role};\nALTER ROLE #{role} IN DATABASE #{name} SET default_transaction_read_only = on;\n", max_seconds: mv_work_budget, step: "clone_#{side}")
-          # No owner/default/analyst grants: only the random role sees either clone.
+          mv_create_resource!(context, journal, side) do
+            # Isolate CREATE from restrictions: identity is fsynced before any
+            # subsequent statement can fail. Lost CREATE responses stay unknown.
+            mv_sql!(context, "CREATE DATABASE #{name} TEMPLATE #{template} OWNER postgres ALLOW_CONNECTIONS false;\n", max_seconds: mv_work_budget, step: "clone_#{side}")
+          end
+          mv_sql!(context, "REVOKE ALL ON DATABASE #{name} FROM PUBLIC;\nGRANT CONNECT ON DATABASE #{name} TO #{role};\nREVOKE CREATE, TEMPORARY ON DATABASE #{name} FROM #{role};\nALTER ROLE #{role} IN DATABASE #{name} SET default_transaction_read_only = on;\nALTER DATABASE #{name} ALLOW_CONNECTIONS true;\n", step: "restrict_#{side}")
           mv_sql!(context, <<~SQL, database: name, step: "restrict_#{side}")
             DO $silo_validation$
             DECLARE application_schema text;
@@ -712,51 +881,18 @@ module SiloMigrate
         mv_error!("STANDARD_MERGE_TEMPLATE_CUSTODY") unless mv_same_template_custody?(mv_custody!(context), journal.fetch("templates"))
         journal["owned_identities"] = mv_owned_identities!(context, journal)
         journal["provision_complete"] = true
-        mv_write!(mv_path(journal.fetch("id"), "resources.json"), journal)
+        mv_save_journal!(journal)
       end
 
       def mv_owned_identities!(context, journal)
         mv_journal!(journal)
-        sql = "/* silo_validation_owned */ SELECT datname, oid, pg_get_userbyid(datdba) FROM pg_database WHERE datname IN ('#{journal.fetch('source')}','#{journal.fetch('base')}') ORDER BY datname;\nSELECT rolname, oid, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolbypassrls, rolreplication, rolcanlogin FROM pg_roles WHERE rolname='#{journal.fetch('role')}';\n"
-        rows = mv_sql!(context, sql, step: "resource_identity").lines.map { |line| line.strip.split("|", -1) }
-        unless rows.size == 3 && rows.first(2).map(&:first).sort == [journal.fetch("source"), journal.fetch("base")].sort &&
-            rows.first(2).all? { |row| row.size == 3 && row[1].match?(/\A[1-9][0-9]*\z/) && row[2] == "postgres" } &&
-            rows.last.size == 9 && rows.last[0] == journal.fetch("role") && rows.last[1].match?(/\A[1-9][0-9]*\z/) && rows.last[2..] == %w[f f f f f f t]
-          mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED")
-        end
-        rows
+        rows = %w[source base role].flat_map { |key| mv_resource_identity!(context, journal, key) || [] }
+        mv_recovery_refuse! unless rows.size == 3
+        rows.sort_by(&:first)
       end
 
       def mv_cleanup!(context, journal)
-        context = context.dup if context.frozen?
-        mv_step!(context, "cleanup_resources")
-        mv_journal!(journal)
-        # No name-only destructive cleanup after a partial/unknown CREATE. Such
-        # resources require explicit scoped recovery, not an automatic guess.
-        unless journal["provision_complete"] == true && mv_owned_identities!(context, journal) == journal.fetch("owned_identities")
-          mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED")
-        end
-        mv_step!(context, "cleanup_resources")
-        if journal["redis"]
-          inspected = @runtime.run(["docker", "inspect", "--format", '{{.Id}}|{{index .Config.Labels "silo-migrate.validation"}}|{{index .Config.Labels "silo-migrate.managed"}}', journal.fetch("redis")], capture: true, timeout: mv_timeout(context, 30))
-          mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless inspected.success? && inspected.stdout.to_s.strip.match?(/\A[0-9a-f]{64}\|#{journal.fetch('id')}\|true\z/)
-          inspected_id = inspected.stdout.strip.split("|").first
-          mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") if journal["redis_id"] && journal["redis_id"] != inspected_id
-          mv_command!(["docker", "rm", "-f", inspected_id], context: context)
-          absent = @runtime.run(["docker", "container", "ls", "-aq", "--filter", "name=^/#{journal.fetch('redis')}$"], capture: true, timeout: mv_timeout(context, 30))
-          mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless absent.success? && absent.stdout.to_s.strip.empty?
-        end
-        if journal["guest_directory"] && journal["guest_cleaned"] != true
-          mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED")
-        end
-        %w[source base].each do |side|
-          name = journal.fetch(side)
-          # Only generated owned clones, never original templates or inspection DBs.
-          mv_sql!(context, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='#{name}' AND pid <> pg_backend_pid();\nDROP DATABASE IF EXISTS #{name};\n", step: "cleanup_#{side}")
-        end
-        mv_sql!(context, "DROP ROLE IF EXISTS #{journal.fetch('role')};\n", step: "cleanup_role")
-        remaining = mv_sql!(context, "SELECT count(*) FROM pg_database WHERE datname IN ('#{journal.fetch('source')}','#{journal.fetch('base')}');\nSELECT count(*) FROM pg_roles WHERE rolname='#{journal.fetch('role')}';\n", step: "cleanup_absence")
-        mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless remaining.lines.map(&:strip) == %w[0 0]
+        mv_lifecycle_cleanup!(context, journal, recovery: false)
       end
 
       def mv_path(id, suffix)
@@ -776,10 +912,12 @@ module SiloMigrate
 
       def mv_read!(path, limit)
         mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") if File.symlink?(path)
-        File.open(path, File::RDONLY | File::NOFOLLOW) do |file|
+        File.open(path, File::RDONLY | File::NOFOLLOW | File::NONBLOCK) do |file|
           stat = file.stat
           mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") unless stat.file? && stat.uid == Process.uid && (stat.mode & 0o077).zero? && stat.size <= limit
-          file.read(limit + 1)
+          bytes = file.read(limit + 1)
+          mv_error!("STANDARD_MERGE_VALIDATION_UNPROVEN") if bytes.bytesize > limit
+          bytes
         end
       end
 

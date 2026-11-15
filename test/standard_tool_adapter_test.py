@@ -182,7 +182,7 @@ CONTEXT_KEYS = {'_private_session', '_session_id', '_uploads'}
 DATA_TOOLS = ('data_guide', 'data_status', 'data_supporting_list', 'data_supporting_read',
               'data_supporting_prepare', 'data_list', 'data_peek', 'data_create', 'data_take', 'data_register', 'data_script',
               'data_extract', 'data_job', 'data_db_up', 'data_db_load', 'data_db_status', 'data_db_reset', 'data_run_evidence',
-              'data_run_count', 'data_plan_propose', 'data_master_lists_propose', 'data_workflow_contract', 'data_workflow_validate', 'data_workflow_exists', 'data_merge_prepare', 'data_merge_inspection',
+              'data_run_count', 'data_plan_propose', 'data_master_lists_propose', 'data_workflow_validation_status', 'data_workflow_contract', 'data_workflow_validate', 'data_workflow_exists', 'data_merge_prepare', 'data_merge_inspection',
               'data_merge_propose', 'data_finding_proposal', 'data_revise_finding', 'data_propose_finding',
               'data_notes', 'data_decide', 'data_decisions', 'data_notes_write')
 BRANCH_TOOLS = ('data_branch_resolve', 'data_branches', 'data_branch_diff', 'data_branch_read')
@@ -215,6 +215,15 @@ if mode == 'large':
     print(json.dumps({'version': 1, 'text': 'x' * (49 * 1024)}))
 elif mode == 'garbage':
     print('{"version": 1, "text": "cut')
+elif os.environ.get('TERM_LLM_TOOL_NAME') == 'data_workflow_validation_status':
+    diagnostic = {'reason': 'unknown', 'stage': 'unknown', 'deadline_reached': None,
+                  'command_outcome': 'unknown', 'status': 'unknown'}
+    print(json.dumps({'version': 1, 'attempt_id': None,
+                      'evidence': {'receipt': 'missing', 'journal': 'missing'},
+                      'status': 'unknown', 'reason': 'unknown', 'work': diagnostic,
+                      'producer_outcome': 'unknown', 'cleanup': diagnostic,
+                      'last_recorded_stage': 'unknown', 'events': [],
+                      'key_path_segments': None, 'next_action': 'no_saved_attempt'}))
 else:
     print(json.dumps({'version': 1, 'status': 'ok'}))
 ''')
@@ -249,9 +258,9 @@ else:
         definition = (ROOT / 'integrations/term-llm/migration-data/agent.yaml').read_text()
         blocks = re.split(r'(?m)^    - name: ', definition)[1:]
         # The four branch tools use a separate reader-role adapter, tested in converter_dev_adapter_test.
-        self.assertEqual(38, len(blocks))
+        self.assertEqual(39, len(blocks))
         declared = [block.splitlines()[0] for block in blocks if 'script: scripts/data_tool.py' in block]
-        self.assertEqual(34, len(declared))
+        self.assertEqual(35, len(declared))
         self.assertEqual(list(DATA_TOOLS), declared)
         self.assertEqual(list(BRANCH_TOOLS), [block.splitlines()[0] for block in blocks if 'script: scripts/dev_tool.py' in block])
         import importlib.util
@@ -369,7 +378,7 @@ else:
         for tool in DATA_TOOLS:
             with self.subTest(tool=tool):
                 result, _raw = self.call(tool, {} if tool.startswith('data_workflow_') else {'id': 'support-' + 'a' * 32})
-                self.assertEqual('ok', result['status'])
+                self.assertEqual('unknown' if tool == 'data_workflow_validation_status' else 'ok', result['status'])
                 ((argv, request),) = self.calls()
                 self.assertEqual(['data', 'arc'], argv)
                 self.assertEqual('chat', request['via'])

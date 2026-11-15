@@ -39,11 +39,34 @@ class StandardMergeValidationTest < Minitest::Test
     attr_accessor :cleanup_failure, :custody_changed, :base_bytes, :template_owner, :template_open, :template_sessions
     def initialize
       @calls = []
+      @inventory = {}
     end
     def run(argv, **options)
+      unless options.key?(:stdin_data)
+        output = if argv[1] == "info"
+          "fixture-daemon-id"
+        elsif argv[1] == "inspect"
+          "#{(argv.last.start_with?('web') || argv.last == 'e' * 64) ? 'e' * 64 : 'd' * 64}|true|2026-11-14T00:00:00Z|true|fixture"
+        else
+          raise "unexpected non-SQL command"
+        end
+        return OpenStruct.new(success?: true, stdout: output, stderr: "", status: 0)
+      end
       sql = options.fetch(:stdin_data)
       calls << [argv, options]
-      output = if sql.include?("silo_validation_owned")
+      if sql =~ /CREATE (?:DATABASE|ROLE) (silo_val_[sbr]_[0-9a-f]{32})/
+        name = Regexp.last_match(1)
+        @inventory[name] = name.include?("_r_") ? [name, "201", *%w[f f f f f f t]] : [name, name.include?("_s_") ? "102" : "101", "10", "postgres"]
+      end
+      sql.scan(/DROP (?:DATABASE|ROLE)(?: IF EXISTS)? (silo_val_[sbr]_[0-9a-f]{32})/).flatten.each { |name| @inventory.delete(name) unless cleanup_failure }
+      output = if sql.include?("silo_validation_identity_")
+        name = sql[/silo_val_[sbr]_[0-9a-f]{32}/]
+        @inventory[name] ? @inventory.fetch(name).join("|") + "\n" : ""
+      elsif sql.include?("silo_validation_producers")
+        "0\n"
+      elsif sql.include?("silo_validation_recovery_sessions")
+        sql.lines.grep(/SELECT count/).map { "0\n" }.join
+      elsif sql.include?("silo_validation_owned")
         source = sql[/silo_val_s_[0-9a-f]{32}/]
         base = sql[/silo_val_b_[0-9a-f]{32}/]
         role = sql[/silo_val_r_[0-9a-f]{32}/]
@@ -56,7 +79,12 @@ class StandardMergeValidationTest < Minitest::Test
         ""
       end
       okay = !(cleanup_failure && sql.include?("DROP DATABASE"))
-      OpenStruct.new(success?: okay, stdout: output, stderr: "PRIVATE NEVER LOG", status: okay ? 0 : 1)
+      sql_result(OpenStruct.new(success?: okay, stdout: output, stderr: "PRIVATE NEVER LOG", status: okay ? 0 : 1), argv)
+    end
+    def sql_result(result, argv)
+      return result unless argv.include?("silo-validation-sql") && result.status.is_a?(Integer)
+      result.stdout = result.stdout.to_s.sub(/\nSILO_VALIDATION_SQL_DONE:[0-9a-f]{32}:[0-9]+\n\z/, "") + "\nSILO_VALIDATION_SQL_DONE:#{argv.last}:#{result.status}\n"
+      result
     end
   end
 
@@ -79,7 +107,7 @@ class StandardMergeValidationTest < Minitest::Test
     def merger_contract!(_) = contract_bytes
     def merge_environment_phase(_, env) = env["phase"]
     def merge_validation_context!(**)
-      { "settings_bytes" => settings_bytes, "code_sha256" => code_sha, "runtime_sha256" => "d" * 64 }
+      { "settings_bytes" => settings_bytes, "code_sha256" => code_sha, "runtime_sha256" => "d" * 64, "runtime_profile" => {} }
     end
     def merge_validation_execute!(context, journal)
       if context["mode"] == "checks"
@@ -101,7 +129,10 @@ class StandardMergeValidationTest < Minitest::Test
     def with_review_runtime(_) = yield
     def disk_headroom!(bytes) = @capacity = bytes
     def stack_for(*)
-      Object.new.tap { |stack| stack.define_singleton_method(:container) { |_| "db-container" } }
+      Object.new.tap do |stack|
+        stack.define_singleton_method(:container) { |service| "#{service}-container" }
+        stack.define_singleton_method(:record) { { "name" => "fixture", "containers" => { "db" => "d" * 64, "web" => "e" * 64 } } }
+      end
     end
     def validate = validate_merge_settings(prepared_from: "prep", generation: "a" * 64, settings: "registered-settings")
     def body(receipt)
@@ -220,7 +251,8 @@ class StandardMergeValidationTest < Minitest::Test
     original = @host.runtime.method(:run)
     @host.runtime.define_singleton_method(:run) do |argv, **options|
       result = original.call(argv, **options)
-      script.call(options.fetch(:stdin_data), options, clock, result) || result
+      injected = script.call(options.fetch(:stdin_data, ""), options, clock, result)
+      injected ? sql_result(injected, argv) : result
     end
     clock
   end
@@ -285,7 +317,7 @@ class StandardMergeValidationTest < Minitest::Test
     result = @host.validate
     assert_equal "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", result["reason"]
     assert_equal false, result["cleanup_confirmed"]
-    assert_equal({ "step" => "clone_base", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN",
+    assert_equal({ "step" => "clone_base", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "error_class" => "other",
       "deadline_reached" => true, "command_outcome" => "timeout_or_interrupted", "command_timeout_seconds" => 180 },
       result.fetch("diagnostics").fetch("work"))
     refute result.key?("binding")
@@ -356,7 +388,7 @@ class StandardMergeValidationTest < Minitest::Test
     value = @host.send(:mv_failure_diagnostic,
       { "validation_step" => "PRIVATE", "sql_outcome" => "PRIVATE", "sql_timeout_seconds" => "PRIVATE", "deadline" => "PRIVATE" },
       SiloMigrate::StandardWorkflowError.new("PRIVATE", "PRIVATE"))
-    assert_equal({ "step" => "unknown", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "deadline_reached" => nil }, value)
+    assert_equal({ "step" => "unknown", "error_class" => "other", "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "deadline_reached" => nil }, value)
   end
 
   def test_nonclone_sql_keeps_the_default_120_second_cap
@@ -393,7 +425,7 @@ class StandardMergeValidationTest < Minitest::Test
     grants = @host.runtime.calls.select { |_, options| options[:stdin_data].include?("DO $silo_validation$") }
     assert_equal 2, grants.size
     grants.each do |argv, options|
-      assert_match(/\Asilo_val_[sb]_[0-9a-f]{32}\z/, argv[argv.index("-d") + 1])
+      assert_match(/\Asilo_val_[sb]_[0-9a-f]{32}\z/, (argv.include?("silo-validation-sql") ? argv[-2] : argv[argv.index("-d") + 1]))
       assert_includes options[:stdin_data], "FROM pg_namespace"
       assert_includes options[:stdin_data], "nspname <> 'information_schema' AND nspname !~ '^pg_'"
       assert_includes options[:stdin_data], "format('REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA %I FROM PUBLIC', application_schema)"
@@ -401,7 +433,14 @@ class StandardMergeValidationTest < Minitest::Test
     end
     refute_match(/ALTER DATABASE (?:merge_source|silo_clean_base)|RENAME TO|GRANT.*discourse/, sql)
     @host.runtime.calls.each do |argv, options|
-      refute argv.include?("-c")
+      # The fixed terminal-proof shell wrapper has -c; SQL still arrives only
+      # on stdin, never as psql -c or interpolated shell source.
+      if argv.include?("silo-validation-sql")
+        assert_equal "sh", argv[argv.index("-c") - 1]
+        assert_includes argv[argv.index("-c") + 1], 'psql -X -q -v ON_ERROR_STOP=1'
+      else
+        refute argv.include?("-c")
+      end
       refute_includes argv.join(" "), "PASSWORD"
       assert options[:stdin_data]
     end
@@ -534,6 +573,21 @@ class StandardMergeValidationTest < Minitest::Test
     path = File.join(@directory, "validations", "#{result.fetch('receipt_id')}.json")
     assert_equal result["failure"], JSON.parse(File.binread(path)).fetch("failure")
     assert_equal 0o600, File.stat(path).mode & 0o777
+  end
+
+  def test_real_duplicate_detecting_wire_parser_preserves_typed_refusal_during_normalization
+    @host.guest_failure = true
+    receipt = @host.validate
+    keys = SiloMigrate::Services::StandardMergeValidation::VALIDATION_RESULT_KEYS + ["failure"]
+    wire = SiloMergeContract.parse(JSON.generate(receipt.slice(*keys)))
+    assert_instance_of SiloMergeContract::UniqueObject, wire
+    checked = @host.send(:mv_result!, wire, { "contract" => SiloMergeContract.load(@host.contract_bytes) }, [])
+    assert_instance_of Hash, checked
+    assert_equal "refused", checked["status"]
+    assert_equal "preflight_refused", checked["reason"]
+    assert_equal checked.fetch("audit"), checked.dig("failure", "counts")
+    assert_equal "partial", checked.dig("failure", "audit_status")
+    assert_raises(SiloMergeContract::Error) { SiloMergeContract.parse('{"status":"refused","status":"passed"}') }
   end
 
   def test_bad_optional_audit_evidence_does_not_mask_a_valid_primary_refusal
@@ -875,13 +929,35 @@ end
 # Scripted production bridge: real private file staging, no Docker/PG processes.
 class MergeValidationTransportTest < Minitest::Test
   class TransportRuntime < StandardMergeValidationTest::Runtime
+    attr_accessor :image_mismatch
+    def redis_document
+      { "Id" => "sha256:#{'8' * 64}", "Architecture" => "amd64", "Os" => "linux", "RootFS" => { "Layers" => [] }, "Config" => {} }
+    end
+    def guest_created! = @guest_present = true
     def run(argv, **options)
-      return super if options[:stdin_data]
+      return super if options[:stdin_data] || argv[1] == "info" || (argv[1] == "inspect" && argv.last != "9" * 64)
       calls << [argv, options]
       output = case argv[0, 2]
-      when %w[docker create] then "#{'9' * 64}\n"
-      when %w[docker inspect] then "#{'9' * 64}|#{argv.last.delete_prefix('silo-val-redis-')}|true\n"
-      when %w[docker exec] then "PONG\n"
+      when %w[docker image]
+        JSON.generate([image_mismatch ? redis_document.merge("Os" => "other") : redis_document])
+      when %w[docker create]
+        @redis_attempt = argv[argv.index("--name") + 1].delete_prefix("silo-val-redis-")
+        @redis_present = true
+        "#{'9' * 64}\n"
+      when %w[docker inspect] then "#{'9' * 64}|#{@redis_attempt}|true|true\n"
+      when %w[docker container] then @redis_present ? "#{'9' * 64}\n" : ""
+      when %w[docker rm]
+        @redis_present = false
+        ""
+      when %w[docker exec]
+        if argv.include?("silo-validation-stat")
+          @guest_present ? "1:123:1000:directory" : "absent"
+        elsif argv.include?("rm")
+          @guest_present = false
+          ""
+        else
+          "PONG\n"
+        end
       else ""
       end
       OpenStruct.new(success?: true, stdout: output, status: 0)
@@ -890,11 +966,13 @@ class MergeValidationTransportTest < Minitest::Test
 
   class Stack
     attr_reader :copied_context, :shell_args, :record, :guest_files
-    def initialize
-      @record = { "networks" => ["internal-fixture"] }
+    def initialize(runtime: nil)
+      @runtime = runtime
+      @record = { "name" => "fixture", "containers" => { "db" => "d" * 64, "web" => "e" * 64 }, "networks" => ["internal-fixture"] }
     end
-    def container(_) = "fixture-container"
+    def container(service) = "#{service}-container"
     def copy_in(host, guest, **)
+      @runtime&.guest_created!
       @copied_context = JSON.parse(File.read(File.join(host, "work", "context.json")))
       @guest_files = Dir.glob("#{host}/**/*").select { |path| File.file?(path) }
     end
@@ -904,7 +982,7 @@ class MergeValidationTransportTest < Minitest::Test
       @result = { "version" => 1, "status" => "passed", "reason" => "ok", "key_path" => [], "approved_ids" => [1], "audit" => { "uploads" => 1 }, "checks" => [],
                   "selected_ids_sha256" => Digest::SHA256.hexdigest("[1]"), "selection_sha256" => "a" * 64, "asset_preflight_sha256" => "b" * 64, "owner_preflight_sha256" => "d" * 64 }
       projection = @result.slice("version", "status", "reason", "selected_ids_sha256", "selection_sha256", "asset_preflight_sha256").merge("key_path" => [])
-      OpenStruct.new(success?: true, status: 0, stdout: "SILO_MERGE_VALIDATION:#{JSON.generate(projection)}\n")
+      OpenStruct.new(success?: true, status: 0, stdout: "SILO_MERGE_VALIDATION:#{JSON.generate(projection)}\n\nSILO_VALIDATION_GUEST_DONE:#{args.fetch(3)}:0\n")
     end
     def copy_out(_, destination, **)
       File.write(destination, JSON.generate(@result), mode: "w", perm: 0o600)
@@ -915,10 +993,13 @@ class MergeValidationTransportTest < Minitest::Test
     attr_reader :stack
     def initialize(root)
       super
-      @runtime, @stack = TransportRuntime.new, Stack.new
+      @runtime = TransportRuntime.new
+      @stack = Stack.new(runtime: @runtime)
     end
     def merge_validation_context!(**options)
-      super.merge("runtime_profile" => { "images" => { "redis" => { "id" => "sha256:#{'8' * 64}" } } })
+      super.merge("runtime_profile" => { "images" => { "redis" => {
+        "ref" => "redis@sha256:#{'7' * 64}", "content_id" => SiloMigrate::ImageIdentity.content_id(runtime.redis_document), "source" => "fixture"
+      } } })
     end
     def merge_validation_execute!(context, journal)
       SiloMigrate::Services::StandardMergeValidation.instance_method(:merge_validation_execute!).bind_call(self, context, journal)
@@ -927,20 +1008,40 @@ class MergeValidationTransportTest < Minitest::Test
     def stack_for(*) = stack
   end
 
+  def test_real_catalog_shape_refuses_changed_content_before_sidecar_creation
+    Dir.mktmpdir do |directory|
+      host = Class.new(Host) { prepend SiloMigrate::Services::StandardMergeValidation }.new(directory)
+      host.define_singleton_method(:merge_validation_context!) do |**options|
+        Host.instance_method(:merge_validation_context!).bind_call(self, **options)
+      end
+      host.runtime.image_mismatch = true
+      result = host.validate
+      assert_equal "refused", result["status"]
+      assert_equal true, result["cleanup_confirmed"]
+      refute host.runtime.calls.any? { |argv, _| argv[0, 2] == %w[docker create] }
+      assert_nil host.stack.shell_args
+    end
+  end
+
   def test_production_transport_uses_private_files_pinned_sidecar_and_no_password_argv
     Dir.mktmpdir do |directory|
       host = Host.new(directory)
       result = host.validate
       assert_equal "passed", result["status"], result.inspect
+      assert host.runtime.calls.any? { |argv, _| argv == ["docker", "image", "inspect", "redis@sha256:#{'7' * 64}"] }
       context = host.stack.copied_context
       assert_equal true, context["redis_isolated"]
       assert_match(/\Asilo_val_r_[0-9a-f]{32}\z/, context["role"])
       arguments, options = host.stack.shell_args
       assert_equal false, options[:env_password]
-      assert arguments.any? { |arg| arg.start_with?("RUBYOPT=-r/shared/silo-validation-") }
+      ruby_index = arguments.index("ruby")
+      assert_equal ["bundle", "exec"], arguments[ruby_index - 2, 2]
+      assert_match(%r{\A-r/shared/silo-validation-[0-9a-f]{32}/merge_validation_config\.rb\z}, arguments[ruby_index + 1])
+      refute arguments.any? { |arg| arg.start_with?("RUBYOPT=") }
       refute_includes arguments.join(" "), context.fetch("password")
       create = host.runtime.calls.find { |argv, _| argv[0, 2] == %w[docker create] }.first
       %w[--cap-drop --read-only --pids-limit --memory --memory-swap --security-opt --pull=never --restart=no].each { |flag| assert_includes create, flag }
+      assert_equal "redis:redis", create[create.index("--user") + 1]
       assert_equal "128m", create[create.index("--memory") + 1]
       assert_equal "128m", create[create.index("--memory-swap") + 1]
       refute_includes create, "--publish"

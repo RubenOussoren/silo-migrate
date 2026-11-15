@@ -430,6 +430,16 @@ tools:
             additionalProperties: false
         required: [source, settings]
         additionalProperties: false
+    - name: data_workflow_validation_status
+      description: "Read saved merge-validation status only (no validation/runtime/settings/custom code). Omit attempt for workspace-scoped latest, then pin its returned attempt_id. Missing/incomplete evidence is unknown, not success. Recovery/reconciliation hints require the operator; this tool cannot apply recovery or retry."
+      script: scripts/data_tool.py
+      call: json
+      timeout_seconds: 70
+      input:
+        type: object
+        properties:
+          attempt: {type: string, pattern: "^(latest|[0-9a-f]{32})$", description: "Saved attempt selector; default latest in this chat's workspace"}
+        additionalProperties: false
     - name: data_workflow_contract
       description: "Read the actual committed workflow-contract.json and supported engine facts privately. Do not infer schema or enums from examples."
       script: scripts/data_tool.py

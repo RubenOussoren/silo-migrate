@@ -17,6 +17,20 @@ class LiveProvision
   def mv_write!(*); end
   def mv_path(*); "fixture-only"; end
   def mv_error!(_code); raise "provision_refused"; end
+  # This older composition intentionally tests SQL/guest behavior, not durable
+  # version-2 host custody. Keep only a local SQL record; do not fabricate daemon
+  # bindings, producer frames, persisted ownership or a recoverable v2 journal.
+  # The connected host fixture is the authority for that lifecycle.
+  def mv_lifecycle_start!(_context, journal)
+    mv_journal!(journal)
+    journal["resources"] = {}
+  end
+  def mv_create_resource!(context, journal, key)
+    yield
+    identity = mv_resource_identity!(context, journal, key)
+    raise "fixture_sql_identity_unproven" unless identity
+    journal.fetch("resources")[key] = { "outcome" => "created", "identity" => identity }
+  end
   def mv_sql!(_context, sql, database: "postgres", max_seconds: 120, step: "sql")
     STDOUT.puts(JSON.generate("sql" => sql, "database" => database))
     STDOUT.flush

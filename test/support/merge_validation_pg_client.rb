@@ -61,12 +61,17 @@ module NativePGAcceptance
 
   def prove_refusal(target, method, args, kwargs)
     connection = nil
+    @progress["phase"], @progress["check"] = "guard_refusal", "guard_refusal_invocation"
     begin
       Timeout.timeout(8) { connection = target.public_send(method, *args, **kwargs) }
     rescue RuntimeError => error
-      # A fixed-tag error counts only in deliberately invalid-input cases.
-      # Every constructor must independently pass actual database queries first.
-      assert(error.class == RuntimeError && error.message == TAG && error.cause.nil?)
+      # A typed fixed-tag error counts only in deliberately invalid-input cases.
+      # Native connection failures must never masquerade as guard acceptance.
+      @progress["check"] = "guard_refusal_class"
+      assert(error.class == SiloMergeValidationConfig::Refused && error.message == TAG && error.cause.nil?)
+      diagnostic = SiloMergeValidationDiagnostic.validate!(error.guest_diagnostic)
+      @progress["check"] = "guard_refusal_diagnostic"
+      assert(diagnostic.fetch("error_class") == "RuntimeError" && diagnostic.fetch("component") == "validation_config")
       return
     ensure
       connection.finish if connection.is_a?(PG::Connection) && !connection.finished?

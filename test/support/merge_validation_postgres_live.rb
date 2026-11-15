@@ -16,19 +16,40 @@ class LiveRuntime
     @id = id
   end
 
-  def run(argv, stdin_data:, capture:, timeout:)
-    raise "bridge target mismatch" unless argv[0, 4] == ["docker", "exec", "-i", @id]
-    raise "bridge executable mismatch" unless argv[4] == "psql" && capture
+  def run(argv, stdin_data: nil, capture:, timeout:)
+    metadata = argv == ["docker", "info", "--format", "{{.ID}}"] || (argv[0, 3] == ["docker", "inspect", "--format"] && argv.last == @id)
+    unless metadata
+      raise "bridge target mismatch" unless argv[0, 3] == ["docker", "exec", "-i"]
+      if argv[3] == "-e"
+        raise "bridge application mismatch" unless argv[4] == "PGAPPNAME=silo_validation_#{ENV.fetch('VALIDATION_LIVE_TOKEN')}"
+        raise "bridge target mismatch" unless argv[5] == @id
+        raise "bridge wrapper mismatch" unless argv[6, 2] == ["sh", "-c"] && argv[9] == "silo-validation-sql" && argv[11].match?(/\A[0-9a-f]{32}\z/)
+      else
+        raise "bridge executable mismatch" unless argv[3] == @id && argv[4] == "psql"
+      end
+    end
+    raise "bridge capture required" unless capture
     output = error = status = nil
     Open3.popen3(*argv, pgroup: true) do |input, stdout, stderr, waiter|
       begin
         Timeout.timeout([timeout, 20].min) do
-          input.write(stdin_data)
+          input.write(stdin_data) if stdin_data
           input.close
           readers = [Thread.new { stdout.read }, Thread.new { stderr.read }]
           output, error = readers.map(&:value)
           status = waiter.value
         end
+      rescue Timeout::Error
+        statement = stdin_data.to_s
+        phase = if statement.start_with?("CREATE DATABASE merge_source;")
+          "create_template_source"
+        elsif statement.start_with?("CREATE DATABASE silo_clean_base;")
+          "create_template_base"
+        else
+          "metadata_or_fixture"
+        end
+        warn "VALIDATION_SQL_BRIDGE:#{phase}:timeout"
+        raise
       ensure
         unless waiter.join(0)
           Process.kill("KILL", -waiter.pid)
@@ -36,13 +57,13 @@ class LiveRuntime
         end
       end
     end
-    OpenStruct.new(success?: status.success?, stdout: output, stderr: error)
+    OpenStruct.new(success?: status.success?, stdout: output, stderr: error, status: status.exitstatus)
   end
 end
 
 class LiveValidation
   include SiloMigrate::Services::StandardMergeValidation
-  CONTEXT = { "prepared_from" => "invented-live" }.freeze
+  CONTEXT = { "prepared_from" => "invented-live", "runtime_profile" => {} }.freeze
   TABLES = %w[categories groups site_settings uploads users].freeze
 
   def initialize(id, root)
@@ -55,10 +76,24 @@ class LiveValidation
     id = @id
     Object.new.tap do |stack|
       stack.define_singleton_method(:container) do |service|
-        raise "unexpected service" unless service == "db"
+        raise "unexpected service" unless %w[db web].include?(service)
         id
       end
+      stack.define_singleton_method(:record) { { "name" => "validation-live", "containers" => { "db" => id, "web" => id } } }
     end
+  end
+
+  # SQL-only acceptance uses the same exact PG fixture for both bound services;
+  # it does not claim that a web/guest lifecycle was exercised.
+  def with_review_runtime(_profile) = yield
+
+  def mv_create_resource!(context, journal, key, &block)
+    super
+    return if key == "role"
+    database = journal.fetch(key)
+    assert(sql("SELECT datallowconn FROM pg_database WHERE datname='#{database}';").strip == "f", "clone open during identity journal window")
+    attempt = raw("SELECT 1;", database, journal.fetch("role"))
+    assert(!attempt.success? && attempt.stderr.include?("not currently accepting connections"), "reader connected before database ACL restriction")
   end
 
   def assert(condition, message)
@@ -166,7 +201,7 @@ class LiveValidation
                 "templates" => mv_custody!(CONTEXT) }
     begin
       # CREATE DATABASE TEMPLATE must work with datallowconn=false throughout.
-      mv_provision!(CONTEXT, journal, SecureRandom.hex(32))
+      mv_provision!(CONTEXT.dup, journal, SecureRandom.hex(32))
       { "source" => "merge_source", "base" => "silo_clean_base" }.each do |side, template|
         database = journal.fetch(side)
         assert(snapshot(database) == originals.fetch(template), "clone used drifted inspection contents")
@@ -196,7 +231,7 @@ class LiveValidation
       end
       assert(mv_same_template_custody?(mv_custody!(CONTEXT), journal.fetch("templates")), "template identity/owner changed during grants")
     ensure
-      mv_cleanup!(CONTEXT, journal)
+      mv_cleanup!(CONTEXT.dup, journal)
     end
     # DROP ROLE above proves clone grants/default role settings left no shared
     # dependencies. Cleanup is identity-bound, not repeatable name-only deletion.
@@ -212,7 +247,7 @@ class LiveValidation
       sql("ALTER DATABASE #{name} ALLOW_CONNECTIONS false;")
     end
     { "status" => "passed", "postgres_id" => @id, "templates_unchanged" => true,
-      "cleanup_confirmed" => true, "active_session_refused" => true,
+      "cleanup_confirmed" => true, "clone_identity_window_closed" => true, "active_session_refused" => true,
       "inspection_drift_ignored" => true, "readonly_acl_verified" => true,
       "nonpublic_function_denied" => true, "original_privileges_unchanged" => true }
   end

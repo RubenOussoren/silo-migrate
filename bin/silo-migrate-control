@@ -281,6 +281,11 @@ def host_data(args, values, base, self):
     result = module.main(args, values, base, Path(__file__).resolve().parent.parent, sys.modules[__name__], sys.stdin,
                          module.control_runner(self))
     sys.stdout.buffer.write((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
+    if result.get("error") == module.VALIDATION_FAILURE:
+        # Tool adapters can consume the validated stdout envelope, while existing
+        # CLI/Project-page callers must still see a failed operation, not a plan.
+        print("Error: " + module.VALIDATION_FAILURE, file=sys.stderr)
+        return 1
     return 0
 
 
@@ -486,7 +491,80 @@ def review_base_migrations(root, encoded_path):
         refuse("STANDARD_BASE_SITE_INVALID")
 
 
-def prepare_review_runtime(args, values, base, repo):
+# The shipped canonical schema lists historical core migrations whose files may
+# have been removed. Read only that fixed public-image metadata, never a backup.
+CACHED_CORE_HISTORY_PROBE = r'''
+require "json"
+path = "/var/www/discourse/db/structure.sql"
+limit = 16 * 1024 * 1024
+source = File.binread(path, limit + 1)
+abort "core history unavailable" if source.bytesize > limit
+marker = /^INSERT INTO "schema_migrations" \(version\) VALUES\r?\n/
+starts = source.enum_for(:scan, marker).map { Regexp.last_match.end(0) }
+abort "core history unavailable" unless starts.size == 1
+ids = []
+finished = false
+source[starts.first..].each_line do |line|
+  row = /\A\('([0-9]{14})'\)([,;])\r?\n?\z/.match(line)
+  abort "core history unavailable" unless row
+  ids << row[1]
+  abort "core history unavailable" if ids.size > 20000
+  if row[2] == ";"
+    finished = true
+    break
+  end
+end
+abort "core history unavailable" unless finished && !ids.empty? && ids.uniq.size == ids.size
+puts JSON.generate(ids.sort)
+'''
+
+
+def cached_review_runtime(repo, baseline, name, version, schema, required_migrations):
+    """Explicit pinned-only admission, never dynamic preparation or a fake ready job.
+
+    This conservative path needs an exact Base version and proves every supplied
+    migration exists in the actual cached image. Plugin/unknown migrations refuse;
+    ordinary automatic runtime resolution remains the default.
+    """
+    if (baseline.get('qualification', {}).get('status') not in ('qualified', 'review_ready') or
+            not isinstance(version, str) or not isinstance(required_migrations, list) or not required_migrations or
+            len(required_migrations) > 20000 or
+            any(not isinstance(item, str) or not re.fullmatch(r'[0-9]{14}', item) for item in required_migrations) or
+            required_migrations != sorted(set(required_migrations)) or
+            required_migrations[-1] != schema):
+        refuse('STANDARD_REVIEW_RUNTIME_UNRESOLVED')
+    import importlib.util
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location('cached_review_runtime', repo / 'bin/review_runtime.py')
+    runtime = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runtime)
+    image = baseline['images']['web']
+    document = runtime.inspect(image['ref'])  # inspect only; never pull a missing image
+    if runtime.identity(document) != image['content_id']:
+        refuse('STANDARD_RUNTIME_MISMATCH')
+    metadata = runtime.probe(document['Id'])  # fixed no-network/no-mount public-image probe
+    app = baseline['app']
+    if (metadata['version'] != version or any(metadata[key] != app.get(key) for key in
+            ('version', 'revision', 'ruby', 'bundler', 'gemfile_lock_sha256'))):
+        refuse('STANDARD_REVIEW_RUNTIME_UNRESOLVED')
+    pg = metadata.get('postgres_major')
+    if pg is not None and int(pg) > int(app['postgres_major']):
+        refuse('STANDARD_REVIEW_RUNTIME_POSTGRES_INCOMPATIBLE')
+    history = json.loads(runtime.sandbox(['--rm', '--pull=never', '--network=none', '--read-only',
+        '--cap-drop=ALL', '--security-opt=no-new-privileges', '--memory=512m', '--cpus=1',
+        '--pids-limit=64', '--user=discourse', '--entrypoint=ruby', document['Id'], '-e', CACHED_CORE_HISTORY_PROBE]))
+    if (not isinstance(history, list) or not history or len(history) > 20000 or
+            any(not isinstance(item, str) or not re.fullmatch(r'[0-9]{14}', item) for item in history) or
+            history != sorted(set(history)) or not set(required_migrations) <= set(history) | set(metadata['core_migrations'])):
+        refuse('STANDARD_REVIEW_RUNTIME_UNRESOLVED')
+    runtime.sandbox(['--rm', '--pull=never', '--network=none', '--read-only', '--cap-drop=ALL',
+        '--security-opt=no-new-privileges', '--memory=512m', '--cpus=1', '--pids-limit=64',
+        '--user=discourse', '--workdir=/var/www/discourse', '--env=BUNDLE_FROZEN=true',
+        '--env=BUNDLE_WITH=generic_import', '--entrypoint=bundle', document['Id'], 'check'])
+    return {'status': 'ready', 'name': name, 'comparison': {'core_comparison_complete': True, 'missing_known_core_migrations': 0}}
+
+
+def prepare_review_runtime(args, values, base, repo, cached_only=False):
     """Fixed public-image preparation for review proposals only. No data is mounted
     into preparation, and neither tools nor backups choose a repository or recipe."""
     if args[:3] != ["standard", "plan", "propose"] or len(args) < 7:
@@ -580,14 +658,17 @@ def prepare_review_runtime(args, values, base, repo):
         required_migrations = review_base_migrations(root, entry["path"])
         if required_migrations[-1] != schema:
             refuse("STANDARD_BASE_SITE_INVALID")
-    import importlib.util
-    sys.dont_write_bytecode = True
-    spec = importlib.util.spec_from_file_location("review_runtime_job", repo / "bin/review_runtime_job.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    prepared = module.request(repo=repo, cache=base.parent / "state/review-runtimes",
-                              private_dir=root / ".silo-migrate/data/review-runtime-jobs",
-                              baseline=baseline, version=version, schema=schema, required_migrations=required_migrations)
+    if cached_only:
+        prepared = cached_review_runtime(repo, baseline, name, version, schema, required_migrations)
+    else:
+        import importlib.util
+        sys.dont_write_bytecode = True
+        spec = importlib.util.spec_from_file_location("review_runtime_job", repo / "bin/review_runtime_job.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        prepared = module.request(repo=repo, cache=base.parent / "state/review-runtimes",
+                                  private_dir=root / ".silo-migrate/data/review-runtime-jobs",
+                                  baseline=baseline, version=version, schema=schema, required_migrations=required_migrations)
     if prepared["status"] == "runtime_preparing":
         return prepared
     values["SILO_REVIEW_RUNTIME_PROFILE"] = prepared["name"]
@@ -597,7 +678,8 @@ def prepare_review_runtime(args, values, base, repo):
             "missing_known_core_migrations" in summary and (type(summary["missing_known_core_migrations"]) is not int or not 0 <= summary["missing_known_core_migrations"] <= 20000)):
         refuse("STANDARD_RUNTIME_MISMATCH")
     values["SILO_REVIEW_RUNTIME_COMPARISON"] = json.dumps(summary, separators=(",", ":"))
-    values["SILO_REVIEW_RUNTIME_PROFILES_DIR"] = str(base.parent / "state/review-runtimes/profiles")
+    if not cached_only:
+        values["SILO_REVIEW_RUNTIME_PROFILES_DIR"] = str(base.parent / "state/review-runtimes/profiles")
 
 
 def merge_validation_options(args):
@@ -623,11 +705,28 @@ def merge_validation_options(args):
     return args, True
 
 
+def cached_runtime_options(args):
+    flag = "--cached-review-runtime"
+    if flag not in args:
+        return args, False
+    if args[0] != flag or args.count(flag) != 1:
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    args = args[1:]
+    if (args[:3] != ["standard", "plan", "propose"] or len(args) < 7 or
+            args[4:6] not in (["--operation", "merge-prepare"], ["--operation", "merge"], ["--operation", "review"]) or
+            "--prepared-from" in args):
+        refuse("STANDARD_ARGUMENTS_INVALID")
+    return args, True
+
+
 def main(args):
+    args, cached_only = cached_runtime_options(args)
     args, long_validation = merge_validation_options(args)
     self = Path(__file__).resolve()
     repo = self.parent.parent
     values, configured = settings()
+    if cached_only and not configured:
+        refuse("STANDARD_CONTROL_CONFIG_INVALID")
     if configured:
         # These are invocation bindings, never persistent service defaults.
         values.pop("SILO_REVIEW_RUNTIME_PROFILE", None)
@@ -673,7 +772,7 @@ def main(args):
         image = document["Id"]
         # Administrative preparation happens on the trusted host, before a plan
         # exists. Ordinary status/start/reset calls never refresh a moving tag.
-        pending = prepare_review_runtime(args, values, base, repo)
+        pending = prepare_review_runtime(args, values, base, repo, cached_only=True) if cached_only else prepare_review_runtime(args, values, base, repo)
         if pending:
             print(json.dumps(pending))
             return 0

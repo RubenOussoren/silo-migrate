@@ -54,9 +54,14 @@ when "create"
     user.required_fields_version = UserRequiredFieldsVersion.current if defined?(UserRequiredFieldsVersion)
     user.skip_email_validation = true
     user.skip_username_watched_words_validation = true if user.respond_to?(:skip_username_watched_words_validation=)
+    # A local inspection identity must not clear first-admin site notices.
+    # Scope this to the new instance, never global callbacks/settings policy.
+    user.define_singleton_method(:clear_global_notice_if_needed) { nil }
     user.save!(validate: false)
     user.email_tokens.update_all(confirmed: true)
-    user.activate
+    # #activate confirms through a newly loaded User, losing the instance-only
+    # callback guard. This user is already active with confirmed signup tokens.
+    user.set_automatic_groups
 
     api_key = ApiKey.new(description: DESCRIPTION, user: user,
                          created_by: Discourse.system_user, scope_mode: "read_only")

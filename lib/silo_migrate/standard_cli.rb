@@ -24,6 +24,8 @@ module SiloMigrate
         merger status WORKSPACE                     (actual local review path and committed layer)
         workflow describe WORKSPACE                  (private committed contract and engine facts)
         workflow validation-status WORKSPACE --attempt latest|ID  (saved evidence only; never reruns validation)
+        workflow validation-recovery-preview WORKSPACE --attempt ID  (live read-only checks; no cleanup)
+        workflow validation-recovery-apply WORKSPACE --attempt ID --intent-sha256 SHA  (exact reviewed cleanup only)
         workflow validate WORKSPACE --prepared-from RUN --generation SHA --settings INPUT
         workflow exists WORKSPACE --prepared-from RUN --generation SHA --queries-file -
         converter status WORKSPACE
@@ -196,6 +198,18 @@ module SiloMigrate
     def workflow(args)
       action = args.shift
       workspace = positional!(args)
+      if %w[validation-recovery-preview validation-recovery-apply].include?(action)
+        keys = action == "validation-recovery-apply" ? %w[--attempt --intent-sha256] : %w[--attempt]
+        opts = options!(args, *keys)
+        attempt = opts.fetch("--attempt")
+        invalid! unless attempt.match?(/\A[0-9a-f]{32}\z/)
+        if action == "validation-recovery-preview"
+          return service(workspace).merge_validation_recovery_preview(attempt_id: attempt)
+        end
+        digest = opts.fetch("--intent-sha256")
+        invalid! unless digest.match?(/\A[0-9a-f]{64}\z/)
+        return service(workspace).merge_validation_recovery_apply(attempt_id: attempt, intent_sha256: digest)
+      end
       if action == "validation-status"
         opts = options!(args, "--attempt")
         attempt = opts.fetch("--attempt")

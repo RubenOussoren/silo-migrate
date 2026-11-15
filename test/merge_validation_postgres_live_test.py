@@ -7,7 +7,7 @@ Opt in: SILO_MERGE_VALIDATION_LIVE=1 python3 -m unittest discover -s test \
 Uses only cached images, no pull/build/install, ports, external network or host
 services. Requires the local Linux Docker socket/binary, ../../.runtime-cache/gems,
 and the cached app image matching runtime/profiles' public web pin. The native
-client mounts ONLY its test script and config helper, shares the exact owned PG
+client mounts ONLY its test script and public validation helpers, shares the exact owned PG
 network-none namespace, uses fixture-only SCRAM loopback auth, and boots no Rails.
 The control container's Docker socket is privileged host access, NOT a sandbox
 security boundary. Its Ruby bridge permits exec only against the exact owned PG ID.
@@ -98,7 +98,7 @@ class MergeValidationPostgresLiveTest(unittest.TestCase):
             return identity
 
         try:
-            pg = create("pg", pg_image, ["--user", "postgres", "-e", "PGDATA=/tmp/pgdata",
+            pg = create("pg", pg_image, ["--label", "silo-migrate.managed=true", "--label", "silo-migrate.instance=validation-live", "--user", "postgres", "-e", "PGDATA=/tmp/pgdata",
                                          "--tmpfs", "/var/lib/postgresql/data:rw,nosuid,nodev,size=1m,mode=1777",
                                          "--tmpfs", "/var/run/postgresql:rw,nosuid,nodev,size=4m,mode=1777",
                                          "-e", "POSTGRES_HOST_AUTH_METHOD=trust"])
@@ -106,8 +106,11 @@ class MergeValidationPostgresLiveTest(unittest.TestCase):
             self.docker("start", pg)
             deadline = time.monotonic() + 40
             while True:
+                # pg_isready can succeed against the entrypoint's temporary
+                # initialization server. Admit only the final PID-1 postmaster.
+                process = self.docker("exec", pg, "cat", "/proc/1/comm", check=False)
                 ready = self.docker("exec", pg, "pg_isready", "-U", "postgres", check=False)
-                if ready.returncode == 0:
+                if process.returncode == 0 and process.stdout.strip() == "postgres" and ready.returncode == 0:
                     break
                 if time.monotonic() >= deadline:
                     self.fail("invented PostgreSQL fixture readiness timeout")
@@ -129,7 +132,8 @@ class MergeValidationPostgresLiveTest(unittest.TestCase):
                 # exception messages from the private bridge into test output.
                 import re
                 locations = re.findall(r"/src/[A-Za-z0-9_./-]+:\d+", result.stderr)
-                self.fail(f"Ruby acceptance failed; source locations: {locations[:8]}")
+                tags = re.findall(r"^VALIDATION_SQL_BRIDGE:(create_template_source|create_template_base|metadata_or_fixture):timeout$", result.stderr, re.M)
+                self.fail(f"Ruby acceptance failed; source locations: {locations[:8]}; fixed timeout phases: {tags[:2]}")
             lines = result.stdout.strip().splitlines()
             self.assertTrue(lines, "Ruby harness did not emit acceptance evidence")
             report = json.loads(lines[-1])
@@ -137,6 +141,7 @@ class MergeValidationPostgresLiveTest(unittest.TestCase):
             self.assertEqual(pg, report["postgres_id"])
             self.assertTrue(report["templates_unchanged"])
             self.assertTrue(report["cleanup_confirmed"])
+            self.assertTrue(report["clone_identity_window_closed"])
             self.assertTrue(report["nonpublic_function_denied"])
             self.assertTrue(report["original_privileges_unchanged"])
             evidence["acceptance"] = report
@@ -182,6 +187,8 @@ class MergeValidationPostgresLiveTest(unittest.TestCase):
                 "-e", "BUNDLE_FROZEN=true", "-e", "BUNDLE_AUTO_INSTALL=false",
                 "-e", "BUNDLE_DISABLE_VERSION_CHECK=true",
                 "--mount", f"type=bind,src={ROOT / 'runtime/prebuilt-discourse/merge_validation_config.rb'},dst=/tmp/helper/merge_validation_config.rb,readonly",
+                "--mount", f"type=bind,src={ROOT / 'runtime/shared/merge_validation_diagnostic.rb'},dst=/tmp/helper/merge_validation_diagnostic.rb,readonly",
+                "--mount", f"type=bind,src={ROOT / 'runtime/shared/merge_contract.rb'},dst=/tmp/helper/merge_contract.rb,readonly",
                 "--mount", f"type=bind,src={ROOT / 'test/support/merge_validation_pg_client.rb'},dst=/tmp/helper/merge_validation_pg_client.rb,readonly",
             ], network_container=pg,
                 command=["-c", "exec bundle exec ruby /tmp/helper/merge_validation_pg_client.rb"])

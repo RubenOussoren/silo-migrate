@@ -8,12 +8,20 @@ User.transaction do
                   required_fields_version: UserRequiredFieldsVersion.current)
   user.skip_email_validation = true
   user.skip_username_watched_words_validation = true
+  # This is a local access identity, not the first real site administrator.
+  # Core's after_save callback would clear has_login_hint/global_notice and
+  # mutate the destination settings after its portable backup was recorded.
+  # Suppress only that callback on THIS instance; retain the final exact check.
+  user.define_singleton_method(:clear_global_notice_if_needed) { nil }
   # Mark this local account current so required fields do not redirect it after login.
   # This fixed, engineer-only identity must not be rejected by the sandbox's username,
   # email, password or required custom-field policies. Database constraints still apply.
   user.save!(validate: false)
   user.email_tokens.update_all(confirmed: true)
-  user.activate
+  # Already saved active/approved and its signup token is confirmed. #activate
+  # would load a NEW User via EmailToken.confirm and run the notice callback
+  # on that different instance. Refresh groups without a second activation.
+  user.set_automatic_groups
   puts "SILO_JSON:" + JSON.generate(
     "admin_username" => user.username, "disable_emails" => SiteSetting.disable_emails.to_s,
     "login_required" => SiteSetting.login_required, "allow_restore" => SiteSetting.allow_restore,

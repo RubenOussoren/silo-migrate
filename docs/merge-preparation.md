@@ -38,6 +38,19 @@ Preparation and Merge have separate approvals: the first authorizes restoring an
 reading the copies, not future mappings. A ready inspection environment is not an
 active migration and should not hold the execution lock indefinitely.
 
+## Diagnose validation before retrying
+
+A failed custom proposal now includes an allowlisted attempt/diagnostic envelope
+alongside the compatible `STANDARD_MERGE_VALIDATION_FAILED` code. In the trusted
+migration-data chat, use `data_workflow_validation_status` (optional `attempt`,
+default `latest`); the installed engineer CLI is
+`standard workflow validation-status PROJECT --attempt latest|ID`.
+Read the **existing** failure, then pin its exact ID—do not rerun validation just
+to obtain diagnostics. Work failure, producer completion and cleanup proof are
+independent. Legacy/unknown ownership remains quarantined, not auto-adopted.
+See [saved diagnostics and exact recovery](merge-validation-diagnostics.md) and
+[connected invented-data acceptance](merge-connected-acceptance.md).
+
 ## Large backups and worker shutdown
 
 New plans size the review/preparation containers from the control host's detected

@@ -156,7 +156,7 @@ module SiloMigrate
       EXECUTE_LOCK_WAIT = 120
       # Longer than EXECUTE_LOCK_WAIT, so a queued executor isn't called never-started.
       CLAIM_GRACE_SECONDS = 180
-      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb review_access.rb review_state.rb merge_run.rb merge_source_config.rb merge_state.rb merge_site_settings.rb merge_rebake.rb merge_adapter.rb merge_validate.rb merge_validation_config.rb merge_asset_references.rb merge_baseline_assets.rb merge_process_run.rb merge_assets.rb merge_contract.rb merge_refusal.rb].freeze
+      HELPERS = %w[baseline_seed.rb site_fingerprint.rb settings_restore.rb set_review_port.rb review_setup.rb review_import.rb review_access.rb review_state.rb merge_run.rb merge_source_config.rb merge_state.rb merge_site_settings.rb merge_rebake.rb merge_adapter.rb merge_validate.rb merge_validation_config.rb merge_asset_references.rb merge_baseline_assets.rb merge_process_run.rb merge_assets.rb merge_contract.rb merge_refusal.rb merge_validation_diagnostic.rb merge_backup_config.rb].freeze
       SANDBOX_ATTACHMENT = "Synthetic sandbox attachment created before migration.\n".b.freeze
 
       attr_reader :store
@@ -1816,7 +1816,12 @@ module SiloMigrate
         made = stack.web_exec(["sh", "-c", "mkdir -m 700 #{Shellwords.escape(remote_dir)} && chown discourse:discourse #{Shellwords.escape(remote_dir)}"], timeout: 30)
         raise StandardWorkflowError.new("STANDARD_BACKUP_FAILED", "staging") unless made.success?
 
-        backup = stack.discourse_shell(["bundle", "exec", "script/discourse", "backup", "#{remote_dir}/#{filename}"], timeout: 1200)
+        arguments = ["bundle", "exec"]
+        # Keep the native CLI and full backup format without its redundant
+        # include_s3_uploads_in_backups setter changing exact stored settings.
+        arguments += ["ruby", "-r/tmp/merge_backup_config.rb"] if merge_plan?(plan_for(run_id))
+        arguments += ["script/discourse", "backup", "#{remote_dir}/#{filename}"]
+        backup = stack.discourse_shell(arguments, timeout: 1200)
         log(run_id, "backup-#{label}", backup)
         raise StandardWorkflowError.new("STANDARD_BACKUP_FAILED", "backup exit") unless backup.success?
 

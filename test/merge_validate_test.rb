@@ -1,4 +1,9 @@
 # frozen_string_literal: true
+begin
+  gem "minitest", ">= 5.0", "< 6.0"
+rescue Gem::LoadError
+  nil
+end
 require "minitest/autorun"
 require "ostruct"
 require "tmpdir"
@@ -371,10 +376,19 @@ class MergeValidateTest < Minitest::Test
     assert_equal context.fetch("port"), options.fetch(:port)
     assert_equal context.fetch("role"), options.fetch(:user)
     assert_equal context.fetch("password"), options.fetch(:password)
-    connection.define_singleton_method(:connect_start) { |**_| raise "ORIGINAL_SECRET" }
+    pg_conn_bad = Class.new(StandardError) { def self.name = "PG::ConnectionBad" }
+    connection.define_singleton_method(:connect_start) { |**_| raise pg_conn_bad, "password=ORIGINAL_SECRET host=private.internal" }
     error = assert_raises(RuntimeError) { connection.new(dbname: context.fetch("base")) }
+    assert_kind_of SiloMergeValidationConfig::Refused, error
     assert_equal "STANDARD_MERGE_VALIDATION_CONFIG", error.message
     assert_nil error.cause
+    assert_equal "PG::ConnectionBad", error.guest_diagnostic["error_class"]
+    refute_includes JSON.generate(error.guest_diagnostic), "ORIGINAL_SECRET"
+    refute_includes JSON.generate(error.guest_diagnostic), "private.internal"
+    captured = SiloMergeValidationDiagnostic.capture(stage: "rails_boot", error: error)
+    assert_equal "rails_boot", captured["stage"]
+    assert_equal "PG::ConnectionBad", captured["error_class"]
+    SiloMergeValidationDiagnostic.validate!(captured)
   end
 
   def test_config_override_matches_pinned_core_keyword_signature
@@ -425,6 +439,247 @@ class MergeValidateTest < Minitest::Test
       assert_equal 0, File.stat(target).mode & 0o077
     ensure
       old_context.nil? ? ENV.delete("SILO_MERGE_VALIDATION_CONTEXT") : ENV["SILO_MERGE_VALIDATION_CONTEXT"] = old_context
+    end
+  end
+
+  def test_refused_results_include_privacy_safe_guest_diagnostic_and_passing_results_do_not
+    passed = validate
+    refute passed.key?("guest_diagnostic")
+    refute SiloMergeValidation.projection(passed).key?("guest_diagnostic")
+
+    klass = merger
+    klass.define_singleton_method(:silo_merge_preflight!) { false }
+    refused = validate(klass)
+    diag = refused.fetch("guest_diagnostic")
+    assert_equal({
+      "version" => 1,
+      "stage" => "policy_preflight",
+      "error_class" => "SiloMergeValidation::Refused",
+      "component" => "validation_runner",
+      "line" => diag["line"]
+    }, diag)
+    assert diag["line"].is_a?(Integer) && diag["line"].positive?
+    assert_equal diag, SiloMergeValidation.projection(refused).fetch("guest_diagnostic")
+
+    finding_klass = merger
+    finding = SiloMergeValidation::Finding.new(["PRIVATE_SETTING_KEY", 7], "policy_conflict")
+    finding.set_backtrace(["/shared/silo-validation-#{'a' * 32}/layer/merger.rb:88:in `silo_merge_preflight!'"])
+    finding_klass.define_singleton_method(:silo_merge_preflight!) { raise finding }
+    finding_result = validate(finding_klass)
+    finding_diag = finding_result.fetch("guest_diagnostic")
+    assert_equal "policy_preflight", finding_diag["stage"]
+    assert_equal "SiloMergeValidation::Finding", finding_diag["error_class"]
+    assert_equal "custom_layer", finding_diag["component"]
+    assert_nil finding_diag["line"]
+    projected = SiloMergeValidation.projection(finding_result)
+    assert_equal [], projected["key_path"]
+    assert_equal finding_diag, projected["guest_diagnostic"]
+    refute_includes JSON.generate(projected), "PRIVATE_SETTING_KEY"
+
+    tampered = finding_result.merge("guest_diagnostic" => finding_diag.merge("error_class" => "PRIVATE_CLASS"))
+    refute SiloMergeValidation.projection(tampered).key?("guest_diagnostic")
+  end
+
+  def test_flat_guest_copy_and_main_retain_top_level_stage_and_safe_error_class
+    Dir.mktmpdir do |root|
+      runtime_root = File.expand_path("../runtime", __dir__)
+      %w[merge_validate.rb merge_validation_config.rb merge_adapter.rb merge_asset_references.rb merge_baseline_assets.rb].each do |name|
+        File.write(File.join(root, name), File.binread(File.join(runtime_root, "prebuilt-discourse", name)), mode: "wb", perm: 0o600)
+      end
+      %w[merge_contract.rb merge_assets.rb merge_refusal.rb merge_validation_diagnostic.rb].each do |name|
+        File.write(File.join(root, name), File.binread(File.join(runtime_root, "shared", name)), mode: "wb", perm: 0o600)
+      end
+      context_path = File.join(root, "context.json")
+      result_path = File.join(root, "result.json")
+      File.write(context_path, JSON.generate({ "mode" => "full" }), mode: "w", perm: 0o600)
+
+      stdout_r, stdout_w = IO.pipe
+      pid = Process.spawn(
+        {
+          "SILO_MERGE_VALIDATION_CONTEXT" => context_path,
+          "SILO_MERGE_VALIDATION_RESULT" => result_path
+        },
+        RbConfig.ruby,
+        File.join(root, "merge_validate.rb"),
+        out: stdout_w,
+        err: File::NULL
+      )
+      stdout_w.close
+      output = stdout_r.read
+      stdout_r.close
+      _, status = Process.wait2(pid)
+
+      assert_equal 4, status.exitstatus
+      assert output.start_with?(SiloMergeValidation::PREFIX)
+      projected = JSON.parse(output.delete_prefix(SiloMergeValidation::PREFIX).strip)
+      persisted = JSON.parse(File.read(result_path))
+      assert_equal "refused", persisted["status"]
+      assert_equal "validation_unproven", persisted["reason"]
+      diag = persisted.fetch("guest_diagnostic")
+      assert_equal "rails_boot", diag["stage"]
+      assert_equal "SiloMergeValidation::Refused", diag["error_class"]
+      assert_equal "validation_runner", diag["component"]
+      assert diag["line"].is_a?(Integer) && diag["line"].positive?
+      assert_equal diag, projected.fetch("guest_diagnostic")
+      SiloMergeValidationDiagnostic.validate!(diag)
+
+      # Existing result file causes result_persistence failure when context fails,
+      # preserving the primary context stage diagnostic; if context+checks pass
+      # and result file already exists, result_persistence is reported.
+      File.write(context_path, JSON.generate({ "mode" => "checks", "host" => "127.0.0.1", "port" => 1, "base" => "b", "role" => "r", "password" => "SECRET_DB_PASSWORD", "checks" => [] }), mode: "w", perm: 0o600)
+      db_result_path = File.join(root, "db-result.json")
+      out2_r, out2_w = IO.pipe
+      pid2 = Process.spawn(
+        {
+          "SILO_MERGE_VALIDATION_CONTEXT" => context_path,
+          "SILO_MERGE_VALIDATION_RESULT" => db_result_path
+        },
+        RbConfig.ruby,
+        File.join(root, "merge_validate.rb"),
+        out: out2_w,
+        err: File::NULL
+      )
+      out2_w.close
+      out2 = out2_r.read
+      out2_r.close
+      _, status2 = Process.wait2(pid2)
+      assert_equal 4, status2.exitstatus
+      refute_includes out2, "SECRET_DB_PASSWORD"
+      refute_includes File.read(db_result_path), "SECRET_DB_PASSWORD"
+      db_diag = JSON.parse(File.read(db_result_path)).fetch("guest_diagnostic")
+      assert_equal "checks_database", db_diag["stage"]
+      SiloMergeValidationDiagnostic.validate!(db_diag)
+
+      # Secondary persistence failure (pre-existing result file with File::EXCL)
+      # preserves an already refused primary reason and first diagnostic instead
+      # of masking it with validation_unproven / result_persistence.
+      stub_pg = File.join(root, "stub_pg.rb")
+      File.write(stub_pg, <<~RUBY, mode: "w", perm: 0o600)
+        $LOADED_FEATURES << "pg.rb" << "pg"
+        module PG
+          def self.connect(**)
+            conn = Object.new
+            conn.define_singleton_method(:exec_params) { |*, **| [{}] }
+            conn.define_singleton_method(:close) { nil }
+            conn
+          end
+        end
+      RUBY
+      File.write(
+        context_path,
+        JSON.generate({
+          "mode" => "checks",
+          "host" => "127.0.0.1",
+          "port" => 5432,
+          "base" => "b",
+          "role" => "r",
+          "password" => "SECRET_DB_PASSWORD",
+          "checks" => [{ "kind" => "tag", "name" => "alpha" }]
+        }),
+        mode: "w",
+        perm: 0o600
+      )
+      existing_result_path = File.join(root, "existing-result.json")
+      File.write(existing_result_path, "{}", mode: "w", perm: 0o600)
+      out3_r, out3_w = IO.pipe
+      pid3 = Process.spawn(
+        {
+          "SILO_MERGE_VALIDATION_CONTEXT" => context_path,
+          "SILO_MERGE_VALIDATION_RESULT" => existing_result_path
+        },
+        RbConfig.ruby,
+        "-r#{stub_pg}",
+        File.join(root, "merge_validate.rb"),
+        out: out3_w,
+        err: File::NULL
+      )
+      out3_w.close
+      out3 = out3_r.read
+      out3_r.close
+      _, status3 = Process.wait2(pid3)
+      assert_equal 4, status3.exitstatus
+      projected3 = JSON.parse(out3.delete_prefix(SiloMergeValidation::PREFIX).strip)
+      assert_equal "refused", projected3["status"]
+      assert_equal "checks_invalid", projected3["reason"]
+      assert_equal "existence_checks", projected3.dig("guest_diagnostic", "stage")
+      assert_equal "none", projected3.dig("guest_diagnostic", "error_class")
+
+      # When primary work passed ("checks": []), secondary persistence failure
+      # converts passing result to refused validation_unproven + result_persistence.
+      File.write(
+        context_path,
+        JSON.generate({
+          "mode" => "checks",
+          "host" => "127.0.0.1",
+          "port" => 5432,
+          "base" => "b",
+          "role" => "r",
+          "password" => "SECRET_DB_PASSWORD",
+          "checks" => []
+        }),
+        mode: "w",
+        perm: 0o600
+      )
+      out4_r, out4_w = IO.pipe
+      pid4 = Process.spawn(
+        {
+          "SILO_MERGE_VALIDATION_CONTEXT" => context_path,
+          "SILO_MERGE_VALIDATION_RESULT" => existing_result_path
+        },
+        RbConfig.ruby,
+        "-r#{stub_pg}",
+        File.join(root, "merge_validate.rb"),
+        out: out4_w,
+        err: File::NULL
+      )
+      out4_w.close
+      out4 = out4_r.read
+      out4_r.close
+      _, status4 = Process.wait2(pid4)
+      assert_equal 4, status4.exitstatus
+      projected4 = JSON.parse(out4.delete_prefix(SiloMergeValidation::PREFIX).strip)
+      assert_equal "refused", projected4["status"]
+      assert_equal "validation_unproven", projected4["reason"]
+      assert_equal "result_persistence", projected4.dig("guest_diagnostic", "stage")
+      assert_equal "Errno::EEXIST", projected4.dig("guest_diagnostic", "error_class")
+
+      # Bootstrap abort via RUBYOPT=-r emits ONE bounded safe diagnostic prefix
+      # line + fixed abort tag, with no raw private path or secret content.
+      secret_context_path = File.join(root, "PRIVATE_CANARY_PATH_SECRET_context.json")
+      File.write(secret_context_path, "{bad_json_SECRET_TOKEN", mode: "w", perm: 0o600)
+      err_r, err_w = IO.pipe
+      pid5 = Process.spawn(
+        {
+          "RUBYOPT" => "-r#{File.join(root, 'merge_validation_config.rb')}",
+          "SILO_MERGE_VALIDATION_CONTEXT" => secret_context_path
+        },
+        RbConfig.ruby,
+        "-e",
+        "exit 0",
+        out: File::NULL,
+        err: err_w
+      )
+      err_w.close
+      stderr5 = err_r.read
+      err_r.close
+      _, status5 = Process.wait2(pid5)
+      refute status5.success?
+      refute_includes stderr5, "PRIVATE_CANARY_PATH_SECRET"
+      refute_includes stderr5, "SECRET_TOKEN"
+      assert_includes stderr5, "STANDARD_MERGE_VALIDATION_CONFIG"
+      diag_lines = stderr5.lines.select { |line| line.start_with?(SiloMergeValidationDiagnostic::PREFIX) }
+      assert_equal 1, diag_lines.size
+      assert_operator diag_lines.first.bytesize, :<=, 1024
+      boot_diag = JSON.parse(diag_lines.first.delete_prefix(SiloMergeValidationDiagnostic::PREFIX).strip)
+      assert_equal({
+        "version" => 1,
+        "stage" => "bootstrap",
+        "error_class" => "JSON::ParserError",
+        "component" => "validation_config",
+        "line" => boot_diag["line"]
+      }, boot_diag)
+      assert boot_diag["line"].is_a?(Integer) && boot_diag["line"].positive?
+      SiloMergeValidationDiagnostic.validate!(boot_diag)
     end
   end
 end

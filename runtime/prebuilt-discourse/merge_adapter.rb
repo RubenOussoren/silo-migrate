@@ -34,6 +34,90 @@ module SiloDiscourseMergeAdapter
     end
   end
 
+  # Core's db/fixtures/010_uploads.rb uses negative IDs and intentionally fake
+  # digests for packaged /images files. These are NOT uploaded customer files.
+  # Reuse is eligible only with exact image bytes/metadata AND the same existing
+  # destination record. Keep them in stock SQL/mappings, never transfer or delete
+  # them, and never generalize this to arbitrary negative IDs or invalid digests.
+  class SeededReuse
+    FILES = { -1 => "d-logo-sketch.png", -2 => "d-logo-sketch-small.png",
+      -3 => "default-favicon.ico", -4 => "default-apple-touch-icon.png",
+      -5 => "discourse-logo-sketch.png", -6 => "discourse-logo-sketch-small.png" }.freeze
+    IMAGE_ROOT = "/var/www/discourse/public/images"
+    MAX_FILE_BYTES = 4 * 1024 * 1024
+    attr_reader :sha1s, :facts
+
+    def initialize(rows)
+      SiloDiscourseMergeAdapter.refuse!("invalid_rows") unless rows.is_a?(Array) && rows.size <= MAX_ASSETS
+      @seeds = {}
+      rows.each do |row|
+        SiloDiscourseMergeAdapter.refuse!("invalid_rows") unless row.is_a?(Hash) && field(row, :id).is_a?(Integer)
+        next if field(row, :id).positive?
+        id = field(row, :id)
+        SiloDiscourseMergeAdapter.refuse!("unsupported_source_id") if @seeds.key?(id)
+        @seeds[id] = prove!(row, tag: "unsupported_source_id")
+      end
+      @sha1s = @seeds.values.map { |row| row.fetch(1) }.freeze
+      @facts = @seeds.keys.sort.map { |id| @seeds.fetch(id) }.freeze
+    end
+
+    def physical_rows!(rows)
+      SiloDiscourseMergeAdapter.refuse!("seeded_reuse_unproven") unless rows.is_a?(Array) && rows.size <= MAX_ASSETS
+      seen = {}
+      rows.each do |row|
+        SiloDiscourseMergeAdapter.refuse!("seeded_reuse_unproven") unless row.is_a?(Hash) && field(row, :id).is_a?(Integer)
+        next if field(row, :id).positive?
+        id = field(row, :id)
+        proof = prove!(row, tag: "seeded_reuse_unproven")
+        SiloDiscourseMergeAdapter.refuse!("seeded_reuse_unproven") unless @seeds[id] == proof && !seen[id]
+        seen[id] = true
+      end
+      # A duplicate digest on ANY other ID would make stock's reuse ambiguous.
+      @seeds.each do |id, proof|
+        matches = rows.select { |row| field(row, :sha1) == proof[1] }
+        SiloDiscourseMergeAdapter.refuse!("seeded_reuse_unproven") unless seen[id] && matches.size == 1 && field(matches.first, :id) == id
+      end
+      rows.reject { |row| @seeds.key?(field(row, :id)) }
+    end
+
+    def physical_source(rows)
+      rows.reject { |row| @seeds.key?(field(row, :id)) }
+    end
+
+    def mapping?(source, target)
+      @seeds.key?(source) && source == target
+    end
+
+    def verify_mapping!(mapping)
+      SiloDiscourseMergeAdapter.refuse!("seeded_reuse_unproven") unless @seeds.keys.all? { |id| mapping[id] == id }
+    end
+
+    def target_ids = @seeds.keys
+
+    private
+
+    def field(row, key)
+      row.key?(key) ? row[key] : row[key.to_s]
+    end
+
+    def prove!(row, tag:)
+      id = field(row, :id)
+      filename = FILES[id]
+      SiloDiscourseMergeAdapter.refuse!(tag) unless filename && field(row, :url) == "/images/#{filename}" && field(row, :original_sha1).nil? && [nil, false, "f"].include?(field(row, :secure))
+      proof = File.open(File.join(IMAGE_ROOT, filename), File::RDONLY | File::NOFOLLOW) do |file|
+        stat = file.stat
+        SiloDiscourseMergeAdapter.refuse!(tag) unless stat.file? && stat.size.between?(1, MAX_FILE_BYTES)
+        bytes = file.read(MAX_FILE_BYTES + 1)
+        SiloDiscourseMergeAdapter.refuse!(tag) unless bytes.bytesize == stat.size
+        [stat.size, "_#{Digest::SHA1.hexdigest(bytes)}"[0, 40]]
+      end
+      SiloDiscourseMergeAdapter.refuse!(tag) unless field(row, :filesize).is_a?(Integer) && field(row, :filesize) == proof[0] && field(row, :sha1).is_a?(String) && field(row, :sha1) == proof[1]
+      [id, field(row, :sha1).dup.freeze, field(row, :url).dup.freeze, proof[0]].freeze
+    rescue SystemCallError, IOError, TypeError, KeyError
+      SiloDiscourseMergeAdapter.refuse!(tag)
+    end
+  end
+
   class << self
     def prepare!(merger_class, source_rows:, approved_ids:, policy:, source_root:, destination_root:,
                  destination_rows: [])
@@ -91,7 +175,9 @@ module SiloDiscourseMergeAdapter
     end
   end
 
-  # Faithful pinned stock method; the sole changed line defers physical IO.
+  # Pinned stock method with two explicit compatibility changes: defer physical
+  # IO, and floor allocation at zero when the destination has only negative
+  # packaged IDs. Preserve stock's existing empty/positive-ID behavior.
   module DeferredUploads
   def copy_uploads
     puts ""
@@ -100,7 +186,7 @@ module SiloDiscourseMergeAdapter
     @silo_uploads_deferred = (@silo_uploads_deferred || 0) + 1
 
     columns = Upload.columns.map(&:name)
-    last_id = Upload.unscoped.maximum(:id) || 1
+    last_id = [Upload.unscoped.maximum(:id) || 1, 0].max
     sql = "COPY uploads (#{columns.map { |c| "\"#{c}\"" }.join(", ")}) FROM STDIN"
     existing_ids_by_sha1 = Upload.unscoped.where.not(sha1: nil).pluck(:sha1, :id).to_h
 
@@ -153,11 +239,12 @@ module SiloDiscourseMergeAdapter
       @policy = policy.dup.freeze
       @source_root = File.expand_path(source_root)
       @destination_root = File.expand_path(destination_root)
-      @rows = normalize(rows, source: true)
+      @seeded_reuse = SeededReuse.new(rows)
+      @rows = normalize(@seeded_reuse.physical_source(rows), source: true)
       ids = checked_ids(approved_ids)
       @required = ids.to_h { |id| [id, true] }
       SiloDiscourseMergeAdapter.refuse!("missing_source_row") unless (ids - @rows.keys).empty?
-      baseline = normalize(destination_rows)
+      baseline = normalize(@seeded_reuse.physical_rows!(destination_rows))
       @before_ids = baseline.keys.to_h { |id| [id, true] }
       @baseline_by_sha1 = baseline.values.group_by { |row| row[:sha1] }
       refuse!("ambiguous_destination") if @baseline_by_sha1.values.any? { |matches| matches.size > 1 }
@@ -173,8 +260,9 @@ module SiloDiscourseMergeAdapter
         refuse!("optimized_classification_unproven") if @source_files.keys.any? { |path| path.start_with?("optimized/") && !approved_paths.key?(path) }
       end
       bind_source_content!
-      @selection_digest = Digest::SHA256.hexdigest(JSON.generate(
-        [@policy, @required.keys.sort, @rows.keys.sort.map { |id| @rows[id].values_at(:id, :sha1, :url, :bytes, :original_sha1, :secure) }])).freeze
+      selection = [@policy, @required.keys.sort, @rows.keys.sort.map { |id| @rows[id].values_at(:id, :sha1, :url, :bytes, :original_sha1, :secure) }]
+      selection << ["pinned_stock_seeded_reuse_v1", @seeded_reuse.facts] unless @seeded_reuse.facts.empty?
+      @selection_digest = Digest::SHA256.hexdigest(JSON.generate(selection)).freeze
       preflight = build_preflight
       @preflight_manifest_digest = Digest::SHA256.hexdigest(JSON.generate(
         [preflight, SiloDiscourseBaselineAssets.digest(@baseline_inventory)])).freeze
@@ -191,10 +279,12 @@ module SiloDiscourseMergeAdapter
         mapping = instance.instance_variable_get(:@uploads)
         refuse!("missing_mapping") unless mapping.is_a?(Hash) && mapping.size <= MAX_ASSETS
         valid_mapping = mapping.all? do |source_id, target_id|
-          source_id.is_a?(Integer) && @rows.key?(source_id) && target_id.is_a?(Integer) && target_id.positive?
+          source_id.is_a?(Integer) && target_id.is_a?(Integer) &&
+            ((@rows.key?(source_id) && target_id.positive?) || @seeded_reuse.mapping?(source_id, target_id))
         end
         refuse!("missing_mapping") unless valid_mapping
-        rows = normalize(destination_rows)
+        @seeded_reuse.verify_mapping!(mapping)
+        rows = normalize(@seeded_reuse.physical_rows!(destination_rows))
         @rows.each_value do |row|
           target = rows[mapping[row[:id]]]
           refuse!("missing_mapping") if @required.key?(row[:id]) && !target
@@ -202,7 +292,7 @@ module SiloDiscourseMergeAdapter
         end
         @verified_approved_ids = @required.keys.map { |id| mapping.fetch(id) }.uniq.sort.freeze
         @verified_excluded_ids = (@rows.keys - @required.keys).filter_map { |id| mapping[id] if rows.key?(mapping[id]) && !@before_ids.key?(mapping[id]) }.uniq.sort.freeze
-        @verified_dangling_ids = (mapping.values.uniq - rows.keys).sort.freeze
+        @verified_dangling_ids = (mapping.values.uniq - rows.keys - @seeded_reuse.target_ids).sort.freeze
         @verified_mapping = mapping.dup.freeze
         @verified_rows = rows
         @verified_instance = instance

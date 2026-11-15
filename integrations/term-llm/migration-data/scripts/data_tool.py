@@ -18,8 +18,10 @@ is outside this boundary. Every tool is one operation of bin/data_tools.py, whic
 workspace's drop folder, inputs, work folders and converter checkout. Arguments never
 reach a shell; only the listed request keys are passed on.
 """
+import importlib.util
 import json
 import os
+from pathlib import Path
 import pwd
 import re
 import subprocess
@@ -30,6 +32,7 @@ WORKSPACE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 MAX_OUTPUT_BYTES = 48 * 1024
 # tool -> (data op, allowed request keys, timeout seconds; term-llm allows at most 300)
 TOOLS = {
+    "data_workflow_validation_status": ("workflow_validation_status", {"attempt"}, 60),
     "data_workflow_contract": ("workflow_contract", set(), 290),
     "data_workflow_validate": ("workflow_validate", {"run", "generation", "settings"}, 290),
     "data_workflow_exists": ("workflow_exists", {"run", "generation", "queries"}, 290),
@@ -118,10 +121,39 @@ def chat_project():
     return cwd[len(root) + 1:].split(os.sep)[0] if cwd.startswith(root + os.sep) else None
 
 
+def saved_validation_json(raw, failure=False):
+    # Fixed shipped source path, never a tool argument/environment-selected module.
+    # Share the backend wire allowlist so the two boundaries cannot drift.
+    source = Path(__file__).resolve().parents[4] / "bin/data_tools.py"
+    spec = importlib.util.spec_from_file_location("migration_validation_wire", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.validation_json(raw, failure=failure)
+
+
 def emit(result):
+    tool = os.environ.get("TERM_LLM_TOOL_NAME", "")
+    # Only these two tools understand this protocol. Preserve the outer error
+    # code even if an old or malformed backend cannot supply safe diagnostics.
+    if tool in ("data_merge_propose", "data_workflow_validation_status") and result.stdout.strip():
+        if len(result.stdout) > MAX_OUTPUT_BYTES:
+            return fail("STANDARD_OUTPUT_TOO_LARGE")
+        try:
+            value = json.loads(result.stdout)
+            if tool == "data_merge_propose" and isinstance(value, dict) and value.get("error") == "STANDARD_MERGE_VALIDATION_FAILED":
+                print(json.dumps(saved_validation_json(result.stdout, failure=True)))
+                return 0
+            if tool == "data_workflow_validation_status" and result.returncode == 0:
+                print(json.dumps(saved_validation_json(result.stdout)))
+                return 0
+        except (ValueError, OSError, ImportError, RecursionError):
+            return fail("STANDARD_MERGE_VALIDATION_FAILED" if tool == "data_merge_propose" else "STANDARD_OPERATION_FAILED")
     if result.returncode != 0 or not result.stdout.strip():
         # The code and the short detail the host adds: this agent is on the customer-data side.
-        match = re.search(rb"(?m)^Error: ((?:STANDARD|NAMED)_[A-Z_]+(?:: [^\n]{1,200})?)", result.stderr)
+        if tool in ("data_merge_propose", "data_workflow_validation_status"):
+            match = re.search(rb"(?m)^Error: ((?:STANDARD|NAMED)_[A-Z_]+)(?::|$)", result.stderr)
+        else:
+            match = re.search(rb"(?m)^Error: ((?:STANDARD|NAMED)_[A-Z_]+(?:: [^\n]{1,200})?)", result.stderr)
         return fail(match.group(1).decode("utf-8", "replace") if match else "STANDARD_OPERATION_FAILED")
     if len(result.stdout) > MAX_OUTPUT_BYTES:
         return fail("STANDARD_OUTPUT_TOO_LARGE")
@@ -147,6 +179,10 @@ def main():
         return fail("STANDARD_ARGUMENTS_INVALID")
     if tool.startswith("data_workflow_") and set(args) - TOOLS[tool][1]:
         return fail("STANDARD_ARGUMENTS_INVALID")
+    if tool == "data_workflow_validation_status":
+        attempt = args.get("attempt", "latest")
+        if not isinstance(attempt, str) or (attempt != "latest" and not re.fullmatch(r"[0-9a-f]{32}", attempt)):
+            return fail("STANDARD_ARGUMENTS_INVALID")
     # One customer per chat: the chat's web UI project decides the workspace, and the model has no say.
     project = chat_project()
     if project is None or not WORKSPACE.match(project):

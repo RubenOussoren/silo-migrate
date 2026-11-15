@@ -261,10 +261,23 @@ or global `FileUtils` patch.
 
 The first shipped adapter is deliberately pinned to the verified stock Discourse
 merger implementation; a changed stock method refuses until separately supported.
-It duplicates that method into a scoped adapter, defers only its physical `cp_r`,
-and retains the stock source/destination upload mapping. This is not a universal
-merge algorithm. A separate test-only adapter exercises the shared contract,
-registry, gate, transfer and evidence seams without Discourse assumptions.
+It duplicates that method into a scoped adapter, defers physical `cp_r`, and floors
+new upload allocation at zero when only negative packaged IDs exist (so the next
+user upload is positive). Empty/positive destination maxima and all stock SQL rows
+and mappings retain their prior behavior; the source method/constructor/start are
+unmodified. An exact equivalence test permits only those two copied-method changes.
+This is not a universal merge algorithm. A separate test-only adapter exercises the
+shared contract, registry, gate, transfer and evidence seams without Discourse assumptions.
+
+Core's six known negative-ID `/images/` seed records use intentionally fake SHA1s.
+They are not customer uploads. The adapter proves their exact IDs/URLs/metadata
+against bounded regular NOFOLLOW packaged files and exactly one identical existing
+destination record, binds that proof into selection freshness, and rechecks the
+stock mappings. Only this proven packaged reuse is outside the physical-upload
+manifest; no database row is filtered/deleted. Unknown or changed records,
+missing/ambiguous counterparts, arbitrary negative IDs and invalid positive upload
+identities still refuse. All actual uploaded files retain the usual policy,
+content-identity, reference and baseline checks.
 
 `carried` means the layer's required IDs, not a separately editable file allowlist;
 `all` must be explicitly declared and selected. The stock merger can still insert

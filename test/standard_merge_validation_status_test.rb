@@ -81,7 +81,7 @@ class StandardMergeValidationStatusTest < SiloMigrateTest
   end
 
   def test_dynamic_reason_and_stage_are_not_echoed
-    save(ID, receipt.merge("reason" => PRIVATE, "diagnostics" => { "work" => { "reason" => PRIVATE, "step" => PRIVATE, "command_outcome" => PRIVATE } }))
+    save(ID, receipt.merge("reason" => PRIVATE, "diagnostics" => { "work" => { "reason" => PRIVATE, "step" => PRIVATE, "command_outcome" => PRIVATE, "error_class" => PRIVATE } }))
     result = @host.merge_validation_status
     assert_equal "unknown", result.fetch("reason")
     assert_equal "unknown", result.dig("work", "stage")
@@ -122,6 +122,7 @@ class StandardMergeValidationStatusTest < SiloMigrateTest
     File.unlink(path)
     File.mkfifo(path, 0o600)
     assert_equal "invalid", @host.merge_validation_status(attempt: ID).dig("evidence", "receipt")
+    assert_raises(SiloMigrate::StandardWorkflowError) { @host.send(:mv_read!, path, 1024) }
     File.unlink(path)
     File.rename(@directory, @directory + "-actual")
     File.symlink(@directory + "-actual", @directory)
@@ -162,6 +163,71 @@ class StandardMergeValidationStatusTest < SiloMigrateTest
     assert_equal ID, result.dig("validation", "attempt_id")
     assert_equal "policy_conflict", result.dig("validation", "work", "reason")
     refute_includes output, PRIVATE
+  end
+
+  def test_saved_guest_diagnostic_is_fixed_and_never_echoes_private_messages_or_classes
+    diagnostic = { "version" => 1, "stage" => "rails_boot", "error_class" => "PG::InsufficientPrivilege", "component" => "stock_runtime", "line" => 42 }
+    save(ID, receipt.merge("guest_diagnostic" => diagnostic))
+    assert_equal diagnostic, @host.merge_validation_status(attempt: ID).fetch("guest_diagnostic")
+    [diagnostic.merge("message" => PRIVATE), diagnostic.merge("error_class" => PRIVATE),
+     diagnostic.merge("component" => "custom_layer", "line" => 12), diagnostic.merge("line" => PRIVATE)].each do |invalid|
+      save(ID, receipt.merge("guest_diagnostic" => invalid))
+      result = @host.merge_validation_status(attempt: ID)
+      refute result.key?("guest_diagnostic")
+      refute_includes JSON.generate(result), PRIVATE
+    end
+  end
+
+  def test_legacy_unknown_guest_evidence_is_not_a_supported_recovery_approval
+    record = receipt.merge("reason" => "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", "diagnostics" => {
+      "work" => { "reason" => "STANDARD_MERGE_VALIDATION_UNPROVEN", "step" => "guest_validation", "deadline_reached" => false },
+      "cleanup" => { "reason" => "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED", "step" => "cleanup_resources", "deadline_reached" => false } })
+    save(ID, record, journal.merge("status" => "owned_unknown", "cleanup_confirmed" => false))
+    result = @host.merge_validation_status(attempt: ID)
+    assert_equal "guest_validation", result.dig("work", "stage")
+    assert_equal false, result.dig("work", "deadline_reached")
+    assert_equal "unknown", result.fetch("producer_outcome")
+    assert_equal "unconfirmed", result.dig("cleanup", "status")
+    assert_equal "reconcile_legacy_attempt", result.fetch("next_action")
+    save(ID, record, journal.merge("version" => 2, "status" => "owned_unknown", "cleanup_confirmed" => false, "producer_outcome" => "unknown"))
+    assert_equal "reconcile_unknown_producer", @host.merge_validation_status(attempt: ID).fetch("next_action")
+  end
+
+  def test_v2_work_cleanup_and_allowlisted_stage_events_remain_independent
+    resource = journal.merge("version" => 2, "primary_reason" => "policy_conflict", "work_status" => "refused",
+      "work_stage" => "result_verification", "work_producer_outcome" => "completed", "last_stage" => "cleanup_absence", "producer_outcome" => "completed",
+      "events" => [{ "step" => "clone_source", "phase" => "finish", "elapsed_ms" => 100, "outcome" => "boundary", "stderr" => PRIVATE },
+                   { "step" => PRIVATE, "phase" => "finish", "elapsed_ms" => 12, "outcome" => PRIVATE },
+                   { "step" => "cleanup_source", "phase" => "finish", "elapsed_ms" => PRIVATE }])
+    save(ID, receipt.merge("reason" => "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED"), resource)
+    result = @host.merge_validation_status(attempt: ID)
+    assert_equal "saved", result.dig("evidence", "journal")
+    assert_equal "policy_conflict", result.dig("work", "reason")
+    assert_equal "result_verification", result.dig("work", "stage")
+    assert_equal "cleanup_absence", result.fetch("last_recorded_stage")
+    assert_equal "completed", result.fetch("producer_outcome")
+    assert_equal "completed", result.dig("work", "command_outcome")
+    assert_equal 2, result.fetch("events").size
+    refute_includes JSON.generate(result), PRIVATE
+  end
+
+  def test_recovery_cli_requires_an_exact_id_and_digest_and_is_not_an_agent_capability
+    service = Object.new
+    calls = []
+    service.define_singleton_method(:merge_validation_recovery_preview) { |**args| calls << args; { "preview" => true } }
+    service.define_singleton_method(:merge_validation_recovery_apply) { |**args| calls << args; { "applied" => true } }
+    assert_equal 0, invoke(["workflow", "validation-recovery-preview", "invented", "--attempt", ID], service).first
+    assert_equal [{ attempt_id: ID }], calls
+    assert_equal 0, invoke(["workflow", "validation-recovery-apply", "invented", "--attempt", ID, "--intent-sha256", "d" * 64], service).first
+    assert_equal({ attempt_id: ID, intent_sha256: "d" * 64 }, calls.last)
+    [%w[workflow validation-recovery-preview invented --attempt latest],
+     ["workflow", "validation-recovery-apply", "invented", "--attempt", ID],
+     ["workflow", "validation-recovery-apply", "invented", "--attempt", ID, "--intent-sha256", "bad"],
+     ["workflow", "validation-recovery-preview", "invented", "--attempt", ID, "--yes"],
+     ["agent", "validation-recovery-apply", "invented", "--attempt", ID, "--intent-sha256", "d" * 64]].each do |args|
+      assert_equal [1, "", "Error: STANDARD_ARGUMENTS_INVALID\n"], invoke(args, service)
+    end
+    assert_equal 2, calls.size
   end
 
   def test_pre_attempt_refusal_has_no_fabricated_receipt

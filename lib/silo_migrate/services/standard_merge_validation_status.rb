@@ -89,10 +89,11 @@ module SiloMigrate
           data
         end
         record = JSON.parse(bytes, max_nesting: 32)
-        return [nil, "invalid"] unless record.is_a?(Hash) && record["version"] == 1
+        return [nil, "invalid"] unless record.is_a?(Hash)
         if suffix == "json"
-          return [nil, "invalid"] unless record["receipt_id"] == id && %w[passed refused].include?(record["status"])
+          return [nil, "invalid"] unless record["version"] == 1 && record["receipt_id"] == id && %w[passed refused].include?(record["status"])
         else
+          return [nil, "invalid"] unless [1, 2].include?(record["version"])
           mv_journal!(record)
           return [nil, "invalid"] unless record["id"] == id
         end
@@ -113,9 +114,22 @@ module SiloMigrate
 
       def mv_saved_diagnostic(value)
         value = {} unless value.is_a?(Hash)
-        { "reason" => mv_saved_reason(value["reason"]), "stage" => mv_saved_stage(value["step"]),
+        result = { "reason" => mv_saved_reason(value["reason"]), "stage" => mv_saved_stage(value["step"]),
           "deadline_reached" => [true, false].include?(value["deadline_reached"]) ? value["deadline_reached"] : nil,
           "command_outcome" => %w[completed failed timeout_or_interrupted unknown].include?(value["command_outcome"]) ? value["command_outcome"] : "unknown" }
+        result["error_class"] = value["error_class"] if SiloMergeValidationDiagnostic::ERROR_CLASSES.include?(value["error_class"])
+        result
+      end
+
+      def mv_saved_events(value)
+        return [] unless value.is_a?(Array) && value.size <= 128
+        value.filter_map do |event|
+          next unless event.is_a?(Hash) && %w[start finish].include?(event["phase"])
+          elapsed = event["elapsed_ms"]
+          next unless elapsed.is_a?(Integer) && elapsed.between?(0, 86_400_000)
+          { "stage" => mv_saved_stage(event["step"]), "phase" => event["phase"], "elapsed_ms" => elapsed,
+            "outcome" => %w[completed failed unknown boundary].include?(event["outcome"]) ? event["outcome"] : "unknown" }
+        end
       end
 
       def mv_saved_unknown(state, id = nil)
@@ -130,15 +144,20 @@ module SiloMigrate
         cleanup = mv_saved_diagnostic(diagnostics["cleanup"])
         reason = mv_saved_reason(receipt["reason"])
         primary = mv_saved_reason(receipt["primary_reason"])
+        primary = mv_saved_reason(journal["primary_reason"]) if primary == "unknown"
         primary = work["reason"] if primary == "unknown"
         primary = reason if primary == "unknown"
         # A cleanup refusal must not hide a typed policy refusal, if preserved.
         failure = receipt["failure"]
         primary = mv_saved_reason(failure["reason"]) if failure.is_a?(Hash) && primary == "STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED"
         work["reason"] = primary
-        work["status"] = %w[passed refused].include?(receipt["work_status"]) ? receipt["work_status"] : receipt.fetch("status", "unknown")
-        work["stage"] = mv_saved_stage(journal["last_stage"]) if work["stage"] == "unknown"
+        work_status = receipt["work_status"] || journal["work_status"] || receipt["status"]
+        work["status"] = %w[passed refused running].include?(work_status) ? work_status : "unknown"
+        work["stage"] = mv_saved_stage(journal["work_stage"]) if work["stage"] == "unknown"
         producer = %w[completed unknown not_started].include?(journal["producer_outcome"]) ? journal["producer_outcome"] : "unknown"
+        if work["command_outcome"] == "unknown" && journal["version"] == 2 && journal["work_producer_outcome"] == "completed"
+          work["command_outcome"] = "completed"
+        end
         # Receipt and journal are independent snapshots. Require both proofs; a
         # repaired journal never rewrites a historical failed receipt as passing.
         cleanup["status"] = if journal_state == "saved" && journal["status"] == "cleaned" && journal["cleanup_confirmed"] == true
@@ -152,13 +171,29 @@ module SiloMigrate
         result = { "version" => 1, "attempt_id" => id, "evidence" => { "receipt" => receipt_state, "journal" => journal_state },
           "status" => receipt.fetch("status", "unknown"), "reason" => reason, "work" => work,
           "producer_outcome" => producer, "cleanup" => cleanup,
+          "last_recorded_stage" => mv_saved_stage(journal["last_stage"]), "events" => mv_saved_events(journal["events"]),
           "key_path_segments" => path.is_a?(Array) && path.size <= 32 ? path.size : nil }
+        diagnostic = receipt["guest_diagnostic"] || journal["guest_diagnostic"]
+        if diagnostic
+          begin
+            SiloMergeValidationDiagnostic.validate!(diagnostic)
+            result["guest_diagnostic"] = diagnostic.dup
+          rescue SiloMergeValidationDiagnostic::Error
+            # Optional corrupt diagnostics are never a raw-data escape hatch.
+          end
+        end
         result["next_action"] = if [receipt_state, journal_state].any? { |state| %w[invalid ambiguous].include?(state) }
           "reconcile_saved_evidence"
         elsif id.nil?
           "no_saved_attempt"
         elsif cleanup["status"] == "confirmed"
           receipt["status"] == "passed" ? "review_exact_plan_before_separate_start" : "inspect_private_evidence_and_correct_cause"
+        elsif receipt_state != "saved" || journal_state != "saved"
+          "reconcile_saved_evidence"
+        elsif journal["version"] != 2
+          "reconcile_legacy_attempt"
+        elsif producer == "unknown"
+          "reconcile_unknown_producer"
         else
           "preview_exact_attempt_recovery"
         end
