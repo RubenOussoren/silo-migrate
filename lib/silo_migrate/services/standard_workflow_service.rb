@@ -577,41 +577,45 @@ module SiloMigrate
       def reset_run(run_id:, yes: false)
         raise StandardWorkflowError, "STANDARD_CONFIRMATION_REQUIRED" unless yes
 
-        @store.with_op_lock do
-          state = @store.load
-          run = state.fetch("runs")[run_id]
-          raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
-          raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" if %w[claimed running].include?(run["status"])
-
-          # Only the environment this run owns; inspection access is fenced before its stack goes.
-          environment = merge_reset_scope!(state, run, state.fetch("plans").fetch(run.fetch("plan_id"), {}))
-          unfenced = environment ? merge_reset_close(environment) : []
-          stacks = run.fetch("instances", {}).values.filter_map do |name|
-            record = state.fetch("instances")[name]
-            next unless record && record["state"] != "removed"
-
-            stack = PrebuiltStack.new(runtime: @runtime, lock: nil, name: name, record: record)
-            stack.remove!
-            stack
-          end
-          # Persist "removed" only after the sweep, so a failed reset stays dirty and
-          # keeps blocking new runs. Retrying is safe: absent resources are skipped.
-          sweep_run_resources(run_id)
-          convert_leftovers!(run_id) if source_db_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
-          # The review admin's sign-in is useless once its site is gone (also a setup file a crash left).
-          if review_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {})) || merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
-            %w[admin-password review-setup.env].each { |name| FileUtils.rm_f(@store.run_dir(run_id, "private", name)) }
-          end
-          if merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {})) || prepare_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
-            %w[merge-source merge].each { |name| FileUtils.rm_rf(@store.run_dir(run_id, "private", name)) }
-          end
-          @store.update do |current|
-            stacks.each { |stack| current.fetch("instances")[stack.name] = stack.record }
-          end
-          merge_reset_finish!(environment, unfenced) if environment
-          { version: 1, run_id: run_id, status: "reset", removed: stacks.map(&:name) }
-        end
+        @store.with_op_lock { reset_run_locked(run_id) }
       end
+
+      # Internal seam for an exact reviewed reset already holding host/op locks.
+      def reset_run_locked(run_id)
+        state = @store.load
+        run = state.fetch("runs")[run_id]
+        raise StandardWorkflowError, "STANDARD_REFERENCE_INVALID" unless run
+        raise StandardWorkflowError, "STANDARD_TRANSITION_INVALID" if %w[claimed running].include?(run["status"])
+
+        # Only the environment this run owns; inspection access is fenced before its stack goes.
+        environment = merge_reset_scope!(state, run, state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+        unfenced = environment ? merge_reset_close(environment) : []
+        stacks = run.fetch("instances", {}).values.filter_map do |name|
+          record = state.fetch("instances")[name]
+          next unless record && record["state"] != "removed"
+
+          stack = PrebuiltStack.new(runtime: @runtime, lock: nil, name: name, record: record)
+          stack.remove!
+          stack
+        end
+        # Persist "removed" only after the sweep, so a failed reset stays dirty and
+        # keeps blocking new runs. Retrying is safe: absent resources are skipped.
+        sweep_run_resources(run_id)
+        convert_leftovers!(run_id) if source_db_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+        # The review admin's sign-in is useless once its site is gone (also a setup file a crash left).
+        if review_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {})) || merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+          %w[admin-password review-setup.env].each { |name| FileUtils.rm_f(@store.run_dir(run_id, "private", name)) }
+        end
+        if merge_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {})) || prepare_plan?(state.fetch("plans").fetch(run.fetch("plan_id"), {}))
+          %w[merge-source merge].each { |name| FileUtils.rm_rf(@store.run_dir(run_id, "private", name)) }
+        end
+        @store.update do |current|
+          stacks.each { |stack| current.fetch("instances")[stack.name] = stack.record }
+        end
+        merge_reset_finish!(environment, unfenced) if environment
+        { version: 1, run_id: run_id, status: "reset", removed: stacks.map(&:name) }
+      end
+      private :reset_run_locked
 
       # Catches what a recorded instance can't: conversion containers and anything
       # left by a creation that died partway. Selected by this run's exact label.

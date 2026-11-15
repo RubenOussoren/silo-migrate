@@ -13,6 +13,7 @@ require_relative "../image_identity"
 require_relative "standard_merge_validation_status"
 require_relative "standard_merge_validation_lifecycle"
 require_relative "standard_merge_validation_reconciliation"
+require_relative "standard_merge_validation_reset"
 
 module SiloMigrate
   module Services
@@ -30,6 +31,7 @@ module SiloMigrate
       include StandardMergeValidationStatus
       include StandardMergeValidationLifecycle
       include StandardMergeValidationReconciliation
+      include StandardMergeValidationReset
       VALIDATION_MAX_SETTINGS = 256 * 1024
       VALIDATION_ALLOWANCE = 512 * 1024 * 1024
       # Chat calls retain their bounded 180s work budget. A deliberate foreground
@@ -909,9 +911,11 @@ module SiloMigrate
           record = JSON.parse(mv_read!(path, 64 * 1024))
           mv_journal!(record)
           mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless File.basename(path) == "#{record.fetch('id')}.resources.json"
-          mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless record["status"] == "cleaned" && record["cleanup_confirmed"] == true
+          clean = record["status"] == "cleaned" && record["cleanup_confirmed"] == true
+          retired = !clean && record["version"] == 1 && mr_retired!(record.fetch("id"))
+          mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED") unless clean || retired
         end
-      rescue JSON::ParserError, SystemCallError
+      rescue StandardError
         mv_error!("STANDARD_MERGE_VALIDATION_RECOVERY_REQUIRED")
       end
 

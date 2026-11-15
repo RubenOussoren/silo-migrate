@@ -26,6 +26,36 @@ class StandardMergeCodeTest < StandardMergePreparationTest
 
   # -- store, status and manifest ----------------------------------------------------------
 
+  def test_merger_reset_preserves_real_committed_work_and_registered_inputs
+    with_prepare do
+      use_layer
+      snapshot = @service.send(:mr_persistent_work!, @merge_settings)
+      files = Dir.glob(File.join(merger_dir, '**', '*'), File::FNM_DOTMATCH).select { |path| File.file?(path) }
+      before = files.to_h { |path| [path, File.binread(path)] }
+      prep = prepared
+      @service.reset_run(run_id: prep[:run_id], yes: true)
+      assert_equal snapshot, @service.send(:mr_persistent_work!, @merge_settings)
+      assert_equal before, files.to_h { |path| [path, File.binread(path)] }
+      assert_equal 'reset', environment(prep[:run_id])['phase']
+    end
+  end
+
+  def test_merger_reset_persistence_check_refuses_dirty_code_and_modified_settings
+    with_prepare do
+      use_layer
+      @service.send(:mr_persistent_work!, @merge_settings)
+      dirty = File.join(merger_dir, 'unsaved.rb')
+      File.write(dirty, '# uncommitted invented work')
+      merger_error('STANDARD_MERGE_RESET_WORK_UNSAVED') { @service.send(:mr_persistent_work!, @merge_settings) }
+      File.unlink(dirty)
+      input = @service.store.named_state.fetch('inputs').fetch(@merge_settings)
+      path = File.join(@root, input.fetch('path').unpack1('m0'))
+      File.chmod(0o600, path)
+      File.write(path, '# changed private settings')
+      merger_error('STANDARD_MERGE_RESET_WORK_UNSAVED') { @service.send(:mr_persistent_work!, @merge_settings) }
+    end
+  end
+
   def test_merger_init_status_and_manifest
     with_prepare do
       status = @service.merger_status

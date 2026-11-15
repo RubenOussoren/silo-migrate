@@ -125,6 +125,21 @@ class OperatorValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '^STANDARD_ARGUMENTS_INVALID$'):
             self.control.merge_validation_options([self.flag, *args])
 
+    def test_reset_preview_uses_read_dispatch_without_long_mode(self):
+        args = ['standard', 'workflow', 'validation-reset-preview', 'invented', '--attempt', 'a' * 32]
+        command = self.launch(args)
+        self.assertEqual(command[-len(args):], args)
+        self.assertEqual('1', command[command.index('--cpus') + 1])
+        self.assertIn('SILO_MERGE_VALIDATION_MODE=chat', command)
+        with self.assertRaisesRegex(ValueError, '^STANDARD_ARGUMENTS_INVALID$'):
+            self.control.merge_validation_options([self.flag, *args])
+
+    def test_reset_actions_refuse_detached_invocation_before_settings_or_runtime_access(self):
+        with mock.patch.object(self.control, 'settings', side_effect=AssertionError('unexpected host access')):
+            for action in ('validation-reset-preview', 'validation-reset-apply'):
+                with self.assertRaisesRegex(ValueError, '^STANDARD_ARGUMENTS_INVALID$'):
+                    self.control.main(['--detach', 'standard', 'workflow', action, 'invented', '--attempt', 'a' * 32])
+
     def test_only_explicit_operator_flag_changes_container_budget(self):
         for flag, mode in (([], 'chat'), ([self.flag], 'operator')):
             command = self.launch(flag + self.proposal)

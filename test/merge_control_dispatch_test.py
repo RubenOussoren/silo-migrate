@@ -1,5 +1,8 @@
 """Host lifecycle cleanup dispatch: no Docker, keys, term-llm calls or customer files."""
+import contextlib
 import importlib.machinery
+import io
+import json
 import importlib.util
 from pathlib import Path
 import re
@@ -48,6 +51,56 @@ class MergeControlDispatchTest(unittest.TestCase):
 
     def invoke(self, args):
         self.control.host_merge_lifecycle_cleanup(args, {}, self.base, ROOT, object())
+
+    def reset_result(self):
+        return {'version': 1, 'attempt_id': 'e' * 32, 'prepared_from': self.prepared,
+                'generation': 'f' * 64, 'intent_sha256': 'd' * 64, 'status': 'reset_retired',
+                'actions': ['fence_inspection', 'remove_preparation_stack', 'verify_runtime_absence', 'retire_legacy_quarantine'],
+                'persistent_work': {'merger_commit': 'a' * 40, 'registered_inputs': 'verified'},
+                'historical_producer': 'unproven', 'next_action': 'prepare_new_environment'}
+
+    def finish_reset(self, result):
+        args = ['standard', 'workflow', 'validation-reset-apply', 'invented', '--attempt', 'e' * 32,
+                '--intent-sha256', 'd' * 64, '--yes']
+        self.state['plans'][self.plan]['body'] = {'operation': 'standard_merge_prepare'}
+        self.state['runs'][self.prepared] = {'status': 'completed', 'plan_id': self.plan,
+                'merge_environment': {'preparation_run_id': self.prepared, 'phase': 'reset'}}
+        output = io.StringIO()
+        with mock.patch.object(self.control, 'capture', return_value=json.dumps(result)) as capture, \
+                contextlib.redirect_stdout(output):
+            code = self.control.host_validation_reset_apply(['docker', 'run', 'fixture'], args, {}, self.base, ROOT, object())
+        self.assertEqual(0, code)
+        capture.assert_called_once_with(['docker', 'run', 'fixture'], passthrough=True, timeout=1800)
+        return output.getvalue()
+
+    def test_reset_connector_cleanup_occurs_only_after_valid_backend_retirement(self):
+        result = self.reset_result()
+        self.assertEqual(result, json.loads(self.finish_reset(result)))
+        self.connector.cleanup.assert_called_once()
+        self.assertEqual(self.prepared, self.connector.cleanup.call_args.kwargs['run_id'])
+
+    def test_reset_unknown_backend_outcome_never_cleans_or_replays(self):
+        with mock.patch.object(self.control, 'capture', side_effect=ValueError('STANDARD_OPERATION_FAILED')) as capture:
+            with self.assertRaisesRegex(ValueError, '^STANDARD_OPERATION_FAILED$'):
+                self.control.host_validation_reset_apply(['docker'], [], {}, self.base, ROOT, object())
+        capture.assert_called_once()
+        self.connector.cleanup.assert_not_called()
+
+    def test_reset_malformed_or_private_backend_projection_is_not_forwarded(self):
+        for field, value in [('prepared_from', '../private'), ('status', 'preview'), ('attempt_id', 'f' * 32),
+                             ('historical_producer', 'completed'), ('unexpected', 'PRIVATE')]:
+            result = self.reset_result()
+            result[field] = value
+            with self.assertRaisesRegex(ValueError, '^STANDARD_OPERATION_FAILED$'):
+                self.finish_reset(result)
+        self.connector.cleanup.assert_not_called()
+
+    def test_completed_reset_with_failed_connector_cleanup_has_fixed_retryable_error(self):
+        self.connector.cleanup.side_effect = ValueError('PRIVATE config error')
+        with self.assertRaisesRegex(ValueError, '^STANDARD_MERGE_RESET_CONNECTORS_UNCONFIRMED$'):
+            self.finish_reset(self.reset_result())
+        self.connector.cleanup.side_effect = None
+        self.assertEqual('reset_retired', json.loads(self.finish_reset(self.reset_result()))['status'])
 
     def test_ready_start_and_consumed_execute_preserve_inspection(self):
         for phase in ('ready', 'consumed'):

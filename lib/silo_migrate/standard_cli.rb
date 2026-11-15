@@ -24,6 +24,8 @@ module SiloMigrate
         merger status WORKSPACE                     (actual local review path and committed layer)
         workflow describe WORKSPACE                  (private committed contract and engine facts)
         workflow validation-status WORKSPACE --attempt latest|ID  (saved evidence only; never reruns validation)
+        workflow validation-reset-preview WORKSPACE --attempt ID  (review whole prepared-runtime reset; preserve saved work)
+        workflow validation-reset-apply WORKSPACE --attempt ID --intent-sha256 SHA --yes  (reset and retire v1 quarantine only)
         workflow validation-reconcile-inspect WORKSPACE --attempt ID  (legacy live observations; never cleanup authority)
         workflow validation-recovery-preview WORKSPACE --attempt ID  (live read-only checks; no cleanup)
         workflow validation-recovery-apply WORKSPACE --attempt ID --intent-sha256 SHA  (exact reviewed cleanup only)
@@ -210,6 +212,19 @@ module SiloMigrate
         digest = opts.fetch("--intent-sha256")
         invalid! unless digest.match?(/\A[0-9a-f]{64}\z/)
         return service(workspace).merge_validation_recovery_apply(attempt_id: attempt, intent_sha256: digest)
+      end
+      if %w[validation-reset-preview validation-reset-apply].include?(action)
+        applying = action == "validation-reset-apply"
+        if applying
+          expect!(args.pop, "--yes")
+        end
+        opts = options!(args, *(applying ? %w[--attempt --intent-sha256] : %w[--attempt]))
+        attempt = opts.fetch("--attempt")
+        invalid! unless attempt.match?(/\A[0-9a-f]{32}\z/)
+        return service(workspace).merge_validation_reset_preview(attempt_id: attempt) unless applying
+        digest = opts.fetch("--intent-sha256")
+        invalid! unless digest.match?(/\A[0-9a-f]{64}\z/)
+        return service(workspace).merge_validation_reset_apply(attempt_id: attempt, intent_sha256: digest, yes: true)
       end
       if action == "validation-reconcile-inspect"
         opts = options!(args, "--attempt")

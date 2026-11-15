@@ -272,6 +272,43 @@ def host_merge_lifecycle_cleanup(args, values, base, repo, host):
         connector.cleanup(ws, data, run_id=run_id)
 
 
+def host_validation_reset_apply(command, args, values, base, repo, host):
+    """Close host registrations only AFTER the backend proves the reviewed reset.
+
+    Unknown/failed backend outcomes never trigger host cleanup or automatic replay.
+    A completed backend reset is idempotent if host cleanup needs a later retry.
+    """
+    raw = capture(command, passthrough=True, timeout=1800)
+    if len(raw) > 8192:
+        refuse("STANDARD_OPERATION_FAILED")
+    result = json.loads(raw)
+    keys = {"version", "attempt_id", "prepared_from", "generation", "intent_sha256", "status", "actions",
+            "persistent_work", "historical_producer", "next_action"}
+    if not isinstance(result, dict) or set(result) != keys:
+        refuse("STANDARD_OPERATION_FAILED")
+    expected_actions = ["fence_inspection", "remove_preparation_stack", "verify_runtime_absence", "retire_legacy_quarantine"]
+    work = result["persistent_work"]
+    if (result["version"] != 1 or result["status"] != "reset_retired" or result["actions"] != expected_actions
+            or result["historical_producer"] != "unproven" or result["next_action"] != "prepare_new_environment"
+            or result["attempt_id"] != args[args.index("--attempt") + 1]
+            or result["intent_sha256"] != args[args.index("--intent-sha256") + 1]
+            or not isinstance(work, dict) or set(work) != {"merger_commit", "registered_inputs"}
+            or work["registered_inputs"] != "verified"):
+        refuse("STANDARD_OPERATION_FAILED")
+    for value, pattern in ((result["attempt_id"], r"[0-9a-f]{32}"), (result["prepared_from"], r"run-[0-9a-f]{32}"),
+                           (result["generation"], r"[0-9a-f]{64}"), (result["intent_sha256"], r"[0-9a-f]{64}"),
+                           (work["merger_commit"], r"[0-9a-f]{40}")):
+        if not isinstance(value, str) or not re.fullmatch(pattern, value):
+            refuse("STANDARD_OPERATION_FAILED")
+    try:
+        host_merge_lifecycle_cleanup(["standard", "run", "reset", args[3], result["prepared_from"], "--yes"],
+                                     values, base, repo, host)
+    except (ValueError, OSError, KeyError, TypeError):
+        refuse("STANDARD_MERGE_RESET_CONNECTORS_UNCONFIRMED")
+    print(json.dumps(result))
+    return 0
+
+
 def host_data(args, values, base, self):
     """`data WS`: the migration-data agent's operations (bin/data_tools.py), JSON on stdin.
     `dbhub WS`: the project's DBHub MCP server over stdio (term-llm starts it; never prints here)."""
@@ -722,6 +759,8 @@ def cached_runtime_options(args):
 def main(args):
     args, cached_only = cached_runtime_options(args)
     args, long_validation = merge_validation_options(args)
+    if args[:3] == ["--detach", "standard", "workflow"] and args[3:4] in (["validation-reset-preview"], ["validation-reset-apply"]):
+        refuse("STANDARD_ARGUMENTS_INVALID")
     self = Path(__file__).resolve()
     repo = self.parent.parent
     values, configured = settings()
@@ -799,7 +838,7 @@ def main(args):
     host_merge_lifecycle_cleanup(args, values, base, repo, sys.modules.get(__name__))
     # Short UI reads need not throttle Ruby startup to a quarter CPU. Mutation/executor ceilings
     # stay unchanged, as do memory, mounts, identity checks and every other isolation setting.
-    read_only = args[:2] == ["standard", "status"] or args[:3] in (["standard", "plan", "show"], ["standard", "run", "show"], ["standard", "workflow", "validation-status"], ["standard", "workflow", "validation-reconcile-inspect"])
+    read_only = args[:2] == ["standard", "status"] or args[:3] in (["standard", "plan", "show"], ["standard", "run", "show"], ["standard", "workflow", "validation-status"], ["standard", "workflow", "validation-reconcile-inspect"], ["standard", "workflow", "validation-reset-preview"])
     cpus = "1" if read_only else "0.25"
     command = ["docker", "run", *mode, "--pull=never", "--restart", "no", "--network", "host", "--read-only",
                "--user", f"{os.getuid()}:{os.getgid()}", "--group-add", str(Path("/var/run/docker.sock").stat().st_gid),
@@ -840,6 +879,8 @@ def main(args):
     for key, value in environment.items():
         command.extend(["-e", key + "=" + value])
     command.extend(["-w", str(repo), image, "bundle", "_2.6.9_", "exec", "ruby", "bin/silo-migrate", *args])
+    if args[:3] == ["standard", "workflow", "validation-reset-apply"]:
+        return host_validation_reset_apply(command, args, values, base, repo, sys.modules.get(__name__))
     os.execvp(command[0], command)
 
 

@@ -125,6 +125,130 @@ mark it cleaned, delete it, bypass the gate, rename the workspace to evade it or
 run v2 recovery-apply on it. Review the safe observations first; any reset and
 legacy retirement need a separate, exact, authorized action and proof of scope.
 
+## Reviewed reset and legacy retirement (version-1 only)
+
+When preserving an unused prepared runtime is not worth in-place reconciliation,
+these **engineer-only** commands reset its entire execution domain and retire the
+one exact legacy quarantine separately:
+
+```sh
+"$CONTROL" standard workflow validation-reset-preview PROJECT --attempt ATTEMPT_ID
+# Review the returned generation, actions and persistent_work.merger_commit.
+# Only then explicitly authorize that exact intent (SHA is the returned digest):
+"$CONTROL" standard workflow validation-reset-apply PROJECT --attempt ATTEMPT_ID --intent-sha256 SHA --yes
+```
+
+Use the installed prefix launcher, not `current/bin`, a direct Ruby invocation or
+the ordinary UI Reset button for this legacy closeout. Ordinary Reset remains
+unchanged and does not create retirement proof. These commands are not exposed
+through `standard agent`, data tools or a new unattended operation. The long
+validation flag does not apply to them.
+
+### What is retained, and what is discarded
+
+**Retained:** the persistent `<workspace>/merger/` local Git repository (code,
+tests and commits), registered private settings and all registered source/Base
+inputs, old plans/findings and the original failed validation receipt/journal.
+Preview requires a clean committed merger worktree and verifies existing named
+input identities without reading input contents. The same preservation binding is
+checked before and after reset. Dirty/uncommitted code or changed/missing inputs
+refuse with `STANDARD_MERGE_RESET_WORK_UNSAVED`; do not copy private settings into
+Git, auto-stash work, delete registrations or rewrite evidence to make it pass.
+
+**Discarded:** the exact preparation's DB/web/Redis/proxy containers, its two
+networks and three owned local volumes, inspection credentials/launchers and
+selected run-private working copies. This intentionally discards sealed copies,
+inspection-only edits and any work saved only inside those disposable containers.
+There is no completed merge output in the supported unconsumed preparation scope.
+A new Prepare must restore the retained original inputs into a fresh generation;
+new validation, exact approval and separate Start are still required.
+
+### Closure proof, not invented historical completion
+
+Preview is live/read-only: existing execution locks, bounded private saved
+records, hardened local Git metadata, registered input stat identities and fixed
+Docker metadata. It performs no SQL, application boot, reset, cleanup or intent
+write. The receipt/journal must agree on the exact v1 attempt, preparation and
+generation. The completed persisted-ready preparation must own its runtime, have
+no consumer or claimed/running workspace run, and its checkpoint-recorded
+container IDs must equal the instance record. All four current container IDs,
+labels, creation/start observations and named-volume mounts are reviewed; local
+volume drivers/options and exclusive use are checked. Unknown ownership, external
+mounts/users or network members refuse. Existing attempt Redis sidecars or host
+credential staging directories refuse rather than being adopted or force-cleaned.
+Other unresolved attempts are not silently retired.
+
+Apply holds host-before-op locks, rechecks the exact digest and preservation
+binding, and durably saves an immutable `ATTEMPT.reset-SHA.intent.json` **before**
+calling the normal reset lifecycle. It fences inspection and removes the whole
+owned runtime rather than trying to prove that an old guest/SQL producer exited
+or surgically dropping scratch databases. A separate
+`ATTEMPT.reset-retirement.json` is written only after the preparation is durably
+reset, the same Docker daemon proves the old IDs/names/networks/volumes/launchers
+absent, attempt-sidecar/staging absence is rechecked and saved-work preservation
+still matches. Thus an old producer cannot continue using the destroyed execution
+domain. `historical_producer` stays **unproven**; no receipt becomes successful and
+no original journal is marked cleaned or upgraded to v2.
+
+The installed launcher closes owned host connector registrations only **after**
+valid backend `reset_retired` output. Backend refusal, stale intent or unknown
+outcome does not trigger host cleanup or automatic replay. A post-success host
+cleanup failure reports `STANDARD_MERGE_RESET_CONNECTORS_UNCONFIRMED`; the backend
+retirement is already saved, and the same reviewed apply can retry that remaining
+host closeout idempotently.
+
+A partial reset retains its one approved immutable intent and no terminal
+retirement. Only that exact digest may resume; it accepts absence of resources
+that the saved intent proved present before removal, never an unreviewed new
+resource. Replacement identities, changed daemon/evidence/work, conflicting
+intents and failed postconditions remain refused. Keep the intent/evidence for
+review; do not generate a replacement approval over a partial deletion.
+
+Successful apply returns `status: reset_retired` and
+`next_action: prepare_new_environment`. Repeating the same apply or preview after
+completion verifies the saved closure proof and is idempotent. The old
+`validation-status --attempt ID` deliberately remains historical: its work can
+still be refused and its original cleanup unconfirmed. That command does not
+rewrite history or consume the separate reset proof. The validation gate accepts
+only a matching completed v1 retirement, bound to the unchanged original bytes
+and exact reset generation, and rechecks old-runtime absence on the same daemon.
+A pending intent alone, ordinary reset alone, forged/stale proof or a new
+preparation generation cannot bypass quarantine. Version-2 unknown producers and
+v2 recovery rules are unchanged.
+
+### Disposable acceptance
+
+**Verified local checkpoint (2026-11-15): 1 live test passed in 772.715s**, with
+exact-owned cleanup confirmed. It left active invented guest/SQL children in the
+old runtime, proved reset/retirement, full Git preservation at reset, unchanged
+working-tree bytes/HEAD after legitimate new plan refs, retained registered inputs
+and failed evidence, then completed fresh Prepare/custom proposal/approval/claim.
+Installed public-source SHA256:
+`289ab224d1d77e239052b8851e4b09cd7320ae1c6a3825c63d8d58fc53b70bae`.
+Final full Python: **953 discovered / 921 passed / 32 skips**. Full Ruby:
+**1,420 runs / 39,228 assertions**, only two established installer expectation
+failures, zero errors/one skip. Syntax/build and **132 packaged-byte comparisons**
+pass. This is invented-data Development acceptance, not a customer reset or new
+full merge/backup acceptance. An earlier rehearsal failed an overly strict Git
+metadata assertion after normal proposal added retention refs; it is not counted
+as a pass or a production code defect.
+
+```sh
+SILO_MERGE_RESET_LIVE=1 python3 -I -B test/merge_reset_retirement_live_test.py
+```
+
+This opt-in test uses only cached images and invented backups in an isolated
+Development workspace. It runs the real installed launcher and normal Prepare,
+seeds explicitly synthetic legacy history plus real scratch SQL objects, then
+checks reviewed reset/retirement, unchanged committed work/settings/inputs and
+original failed evidence, actual owned resource absence, idempotent apply, and a
+fresh Prepare/custom proposal/approval/claim. Host MCP configuration is isolated
+under the fixture's private `XDG_CONFIG_HOME`. It pulls/installs nothing, publishes
+no ports, touches no existing customer workspace, and confirms exact-owned
+teardown. Default mode skips; a skip is not live acceptance. Opted-in missing
+prerequisites fail. This is not a new full merge/backup acceptance or a customer
+reset authorization.
+
 ## Incremental ownership and exact-attempt recovery (new attempts)
 
 New attempts save version-2 resource journals. Each CREATE intent is written before
