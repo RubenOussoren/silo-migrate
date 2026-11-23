@@ -1,6 +1,6 @@
 # Running a Migrations node day to day
 
-> **Current stock workflow:** this release uses official, unmodified term-llm 0.9.103
+> **Current stock workflow:** this release uses official, unmodified term-llm 0.9.122
 > through normal `silo update`. Intake/reference preparation needs no fork package,
 > native marker or capability command. Keep `TERM_LLM_PACKAGE` empty/unset. Earlier
 > protected-native handoff instructions below are historical, not prerequisites.
@@ -423,7 +423,7 @@ silo prime                                             # on its own: it asks for
 
 ## Stock native updates and deferred conversation protection
 
-This release pins the official, unmodified **term-llm 0.9.103** archive and verifies
+This release pins the official, unmodified **term-llm 0.9.122** archive and verifies
 its reviewed SHA-256 against the official checksums. No capability command, native
 session marker, `lock_session` key or `SILO_PROTECTED_SESSIONS` grant is required.
 
@@ -436,16 +436,14 @@ sudo silo update
 
 That fast-forwards the installer, updates Silo and its pinned official native binary,
 refreshes managed service arguments when needed, restarts the web service and runs
-doctor. Existing 0.9.93/0.9.99 version settings are accepted as older release pins;
+doctor. Existing 0.9.93/0.9.99/0.9.103 version settings are accepted as older release pins;
 no manual version edit is needed. Keep `TERM_LLM_PACKAGE` empty/unset for stock
 operation. A previously explicit experimental package needs review before returning
 to stock; it is not silently ignored. The existing control-runtime artifact package
 is separate and remains verified, not replaced with a native binary or Ruby gem.
 
-Use an idle maintenance window and preserve the previous release/native receipts
-and a consistent private session-database/configuration backup. Updates interrupt
-chats. Verify the running service and start a new migration-data chat; do not alter
-old session rows, remove locks or fabricate context to retrofit a conversation.
+Follow the [v0.9.122 rollout checklist](#v09122-rollout-checklist) for preflight,
+version checks, and rollback.
 
 Stronger durable conversation locking, trusted native tool identity, cross-resume/
 retarget privacy guarantees and trusted chat-upload import are **deferred**, not
@@ -454,6 +452,82 @@ tools and DBHub's migration-data rules remain, but are not universal DLP or OS
 isolation. Doctor warns about the deferred guarantee without blocking intake tools.
 Run invented-data acceptance before any separately approved customer-data use.
 Source publication does not authorize a server connection, update or restart.
+
+## v0.9.122 rollout checklist
+
+For `migrations07`, using the existing `silomig` user service and `/srv/silo-migrate`
+layout. These are operator steps for a **separately approved** maintenance window.
+
+1. **Confirm the approved commit is published** on `mvp/metal-installer` and the
+   host's installer checkout is on that branch. Until then, `silo update` cannot
+   deliver 0.9.122. Verify the baseline with `sudo silo doctor`, the two version checks
+   below (expect `0.9.103`), and the current release/installer commits. Confirm
+   stock operation (`TERM_LLM_PACKAGE` empty/unset); an explicit `0.9.103` line may
+   stay. Do not run an Updates widget update action or `term-llm upgrade`.
+2. **Quiesce work.** Notify users that the web service will restart. Finish chats
+   and data jobs, and let conversion/review/merge operations reach terminal states;
+   prevent new work during the window. If Silo reports `METAL_BUSY`, stop and wait
+   or recover through the normal workflow. Do not delete locks or force the update.
+3. **Back up privately.** Record `current`, `previous`, `bin/term-llm` and any existing
+   `bin/term-llm.previous` targets. Retain the baseline Silo release, binary and both
+   hash receipts, install manifest/history, `metal.conf`, and Term-LLM service spec,
+   config and MCP rules. Take a consistent backup of Term-LLM's application databases,
+   including the session store (SQLite backup API or a quiesced snapshot, not a live
+   `.db` file copy without its WAL). Protect backups like the originals and verify
+   the backup before proceeding. Keep workspace/data backups under the usual policy.
+4. **Run the managed update**, then explicitly recheck doctor:
+
+   ```sh
+   sudo silo update --branch mvp/metal-installer
+   sudo silo doctor
+   ```
+
+   Stop on any error, `METAL_TERM_NOT_UPDATED`, `METAL_TERM_KEPT_PREVIOUS`, or
+   `METAL_SERVICE_UPDATE_SKIPPED`; check status and the retained links before retrying.
+   Don't treat an active service or a successful Git pull as proof of the upgrade.
+5. **Check installed and running versions separately** (both must report `0.9.122`):
+
+   ```sh
+   sudo -u silomig -H -- /srv/silo-migrate/bin/term-llm --version
+   uid=$(id -u silomig)
+   pid=$(sudo -u silomig -H -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+     systemctl --user show --property=MainPID --value term-llm-web.service)
+   test "$pid" -gt 0 && sudo readlink "/proc/$pid/exe" && sudo -u silomig -H -- "/proc/$pid/exe" --version
+   ```
+
+   The process executable should resolve to the managed `term-llm/0.9.122/term-llm`.
+   Review doctor (including Projects, Project page, agents and DBHub) and check the
+   authenticated web UI with an invented-data project and a **new** migration-data
+   chat. Check the Project page, Files/Findings/Runs, and that project DBHub access
+   stays limited to `migration-data`. Do not change old session rows to retrofit a
+   conversation, or resume customer-data work if these checks fail.
+6. **Cross-check Hub discovery (read-only).** From the signed-in Hub, open
+   **Term-LLM Updates → Additional nodes**. Confirm `migrations07` appears and its
+   **Running version** matches the running version you verified on the node in step 5.
+   **Installed executable: Not measured** is expected. Use the widget's existing Hub
+   discovery only: do not add a helper or SSH key, and do not use a widget update
+   action. If `migrations07` is missing or its version is **Unknown**, report a Hub
+   discovery issue rather than changing the deployment. If the reported version
+   differs, report the discrepancy and retain the on-node version as the source of truth.
+7. **If rollback is needed**, keep the node idle and confirm `previous` and
+   `bin/term-llm.previous` point to the recorded baseline Silo commit and v0.9.103.
+   A failed/partial update may not have switched both links; do not run a blind
+   combined rollback in that case. For a completed switch of both links:
+
+   ```sh
+   sudo /opt/silo-migrate-installer/script/metal rollback --config /etc/silo-migrate/metal.conf --term-llm &&
+     sudo silo restart &&
+     sudo silo doctor
+   ```
+
+   `metal rollback` switches the retained Silo release and binary but does not
+   restart the service or reverse application database migrations. Verify the known
+   baseline release and that both version checks report `0.9.103`; if the old binary
+   cannot read the store, use the verified backup through a separately reviewed
+   restore, preserving any newer data first. The installer checkout may still be
+   ahead of the rolled-back release (doctor warns); don't rerun `silo update` until a
+   new rollout is approved.
 
 ## Checking a change
 

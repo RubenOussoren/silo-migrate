@@ -85,7 +85,7 @@ class SiloTest(unittest.TestCase):
         listing = 'Available agents (2):\n\n  [user] /x/\n    converter-developer - a\n    migration-analyst - b\n'
         return {'service status': (0, 'ActiveState=active\n'), ' agents': (0, listing), 'sh op://Everybody/Snorlax LLM/credential --account discourse.1password.com': (0, 'secret'),
                 'auth status --json': (0, json.dumps({'loggedIn': True})), 'docker info': (0, '29.9.3\n'),
-                ' version': (0, 'term-llm version 0.9.103 (commit: invented)\n')}
+                ' version': (0, 'term-llm version 0.9.122 (commit: invented)\n')}
 
     def test_doctor_all_good(self):
         token = self.home / '.config/silo-migrate/github/token-discourse-org'
@@ -128,6 +128,13 @@ class SiloTest(unittest.TestCase):
         self.assertIn('normal Project Files intake is supported', checks['conversation protection']['detail'])
         self.assertFalse(any('capabilities' in argv for argv in calls))
         self.assertNotIn('TERM_LLM_PACKAGE', checks['conversation protection']['fix'])
+
+    def test_doctor_guides_previous_stock_pin_through_silo_update(self):
+        responses = dict(self.healthy(), **{' version': (0, 'term-llm version 0.9.103 (commit: invented)\n')})
+        check = self.statuses(responses)['term-llm version']
+        self.assertEqual(('FAIL', '0.9.103'), (check['status'], check['detail']))
+        self.assertIn('silo update (this release pins official term-llm 0.9.122)', check['fix'])
+        self.assertIn('TERM_LLM_PACKAGE', check['fix'])
 
     def test_doctor_stock_dbhub_retains_agent_rules_without_private_grant(self):
         config = self.home / '.config/term-llm/mcp.json'

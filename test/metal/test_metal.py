@@ -522,11 +522,10 @@ class InstallerTests(unittest.TestCase):
     def test_the_release_decides_the_term_llm_version(self):
         self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("SILO_ACCOUNT=x")["TERM_LLM_VERSION"])
         self.assertEqual("", self.m.TERM_NOTE)
-        # metal.example.conf used to name 0.9.93: such a config gets this release's version, with a note.
-        self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("TERM_LLM_VERSION=0.9.93")["TERM_LLM_VERSION"])
-        self.assertIn("TERM_LLM_VERSION=0.9.93 is an older pin", self.m.TERM_NOTE)
-        self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("TERM_LLM_VERSION=0.9.99")["TERM_LLM_VERSION"])
-        self.assertIn("TERM_LLM_VERSION=0.9.99 is an older pin", self.m.TERM_NOTE)
+        for old in ("0.9.93", "0.9.99", "0.9.103"):
+            with self.subTest(old=old):
+                self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("TERM_LLM_VERSION=" + old)["TERM_LLM_VERSION"])
+                self.assertIn("TERM_LLM_VERSION=" + old + " is an older pin", self.m.TERM_NOTE)
         self.assertEqual(self.m.TERM_LLM_PINNED, self.configured("TERM_LLM_VERSION=" + self.m.TERM_LLM_PINNED)["TERM_LLM_VERSION"])
         for other in ("0.9.95", "0.9.100", "0.9.102", "0.9.104"):
             with self.subTest(other=other), self.assertRaisesRegex(self.m.Refusal, "METAL_VERSION_UNPINNED"):
@@ -602,9 +601,13 @@ class InstallerTests(unittest.TestCase):
         manifest = json.loads((P/"state/install-manifest.json").read_text())
         self.assertEqual(self.m.TERM_LLM_PINNED, manifest["term_llm_version"])
         # A rollback to a release that writes no MCP rules, on a term-llm that enforces them, needs --term-llm.
-        with self.assertRaisesRegex(self.m.Refusal, "METAL_ROLLBACK_TERM_LLM"), contextlib.redirect_stdout(io.StringIO()):
-            self.m.account_update(True)
-        self.assertEqual(b, (P/"current").resolve().name)  # refused before anything changed
+        for active_version in (self.m.TERM_LLM_PINNED, "0.9.103", "0.9.99"):
+            with self.subTest(active_version=active_version):
+                self.m.symlink(P/"term-llm"/active_version/"term-llm", P/"bin/term-llm")
+                with self.assertRaisesRegex(self.m.Refusal, "METAL_ROLLBACK_TERM_LLM"), contextlib.redirect_stdout(io.StringIO()):
+                    self.m.account_update(True)
+                self.assertEqual(b, (P/"current").resolve().name)  # refused before anything changed
+        self.m.symlink(P/"term-llm"/self.m.TERM_LLM_PINNED/"term-llm", P/"bin/term-llm")
         # One that writes them: a rollback leaves term-llm, the agents and the rules alone.
         (P/"releases"/a/"bin").mkdir()
         (P/"releases"/a/"bin/data_tools.py").write_text("def mcp_rules_main(args):\n    pass\n")

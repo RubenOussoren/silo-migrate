@@ -304,10 +304,12 @@ def doctor_checks(entry, runner=run):
     add("OK" if active else "FAIL", "web service", "active" if active else "not active", None if active else "silo restart")
 
     version = term_llm_version(entry, runner)
-    supported = version is not None and version >= (0, 9, 103)
+    reviewed = (0, 9, 122)  # Keep in sync with script/metal's stock pin.
+    supported = version is not None and version >= reviewed
     add("OK" if supported else "FAIL", "term-llm version",
         ".".join(map(str, version)) if version else "unavailable",
-        None if supported else "silo update (this release pins official term-llm 0.9.103); if TERM_LLM_PACKAGE is explicitly set, review that experimental override first")
+        None if supported else "silo update (this release pins official term-llm %s); if TERM_LLM_PACKAGE is explicitly set, review that experimental override first"
+        % ".".join(map(str, reviewed)))
     add("WARN", "conversation protection",
         "durable session locking and trusted chat-upload import are deferred; normal Project Files intake is supported",
         "use invented data for workflow testing; stock agent model rules are not a permanent conversation lock; see docs/intake-preparation.md")

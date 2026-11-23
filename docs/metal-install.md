@@ -1,7 +1,7 @@
 # Debian metal installer (single account; synthetic MVP)
 
-**Current native default:** official, unmodified term-llm **0.9.103**, verified against
-both the reviewed archive SHA and official release checksums. Existing 0.9.93/0.9.99
+**Current native default:** official, unmodified term-llm **0.9.122**, verified against
+both the reviewed archive SHA and official release checksums. Existing 0.9.93/0.9.99/0.9.103
 configuration pins are recognized as older release pins. `TERM_LLM_PACKAGE` is not
 required; leave it empty for stock operation. Ordinary `silo update` delivers the
 Silo release and pinned native update, then restarts the service. Experimental
@@ -131,21 +131,21 @@ configuration; workspaces may be separate or exactly `P/workspaces`, never
 elsewhere overlapping the prefix. Stale installer-owned `.metal-link-*` symlinks
 are cleaned without deleting ordinary files.
 
-The pinned term-llm v0.9.99 linux_amd64 archive must match **both** the installer
-SHA256 `1c2004cf869e9470e605197f386347ff938ab88e431edb3637ee65b95c24cc8f`
-and release `checksums.txt`. A binary hash receipt detects later corruption.
-`bin/term-llm` points at `term-llm/0.9.99/term-llm`. The release decides the version: `metal update`
-(and so `silo update`) installs it when `bin/term-llm` is another one, keeps the old one as
-`bin/term-llm.previous` (for `metal rollback --term-llm`) and re-installs the service once. A
-`metal.conf` still naming 0.9.93 (the old example) gets the release's version, with a note; any
-other unpinned version is refused (`METAL_VERSION_UNPINNED`). The new term-llm goes in only after the agents are
-trusted (otherwise `METAL_TERM_NOT_UPDATED`, and the old one stays), and the old one comes back if
-`web.project_default_agent` can't be set (`METAL_TERM_KEPT_PREVIOUS`). **Rollback:** `metal rollback
---term-llm` puts 0.9.93 back; it reads the updated config and lists the linked agents, but ignores the
-MCP rules. A rollback to a release that doesn't write MCP rules, while term-llm stays at 0.9.99, is
-refused (`METAL_ROLLBACK_TERM_LLM`): new project databases would be open to every agent. Because this
-release pins 0.9.99, a later `silo update` installs it again; that release's own `metal apply`
-refuses the linked agents folder (`METAL_AGENT_CONFLICT`).
+The pinned term-llm v0.9.122 Linux amd64 archive must match **both** the installer
+SHA-256 `01258e7461c6eeb08ce97be611f7abbb19dd10f3e76dce7439ba5728bb52dab0`
+and the official `checksums.txt`. A binary hash receipt detects later corruption.
+`bin/term-llm` points at `term-llm/0.9.122/term-llm`. The release decides the version:
+`metal update` (and so `silo update`) keeps the former binary as `bin/term-llm.previous`
+(for `metal rollback --term-llm`) and refreshes the managed service definition. A
+`metal.conf` naming 0.9.93, 0.9.99 or 0.9.103 gets the reviewed pin, with a note;
+other unpinned versions are refused (`METAL_VERSION_UNPINNED`). The new binary goes
+in only after the agents are trusted (otherwise `METAL_TERM_NOT_UPDATED`), and the
+old one comes back if `web.project_default_agent` cannot be set (`METAL_TERM_KEPT_PREVIOUS`).
+A release-only rollback to code that does not write MCP rules is refused when the
+active binary enforces them (`METAL_ROLLBACK_TERM_LLM`). See the
+[rollout and rollback checklist](node-operations.md#v09122-rollout-checklist) for the combined
+rollback and restart; a later `silo update` would install the published pin again.
+
 `etc/silo-control.env` provides:
 
 - `SILO_MIGRATE_BASE_PATH`: workspace root;

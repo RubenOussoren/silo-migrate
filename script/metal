@@ -35,11 +35,12 @@ ROOT = SELF.parent.parent
 # Reviewed term-llm release: version, and the SHA-256 of term-llm_VERSION_linux_amd64.tar.gz
 # (it must also match the release's checksums.txt). 0.9.96+ enforces config.yaml's
 # mcp.servers.NAME.agents for agents in ~/.config/term-llm/agents (SamSaffron/term-llm#1341).
-TERM_LLM_PINNED = "0.9.103"
-PIN = "ad6120221d9c34975c0c6ce25f00d9d3b68d0b174c8bf0bcca20e6e04240d9ed"
-# Versions earlier releases pinned. Existing configs naming either receive this
-# release's reviewed version instead of a refusal.
-TERM_LLM_SUPERSEDED = ("0.9.93", "0.9.99")
+TERM_LLM_PINNED = "0.9.122"
+PIN = "01258e7461c6eeb08ce97be611f7abbb19dd10f3e76dce7439ba5728bb52dab0"
+# Historical config pins accepted on update, independent of rollback capabilities.
+TERM_LLM_SUPERSEDED = ("0.9.93", "0.9.99", "0.9.103")
+# Only the known pre-agent-rule binary is exempt from the release-only rollback guard.
+TERM_LLM_WITHOUT_MCP_AGENT_RULES = ("0.9.93",)
 TERM_NOTE = ""
 PACKAGES = ("git", "curl", "ca-certificates", "python3", "util-linux", "gzip", "tar", "gnupg")
 DEFAULTS = dict(SILO_ACCOUNT="silomig", SILO_PREFIX="/srv/silo-migrate", SILO_WORKSPACES="",
@@ -1639,10 +1640,12 @@ def account_update(rollback=False, branch=None, term=False):
             symlink(previous_bin.resolve(), P/"bin/term-llm")
             symlink(active, previous_bin)
             target["term_llm_version"] = (P/"bin/term-llm").resolve().parent.name
-        if rollback and not term and not rules_supported(release) and (P/"bin/term-llm").resolve().parent.name not in TERM_LLM_SUPERSEDED:
-            # That release registers project databases without the rule this term-llm enforces.
-            refuse("METAL_ROLLBACK_TERM_LLM", "that release doesn't write the MCP rules term-llm " + (P/"bin/term-llm").resolve().parent.name
-                   + " enforces, so a new project database would be open to every agent; roll back with --term-llm")
+        if rollback and not term and not rules_supported(release):
+            active_version = (P/"bin/term-llm").resolve().parent.name
+            if active_version not in TERM_LLM_WITHOUT_MCP_AGENT_RULES:
+                # That release registers project databases without the rule this term-llm enforces.
+                refuse("METAL_ROLLBACK_TERM_LLM", "that release doesn't write the MCP rules term-llm " + active_version
+                       + " enforces, so a new project database would be open to every agent; roll back with --term-llm")
         changed = False
         previous = switch(release)
         link_skills()

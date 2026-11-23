@@ -153,7 +153,7 @@ review (`from_run`) plans refuse both keys.
 
 ## Stock term-llm support
 
-The supported host is the official, unmodified **term-llm 0.9.103** release, pinned
+The supported host is the official, unmodified **term-llm 0.9.122** release, pinned
 by version and archive checksum in `script/metal`. No fork, capability command,
 `lock_session` key or custom native package is required for intake references,
 preparation, script references, plan citations or the ordinary migration-data tools.
@@ -202,7 +202,7 @@ this stock workflow and no equivalent privacy attestation is claimed.
 
 Use the normal `sudo silo update` on an installer already tracking
 `mvp/metal-installer`, during an approved idle maintenance window. The release pins
-and checks the official binary; existing 0.9.93/0.9.99 version settings are recognized
+and checks the official binary; existing 0.9.93/0.9.99/0.9.103 version settings are recognized
 as older pins. Keep `TERM_LLM_PACKAGE` empty/unset; it is not needed. If a previous
 experiment explicitly configured a package, review that configuration before
 returning to stock rather than silently ignoring it.
