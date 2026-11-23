@@ -7,7 +7,8 @@ The folder integrations/term-llm/extensions/varnish is a copy of upstream, unmod
 checked compatibility patches this script applies (PATCHES below; the same ones the Development node's
 update helper uses). Nobody edits the folder by hand: our changes live in the silo-theme extension. Each
 patch recognises the exact upstream code or its already-fixed form and refuses anything else, so an
-upstream change gets a person's review. This fetches the commit, replaces the folder as a whole (keeping
+upstream change gets a person's review. The tile-image patch also allows older bundles without the
+feature. This fetches the commit, replaces the folder as a whole (keeping
 local.json), records what was installed (with each patch and the upstream hashes of the files it
 changed) in silo-theme/varnish-upstream.json and shows what changed. Nothing from upstream is run.
 
@@ -86,8 +87,20 @@ FIXED_MARK_CSS = '''.runtime-popover-field .vn-field-mark svg { width: 14px; hei
 # scripts/update_varnish.py, "hub_compatibility"); drop it once upstream supports prefixed paths.
 OLD_NODE_ID = r'location.pathname.match(/^\/node\/([^/]+)\//)'
 FIXED_NODE_ID = r'location.pathname.match(/\/node\/([^/]+)\//)'
+# Match the Development node's checked tile-image origin fix (infrastructure
+# scripts/update_varnish.py). The old character allowlist also admits URLs starting
+# with a slash; accept only inline images or extension-relative files.
+TILE_IMAGE_URL_UPSTREAM = r'''        // Same-origin files or inline images only: nothing is fetched from elsewhere.
+        const url = /^data:image\//.test(src) ? src : /^[\w./-]+$/.test(src) && !src.includes("..") ? new URL(src, import.meta.url).href : null;'''
+TILE_IMAGE_URL_FIXED = r'''        // Allow inline images or files relative to this extension, never origin-relative URLs.
+        const base = new URL(import.meta.url);
+        const relative = /^[\w./-]+$/.test(src) && !src.startsWith("/") && !src.includes("..");
+        const resolved = relative ? new URL(src, base) : null;
+        const url = /^data:image\//.test(src) ? src : resolved?.origin === base.origin ? resolved.href : null;'''
 PATCHES = {"runtime_marks": (("main.js", OLD_MARK_LOOKUP, FIXED_MARK_LOOKUP), ("style.css", OLD_MARK_CSS, FIXED_MARK_CSS)),
-           "hub_node_id": (("util.js", OLD_NODE_ID, FIXED_NODE_ID),)}
+           "hub_node_id": (("util.js", OLD_NODE_ID, FIXED_NODE_ID),),
+           "tile_image_origin": (("util.js", TILE_IMAGE_URL_UPSTREAM, TILE_IMAGE_URL_FIXED),)}
+TILE_IMAGE_FEATURE = re.compile(r"node_?images|tile[-_ ](?:pictures?|images?)|inline images", re.I)
 NETWORK = re.compile(r"\bfetch\(|\bWebSocket\(|\bEventSource\(|\bXMLHttpRequest\b|\bsendBeacon\(|\bimport\(")
 
 
@@ -125,13 +138,28 @@ def refuse_unknown_files(folder):
                 raise SystemExit("update-varnish: extension.yaml has an entry this can't check: %s" % line.strip())
 
 
-def apply_patch(folder, name, edits):
+def has_tile_image_feature(folder):
+    # Absence of the exact URL block is not enough to skip the patch. Look for
+    # the feature's config key, JS symbol and comments across the staged bundle
+    # so moving the handler or editing its guard still sends it for review.
+    # The data:image check in util.js is also evidence if the comment changed.
+    for path in folder.rglob("*"):
+        if path.is_file() and path.suffix in CODE + (".json", ".yaml", ".md", ".txt"):
+            text = path.read_text(encoding="utf-8")
+            if TILE_IMAGE_FEATURE.search(text) or (path.name == "util.js" and "data:image" in text):
+                return True
+    return False
+
+
+def apply_patch(folder, source, name, edits):
     """All of a patch's replacements, or none: (status, {file: upstream sha256} of the files it changed)."""
+    if name == "tile_image_origin" and not has_tile_image_feature(folder):
+        return "feature-absent", {}
     planned = []
     for filename, old, fixed in edits:
         text = (folder / filename).read_text() if (folder / filename).is_file() else ""
         if text.count(old) == 1 and fixed not in text:
-            planned.append((filename, text, text.replace(old, fixed)))
+            planned.append((filename, text.replace(old, fixed)))
         elif text.count(fixed) == 1 and old not in text:
             planned.append(None)
         else:
@@ -141,8 +169,9 @@ def apply_patch(folder, name, edits):
     if any(item is None for item in planned):
         raise SystemExit("update-varnish: upstream fixed only part of what the %s patch fixes; review it before updating" % name)
     upstream = {}
-    for filename, text, patched in planned:
-        upstream[filename] = sha256(folder / filename)
+    for filename, patched in planned:
+        # Two patches can touch the same file; record the untouched upstream bytes.
+        upstream[filename] = sha256(source / filename)
         (folder / filename).write_text(patched)
     return "patched", upstream
 
@@ -169,7 +198,7 @@ def install(source, commit):
         refuse_unknown_files(fresh)
         patches = {}
         for name, edits in PATCHES.items():
-            status, upstream = apply_patch(fresh, name, edits)
+            status, upstream = apply_patch(fresh, source, name, edits)
             patches[name] = {"status": status, "upstream_files": upstream}
         outside, network = scan(fresh)
         if outside:

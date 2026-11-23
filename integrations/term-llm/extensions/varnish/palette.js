@@ -158,14 +158,12 @@ export function createPalette(root, { theme, thread, toggleAgentDock }) {
     }
 
     // Chats (as loaded in the sidebar)
-    const seen = new Set();
+    // Display text is not chat identity: separate sessions can have the same
+    // title and metadata. Keep each sidebar button's own navigation action.
     for (const btn of root.querySelectorAll(".sidebar .session-row .session-btn")) {
       const title = btn.querySelector(".session-title")?.textContent.trim();
       if (!title) continue;
       const meta = btn.querySelector(".session-meta")?.textContent.trim() ?? "";
-      const key = `${title}|${meta}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
       out.push({ group: "Chats", icon: "chat", title, hint: meta, current: btn.classList.contains("active"), run: () => btn.click() });
     }
 
@@ -272,6 +270,10 @@ export function createPalette(root, { theme, thread, toggleAgentDock }) {
     input.setAttribute("aria-activedescendant", items.length ? `vn-pal-${index}` : "");
   }
 
+  function revealSelection() {
+    list?.querySelector(`#vn-pal-${index}`)?.scrollIntoView({ block: "nearest" });
+  }
+
   function select(i, scroll = true) {
     if (i === index) return;
     list.querySelector(`#vn-pal-${index}`)?.setAttribute("aria-selected", "false");
@@ -279,7 +281,7 @@ export function createPalette(root, { theme, thread, toggleAgentDock }) {
     const row = list.querySelector(`#vn-pal-${index}`);
     row?.setAttribute("aria-selected", "true");
     input.setAttribute("aria-activedescendant", `vn-pal-${index}`);
-    if (scroll) row?.scrollIntoView({ block: "nearest" });
+    if (scroll) revealSelection();
   }
 
   function choose(i) {
@@ -361,12 +363,26 @@ export function createPalette(root, { theme, thread, toggleAgentDock }) {
         close();
       }
     });
+    // Noninteractive panel content can receive a pointer click without being
+    // focusable. Restore the combobox after that native focus change so its
+    // keyboard controls keep working. Do not prevent pointer defaults: the input
+    // still supports caret/selection and the list keeps native touch/scrollbar
+    // behavior. Choosing an option closes the overlay before this bubbles.
+    panel.addEventListener("click", (event) => {
+      if (overlay && event.target !== input) input.focus({ preventScroll: true });
+    });
     input.addEventListener("input", () => {
       index = 0;
       render();
+      // Query edits select the first result; do not retain the previous
+      // result set's scroll offset with that selection hidden above it.
+      list.scrollTop = 0;
     });
     input.addEventListener("keydown", onKey);
     document.body.append(overlay);
+    // Resizing can shrink the list without changing the active option. Keep
+    // that option visible just as keyboard navigation does, without refocusing.
+    window.addEventListener("resize", revealSelection);
     render();
     input.focus();
   }
@@ -376,6 +392,7 @@ export function createPalette(root, { theme, thread, toggleAgentDock }) {
     if (!overlay) return;
     const o = overlay;
     overlay = null;
+    window.removeEventListener("resize", revealSelection);
     if (reducedMotion.matches) o.remove();
     else {
       o.setAttribute("data-leaving", "");

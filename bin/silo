@@ -358,6 +358,10 @@ def doctor_checks(entry, runner=run):
               and extensions[:2] == ["varnish", "silo-theme"]
               and (PREFIX / "current/integrations/term-llm/extensions/varnish/extension.yaml").is_file())  # after a rollback it may not be
     add("OK" if themed else "WARN", "theme", "Varnish with our layer" if themed else "off: the web UI has its plain look", None if themed else "silo update")
+    sidebar = ("--disable-extensions" not in args and ui + "/extensions" in args and "sidebar-agent" in extensions
+               and (current / "integrations/term-llm/extensions/sidebar-agent/extension.yaml").is_file())
+    add("OK" if sidebar else "WARN", "sidebar agents", "configured: labels use the recorded chat agent" if sidebar else
+        "off: sidebar-agent is not configured in the managed release and service", None if sidebar else "silo update")
     try:
         info = os.lstat(WIDGET_RUNTIME)
         good = stat.S_ISDIR(info.st_mode) and info.st_uid == entry.pw_uid and not info.st_mode & 0o077

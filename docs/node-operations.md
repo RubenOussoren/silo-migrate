@@ -142,7 +142,7 @@ and the web UI keeps chats apart:
   it); customer data stays in the workspace. The lock doesn't reach DBHub: MCP servers start in
   the service's home folder, not the project's, so turning on only the chat's own `db-<project>`
   stays your job (migration-data is told to stop if another project's server is on).
-- **Look and feel:** the web UI uses Varnish by Keegan George (`extensions/varnish`, a copy of upstream with two checked compatibility patches; `script/update-varnish COMMIT` replaces it and applies them) with our changes kept in `extensions/silo-theme`. Updates are deliberate: this code runs on pages showing customer data, so run the browser tests before shipping one.
+- **Look and feel:** the web UI uses Varnish by Keegan George (`extensions/varnish`, a copy of upstream with checked compatibility patches; `script/update-varnish COMMIT` replaces it and applies them) with our changes kept in `extensions/silo-theme`. Updates are deliberate: this code runs on pages showing customer data, so run the browser tests before shipping one.
 - **The Project page** (the horizontal **Project** button in the chat header, and under Widgets) shows one project at a time: which data is in use, where it stands, what to do next. New files are labelled there as Development or Launch, and only there: the agent can't take a file until it's labelled, a plan's approval covers which delivery it uses, and a launch run is refused until running on launch data is built (the accepted process it will repeat is already recorded: see Accepting a site).
 - **Faster navigation:** Findings and Runs share one read and keep a project-scoped snapshot in page memory. Previously loaded lists appear immediately and refresh in the background; no finding text is stored in persistent browser storage. Switching projects or making a decision clears the snapshots. Approval, release and site-acceptance details still read fresh state and retain their exact-text/digest checks. A failed refresh is shown rather than silently presenting the list as current.
 - **What labels guard against:** mixing up data by accident. A script reads one delivery and its outputs belong to it, but migration-data can still read every delivery, so the labels don't stop an agent deliberately copying one delivery's content into another's script.
@@ -579,17 +579,64 @@ with invented data. Short engineer reads (`standard status`, `standard plan show
 ceiling to avoid throttling CLI startup; mutation/executor control commands retain 0.25 CPU, and
 migration containers' own profile limits and all other isolation settings are unchanged.
 
-**The Varnish patch (runtime marks):** term-llm 0.9.99 wraps each Runtime popover select in
-`.control-select`, and upstream Varnish (`002f10e`) then showed ~320 px provider logos that multiplied
-while the popover was open. `update-varnish` applies the same patch as the Development node (two
-exact replacements, `main.js` and `style.css`), refuses an upstream change it doesn't recognise, and
-records it under `patches` in `varnish-upstream.json`, with the upstream hashes of the two files. It
-was submitted upstream (keegangeorge/term-llm-varnish#20). When upstream has the fix, the update
-stops; review it, keep the patch only if needed, and check the Runtime popover in a browser: one
-14 px mark inside each of the Provider and Model fields.
+**Runtime marks:** the current Varnish revision includes the upstream fix
+([Varnish #20](https://github.com/keegangeorge/term-llm-varnish/pull/20)) for hosts
+that wrap Runtime selects in `.control-select`. The vendor tool records this as
+`already-supported`. Check for one 14 px mark inside each of the Provider and Model fields.
 
 **The Varnish patch (Hub node ID):** through the Hub, a node's web UI is at `/hub/node/<id>/`, but
 upstream finds the node only at the start of the path (`/node/<id>/`), so the node's own accent,
 favicon and per-node settings don't apply there. `update-varnish` applies the Development node's
 one-expression change in `util.js` (the same checks and record, under `hub_node_id`). Check: served
 under `--base-path /hub/node/<id>`, Varnish's `NODE_ID` is the node's id; served directly, none.
+
+## Varnish and sidebar agent labels on migrations07
+
+Varnish is pinned to upstream `551225262703f243507bea8e6876c9b20f601aae`
+(the default-branch tip checked November 23, 2026; no published release tag).
+This copy keeps the Hub-prefix fix and restricts optional tile pictures to
+extension-relative URLs or inline images. It does not ship personal settings.
+`sidebar-agent` is a separate extension, copied unmodified from the reviewed
+three-file bundle (archive SHA-256
+`3800963b0ea1beeb3e4e32c77f5f902ebb24f480dd2c1a68a9fc121b88593eee`). It reads only
+the saved chat's `data-session-agent` when `data-session-id` exists, as supplied by
+[Term-LLM #1383](https://github.com/term-llm/term-llm/pull/1383). No fallback to
+chat titles, the current picker, model, or guessed agents; a chat without recorded
+agent metadata remains unlabeled. This is not a per-turn or delegated-agent history.
+
+Before enabling on the node, verify the managed running version remains v0.9.122
+and confirm the attributes exist in the signed-in UI, using invented chats: one
+with a saved agent and one without. Do not copy files into the sealed `current`
+release or change `extensions.yaml`; the existing `--extensions` launch override
+is authoritative. After review, publication and explicit approval for an idle-window
+restart, save a private backup of the existing managed web service spec/enable list,
+verify the baseline and prior release, then run the existing Silo update:
+
+```sh
+sudo silo update --branch mvp/metal-installer
+sudo silo doctor
+```
+
+The update refreshes the existing service spec and appends `sidebar-agent` after
+`varnish,silo-theme,silo-findings`, without installing a second service or updating
+Term-LLM. After the managed restart, check **sidebar agents** in doctor (saved
+configuration, not live rendering). Sign in to this node and refresh the browser;
+check the local extension registry for no errors, the enabled order, and the
+served JS/CSS against the reviewed files. In that UI, confirm the invented
+recorded chat shows its agent and the unlabeled chat remains unlabeled. A registry
+rescan or idle-safe browser activation alone cannot change startup flags.
+
+For rollback of this UI-only release, verify the retained previous release and
+use `metal rollback` **without** `--term-llm`; the native binary must stay v0.9.122.
+The installer drops its managed `sidebar-agent` flag when the prior release has
+no sidebar bundle. Check the saved service spec and stop before restarting if
+`METAL_SERVICE_UPDATE_SKIPPED` was reported. Restart the managed web service only
+in the approved idle window, then check doctor and the UI again.
+
+The focused local test uses a disposable stock binary and existing browser tools:
+
+```sh
+TERM_LLM_BINARY=/path/to/verified/term-llm \
+PLAYWRIGHT_CORE=/path/to/playwright-core/index.mjs CHROMIUM=/path/to/chromium \
+node test/sidebar_agent_browser.mjs
+```

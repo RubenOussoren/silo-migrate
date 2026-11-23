@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,55 @@ class ShippedVarnishTest(unittest.TestCase):
         self.assertNotIn(':scope > .vn-field-mark', (VARNISH / 'main.js').read_text())
         self.assertIn('.runtime-popover-field .vn-field-mark svg { width: 14px; height: 14px; }', (VARNISH / 'style.css').read_text())
 
+    def test_the_shipped_copy_has_the_checked_tile_image_fix(self):
+        record = json.loads((THEME / 'varnish-upstream.json').read_text())
+        patch = record['patches']['tile_image_origin']
+        self.assertIn(patch['status'], ('patched', 'already-supported'))
+        if patch['status'] == 'patched':
+            self.assertRegex(patch['upstream_files']['util.js'], r'\A[0-9a-f]{64}\Z')
+            self.assertNotEqual(record['files']['util.js'], patch['upstream_files']['util.js'])
+            if record['patches']['hub_node_id']['status'] == 'patched':
+                self.assertEqual(record['patches']['hub_node_id']['upstream_files'], patch['upstream_files'])
+        script = load()
+        source = (VARNISH / 'util.js').read_text()
+        self.assertEqual(1, source.count(script.TILE_IMAGE_URL_FIXED))
+        self.assertNotIn(script.TILE_IMAGE_URL_UPSTREAM, source)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is needed to check tile-image URL handling')
+    def test_tile_images_allow_extension_relative_or_inline_but_not_origin_relative(self):
+        # Run the shipped module at a browser-like HTTPS URL with stubbed globals.
+        script = '''
+            import assert from 'node:assert/strict';
+            import fs from 'node:fs';
+            import vm from 'node:vm';
+            const base = 'https://silo.example/hub/extensions/varnish/';
+            const module = new vm.SourceTextModule(fs.readFileSync(process.argv[1], 'utf8'), {
+                initializeImportMeta(meta) { meta.url = base + 'util.js'; },
+                context: vm.createContext({
+                    URL, location: { pathname: '/hub/node/dev/' },
+                    document: { documentElement: {} }, matchMedia: () => ({}),
+                    fetch: async (url) => {
+                        assert.equal(url.href, base + 'local.json');
+                        return { ok: true, json: async () => ({ nodeImages: {
+                            relative: 'local/tile.png', inline: 'data:image/png;base64,AA==',
+                            schemeRelative: '//outside.example/tile.png',
+                            rootRelative: '/local/tile.png', parent: '../tile.png',
+                        } }) };
+                    },
+                }),
+            });
+            await module.link(() => { throw new Error('Unexpected import'); });
+            await module.evaluate();
+            await module.namespace.loadLocalConfig();
+            assert.deepEqual({ ...module.namespace.NODE_IMAGES }, {
+                relative: `url("${base}local/tile.png")`,
+                inline: 'url("data:image/png;base64,AA==")',
+            });
+        '''
+        result = subprocess.run(['node', '--experimental-vm-modules', '--input-type=module', '-e', script,
+                                 str(VARNISH / 'util.js')], capture_output=True, text=True, timeout=10)
+        self.assertEqual(0, result.returncode, result.stderr)
+
     def test_licenses_and_credit_ship_with_it(self):
         self.assertIn('Keegan George', (VARNISH / 'LICENSE').read_text())
         self.assertIn('SIL OPEN FONT LICENSE', (VARNISH / 'fonts/OFL.txt').read_text().upper())
@@ -62,7 +112,12 @@ class ShippedVarnishTest(unittest.TestCase):
     def test_nothing_reaches_an_outside_address(self):
         outside, network = load().scan(VARNISH)
         self.assertEqual([], outside)
-        self.assertEqual(['util.js:35', 'util.js:112'], network)
+        util_lines = (VARNISH / 'util.js').read_text().splitlines()
+        expected_calls = (
+            '    const res = await fetch(new URL("./local.json", import.meta.url), { credentials: "same-origin" });',
+            '  const res = await fetch(`${apiPrefix}${path}`, { headers, credentials: "same-origin" });',
+        )
+        self.assertEqual(['util.js:%d' % (util_lines.index(call) + 1) for call in expected_calls], network)
         self.assertEqual([], load().scan(THEME)[0])
 
     def test_no_personal_settings_ship(self):
@@ -236,6 +291,67 @@ class UpdateTest(unittest.TestCase):
                 self.assertIn('runtime_marks patch', result.stderr)
                 self.assertEqual(before, {path.name: path.read_bytes() for path in self.target.iterdir() if path.is_file()})
                 self.assertEqual(self.first, json.loads(self.record.read_text())['commit'])
+
+    def test_legacy_upstream_without_tile_images_records_the_absent_feature(self):
+        result = self.update(self.first)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual({'status': 'feature-absent', 'upstream_files': {}},
+                         json.loads(self.record.read_text())['patches']['tile_image_origin'])
+        self.assertNotIn(self.script.TILE_IMAGE_URL_FIXED, (self.target / 'util.js').read_text())
+
+    def test_the_tile_image_patch_records_pristine_upstream_bytes_even_with_the_hub_patch(self):
+        legacy = (self.upstream / 'util.js').read_text()
+        original = legacy + self.script.TILE_IMAGE_URL_UPSTREAM + '\n'
+        self.write('util.js', original)
+        result = self.update(self.commit())
+        self.assertEqual(0, result.returncode, result.stderr)
+        expected = legacy.replace(self.script.OLD_NODE_ID, self.script.FIXED_NODE_ID) + self.script.TILE_IMAGE_URL_FIXED + '\n'
+        self.assertEqual(expected, (self.target / 'util.js').read_text())
+        record = json.loads(self.record.read_text())
+        upstream = {'util.js': hashlib.sha256(original.encode()).hexdigest()}
+        self.assertEqual({'status': 'patched', 'upstream_files': upstream}, record['patches']['tile_image_origin'])
+        self.assertEqual(upstream, record['patches']['hub_node_id']['upstream_files'])
+        self.assertEqual(hashlib.sha256(expected.encode()).hexdigest(), record['files']['util.js'])
+        self.assertEqual(original, (self.upstream / 'util.js').read_text())
+
+    def test_an_upstream_with_the_exact_tile_image_fix_is_left_as_it_is(self):
+        legacy = (self.upstream / 'util.js').read_text().replace(self.script.OLD_NODE_ID, self.script.FIXED_NODE_ID)
+        original = legacy + self.script.TILE_IMAGE_URL_FIXED + '\n'
+        self.write('util.js', original)
+        result = self.update(self.commit())
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(original, (self.target / 'util.js').read_text())
+        self.assertEqual({'status': 'already-supported', 'upstream_files': {}},
+                         json.loads(self.record.read_text())['patches']['tile_image_origin'])
+
+    def test_tile_image_drift_stops_the_update_without_replacing_the_bundle_or_record(self):
+        self.assertEqual(0, self.update(self.first).returncode)
+        before = (self.target / 'util.js').read_bytes(), self.record.read_bytes()
+        legacy = (self.upstream / 'util.js').read_text()
+        old, fixed = self.script.TILE_IMAGE_URL_UPSTREAM, self.script.TILE_IMAGE_URL_FIXED
+        for case, handler in (
+            ('changed', old.replace('new URL(src, import.meta.url).href', 'src')),
+            ('changed without comment', old.split('\n', 1)[1].replace('new URL(src, import.meta.url).href', 'src')),
+            ('partly fixed', fixed.replace(' && !src.startsWith("/")', '')),
+            ('duplicate upstream', old + '\n' + old),
+            ('duplicate fixed', fixed + '\n' + fixed),
+            ('mixed', fixed + '\n' + old),
+        ):
+            with self.subTest(case=case):
+                self.write('util.js', legacy + handler + '\n')
+                result = self.update(self.commit())
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn('tile_image_origin patch', result.stderr)
+                self.assertIn('review it before updating', result.stderr)
+                self.assertEqual(before, ((self.target / 'util.js').read_bytes(), self.record.read_bytes()))
+        # A config key is enough evidence even if the handler disappears from util.js.
+        self.write('util.js', legacy)
+        self.write('local.example.json', '{"nodeImages": {}}\n')
+        result = self.update(self.commit())
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('tile_image_origin patch', result.stderr)
+        self.assertEqual(before, ((self.target / 'util.js').read_bytes(), self.record.read_bytes()))
+        self.assertFalse(self.target.with_name('.varnish.new').exists())
 
     def test_a_short_hash_is_refused_even_when_a_tag_shares_it(self):
         self.write('main.js', 'export const other = 1;\n' + MARK)

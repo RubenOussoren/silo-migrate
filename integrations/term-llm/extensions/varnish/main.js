@@ -7,7 +7,7 @@
 
 import {
   KEYS, ACCENTS, NODE_ID, html, reducedMotion, read, write, nodeAccent,
-  setApiPrefix, loadLocalConfig, NODE_ICONS, currentProviderSync, loadProviders, providerTypeSync,
+  setApiPrefix, loadLocalConfig, NODE_ICONS, NODE_IMAGES, currentProviderSync, loadProviders, providerTypeSync,
 } from "./util.js";
 import { logoKey, logoSvg } from "./logos.js";
 import { createThread } from "./thread.js";
@@ -63,6 +63,8 @@ function createTheme() {
   let type = read(KEYS.type, "comfortable") === "compact" ? "compact" : "comfortable";
   html.setAttribute("data-vn-type", type);
   let switchTimer = 0;
+  const listeners = new Set();
+  const notify = () => listeners.forEach((listener) => listener());
 
   const resolved = () =>
     scheme === "system" ? (systemDark.matches ? "dark" : "light") : scheme;
@@ -107,11 +109,19 @@ function createTheme() {
     }
   }
 
-  const onSystem = () => scheme === "system" && apply(true);
+  const onSystem = () => {
+    if (scheme !== "system") return;
+    apply(true);
+    notify();
+  };
   systemDark.addEventListener("change", onSystem);
   apply(false);
 
   return {
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
     get scheme() { return scheme; },
     get accent() { return accent; },
     get resolved() { return resolved(); },
@@ -120,25 +130,30 @@ function createTheme() {
       toolbar = next === "accent" ? "accent" : "neutral";
       write(KEYS.toolbar, toolbar);
       applyToolbar();
+      notify();
     },
     setScheme(next) {
       scheme = next;
       write(KEYS.scheme, next);
       apply(true);
+      notify();
     },
     setAccent(next) {
       accent = next;
       write(accentKey, next);
       apply(true);
       document.dispatchEvent(new CustomEvent("vn:accent-change"));
+      notify();
     },
     get type() { return type; },
     setType(next) {
       type = next === "compact" ? "compact" : "comfortable";
       write(KEYS.type, type);
       html.setAttribute("data-vn-type", type);
+      notify();
     },
     dispose() {
+      listeners.clear();
       systemDark.removeEventListener("change", onSystem);
       html.removeAttribute("data-vn-scheme");
       html.removeAttribute("data-vn-accent");
@@ -164,6 +179,9 @@ function createThemePicker(theme, mount) {
     const b = backdrop;
     popover = null;
     backdrop = null;
+    // The exit animation keeps the panel mounted, but dismissal ends its
+    // interaction lifetime immediately (including pointer and keyboard focus).
+    p.inert = true;
     anchor?.setAttribute("aria-expanded", "false");
     document.removeEventListener("keydown", onKey);
     if (restoreFocus) anchor?.focus({ preventScroll: true });
@@ -173,8 +191,13 @@ function createThemePicker(theme, mount) {
       return;
     }
     p.setAttribute("data-leaving", "");
-    b.remove();
-    setTimeout(() => p.remove(), 220);
+    // Keep the dismissing backdrop as a click shield until the inert panel is
+    // gone; otherwise a click on its exit frame can activate the page below.
+    b.setAttribute("data-leaving", "");
+    setTimeout(() => {
+      p.remove();
+      b.remove();
+    }, 220);
   }
 
   function onKey(event) {
@@ -217,6 +240,34 @@ function createThemePicker(theme, mount) {
       </button>`;
   }
 
+  function updateTabStops() {
+    popover.querySelectorAll('[role="radio"]').forEach((radio) => {
+      radio.tabIndex = radio.getAttribute("aria-checked") === "true" ? 0 : -1;
+    });
+  }
+  // Update controls in place: palette actions must not replace the focused radio.
+  function sync() {
+    if (!popover) return;
+    for (const [key, choices] of [["scheme", SCHEMES], ["type", TYPE_SCALES]]) {
+      popover.querySelectorAll(`[data-${key}]`).forEach((button) =>
+        button.setAttribute("aria-checked", String(button.dataset[key] === theme[key])),
+      );
+      popover.querySelector(`[data-${key}]`).closest(".vn-segment").style.setProperty(
+        "--vn-seg-index", String(choices.findIndex((choice) => choice.id === theme[key])),
+      );
+    }
+    popover.querySelectorAll("[data-accent]").forEach((button) => {
+      const accent = ACCENTS.find((choice) => choice.id === button.dataset.accent);
+      button.setAttribute("aria-checked", String(accent.id === theme.accent));
+      button.style.setProperty("--sw", theme.resolved === "light" ? accent.light : accent.dark);
+    });
+    popover.querySelector(".vn-swatch-name").textContent =
+      ACCENTS.find((accent) => accent.id === theme.accent)?.name ?? "";
+    popover.querySelector("[data-toolbar]").setAttribute("aria-checked", String(theme.toolbar === "accent"));
+    updateTabStops();
+  }
+  const unsubscribe = theme.subscribe(sync);
+
   function position() {
     if (!popover || !anchor) return;
     const r = anchor.getBoundingClientRect();
@@ -241,6 +292,7 @@ function createThemePicker(theme, mount) {
     popover.setAttribute("role", "dialog");
     popover.setAttribute("aria-label", "Appearance");
     render();
+    updateTabStops();
     popover.addEventListener("click", (event) => {
       const schemeBtn = event.target.closest("[data-scheme]");
       const accentBtn = event.target.closest("[data-accent]");
@@ -248,45 +300,26 @@ function createThemePicker(theme, mount) {
       const typeBtn = event.target.closest("[data-type]");
       if (typeBtn) {
         theme.setType(typeBtn.dataset.type);
-        popover.querySelectorAll("[data-type]").forEach((b) =>
-          b.setAttribute("aria-checked", String(b.dataset.type === theme.type)),
-        );
-        popover.querySelector(".vn-segment-type").style.setProperty(
-          "--vn-seg-index",
-          String(TYPE_SCALES.findIndex((t) => t.id === theme.type)),
-        );
       } else if (toolbarBtn) {
         theme.setToolbar(theme.toolbar === "accent" ? "neutral" : "accent");
-        toolbarBtn.setAttribute("aria-checked", String(theme.toolbar === "accent"));
       } else if (schemeBtn) {
         theme.setScheme(schemeBtn.dataset.scheme);
-        const focusId = schemeBtn.dataset.scheme;
-        popover.querySelectorAll("[data-scheme]").forEach((b) =>
-          b.setAttribute("aria-checked", String(b.dataset.scheme === focusId)),
-        );
-        popover.querySelector(".vn-segment").style.setProperty(
-          "--vn-seg-index",
-          String(SCHEMES.findIndex((s) => s.id === focusId)),
-        );
       } else if (accentBtn) {
         theme.setAccent(accentBtn.dataset.accent);
-        popover.querySelectorAll("[data-accent]").forEach((b) =>
-          b.setAttribute("aria-checked", String(b.dataset.accent === theme.accent)),
-        );
-        popover.querySelector(".vn-swatch-name").textContent =
-          ACCENTS.find((a) => a.id === theme.accent)?.name ?? "";
       }
+      updateTabStops();
     });
-    // Arrow keys move within each radio group.
+    // Arrow keys select within each radio group; Tab visits only its checked radio.
     popover.addEventListener("keydown", (event) => {
-      if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
       const group = event.target.closest('[role="radiogroup"]');
       if (!group) return;
       const items = [...group.querySelectorAll('[role="radio"]')];
       const i = items.indexOf(event.target);
       if (i < 0) return;
       event.preventDefault();
-      const next = items[(i + (event.key === "ArrowRight" ? 1 : -1) + items.length) % items.length];
+      const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
+      const next = items[(i + (forward ? 1 : -1) + items.length) % items.length];
       next.focus();
       next.click();
     });
@@ -336,6 +369,7 @@ function createThemePicker(theme, mount) {
   return {
     ensureButton,
     dispose() {
+      unsubscribe();
       close({ restoreFocus: false });
       window.removeEventListener("resize", onResize);
       document.querySelectorAll(".vn-theme-btn").forEach((b) => b.remove());
@@ -733,11 +767,13 @@ function createAgentSection(root) {
     const name = nameEl.textContent.trim();
     if (icon.dataset.vnName === name) return;
     const id = link.closest(".hub-agent-row")?.dataset.reorderId;
-    const kind = NODE_ICONS[id] ?? NODE_ICONS[name] ?? KINDS.find(([re]) => re.test(name))?.[1] ?? "monogram";
+    const image = NODE_IMAGES[id] ?? NODE_IMAGES[name];
+    const kind = image ? "image" : NODE_ICONS[id] ?? NODE_ICONS[name] ?? KINDS.find(([re]) => re.test(name))?.[1] ?? "monogram";
     icon.dataset.vnName = name;
     icon.dataset.vnKind = kind;
     icon.dataset.vnInitials = initials(name);
-    if (kind === "monogram") icon.style.setProperty("--vn-glyph", monogramGlyph(icon.dataset.vnInitials));
+    if (kind === "image") icon.style.setProperty("--vn-glyph", image);
+    else if (kind === "monogram") icon.style.setProperty("--vn-glyph", monogramGlyph(icon.dataset.vnInitials));
     else icon.style.removeProperty("--vn-glyph");
     if (!link.title) link.title = name;
   }

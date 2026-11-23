@@ -1,0 +1,31 @@
+/* Keep the metadata's native truncation, layout, and hover behavior. */
+.sidebar-agent-label {
+  --sidebar-agent-dark: #b4a0ff;
+  --sidebar-agent-light: #5233a0;
+  color: var(--sidebar-agent-dark);
+  font-weight: 550;
+}
+.sidebar-agent-label[data-color="amber"] {
+  --sidebar-agent-dark: #efba74;
+  --sidebar-agent-light: #85450c;
+}
+.sidebar-agent-label[data-color="teal"] {
+  --sidebar-agent-dark: #76d7cf;
+  --sidebar-agent-light: #0b615c;
+}
+.sidebar-agent-label[data-color="blue"] {
+  --sidebar-agent-dark: #99c8ff;
+  --sidebar-agent-light: #174f93;
+}
+.sidebar-agent-label[data-color="rose"] {
+  --sidebar-agent-dark: #f7a7c3;
+  --sidebar-agent-light: #913157;
+}
+@media (prefers-color-scheme: light) {
+  .sidebar-agent-label { color: var(--sidebar-agent-light); }
+}
+:root[data-vn-scheme="light"] .sidebar-agent-label { color: var(--sidebar-agent-light); }
+:root[data-vn-scheme="dark"] .sidebar-agent-label { color: var(--sidebar-agent-dark); }
+@media (forced-colors: active) {
+  .sidebar-agent-label { color: inherit; }
+}

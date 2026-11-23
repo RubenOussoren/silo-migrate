@@ -450,21 +450,22 @@ def artifact():
         refuse("METAL_ARTIFACT_INVALID", "verify the allowlisted package before applying; no images loaded")
     return dict(id=sha(Path(C["ARTIFACT_PACKAGE"])/"manifest.json"), sha256=sha(Path(C["ARTIFACT_PACKAGE"])/"SHA256SUMS"), manifest=manifest)
 
-def service_args(dry=False):
+def service_args(dry=False, *, sidebar=True):
     # Only the secrets file PATH is passed; term-llm imports it into its private store.
     secrets = ["--secrets-file", C["HUB_SECRETS_FILE"]] if C["HUB_URL"] else []
     hub = (["--hub-url", C["HUB_URL"], "--hub-node-id", C["HUB_NODE_ID"]] + (["--hub-node-name", C["HUB_NODE_NAME"]] if C["HUB_NODE_NAME"] else [])
            + ["--hub-connect", "reverse", "--hub-register"]) if C["HUB_URL"] else []
     return ([str(P/"bin/term-llm"), "service", "install", "web", "--binary", str(P/"bin/term-llm"), "--no-start"] + (["--dry-run"] if dry else []) + secrets
             + ["--", "--host", "127.0.0.1", "--port", C["TERM_LLM_PORT"], "--auth", "bearer", "--approval", "prompt", "--projects"]
-            + web_ui_args() + hub)
+            + web_ui_args(sidebar=sidebar) + hub)
 
-def web_ui_args():
+def web_ui_args(*, sidebar=True):
     # Only the release's own widgets and extensions (sealed read-only), named explicitly and in
     # this order: the theme, then our layer on it, then the features. The Findings one is the
     # Findings release gate. Nothing from ~/.config/term-llm/{widgets,extensions}.
     ui = P/"current/integrations/term-llm"
-    return ["--widgets-dir", str(ui/"widgets"), "--extensions-dir", str(ui/"extensions"), "--extensions", "varnish,silo-theme,silo-findings"]
+    enabled = "varnish,silo-theme,silo-findings" + (",sidebar-agent" if sidebar else "")
+    return ["--widgets-dir", str(ui/"widgets"), "--extensions-dir", str(ui/"extensions"), "--extensions", enabled]
 
 def hub_secrets_state(entry):
     # Metadata only: the file holds TERM_LLM_HUB_REGISTRATION_TOKEN and is never read or hashed here.
@@ -1488,29 +1489,27 @@ def service_spec_args():
         return None
     return args if isinstance(args, list) else None
 
-def service_current(args):
-    """The saved service arguments already have web UI projects and the Project page and its extension."""
-    wanted = web_ui_args()
+def service_current(args, *, sidebar=True):
+    """The saved service arguments match the managed Projects and UI settings."""
+    wanted = web_ui_args(sidebar=sidebar)
     pairs = {wanted[i]: wanted[i + 1] for i in range(0, len(wanted), 2)}
     return ("--projects" in args and not {"--no-projects", "--disable-widgets", "--disable-extensions"} & set(args)
             and all(flag in args and args.index(flag) + 1 < len(args) and args[args.index(flag) + 1] == value for flag, value in pairs.items()))
 
-def refresh_service(force=False):
-    """Re-install the web service when its saved arguments predate web UI projects or the Project page,
-    or (force) when term-llm itself changed. Keeps the unit's directory, environment and secrets
-    (term-llm reuses them); silo update restarts."""
+def refresh_service(force=False, *, sidebar=True):
+    """Refresh the managed UI arguments, or force when the binary changed. This keeps the
+    service directory, environment and secrets; it never starts the service."""
     global STAGE
     args = service_spec_args()
-    if C["TERM_LLM_SERVICE"] == "skip" or args is None or (service_current(args) and not force):
+    if C["TERM_LLM_SERVICE"] == "skip" or args is None or (service_current(args, sidebar=sidebar) and not force):
         return False
     STAGE = "SERVICE_UPDATE"
     try:
-        run(service_args(True))
-        run(service_args())
+        run(service_args(True, sidebar=sidebar))
+        run(service_args(sidebar=sidebar))
     except Refusal as refusal:
         # The new release is in place either way; doctor shows the fix.
-        print("METAL_SERVICE_UPDATE_SKIPPED: " + str(refusal).split(":")[0] + "; web UI projects stay off, so the migration agents' tools "
-              "refuse (STANDARD_CHAT_NOT_IN_PROJECT) until 'silo update' is run again", flush=True)
+        print("METAL_SERVICE_UPDATE_SKIPPED: " + str(refusal).split(":")[0] + "; managed web service arguments may be stale; inspect before restarting", flush=True)
         return False
     return True
 
@@ -1654,6 +1653,13 @@ def account_update(rollback=False, branch=None, term=False):
             target["term_llm_version"] = (P/"bin/term-llm").resolve().parent.name
         else:
             set_private_scope_flag(release)
+            # Older bundles do not ship sidebar-agent. Drop just our managed override on
+            # release rollback so the next startup does not report a missing extension.
+            saved_args = service_spec_args()
+            if (saved_args is not None and service_current(saved_args)
+                    and not (release/"integrations/term-llm/extensions/sidebar-agent/extension.yaml").is_file()
+                    and refresh_service(sidebar=False)):
+                print("METAL_SERVICE_UPDATED", flush=True)
         for key in ("installed_at", "operation", "previous_commit"):
             target.pop(key, None)
         record(target, "rollback" if rollback else "update", previous)

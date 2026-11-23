@@ -477,6 +477,18 @@ class SiloTest(unittest.TestCase):
         self.assertEqual('OK', statuses['project page']['status'])
         self.assertEqual('OK', statuses['theme']['status'])
 
+    def test_doctor_sidebar_agents_requires_the_release_and_managed_flag(self):
+        ui = self.prefix / 'current/integrations/term-llm'
+        directory = ui / 'extensions/sidebar-agent'
+        directory.mkdir(parents=True)
+        args = ['--extensions-dir', str(ui / 'extensions'), '--extensions', 'varnish,silo-theme,silo-findings,sidebar-agent']
+        with mock.patch.object(self.s, 'service_spec', return_value={'args': args}):
+            self.assertEqual('WARN', self.statuses(self.healthy())['sidebar agents']['status'])
+            (directory / 'extension.yaml').write_text('title: Sidebar agent labels\n')
+            self.assertEqual('OK', self.statuses(self.healthy())['sidebar agents']['status'])
+            args.append('--disable-extensions')
+            self.assertEqual('WARN', self.statuses(self.healthy())['sidebar agents']['status'])
+
     def test_doctor_checks_the_widget_socket_folder_is_private(self):
         runtime, tmpfiles = self.root / 'widgets-run', self.root / 'tmpfiles.conf'
         with mock.patch.object(self.s, 'WIDGET_RUNTIME', runtime), mock.patch.object(self.s, 'WIDGET_TMPFILES', tmpfiles):

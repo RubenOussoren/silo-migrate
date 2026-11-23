@@ -110,8 +110,8 @@ class InstallerTests(unittest.TestCase):
         # Only the release's own widget and extension, named explicitly.
         self.assertEqual(str(self.m.P/"current/integrations/term-llm/widgets"), args[args.index("--widgets-dir") + 1])
         self.assertEqual(str(self.m.P/"current/integrations/term-llm/extensions"), args[args.index("--extensions-dir") + 1])
-        self.assertEqual("varnish,silo-theme,silo-findings", args[args.index("--extensions") + 1])
-        for name in ("varnish", "silo-theme", "silo-findings"):
+        self.assertEqual("varnish,silo-theme,silo-findings,sidebar-agent", args[args.index("--extensions") + 1])
+        for name in ("varnish", "silo-theme", "silo-findings", "sidebar-agent"):
             self.assertTrue((Path(__file__).resolve().parents[2]/"integrations/term-llm/extensions"/name/"extension.yaml").is_file())
         shipped = Path(__file__).resolve().parents[2]/"integrations/term-llm"
         self.assertTrue((shipped/"widgets/project/widget.yaml").is_file())
@@ -252,6 +252,10 @@ class InstallerTests(unittest.TestCase):
             spec.write_text(json.dumps({"args": current[current.index("--") + 1:]}))
             self.assertFalse(self.m.refresh_service())  # already as wanted: no re-install
             self.assertEqual(4, len(calls))
+            old = self.m.service_args(sidebar=False)
+            spec.write_text(json.dumps({"args": old[old.index("--") + 1:]}))
+            self.assertTrue(self.m.refresh_service())  # Append sidebar-agent without reordering.
+            self.assertEqual(current, calls[-1])
         spec.write_text(json.dumps({"args": ["--no-projects"]}))
         def failing(argv, **kw):
             self.m.refuse("METAL_SERVICE_UPDATE_FAILED", "x")
@@ -615,6 +619,28 @@ class InstallerTests(unittest.TestCase):
             self.m.account_update(True)
         self.assertEqual([], steps)
         self.assertEqual(a, (P/"current").resolve().name)
+
+    def test_release_rollback_drops_sidebar_flag_if_previous_bundle_does_not_ship_it(self):
+        P = self.m.P
+        old, new = "a" * 40, "b" * 40
+        prior, current = P/"releases"/old, P/"releases"/new
+        for directory in (prior/"bin", current, P/"state/logs", self.m.W):
+            directory.mkdir(parents=True)
+        (prior/"bin/data_tools.py").write_text("def mcp_rules_main(args):\n    pass\n")
+        (P/"current").symlink_to(current)
+        (self.m.W/".silo-standard-execution.lock").touch()
+        self.m.record({"commit": old}, "update")
+        self.m.record({"commit": new}, "update", old)
+        self.m.C["TERM_LLM_SERVICE"] = "install"
+        spec = self.home/".config/term-llm/services/web/service.json"
+        spec.parent.mkdir(parents=True)
+        active = self.m.service_args()
+        spec.write_text(json.dumps({"args": active[active.index("--") + 1:]}))
+        with patch.object(self.m, "run") as run, contextlib.redirect_stdout(io.StringIO()):
+            self.m.account_update(True)
+        self.assertEqual(prior, (P/"current").resolve())
+        self.assertEqual([self.m.service_args(True, sidebar=False), self.m.service_args(sidebar=False)],
+                         [call.args[0] for call in run.call_args_list])  # --no-start throughout
 
     def test_project_default_agent_is_the_lead_agent_unless_an_available_one_is_chosen(self):
         for name in self.m.MIGRATION_AGENTS:

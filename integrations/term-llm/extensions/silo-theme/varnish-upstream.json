@@ -1,39 +1,41 @@
 {
   "repository": "https://github.com/keegangeorge/term-llm-varnish.git",
-  "commit": "002f10eca21d766bcf0271c188ed592f6789333c",
+  "commit": "551225262703f243507bea8e6876c9b20f601aae",
   "files": {
     "LICENSE": "04059d015bbc91b78e628a68576c8e8f8dbc56b6d2b8925e17c087de7fcbb0f8",
-    "README.md": "7726733cb735a938fad70f4f7bf1803a3a9d10da4a9b67b3026dd47048ba12a1",
+    "README.md": "9c9c23683716ec428d01b9656b1ac270158d831f79c00a39be096b33d5a65bf6",
     "arrivals.js": "12756d1b6c9d72dda335a11ac21dd45a5a1a92caf113b98960ce721549b22331",
     "composer.js": "11213540b9862d2735223c1a61bd371c882d82290dda8306f311f61b6c0c6b61",
     "extension.yaml": "cbfec328bd2d216db94ed40a400ff17c14d5ad4a47eab76b65f3234a5f80723c",
-    "favicon.js": "5d3e88317ae199bb47c18b4bef195478079e07f1a7a8cb81576ae9501e52dc9a",
+    "favicon.js": "43dad209a4c088ff5aee46aaf4f04d0190f233c72de2e1dd00caa9249552d8e2",
     "fonts/Geist-Variable.woff2": "9ce2d97863cab59a0c7522534112d6c42a4e25c0e6b2ab37766761b0f82cfbd6",
     "fonts/GeistMono-Variable.woff2": "119f3e159fc15dd77311e929d3a657a193b57a3e625234666bc43c6e2b1127f7",
     "fonts/OFL.txt": "930853ee1daa68554d9e35c8a9175affb74f699fad9a5da6ee5ebe76379d9137",
-    "local.example.json": "82b9f680e41b1bec9c69f913e488e98f64ceae17d4de2396da0315f22a83d0f2",
+    "local.example.json": "1c687ccc1fcdb617d70bc777216eb8b4a9d6dea62f6706f67bc0ce5b25b20dcc",
     "logos.js": "42ddda13f6b4c3cf92d0a9c4b17adfbb1389cab91622cf3ba35daaa963a66595",
-    "main.js": "3f1b2158f2fbd5b5db35aa957217391320febf5316e56a8140ff116957033163",
+    "main.js": "05f76e8be5da7fa92b590e1f2d506dd847a76744584efe72c991494c98cf5da6",
     "notify.js": "b22ef24159ce767cb7feb3f85d2a9dddc985c9494f36bf6bab9b520712993c49",
-    "palette.js": "762e519c0373577d784779bc6b675a400b4ecc9c80f93e936ae972acb4e9e065",
-    "style.css": "9650c50e259b8219fd344214f3943257485b0c675a7a0aaaae626ce0ae4b85f3",
-    "thread.js": "ebb108e77e7f36795a39a4231eac92c52e0c437e999a4612c479871179fe1cd4",
-    "util.js": "86a0a626ca9aea82c001cd183b352aab84c7d437575220db96e6074c23b1e5d0"
+    "palette.js": "8219551ec6738cf54918adb7cbc4365ec1b58d42dd369ad24696b82eb74d4abb",
+    "style.css": "d1cce9617fd2b1a4381768952b0c34eafad3d5cb3adbe43c82839d0a3b9c69d9",
+    "thread.js": "fe82107a28189214db009147e131e88ca9f59b0be1a3fff1cbf1a44e4eb7368b",
+    "util.js": "854c857ac3557c37df0ab4b71b1f366572b7b73410a7d5e5e049b5909b0dd93e"
   },
   "patches": {
     "runtime_marks": {
-      "status": "patched",
-      "upstream_files": {
-        "main.js": "bca7bba3312ccf53a1df928120ffc995103997c20bff11bace0d4189db17143a",
-        "style.css": "c6aa3af9df1d8231d1ec9d113662bad3e771f1cea3e8038d14e10f26002b51a1"
-      }
+      "status": "already-supported",
+      "upstream_files": {}
     },
     "hub_node_id": {
       "status": "patched",
       "upstream_files": {
-        "util.js": "5755a7ce8b1bc45bc0950d391c10f1e520f4c4616215e2b8e5e6682b41fa56ed"
+        "util.js": "11f27126108af079f101ec3cb15d427202ade9d277252cebe9085e1ab346aec0"
+      }
+    },
+    "tile_image_origin": {
+      "status": "patched",
+      "upstream_files": {
+        "util.js": "11f27126108af079f101ec3cb15d427202ade9d277252cebe9085e1ab346aec0"
       }
     }
-  },
-  "fetched_from_a_clone": true
+  }
 }

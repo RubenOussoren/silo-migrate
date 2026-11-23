@@ -180,9 +180,9 @@ especially before any customer data. Same-user agents are not OS isolation.
 
 Confirmed against the **real 0.9.99 binary's help** (and before it 0.9.93's): `service install web`,
 `--binary`, `--no-start`, `--dry-run`, and serve flags `--host`, `--port`,
-`--auth bearer`, `--approval prompt`, `--projects`, and only the release's own Findings
-widget and extension (`--widgets-dir <prefix>/current/integrations/term-llm/widgets
---extensions-dir <prefix>/current/integrations/term-llm/extensions --extensions varnish,silo-theme,silo-findings`;
+`--auth bearer`, `--approval prompt`, `--projects`, and only the release's own widgets
+and extensions (`--widgets-dir <prefix>/current/integrations/term-llm/widgets
+--extensions-dir <prefix>/current/integrations/term-llm/extensions --extensions varnish,silo-theme,silo-findings,sidebar-agent`;
 nothing from `~/.config/term-llm/{widgets,extensions}`). No startup agent is pinned: with `--agent` the web UI hides its
 agent picker. Instead the account's config sets `agents.use_builtin: false`, so the
 picker offers only `migration-operator`, `migration-data`, `server-support`,

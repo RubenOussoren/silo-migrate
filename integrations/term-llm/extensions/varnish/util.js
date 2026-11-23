@@ -30,6 +30,12 @@ export const NODE_ACCENTS = {};
 export const NODE_ICONS = {};
 export const GLYPHS = ["laptop", "cloud", "box", "sparkle", "home", "server", "core", "monogram"];
 
+// Optional per-node tile pictures, keyed by Hub node id or display name, also
+// from local.json. Values are image paths relative to this extension (put the
+// files in an untracked local/ folder; install.sh copies it) or data:image URIs.
+// A picture replaces the glyph and wins over nodeIcons.
+export const NODE_IMAGES = {};
+
 export async function loadLocalConfig() {
   try {
     const res = await fetch(new URL("./local.json", import.meta.url), { credentials: "same-origin" });
@@ -38,6 +44,17 @@ export async function loadLocalConfig() {
     if (cfg && typeof cfg.nodeAccents === "object") Object.assign(NODE_ACCENTS, cfg.nodeAccents);
     if (cfg && typeof cfg.nodeIcons === "object") {
       for (const [key, glyph] of Object.entries(cfg.nodeIcons)) if (GLYPHS.includes(glyph)) NODE_ICONS[key] = glyph;
+    }
+    if (cfg && typeof cfg.nodeImages === "object") {
+      for (const [key, src] of Object.entries(cfg.nodeImages)) {
+        if (typeof src !== "string") continue;
+        // Allow inline images or files relative to this extension, never origin-relative URLs.
+        const base = new URL(import.meta.url);
+        const relative = /^[\w./-]+$/.test(src) && !src.startsWith("/") && !src.includes("..");
+        const resolved = relative ? new URL(src, base) : null;
+        const url = /^data:image\//.test(src) ? src : resolved?.origin === base.origin ? resolved.href : null;
+        if (url) NODE_IMAGES[key] = `url("${url.replace(/"/g, "%22")}")`;
+      }
     }
   } catch {
     // No local.json (the normal case): built-in defaults apply.

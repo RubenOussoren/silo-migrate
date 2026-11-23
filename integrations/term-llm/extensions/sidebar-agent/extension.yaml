@@ -1,0 +1,5 @@
+title: Sidebar agent labels
+description: Show the recorded agent beside each chat’s sidebar metadata.
+format_version: 1
+css: style.css
+js: main.js
